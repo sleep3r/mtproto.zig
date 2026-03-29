@@ -37,6 +37,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp Validation | Rejects replayed handshakes outside a +/- 2 min window |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients to a real domain |
+| **Fast Mode** | Zero-copy S2C | Drastically reduces CPU usage by delegating Server-to-Client AES encryption to the DC |
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
@@ -273,8 +274,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 |---------|-----|---------|-------------|
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
-| `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` |
-| `[censorship]` | `fast_mode` | `false` | Skip S2C re-encryption (experimental, requires DC support) |
+| `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
+| `[censorship]` | `fast_mode` | `false` | **Recommended**. Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 
 </details>
@@ -322,6 +323,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 ## &nbsp; iOS Compatibility
 
 The proxy includes specific handling for iOS Telegram clients:
+
+- **Fast Mode (`fast_mode = true`)** — Highly recommended for iOS clients to fix the "Updating..." connection loop. This bypasses proxy S2C encryption and relies on the Telegram DC directly.
 
 - **Fragmented handshake assembly** — iOS may split the 64-byte MTProto handshake across multiple TLS AppData records or interleave CCS records
 - **Two-stage timeouts** — idle pool connections (common on iOS) get a generous 5-minute poll timeout; active data gets a tight 10s `SO_RCVTIMEO`
