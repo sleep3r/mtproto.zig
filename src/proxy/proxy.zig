@@ -19,8 +19,15 @@ const tls_header_len = 5;
 const max_tls_payload = constants.max_tls_ciphertext_size;
 /// Idle timeout for relay poll() and write backpressure (5 minutes)
 const relay_timeout_ms = 5 * 60 * 1000;
-/// Handshake read timeout applied via SO_RCVTIMEO (seconds)
-const handshake_timeout_sec = 30;
+/// Idle Phase: wait for first byte from client (5 minutes).
+/// Mobile clients (iOS Telegram) aggressively pre-warm TCP connection pools,
+/// opening 2-5 idle sockets that sit empty until the app needs to send data.
+/// A short timeout here kills these pooled connections, causing iOS to mark
+/// the proxy as unstable and enter long reconnect cycles.
+const idle_timeout_ms: i32 = 5 * 60 * 1000;
+/// Active Phase: once data starts arriving, apply tight SO_RCVTIMEO
+/// to protect against Slowloris-style attacks (seconds).
+const active_timeout_sec: u32 = 10;
 
 // ============= Dynamic Record Sizing (DRS) =============
 
@@ -125,7 +132,12 @@ pub const ProxyState = struct {
 
             const conn_id = self.connection_count.fetchAdd(1, .monotonic);
 
-            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream, conn.address, conn_id }) catch |err| {
+            const thread = std.Thread.spawn(.{
+                // Proxy threads just shuffle bytes between sockets + AES-CTR (no deep recursion).
+                // 128 KB is plenty. Default 8-16 MB per thread would exhaust memory with thousands
+                // of idle iOS pool connections (e.g. 4000 threads * 8 MB = 32 GB virtual memory).
+                .stack_size = 128 * 1024,
+            }, handleConnection, .{ self, conn.stream, conn.address, conn_id }) catch |err| {
                 log.err("[{d}] Spawn error: {any}", .{ conn_id, err });
                 conn.stream.close();
                 continue;
@@ -145,6 +157,17 @@ fn handleConnection(
     defer client_stream.close();
 
     handleConnectionInner(state, client_stream, conn_id) catch |err| {
+        // Idle pool closure is normal — mobile clients pre-warm connections
+        // that may never send data. Don't pollute logs.
+        if (err == error.IdleConnectionClosed) {
+            log.debug("[{d}] Closed idle pooled connection", .{conn_id});
+            return;
+        }
+        // WouldBlock during handshake = Slowloris or extreme lag
+        if (err == error.WouldBlock) {
+            log.warn("[{d}] Handshake timeout (Slowloris/lag)", .{conn_id});
+            return;
+        }
         log.err("[{d}] Connection error: {any}", .{ conn_id, err });
     };
     _ = peer_addr;
@@ -155,9 +178,34 @@ fn handleConnectionInner(
     client_stream: net.Stream,
     conn_id: u64,
 ) !void {
-    // Apply receive timeout to protect against Slowloris-style attacks.
-    // Blocks the handshake phase from holding a thread indefinitely.
-    setRecvTimeout(client_stream.handle, handshake_timeout_sec);
+    // === Two-Stage Timeout (Split Timeout) ===
+    //
+    // Stage 1 — Idle Phase: wait for the first byte with a long timeout.
+    // Mobile clients (iOS Telegram) pre-warm TCP connection pools by opening
+    // several idle sockets. Killing them too early causes reconnect storms.
+    // A sleeping thread in poll() consumes zero CPU.
+    //
+    // Stage 2 — Active Phase: once data arrives, apply a tight SO_RCVTIMEO
+    // to catch real Slowloris attacks (slow-drip partial sends).
+
+    const fd = client_stream.handle;
+
+    // Stage 1: wait for first byte (idle pool phase)
+    var poll_fds = [_]posix.pollfd{
+        .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
+    };
+    const ready = posix.poll(&poll_fds, idle_timeout_ms) catch return error.ConnectionReset;
+    if (ready == 0) {
+        // Client held the socket open but never sent data — normal pool behavior.
+        return error.IdleConnectionClosed;
+    }
+    // Client closed the pooled socket from their side (FIN/RST)
+    if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) {
+        return error.IdleConnectionClosed;
+    }
+
+    // Stage 2: data is coming — apply tight recv timeout (anti-Slowloris)
+    setRecvTimeout(fd, active_timeout_sec);
 
     // Read first 5 bytes to determine TLS vs direct
     var first_bytes: [5]u8 = undefined;

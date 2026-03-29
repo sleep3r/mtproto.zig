@@ -87,11 +87,6 @@ pub const max_msg_len: usize = 1 << 24; // 16 MB
 
 pub const default_buffer_size: usize = 16384;
 
-// ============= Timeouts (nanoseconds for Zig timer) =============
-
-pub const default_handshake_timeout_ns: u64 = 10 * std.time.ns_per_s;
-pub const default_connect_timeout_ns: u64 = 10 * std.time.ns_per_s;
-
 // ============= TLS Handshake Constants =============
 
 pub const tls_digest_len: usize = 32;

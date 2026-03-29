@@ -11,6 +11,11 @@ const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
 
+// Override default log level so info/debug messages are visible in release builds.
+pub const std_options = std.Options{
+    .log_level = .debug,
+};
+
 const log = std.log.scoped(.mtproto);
 
 const version = "0.1.0";
