@@ -1,5 +1,5 @@
 [server]
-port = 8443
+port = 443
 
 [censorship]
 tls_domain = "wb.ru"
