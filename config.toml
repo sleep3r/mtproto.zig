@@ -4,6 +4,7 @@ port = 443
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+fast_mode = false
 
 [access.users]
 alexander = "0b513f6e83524354984a8835939fa9af"

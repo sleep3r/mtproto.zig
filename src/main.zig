@@ -18,9 +18,7 @@ const proxy = @import("proxy/proxy.zig");
 // default logger uses, which causes catastrophic contention under
 // hundreds of concurrent threads.
 pub const std_options = std.Options{
-    // ReleaseFast default (.info) compiles out all log.debug calls entirely.
-    // DO NOT override to .debug in production — it causes 99% CPU from
-    // stderr mutex contention with hundreds of threads.
+    .log_level = .debug,
     .logFn = lockFreeLog,
 };
 

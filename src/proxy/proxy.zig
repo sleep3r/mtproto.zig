@@ -239,23 +239,33 @@ fn handleConnectionInner(
     // Read first 5 bytes to determine TLS vs direct
     var first_bytes: [5]u8 = undefined;
     const n = try readExact(client_stream, &first_bytes);
-    if (n < 5) return;
+    if (n < 5) {
+        log.debug("[{d}] ({s}) Short read on first 5 bytes (got {d}), dropping.", .{ conn_id, peer_str, n });
+        return;
+    }
 
     if (!tls.isTlsHandshake(&first_bytes)) {
         log.debug("[{d}] ({s}) Non-TLS connection, dropping. First bytes: {x:0>2}", .{ conn_id, peer_str, first_bytes });
+        maskConnection(state, client_stream, peer_str, conn_id, &first_bytes, null);
         return;
     }
 
     // TLS path: read full ClientHello
     const record_len = std.mem.readInt(u16, first_bytes[3..5], .big);
     if (record_len < constants.min_tls_client_hello_size or record_len > constants.max_tls_plaintext_size) {
+        log.debug("[{d}] ({s}) Invalid ClientHello size: {d}, dropping.", .{ conn_id, peer_str, record_len });
+        maskConnection(state, client_stream, peer_str, conn_id, &first_bytes, null);
         return;
     }
 
     var client_hello_buf: [5 + constants.max_tls_plaintext_size]u8 = undefined;
     @memcpy(client_hello_buf[0..5], &first_bytes);
     const body_n = try readExact(client_stream, client_hello_buf[5..][0..record_len]);
-    if (body_n < record_len) return;
+    if (body_n < record_len) {
+        log.debug("[{d}] ({s}) Short read on ClientHello body (got {d}, expected {d}), dropping.", .{ conn_id, peer_str, body_n, record_len });
+        maskConnection(state, client_stream, peer_str, conn_id, client_hello_buf[0 .. 5 + body_n], null);
+        return;
+    }
 
     const client_hello = client_hello_buf[0 .. 5 + record_len];
 
@@ -269,6 +279,7 @@ fn handleConnectionInner(
 
     if (validation == null) {
         log.debug("[{d}] ({s}) TLS auth failed", .{ conn_id, peer_str });
+        maskConnection(state, client_stream, peer_str, conn_id, client_hello, null);
         return;
     }
 
@@ -297,7 +308,10 @@ fn handleConnectionInner(
 
     while (hs_pos < constants.handshake_len) {
         var tls_header: [5]u8 = undefined;
-        if (try readExact(client_stream, &tls_header) < 5) return;
+        if (try readExact(client_stream, &tls_header) < 5) {
+            log.debug("[{d}] ({s}) Short read waiting for AppData header during handshake, dropping.", .{ conn_id, peer_str });
+            return;
+        }
 
         const record_type = tls_header[0];
         const body_len = std.mem.readInt(u16, tls_header[3..5], .big);
@@ -307,12 +321,18 @@ fn handleConnectionInner(
                 // Read and discard CCS body
                 if (body_len > 256) return;
                 var ccs_buf: [256]u8 = undefined;
-                if (try readExact(client_stream, ccs_buf[0..body_len]) < body_len) return;
+                if (try readExact(client_stream, ccs_buf[0..body_len]) < body_len) {
+                    log.debug("[{d}] ({s}) Short read on CCS body, dropping.", .{ conn_id, peer_str });
+                    return;
+                }
             },
             constants.tls_record_application => {
                 if (body_len == 0 or body_len > constants.max_tls_ciphertext_size) return;
                 var body_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
-                if (try readExact(client_stream, body_buf[0..body_len]) < body_len) return;
+                if (try readExact(client_stream, body_buf[0..body_len]) < body_len) {
+                    log.debug("[{d}] ({s}) Short read on AppData body, dropping.", .{ conn_id, peer_str });
+                    return;
+                }
 
                 app_records_used += 1;
 
@@ -398,9 +418,19 @@ fn handleConnectionInner(
 
     // Generate and send obfuscated handshake to Telegram DC
     var tg_nonce = obfuscation.generateNonce();
-    // Set proto tag and DC index in the nonce
-    const tag_bytes = params.proto_tag.toBytes();
-    @memcpy(tg_nonce[constants.proto_tag_pos..][0..4], &tag_bytes);
+    
+    // In FAST_MODE, embed the client's S2C key/IV into the DC nonce so the DC
+    // derives direct-to-client encryption parameters, bypassing proxy S2C crypto.
+    if (state.config.fast_mode) {
+        var client_s2c_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
+        @memcpy(client_s2c_key_iv[0..constants.key_len], &params.encrypt_key);
+        std.mem.writeInt(u128, client_s2c_key_iv[constants.key_len..][0..constants.iv_len], params.encrypt_iv, .big);
+        obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, &client_s2c_key_iv);
+    } else {
+        obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, null);
+    }
+    
+    // DC index must be set explicitly after prepareTgNonce
     std.mem.writeInt(i16, tg_nonce[constants.dc_idx_pos..][0..2], params.dc_idx, .little);
 
     // Derive TG crypto keys from nonce (raw key bytes, NOT SHA256)
@@ -490,6 +520,7 @@ fn handleConnectionInner(
         &tg_decryptor,
         initial_c2s_bytes,
         conn_id,
+        state.config.fast_mode,
     ) catch |err| {
         log.debug("[{d}] ({s}) Relay ended: {any}", .{ conn_id, peer_str, err });
     };
@@ -520,6 +551,7 @@ fn relayBidirectional(
     tg_decryptor: *crypto.AesCtr,
     initial_c2s_bytes: u64,
     conn_id: u64,
+    fast_mode: bool,
 ) !void {
     var fds = [2]posix.pollfd{
         .{ .fd = client.handle, .events = posix.POLL.IN, .revents = 0 },
@@ -603,8 +635,8 @@ fn relayBidirectional(
             const step = relayDcToClient(
                 dc,
                 client,
-                tg_decryptor,
-                client_encryptor,
+                if (fast_mode) null else tg_decryptor,
+                if (fast_mode) null else client_encryptor,
                 &dc_read_buf,
                 &drs,
                 &s2c_bytes,
@@ -793,8 +825,8 @@ fn relayClientToDc(
 fn relayDcToClient(
     dc: net.Stream,
     client: net.Stream,
-    tg_decryptor: *crypto.AesCtr,
-    client_encryptor: *crypto.AesCtr,
+    tg_decryptor: ?*crypto.AesCtr,
+    client_encryptor: ?*crypto.AesCtr,
     dc_read_buf: *[constants.default_buffer_size]u8,
     drs: *DynamicRecordSizer,
     bytes_counter: *u64,
@@ -807,11 +839,11 @@ fn relayDcToClient(
 
     const data = dc_read_buf[0..nr];
 
-    // AES-CTR decrypt DC obfuscation
-    tg_decryptor.apply(data);
+    // In fast mode, the DC encrypts directly for the client, so we skip these
+    if (tg_decryptor) |dec| dec.apply(data);
 
     // AES-CTR encrypt for client obfuscation
-    client_encryptor.apply(data);
+    if (client_encryptor) |enc| enc.apply(data);
 
     // Wrap in TLS Application Data record(s) using DRS-controlled sizes
     var offset: usize = 0;
@@ -953,6 +985,76 @@ fn setTcpKeepalive(fd: posix.fd_t) void {
 fn configureRelaySocket(fd: posix.fd_t) void {
     setTcpKeepalive(fd);
     setSendTimeout(fd, send_timeout_sec);
+}
+
+fn maskConnection(
+    state: *ProxyState,
+    client_stream: net.Stream,
+    peer_str: []const u8,
+    conn_id: u64,
+    buffered_data1: []const u8,
+    buffered_data2: ?[]const u8,
+) void {
+    if (!state.config.mask) return;
+
+    // Connect to the real domain on port 443
+    const upstream_stream = std.net.tcpConnectToHost(state.allocator, state.config.tls_domain, 443) catch {
+        log.debug("[{d}] ({s}) Masking failed: cannot connect to {s}:443", .{ conn_id, peer_str, state.config.tls_domain });
+        return;
+    };
+    defer upstream_stream.close();
+
+    // Write any already read bytes to the upstream server
+    if (buffered_data1.len > 0) {
+        writeAll(upstream_stream, buffered_data1) catch return;
+    }
+    if (buffered_data2) |buf2| {
+        if (buf2.len > 0) {
+            writeAll(upstream_stream, buf2) catch return;
+        }
+    }
+
+    log.debug("[{d}] ({s}) Masking active: forwarding to {s}:443", .{ conn_id, peer_str, state.config.tls_domain });
+
+    // Bidirectional raw relay
+    relayRaw(client_stream, upstream_stream, peer_str, conn_id) catch |err| {
+        log.debug("[{d}] ({s}) Masking relay ended: {any}", .{ conn_id, peer_str, err });
+    };
+}
+
+fn relayRaw(client: net.Stream, upstream: net.Stream, peer_str: []const u8, conn_id: u64) !void {
+    _ = peer_str;
+    _ = conn_id;
+    var fds = [2]posix.pollfd{
+        .{ .fd = client.handle, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = upstream.handle, .events = posix.POLL.IN, .revents = 0 },
+    };
+
+    var buf: [constants.default_buffer_size]u8 = undefined;
+
+    while (true) {
+        fds[0].events = posix.POLL.IN;
+        fds[1].events = posix.POLL.IN;
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+
+        const ready = try posix.poll(&fds, 30_000); // 30s timeout
+        if (ready == 0) return error.ConnectionReset;
+
+        if (fds[0].revents & posix.POLL.IN != 0) {
+            const n = try client.read(&buf);
+            if (n == 0) return;
+            try writeAll(upstream, buf[0..n]);
+        }
+        if (fds[1].revents & posix.POLL.IN != 0) {
+            const n = try upstream.read(&buf);
+            if (n == 0) return;
+            try writeAll(client, buf[0..n]);
+        }
+
+        if (fds[0].revents & posix.POLL.HUP != 0 or fds[0].revents & posix.POLL.ERR != 0) return error.ConnectionReset;
+        if (fds[1].revents & posix.POLL.HUP != 0 or fds[1].revents & posix.POLL.ERR != 0) return error.ConnectionReset;
+    }
 }
 
 test "ProxyState init/deinit" {

@@ -11,6 +11,8 @@ pub const Config = struct {
     users: std.StringHashMap([16]u8),
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
+    /// Fast mode: skip S2C encryption by passing client keys to DC directly
+    fast_mode: bool = false,
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -64,6 +66,8 @@ pub const Config = struct {
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
                         cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
+                    } else if (std.mem.eql(u8, key, "fast_mode")) {
+                        cfg.fast_mode = std.mem.eql(u8, value, "true");
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
@@ -112,6 +116,7 @@ test "parse config" {
     const content =
         \\[server]
         \\port = 8443
+        \\fast_mode = false
         \\
         \\[censorship]
         \\tls_domain = "example.com"
@@ -128,6 +133,7 @@ test "parse config" {
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.mask);
+    try std.testing.expect(!cfg.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
 
     const alice_secret = cfg.users.get("alice").?;
