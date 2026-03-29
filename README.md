@@ -7,7 +7,7 @@
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.13.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![LOC](https://img.shields.io/badge/lines_of_code-1.7k-informational)](src/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
@@ -59,7 +59,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) **0.13.0** or later
+- [Zig](https://ziglang.org/download/) **0.15.2** or later
 
 ### Build & Run
 
