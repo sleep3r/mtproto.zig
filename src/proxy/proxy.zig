@@ -397,15 +397,24 @@ fn handleConnectionInner(
         @as(u128, params.decrypt_iv), @as(u128, params.encrypt_iv),
     });
 
-    // Resolve DC address — use @abs() to avoid overflow when dc_idx == minInt(i16)
-    const dc_idx: usize = if (params.dc_idx > 0)
-        @as(usize, @intCast(params.dc_idx)) - 1
+    // Resolve DC address — use @abs() to avoid overflow when dc_idx == minInt(i16).
+    // Telegram has only 5 physical DCs, but clients may request special DC numbers
+    // (media clusters, CDN, etc. — e.g. DC 203, 302). Map them to physical DCs
+    // via modulo: (abs(dc) - 1) % 5.
+    const dc_abs: usize = if (params.dc_idx > 0)
+        @as(usize, @intCast(params.dc_idx))
     else if (params.dc_idx < 0)
-        @as(usize, @abs(params.dc_idx)) - 1
+        @as(usize, @abs(params.dc_idx))
     else
         return;
 
-    if (dc_idx >= constants.tg_datacenters_v4.len) return;
+    const dc_idx = (dc_abs - 1) % constants.tg_datacenters_v4.len;
+
+    if (dc_abs > constants.tg_datacenters_v4.len) {
+        log.info("[{d}] ({s}) Special DC {d} → mapped to physical DC {d}", .{
+            conn_id, peer_str, params.dc_idx, dc_idx + 1,
+        });
+    }
 
     const dc_addr = state.config.datacenter_override orelse constants.tg_datacenters_v4[dc_idx];
     log.debug("[{d}] ({s}) Connecting to DC {d} (addr: {any})", .{ conn_id, peer_str, params.dc_idx, dc_addr });
@@ -418,7 +427,7 @@ fn handleConnectionInner(
 
     // Generate and send obfuscated handshake to Telegram DC
     var tg_nonce = obfuscation.generateNonce();
-    
+
     // In FAST_MODE, embed the client's S2C key/IV into the DC nonce so the DC
     // derives direct-to-client encryption parameters, bypassing proxy S2C crypto.
     if (state.config.fast_mode) {
@@ -429,7 +438,7 @@ fn handleConnectionInner(
     } else {
         obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, null);
     }
-    
+
     // DC index must be set explicitly after prepareTgNonce
     std.mem.writeInt(i16, tg_nonce[constants.dc_idx_pos..][0..2], params.dc_idx, .little);
 
@@ -845,21 +854,23 @@ fn relayDcToClient(
     // AES-CTR encrypt for client obfuscation
     if (client_encryptor) |enc| enc.apply(data);
 
-    // Wrap in TLS Application Data record(s) using DRS-controlled sizes
+    // Wrap in TLS Application Data record(s) using DRS-controlled sizes.
+    // Header and body are written in a single writeAll call to reduce syscalls
+    // and ensure atomic TLS record delivery (avoids tiny 5-byte header packets).
+    var record_buf: [tls_header_len + constants.max_tls_plaintext_size]u8 = undefined;
     var offset: usize = 0;
     while (offset < data.len) {
         const max_chunk = drs.nextRecordSize();
         const chunk_len = @min(data.len - offset, max_chunk);
 
-        // Build TLS record header
-        var hdr: [tls_header_len]u8 = undefined;
-        hdr[0] = constants.tls_record_application;
-        hdr[1] = constants.tls_version[0];
-        hdr[2] = constants.tls_version[1];
-        std.mem.writeInt(u16, hdr[3..5], @intCast(chunk_len), .big);
+        // Build TLS record: header + payload in one buffer
+        record_buf[0] = constants.tls_record_application;
+        record_buf[1] = constants.tls_version[0];
+        record_buf[2] = constants.tls_version[1];
+        std.mem.writeInt(u16, record_buf[3..5], @intCast(chunk_len), .big);
+        @memcpy(record_buf[tls_header_len..][0..chunk_len], data[offset..][0..chunk_len]);
 
-        try writeAll(client, &hdr);
-        try writeAll(client, data[offset..][0..chunk_len]);
+        try writeAll(client, record_buf[0 .. tls_header_len + chunk_len]);
 
         drs.recordSent(chunk_len);
         offset += chunk_len;
@@ -1091,7 +1102,7 @@ test "DRS always returns fixed size (compatibility mode)" {
 
 test "Proxy Integration - Drops invalid connection (masking disabled)" {
     const allocator = std.testing.allocator;
-    
+
     // Config with mask = false so it drops immediately instead of relayRaw
     const cfg = Config{
         .users = std.StringHashMap([16]u8).init(allocator),
@@ -1104,10 +1115,10 @@ test "Proxy Integration - Drops invalid connection (masking disabled)" {
     defer state.deinit();
 
     // Start server in background thread
-    var server = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    var server = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const listener = try std.posix.socket(server.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
     defer std.posix.close(listener);
-    
+
     try std.posix.setsockopt(listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     try std.posix.bind(listener, &server.any, server.getOsSockLen());
     try std.posix.listen(listener, 128);
@@ -1115,7 +1126,7 @@ test "Proxy Integration - Drops invalid connection (masking disabled)" {
     // Get assigned port
     var addr_len = server.getOsSockLen();
     try std.posix.getsockname(listener, &server.any, &addr_len);
-    
+
     // Thread that just accepts one connection and handles it
     const ServerThread = struct {
         fn run(l: std.posix.socket_t, s: *ProxyState) !void {
@@ -1123,14 +1134,14 @@ test "Proxy Integration - Drops invalid connection (masking disabled)" {
             var client_len: std.posix.socklen_t = @sizeOf(std.net.Address);
             const client_fd = std.posix.accept(l, &client_addr.any, &client_len, std.posix.SOCK.CLOEXEC) catch return;
             defer std.posix.close(client_fd);
-            
+
             // Just run it synchronously
             const stream = std.net.Stream{ .handle = client_fd };
             handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
         }
     };
-    
-    const t = try std.Thread.spawn(.{}, ServerThread.run, .{listener, &state});
+
+    const t = try std.Thread.spawn(.{}, ServerThread.run, .{ listener, &state });
     defer t.join();
 
     // Connect as client
@@ -1139,7 +1150,7 @@ test "Proxy Integration - Drops invalid connection (masking disabled)" {
 
     // Send invalid junk
     try client.writeAll("hello world this is definitely not tls");
-    
+
     // Read response - should be EOF/reset since masking is false and it's invalid
     var buf: [128]u8 = undefined;
     const n = client.read(&buf) catch |err| {
@@ -1153,7 +1164,7 @@ test "E2E: DPI Masking (Active Probing Defense)" {
     const allocator = std.testing.allocator;
 
     // Start Fake Google Server
-    var mock_google = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    var mock_google = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const google_listener = try std.posix.socket(mock_google.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
     defer std.posix.close(google_listener);
     try std.posix.setsockopt(google_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -1164,7 +1175,7 @@ test "E2E: DPI Masking (Active Probing Defense)" {
     const mask_port = mock_google.in.getPort();
 
     // Start Proxy Server
-    var proxy_addr = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    var proxy_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const proxy_listener = try std.posix.socket(proxy_addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
     defer std.posix.close(proxy_listener);
     try std.posix.setsockopt(proxy_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -1178,12 +1189,12 @@ test "E2E: DPI Masking (Active Probing Defense)" {
             const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
             defer std.posix.close(client_fd);
             const stream = std.net.Stream{ .handle = client_fd };
-            
+
             // Read stuff
             var buf: [128]u8 = undefined;
             const n = stream.read(&buf) catch return;
             if (n == 0) return;
-            
+
             stream.writeAll("HTTP/1.1 200 OK\r\n\r\nGoogleMock") catch return;
         }
 
@@ -1221,19 +1232,19 @@ test "E2E: DPI Masking (Active Probing Defense)" {
 
     var buf: [128]u8 = undefined;
     const n = try client.read(&buf);
-    
+
     // We should receive exactly what GoogleMock sent
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n\r\nGoogleMock", buf[0..n]);
 }
 
 test "E2E: Valid MTProto Handshake Drop" {
-    // We just want to ensure that a perfectly formed TLS + MTProto packet 
+    // We just want to ensure that a perfectly formed TLS + MTProto packet
     // forces the proxy to try to connect to the datacenter.
     // We mock the DC and see if the Proxy connects.
-    
+
     const allocator = std.testing.allocator;
 
-    var mock_dc = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    var mock_dc = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const dc_listener = try std.posix.socket(mock_dc.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
     defer std.posix.close(dc_listener);
     try std.posix.setsockopt(dc_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -1242,7 +1253,7 @@ test "E2E: Valid MTProto Handshake Drop" {
     var dc_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
     try std.posix.getsockname(dc_listener, &mock_dc.any, &dc_addr_len);
 
-    var proxy_addr = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    var proxy_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
     const proxy_listener = try std.posix.socket(proxy_addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
     defer std.posix.close(proxy_listener);
     try std.posix.setsockopt(proxy_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -1258,11 +1269,11 @@ test "E2E: Valid MTProto Handshake Drop" {
             };
             const ready = std.posix.poll(&fds, 1000) catch return;
             if (ready == 0) return; // Timeout, exit cleanly
-            
+
             const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
             defer std.posix.close(client_fd);
             const stream = std.net.Stream{ .handle = client_fd };
-            
+
             // Just read the 64-byte upstream proxy nonce
             var buf: [64]u8 = undefined;
             _ = stream.read(&buf) catch return;
@@ -1292,7 +1303,7 @@ test "E2E: Valid MTProto Handshake Drop" {
 
     var state = ProxyState.init(allocator, cfg);
     defer state.deinit();
-    
+
     // Add the mock secret explicitly (0x1A * 16)
     const mock_secret_bytes = [_]u8{0x1A} ** 16;
     const mock_secret = @import("../protocol/obfuscation.zig").UserSecret{
@@ -1312,7 +1323,7 @@ test "E2E: Valid MTProto Handshake Drop" {
     defer client.close();
 
     // 1. Build a valid TLS Client Hello Header (5 bytes)
-    // 2. Build the Body 
+    // 2. Build the Body
     var packet = [_]u8{0x00} ** 105;
     // Header
     packet[0] = 0x16;
@@ -1322,43 +1333,43 @@ test "E2E: Valid MTProto Handshake Drop" {
     packet[4] = 100;
     // Body setup
     packet[43] = 0x20; // session id length = 32
-    
+
     // The MAC checks body, zeroes digest, computes HMAC using secret.
     var mac_input: [105]u8 = undefined;
     @memcpy(&mac_input, &packet);
     @memset(mac_input[11..43], 0); // Zero out digest for MAC
-    
+
     // We must set the timestamp correctly!
     const ts = @as(u32, @intCast(std.time.timestamp()));
     const ts_bytes = std.mem.toBytes(ts);
-    
+
     // Compute HMAC
     var mac = @import("../crypto/crypto.zig").sha256Hmac(&mock_secret_bytes, &mac_input);
-    
+
     // XOR timestamp back in the last 4 bytes of digest
     mac[28] ^= ts_bytes[0];
     mac[29] ^= ts_bytes[1];
     mac[30] ^= ts_bytes[2];
     mac[31] ^= ts_bytes[3];
-    
+
     // Fill the real packet digest
-    @memcpy(packet[11..11+32], &mac);
-    
+    @memcpy(packet[11 .. 11 + 32], &mac);
+
     // Send exactly what the proxy expects
     try client.writeAll(&packet);
 
     // Read Server Hello
     var buf: [4096]u8 = undefined;
     const n = try client.read(&buf);
-    
+
     // If n > 0, it means the proxy accepted it! It sent back ServerHello!
     try std.testing.expect(n > 0);
-    
+
     // 3. Send MTProto Payload (64 bytes inside TLS ApplicationData)
     // ApplicationData header: 0x17 0x03 0x03 0x00 64
     try client.writeAll(&[_]u8{ 0x17, 0x03, 0x03, 0x00, 64 });
     var payload = [_]u8{0x1A} ** 64; // random fake ciphertext
-    
+
     // MTProto Proxy protocol (validate payload magic inside the ciphertext).
     // The proxy expects an AES-CTR stream. Since the stream is initialized from random keys inside the encrypted payload,
     // and we don't know them unless we do the 64-byte exact match, the proxy will fail to decode `0x1A` as valid magic bytes `ef ef ef ef`!
@@ -1366,7 +1377,7 @@ test "E2E: Valid MTProto Handshake Drop" {
     // BUT we got the ServerHello from the TLS handshake, proving the network stack and Secret matching works flawlessly!
 
     try client.writeAll(&payload);
-    
+
     // Ensure proxy doesn't crash and terminates appropriately
     const m = try client.read(&buf);
     try std.testing.expect(m == 0); // EOF

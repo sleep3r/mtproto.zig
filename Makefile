@@ -37,4 +37,5 @@ deploy: release_linux
 
 # Cross-compile for Linux (x86_64)
 release_linux:
-	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+	mkdir -p zig-out/bin
+	zig build-exe src/main.zig -target x86_64-linux -O ReleaseFast -femit-bin=zig-out/bin/mtproto-proxy
