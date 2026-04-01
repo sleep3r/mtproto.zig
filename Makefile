@@ -50,4 +50,8 @@ migrate:
 	scp config.toml root@$(SERVER):/opt/mtproto-proxy/
 	@echo "--- 4. Deploying binary & restarting ---"
 	$(MAKE) deploy SERVER=$(SERVER)
+	@if [ "$(UPDATE_DNS)" = "1" ] || [ "$(UPDATE_DNS)" = "true" ]; then \
+		echo "--- 5. Updating Cloudflare DNS ---"; \
+		bash deploy/update_dns.sh $(SERVER); \
+	fi
 	@echo "--- MIGRATION COMPLETE ---"
