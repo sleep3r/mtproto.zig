@@ -161,14 +161,30 @@ This will:
 7. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
 8. Print a ready-to-use `tg://` connection link
 
-To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you can either pass variables directly:
+To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must provide Cloudflare API credentials. The script uses these to update your domain's AAAA record to a new random IPv6 address from your server's `/64` pool when it detects DPI active probing.
+
+#### Obtaining Cloudflare Credentials
+
+1. **`CF_ZONE` (Zone ID)**:
+   - Go to your Cloudflare dashboard and select your active domain.
+   - On the right sidebar of the Overview page, scroll down to the "API" section and copy the **Zone ID**.
+2. **`CF_TOKEN` (API Token)**:
+   - Click "Get your API token" below the Zone ID (or go to *My Profile -> API Tokens*).
+   - Click **Create Token** -> **Create Custom Token**.
+   - Permissions: `Zone` | `DNS` | `Edit`.
+   - Zone Resources: `Include` | `Specific zone` | `<Your Domain>`.
+   - Create the token and copy the secret string.
+
+#### Enabling the Bypass during Installation
+
+You can either pass variables directly inline:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | \
   sudo CF_TOKEN=<your_cf_token> CF_ZONE=<your_zone_id> bash
 ```
 
-Or you can use a `.env` file (copy `.env.example` to `.env` and fill it out):
+Or, for a cleaner and more secure approach, create a `.env` file first (you can copy `.env.example` as a template):
 
 ```bash
 export $(cat .env | xargs)
