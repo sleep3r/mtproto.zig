@@ -137,6 +137,31 @@ else
     echo -e "${RED}⚠${RESET} iptables not found — TCPMSS bypass NOT applied"
 fi
 
+# ── IPv6 Hopping (Cloudflare API) ───────────────────────────
+if [[ -n "${CF_TOKEN:-}" && -n "${CF_ZONE:-}" ]]; then
+    info "Setting up IPv6 auto-hopping..."
+    cp "$TMPBUILD/deploy/ipv6-hop.sh" "$INSTALL_DIR/"
+    chmod +x "$INSTALL_DIR/ipv6-hop.sh"
+    
+    # Save credentials securely
+    cat > "$INSTALL_DIR/env.sh" << EOF
+export CF_TOKEN="${CF_TOKEN}"
+export CF_ZONE="${CF_ZONE}"
+EOF
+    chmod 600 "$INSTALL_DIR/env.sh"
+    
+    # Set up cron job (every 5 minutes)
+    cat > /etc/cron.d/mtproto-ipv6 << EOF
+*/5 * * * * root $INSTALL_DIR/ipv6-hop.sh >> /var/log/mtproto-ipv6-hop.log 2>&1
+EOF
+    chmod 644 /etc/cron.d/mtproto-ipv6
+    # Run the first hop immediately to ensure it works
+    $INSTALL_DIR/ipv6-hop.sh >/dev/null 2>&1 || true
+    ok "IPv6 auto-hopping configured (via Cloudflare)"
+else
+    info "Skipping IPv6 hopping setup (CF_TOKEN and CF_ZONE not set)"
+fi
+
 # ── Cleanup ─────────────────────────────────────────────────
 rm -rf "$TMPBUILD"
 

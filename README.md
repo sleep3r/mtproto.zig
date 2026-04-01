@@ -161,11 +161,18 @@ This will:
 7. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
 8. Print a ready-to-use `tg://` connection link
 
-To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection):
+To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you can either pass variables directly:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | \
   sudo CF_TOKEN=<your_cf_token> CF_ZONE=<your_zone_id> bash
+```
+
+Or you can use a `.env` file (copy `.env.example` to `.env` and fill it out):
+
+```bash
+export $(cat .env | xargs)
+curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | sudo -E bash
 ```
 
 ### Manual deploy
