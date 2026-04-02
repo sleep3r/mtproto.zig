@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/sleep3r/mtproto.zig/compare/v0.2.1...v0.2.2) (2026-04-02)
+
+
+### Bug Fixes
+
+* **middleproxy:** assert computed C2S frame size ([#31](https://github.com/sleep3r/mtproto.zig/issues/31)) ([6ced4b3](https://github.com/sleep3r/mtproto.zig/commit/6ced4b32f5e4ac5925e3372c57223414cce254b3))
+* **proxy:** increase max_connections to 65535 ([#27](https://github.com/sleep3r/mtproto.zig/issues/27)) ([52a9fc4](https://github.com/sleep3r/mtproto.zig/commit/52a9fc4f5ff6622740fdc8d5c68f73d53f3555c5)), closes [#26](https://github.com/sleep3r/mtproto.zig/issues/26)
+
 ## [0.2.1](https://github.com/sleep3r/mtproto.zig/compare/v0.2.0...v0.2.1) (2026-04-02)
 
 
