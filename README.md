@@ -265,6 +265,8 @@ tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTPro
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+mask_port = 8443
+desync = true
 fast_mode = true
 
 [access.users]
@@ -279,8 +281,10 @@ bob   = "ffeeddccbbaa99887766554433221100"
 |---------|-----|---------|-------------|
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
-| `[censorship]` | `tls_domain` | `"wb.ru"` | Domain to impersonate / forward bad clients to |
+| `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
+| `[censorship]` | `mask_port` | `443` | Non-standard port override for masking locally (e.g. `8443` for zero-RTT local Nginx) |
+| `[censorship]` | `desync` | `true` | Application-level Split-TLS (1-byte chunking) for passive DPI evasion |
 | `[censorship]` | `fast_mode` | `false` | **Recommended**. Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 
