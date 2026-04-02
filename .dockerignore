@@ -1,0 +1,12 @@
+.git
+.github
+.zig-cache
+zig-out
+*.md
+!README.md
+.env
+.env.*
+deploy
+GEMINI.md
+Makefile
+test_*.zig
