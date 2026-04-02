@@ -1,3 +1,10 @@
+[general]
+# Telemt compatibility: route regular DC traffic via MiddleProxy transport (required for promo parity)
+use_middle_proxy = true
+
+# Optional telemt-compatible alias for promotion tag from @MTProxybot
+# ad_tag = "1234567890abcdef1234567890abcdef"
+
 [server]
 port = 443
 # Optional: 32 hex-char promotion tag from @MTProxybot

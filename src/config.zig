@@ -8,6 +8,9 @@ const std = @import("std");
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
 
+    /// Route regular DC traffic via Telegram MiddleProxy transport.
+    /// Mirrors telemt's [general].use_middle_proxy behavior.
+    use_middle_proxy: bool = false,
     port: u16 = 443,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
@@ -40,6 +43,8 @@ pub const Config = struct {
         var in_users_section = false;
         var in_censorship_section = false;
         var in_server_section = false;
+        var in_general_section = false;
+        var server_tag_set = false;
 
         while (lines.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
@@ -52,6 +57,7 @@ pub const Config = struct {
                 in_users_section = std.mem.eql(u8, line, "[access.users]");
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
+                in_general_section = std.mem.eql(u8, line, "[general]");
                 continue;
             }
 
@@ -72,6 +78,22 @@ pub const Config = struct {
                     _ = std.fmt.hexToBytes(&secret, value) catch continue;
                     const name = try allocator.dupe(u8, key);
                     try cfg.users.put(name, secret);
+                } else if (in_general_section) {
+                    if (std.mem.eql(u8, key, "use_middle_proxy")) {
+                        cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "fast_mode")) {
+                        // telemt compatibility: [general].fast_mode
+                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "ad_tag")) {
+                        // telemt compatibility: [general].ad_tag
+                        // If [server].tag is present and valid, it has priority.
+                        if (!server_tag_set and value.len == 32) {
+                            var tag: [16]u8 = undefined;
+                            if (std.fmt.hexToBytes(&tag, value)) |_| {
+                                cfg.tag = tag;
+                            } else |_| {}
+                        }
+                    }
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
                         cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
@@ -80,6 +102,7 @@ pub const Config = struct {
                             var tag: [16]u8 = undefined;
                             if (std.fmt.hexToBytes(&tag, value)) |_| {
                                 cfg.tag = tag;
+                                server_tag_set = true;
                             } else |_| {}
                         }
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
@@ -133,6 +156,9 @@ pub const Config = struct {
 
 test "parse config - valid complete" {
     const content =
+        \\[general]
+        \\use_middle_proxy = true
+        \\
         \\[server]
         \\port = 8443
         \\fast_mode = true
@@ -152,6 +178,7 @@ test "parse config - valid complete" {
 
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
+    try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
     try std.testing.expect(cfg.desync);
     try std.testing.expect(cfg.fast_mode);
@@ -172,6 +199,7 @@ test "parse config - missing fields defaults" {
 
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
+    try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expect(!cfg.fast_mode); // Default is false
@@ -272,4 +300,41 @@ test "parse config - invalid tag ignored" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.tag == null);
+}
+
+test "parse config - general ad_tag alias" {
+    const content =
+        \\[general]
+        \\ad_tag = "1234567890abcdef1234567890abcdef"
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag != null);
+    const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+    try std.testing.expectEqual(expected_tag, cfg.tag.?);
+}
+
+test "parse config - server tag overrides general ad_tag" {
+    const content =
+        \\[general]
+        \\ad_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\
+        \\[server]
+        \\tag = "1234567890abcdef1234567890abcdef"
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag != null);
+    const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+    try std.testing.expectEqual(expected_tag, cfg.tag.?);
 }

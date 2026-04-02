@@ -145,8 +145,10 @@ pub const ProxyState = struct {
     replay_cache: ReplayCache,
     /// Protects live middle-proxy address/secret cache.
     middle_proxy_lock: std.Thread.RwLock = .{},
+    /// Current middle-proxy endpoints for primary DCs (1..5).
+    middle_proxy_addrs_primary: [5]net.Address,
     /// Current middle-proxy endpoint for media DC 203.
-    middle_proxy_addr: net.Address,
+    middle_proxy_addr_203: net.Address,
     /// Current middle-proxy shared secret from getProxySecret.
     middle_proxy_secret: [256]u8,
     /// Valid length of middle_proxy_secret bytes.
@@ -193,7 +195,8 @@ pub const ProxyState = struct {
             .active_connections = std.atomic.Value(u32).init(0),
             .mask_addr = resolved_addr,
             .replay_cache = .{},
-            .middle_proxy_addr = constants.getDcAddressV4(203),
+            .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
+            .middle_proxy_addr_203 = constants.getDcAddressV4(203),
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
         };
@@ -267,9 +270,18 @@ pub const ProxyState = struct {
     }
 
     const MiddleProxySnapshot = struct {
-        addr: net.Address,
+        addrs_primary: [5]net.Address,
+        addr_203: net.Address,
         secret: [256]u8,
         secret_len: usize,
+
+        fn getForDc(self: *const MiddleProxySnapshot, dc_abs: usize) ?net.Address {
+            if (dc_abs == 203) return self.addr_203;
+            if (dc_abs >= 1 and dc_abs <= self.addrs_primary.len) {
+                return self.addrs_primary[dc_abs - 1];
+            }
+            return null;
+        }
     };
 
     fn getMiddleProxySnapshot(self: *ProxyState) MiddleProxySnapshot {
@@ -277,7 +289,8 @@ pub const ProxyState = struct {
         defer self.middle_proxy_lock.unlockShared();
 
         return .{
-            .addr = self.middle_proxy_addr,
+            .addrs_primary = self.middle_proxy_addrs_primary,
+            .addr_203 = self.middle_proxy_addr_203,
             .secret = self.middle_proxy_secret,
             .secret_len = self.middle_proxy_secret_len,
         };
@@ -296,7 +309,11 @@ pub const ProxyState = struct {
         const cfg_bytes = try fetchUrlBytes(self.allocator, middle_proxy_config_url);
         defer self.allocator.free(cfg_bytes);
 
-        const next_addr = parseMiddleProxyAddressForDc(cfg_bytes, 203);
+        var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
+        for (0..next_primary.len) |i| {
+            next_primary[i] = parseMiddleProxyAddressForDc(cfg_bytes, @as(i16, @intCast(i + 1)));
+        }
+        const next_addr_203 = parseMiddleProxyAddressForDc(cfg_bytes, 203);
 
         const next_secret = try fetchUrlBytes(self.allocator, middle_proxy_secret_url);
         defer self.allocator.free(next_secret);
@@ -310,9 +327,18 @@ pub const ProxyState = struct {
 
         var changed = false;
 
-        if (next_addr) |addr| {
-            if (!self.middle_proxy_addr.eql(addr)) {
-                self.middle_proxy_addr = addr;
+        for (0..next_primary.len) |i| {
+            if (next_primary[i]) |addr| {
+                if (!self.middle_proxy_addrs_primary[i].eql(addr)) {
+                    self.middle_proxy_addrs_primary[i] = addr;
+                    changed = true;
+                }
+            }
+        }
+
+        if (next_addr_203) |addr| {
+            if (!self.middle_proxy_addr_203.eql(addr)) {
+                self.middle_proxy_addr_203 = addr;
                 changed = true;
             }
         }
@@ -328,7 +354,7 @@ pub const ProxyState = struct {
 
         if (changed) {
             log.info("Middle-proxy cache updated: addr={any} secret_len={d}", .{
-                self.middle_proxy_addr,
+                self.middle_proxy_addr_203,
                 self.middle_proxy_secret_len,
             });
         }
@@ -411,6 +437,27 @@ test "parse middle proxy address returns null when absent" {
     try std.testing.expect(parseMiddleProxyAddressForDc(cfg, 203) == null);
 }
 
+test "middle proxy snapshot selects primary dc and 203" {
+    const snapshot = ProxyState.MiddleProxySnapshot{
+        .addrs_primary = constants.tg_middle_proxies_v4,
+        .addr_203 = constants.getDcAddressV4(203),
+        .secret = [_]u8{0} ** 256,
+        .secret_len = 128,
+    };
+
+    const dc1 = snapshot.getForDc(1) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dc1.eql(constants.tg_middle_proxies_v4[0]));
+
+    const dc5 = snapshot.getForDc(5) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dc5.eql(constants.tg_middle_proxies_v4[4]));
+
+    const dc203 = snapshot.getForDc(203) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dc203.eql(constants.getDcAddressV4(203)));
+
+    try std.testing.expect(snapshot.getForDc(6) == null);
+    try std.testing.expect(snapshot.getForDc(302) == null);
+}
+
 /// Handle a single client connection.
 fn handleConnection(
     state: *ProxyState,
@@ -438,6 +485,10 @@ fn handleConnection(
         // WouldBlock during handshake = Slowloris or extreme lag
         if (err == error.WouldBlock) {
             log.warn("[{d}] ({s}) Handshake timeout (Slowloris/lag)", .{ conn_id, peer_str });
+            return;
+        }
+        if (err == error.ConnectionResetByPeer or err == error.ConnectionReset or err == error.EndOfStream) {
+            log.debug("[{d}] ({s}) Connection closed: {any}", .{ conn_id, peer_str, err });
             return;
         }
         log.err("[{d}] ({s}) Connection error: {any}", .{ conn_id, peer_str, err });
@@ -694,13 +745,29 @@ fn handleConnectionInner(
     else
         return;
 
-    const middle_proxy_snapshot = if (dc_abs == 203)
+    const middle_proxy_snapshot = if (state.config.datacenter_override == null and (state.config.use_middle_proxy or dc_abs == 203))
         state.getMiddleProxySnapshot()
     else
         null;
 
-    const dc_addr = state.config.datacenter_override orelse if (dc_abs == 203)
-        middle_proxy_snapshot.?.addr
+    const middle_proxy_addr = if (middle_proxy_snapshot) |*snap|
+        snap.getForDc(dc_abs)
+    else
+        null;
+
+    // Compatibility behavior:
+    // - dc=203 always uses middle-proxy transport when not overridden in tests.
+    // - [general].use_middle_proxy enables middle-proxy transport for regular DC1..5.
+    const force_media_middle_proxy = (dc_abs == 203 and state.config.datacenter_override == null);
+    const use_middle_proxy_transport = if (state.config.datacenter_override != null)
+        false
+    else if (force_media_middle_proxy)
+        true
+    else
+        state.config.use_middle_proxy and middle_proxy_addr != null;
+
+    const dc_addr = state.config.datacenter_override orelse if (use_middle_proxy_transport)
+        middle_proxy_addr.?
     else
         constants.getDcAddressV4(dc_abs);
     log.debug("[{d}] ({s}) Connecting to DC {d} (addr: {any})", .{ conn_id, peer_str, params.dc_idx, dc_addr });
@@ -720,7 +787,7 @@ fn handleConnectionInner(
     var tg_encryptor_opt: ?crypto.AesCtr = null;
     var tg_decryptor_opt: ?crypto.AesCtr = null;
 
-    if (dc_abs == 203) {
+    if (use_middle_proxy_transport) {
         // Execute MiddleProxy Handshake
         const mp_secret = if (middle_proxy_snapshot) |snap| snap.secret[0..snap.secret_len] else middleproxy.proxy_secret[0..];
         opt_middle_proxy = try middleproxy.executeHandshake(
@@ -730,8 +797,9 @@ fn handleConnectionInner(
             params.proto_tag,
             client_addr,
             mp_secret,
+            state.config.tag,
         );
-        log.debug("[{d}] MiddleProxy handshake successful", .{conn_id});
+        log.debug("[{d}] MiddleProxy handshake successful (dc={d})", .{ conn_id, params.dc_idx });
     } else {
         // Generate and send obfuscated handshake to Telegram DC
         var tg_nonce = obfuscation.generateNonce();
@@ -878,8 +946,7 @@ fn handleConnectionInner(
         conn_id,
         use_fast_mode,
     ) catch |err| {
-        // DIAG: temporarily info-level to see relay death reasons in ReleaseFast
-        log.info("[{d}] ({s}) Relay ended: dc={d} err={any} fast={}", .{ conn_id, peer_str, params.dc_idx, err, use_fast_mode });
+        log.debug("[{d}] ({s}) Relay ended: dc={d} err={any} fast={}", .{ conn_id, peer_str, params.dc_idx, err, use_fast_mode });
     };
 }
 
@@ -984,7 +1051,7 @@ fn relayBidirectional(
                 &c2s_bytes,
                 conn_id,
             ) catch |err| {
-                log.info("[{d}] DIAG C2S err: {any} c2s={d} s2c={d}", .{ conn_id, err, c2s_bytes, s2c_bytes });
+                log.debug("[{d}] DIAG C2S err: {any} c2s={d} s2c={d}", .{ conn_id, err, c2s_bytes, s2c_bytes });
                 return err;
             };
             if (step != .none) progressed = true;
@@ -1001,7 +1068,7 @@ fn relayBidirectional(
                 &drs,
                 &s2c_bytes,
             ) catch |err| {
-                log.info("[{d}] DIAG S2C err: {any} c2s={d} s2c={d}", .{ conn_id, err, c2s_bytes, s2c_bytes });
+                log.debug("[{d}] DIAG S2C err: {any} c2s={d} s2c={d}", .{ conn_id, err, c2s_bytes, s2c_bytes });
                 return err;
             };
             if (step != .none) progressed = true;
@@ -1009,22 +1076,22 @@ fn relayBidirectional(
 
         // Hard errors after draining readable data
         if ((client_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            log.info("[{d}] DIAG client ERR/NVAL c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
+            log.debug("[{d}] DIAG client ERR/NVAL c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
         if ((dc_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            log.info("[{d}] DIAG DC ERR/NVAL c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
+            log.debug("[{d}] DIAG DC ERR/NVAL c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
 
         // If HUP arrived without readable data, close immediately.
         // If it arrived with POLLIN, we already drained what we could above.
         if (((client_revents & posix.POLL.HUP) != 0) and ((client_revents & posix.POLL.IN) == 0)) {
-            log.info("[{d}] DIAG client HUP c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
+            log.debug("[{d}] DIAG client HUP c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
         if (((dc_revents & posix.POLL.HUP) != 0) and ((dc_revents & posix.POLL.IN) == 0)) {
-            log.info("[{d}] DIAG DC HUP c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
+            log.debug("[{d}] DIAG DC HUP c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
 

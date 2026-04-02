@@ -42,6 +42,7 @@ src/
 │   └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
 deploy/
 ├── install.sh            # One-line VPS bootstrap (Zig + build + systemd + TCPMSS + IPv6)
+├── update.sh             # In-place server updater from GitHub Release artifacts
 ├── ipv6-hop.sh           # IPv6 address rotation (Cloudflare API)
 ├── mtproto-proxy.service # systemd unit file
 ├── update_dns.sh         # Cloudflare DNS A-record updater
@@ -56,10 +57,10 @@ deploy/
 2. Proxy validates HMAC, sends `ServerHello`.
 3. Client sends `CCS` + 64-byte MTProto obfuscation handshake (in TLS `AppData`).
 4. Proxy derives AES-CTR keys, connects to Telegram DC.
-5. For regular DCs, proxy sends 64-byte obfuscated nonce.
-6. For media DC203, proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
-5b. (Optional) Proxy sends promotion tag RPC (`0xaeaf0c42` + 16-byte tag) to DC.
-7. **Bidirectional relay**: Client ↔ Proxy ↔ DC
+5. In direct mode (`use_middle_proxy = false`), proxy sends 64-byte obfuscated nonce to regular DCs.
+6. If `use_middle_proxy = true` (or `dc=203`), proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
+7. Promotion tag is carried in ME path as `ad_tag` TL block inside `RPC_PROXY_REQ` and in direct path via promo RPC (`0xaeaf0c42` + 16-byte tag).
+8. **Bidirectional relay**: Client ↔ Proxy ↔ DC
    - **C2S**: TLS unwrap → AES-CTR decrypt(client) → AES-CTR encrypt(DC) → DC
    - **S2C (classic DC)**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
    - **S2C (DC203)**: DC AES-CBC frame → decapsulate `RPC_PROXY_ANS`/`RPC_SIMPLE_ACK` → TLS wrap → Client
@@ -86,7 +87,19 @@ make release                                           # Release build (native)
 make release_linux                                     # Cross-compile for Linux
 make test                                              # Run unit tests
 make deploy                                            # Cross-compile + stop + scp + start
+make update-server SERVER=<ip> [VERSION=vX.Y.Z]       # Update VPS from GitHub Release
 ```
+
+### Release Workflow (GitHub)
+
+- Release automation is handled by `release-please` in `.github/workflows/release-please.yml`.
+- It updates/opens one release PR, not one release per commit.
+- A real GitHub release is created only when the release PR is merged.
+- Bump policy follows Conventional Commits:
+  - `fix:` -> patch
+  - `feat:` -> minor
+  - `BREAKING CHANGE:` / `!` -> major
+- To keep required checks compatible with release PRs, repository secret `RELEASE_PLEASE_TOKEN` must be set (PAT with `Contents`, `Pull requests`, `Issues` read/write for this repo).
 
 > [!NOTE]
 > On macOS 26 (Tahoe), `zig build` is broken due to Zig 0.15.2's linker not supporting the new TBD format.
@@ -96,11 +109,44 @@ make deploy                                            # Cross-compile + stop + 
 `make deploy` performs the following steps:
 1. Cross-compile for Linux.
 2. `systemctl stop mtproto-proxy`.
-3. `scp` binary to VPS.
-4. `systemctl start mtproto-proxy`.
+3. `scp` binary and deploy scripts to VPS.
+4. If `$(CONFIG)` exists locally, upload it as `/opt/mtproto-proxy/config.toml`.
+5. `systemctl start mtproto-proxy`.
 
 > [!IMPORTANT]
 > You must stop the service before using `scp` because the systemd unit has `ReadOnlyPaths=/opt/mtproto-proxy`, which prevents overwriting the binary while it is running.
+
+### Server Update Path (Recommended for Operators)
+
+For routine production upgrades, users should update from GitHub Releases instead of rebuilding on the VPS.
+
+#### Local orchestrated update
+```bash
+make update-server SERVER=<SERVER_IP>
+make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
+```
+
+This runs `deploy/update.sh` remotely over SSH.
+
+#### Direct update on the VPS
+```bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
+```
+
+#### Update safety guarantees
+- Detects server architecture (`x86_64`/`aarch64`) and downloads matching release artifact.
+- Stops `mtproto-proxy`, installs new binary, updates deploy helper scripts and service unit.
+- Preserves runtime state (`/opt/mtproto-proxy/config.toml`, `/opt/mtproto-proxy/env.sh`).
+- Creates timestamped backup of current binary before replacement.
+- Automatically rolls back to previous binary if restart fails.
+
+#### Operator rollback
+If needed, restore the backup binary printed by `update.sh` and restart:
+```bash
+sudo cp /opt/mtproto-proxy/mtproto-proxy.backup.<timestamp> /opt/mtproto-proxy/mtproto-proxy
+sudo systemctl restart mtproto-proxy
+```
 
 ### Configuration (`config.toml.example`)
 Users can copy `config.toml.example` to `config.toml`. The structure natively supports the new anti-DPI routing fields:
@@ -268,6 +314,9 @@ All relay sockets use these settings:
 19. **Split-TLS desync**: Added 1-byte TCP split on ServerHello send to break ТСПУ passive signature matching. Gated by `desync` config flag.
 20. **MiddleProxy DC203 parity fix**: Added complete `middleproxy.zig` path, fixed `RPC_PROXY_REQ` serialization, CBC frame handling, key derivation inputs, and `RPC_HANDSHAKE_ANS` validation.
 21. **MiddleProxy metadata updater**: Added periodic refresh of DC203 proxy endpoint and shared secret from Telegram core endpoints.
+22. **Telemt promo parity**: Added `[general].use_middle_proxy` support for regular DC1..5 and `[general].ad_tag` alias; ME path now injects ad tag into `RPC_PROXY_REQ` when configured.
+23. **Deploy config parity**: `make deploy` now uploads runtime `config.toml` (via `CONFIG`) to `/opt/mtproto-proxy/config.toml` to avoid stale server config after binary-only deploys.
+24. **Production log normalization**: reverted temporary relay diagnostics (`DIAG C2S/S2C`, `Relay ended`, common reset/EOF errors) back to debug level to reduce log I/O noise and keep warning/error logs actionable under high mobile churn.
 
 ---
 
@@ -480,6 +529,10 @@ If connecting to the proxy while behind a **Commercial/Premium VPN**, the VPN pr
 - **Testing**: Comprehensive E2E Integration tests + unit tests in `test` blocks at the bottom of `.zig` files. Includes fake localhost TCP servers directly communicating via background loopback sockets.
 - **Logging**: Only `log.info` for essential events; `log.debug` for diagnostics.
 - **No global mutable state**: Always pass `ProxyState` by reference.
+
+### Repository Workflow Rule
+- For every substantial code task, update both `README.md` (sometimes referred to as `REDMI`) and `GEMINI.md` before finalizing, so user-facing docs and engineering notes stay in sync.
+- Agent-facing instruction: treat README/REDMI + GEMINI updates as part of done criteria for feature/fix work, not as optional cleanup.
 
 ---
 

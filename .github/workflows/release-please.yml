@@ -1,0 +1,65 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-and-upload:
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    needs: release-please
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            artifact_name: mtproto-proxy-linux-x86_64
+          - target: aarch64-linux
+            artifact_name: mtproto-proxy-linux-aarch64
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/mtproto-proxy dist/${{ matrix.artifact_name }}
+          chmod +x dist/${{ matrix.artifact_name }}
+          tar -C dist -czf dist/${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/${{ matrix.artifact_name }}.tar.gz --clobber

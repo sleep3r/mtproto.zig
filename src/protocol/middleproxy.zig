@@ -106,11 +106,12 @@ pub const MiddleProxyContext = struct {
     encryptor: crypto.AesCbc,
     decryptor: crypto.AesCbc,
     seq_no: i32 = -2,
+    read_seq_no: i32 = 0,
     conn_id: [8]u8,
     remote_ip_port: [20]u8,
     our_ip_port: [20]u8,
     proto_tag: constants.ProtoTag,
-    ad_tag: []u8 = &[_]u8{},
+    ad_tag: ?[16]u8 = null,
 
     // For S2C chunk parser
     s2c_buf: []u8,
@@ -123,7 +124,7 @@ pub const MiddleProxyContext = struct {
     c2s_len: usize = 0,
     c2s_out_buf: []u8,
 
-    pub fn init(allocator: std.mem.Allocator, encryptor: crypto.AesCbc, decryptor: crypto.AesCbc, conn_id: [8]u8, initial_seq_no: i32, remote_addr: net.Address, our_addr: net.Address, proto_tag: constants.ProtoTag) !MiddleProxyContext {
+    pub fn init(allocator: std.mem.Allocator, encryptor: crypto.AesCbc, decryptor: crypto.AesCbc, conn_id: [8]u8, initial_seq_no: i32, remote_addr: net.Address, our_addr: net.Address, proto_tag: constants.ProtoTag, ad_tag: ?[16]u8) !MiddleProxyContext {
         var rip: [20]u8 = undefined;
         var rport: u16 = 0;
         if (remote_addr.any.family == posix.AF.INET) {
@@ -166,10 +167,12 @@ pub const MiddleProxyContext = struct {
             .encryptor = encryptor,
             .decryptor = decryptor,
             .seq_no = initial_seq_no,
+            .read_seq_no = 0,
             .conn_id = conn_id,
             .remote_ip_port = rip,
             .our_ip_port = oip,
             .proto_tag = proto_tag,
+            .ad_tag = ad_tag,
             .s2c_buf = s2c_buf,
             .s2c_out_buf = s2c_out_buf,
             .c2s_buf = c2s_buf,
@@ -259,7 +262,10 @@ pub const MiddleProxyContext = struct {
     }
 
     pub fn encapsulateSingleMessageC2S(self: *MiddleProxyContext, client_data: []const u8, is_quickack: bool, out_buf: []u8) !usize {
-        var flags = Flag.has_ad_tag | Flag.magic | Flag.extmode2;
+        var flags = Flag.magic | Flag.extmode2;
+        if (self.ad_tag != null) {
+            flags |= Flag.has_ad_tag;
+        }
         switch (self.proto_tag) {
             .abridged => flags |= Flag.abridged,
             .intermediate => flags |= Flag.intermediate,
@@ -291,30 +297,27 @@ pub const MiddleProxyContext = struct {
         @memcpy(rpc_payload[rpc_len .. rpc_len + 20], &self.our_ip_port);
         rpc_len += 20;
 
-        // Force EXTRA_SIZE to exactly 24 to pass TL parser checks
-        const extra_size: u32 = 24;
-        std.mem.writeInt(u32, rpc_payload[rpc_len..][0..4], extra_size, .little);
-        rpc_len += 4;
+        if (self.ad_tag) |ad_tag| {
+            // EXTRA_SIZE field + TL proxy_tag bytes (24 bytes total)
+            const extra_size: u32 = 24;
+            std.mem.writeInt(u32, rpc_payload[rpc_len..][0..4], extra_size, .little);
+            rpc_len += 4;
 
-        const proxy_tag = [_]u8{ 0xae, 0x26, 0x1e, 0xdb };
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 4], &proxy_tag);
-        rpc_len += 4;
+            const proxy_tag = [_]u8{ 0xae, 0x26, 0x1e, 0xdb };
+            @memcpy(rpc_payload[rpc_len .. rpc_len + 4], &proxy_tag);
+            rpc_len += 4;
 
-        // Declare exactly 16 bytes for the tag length
-        rpc_payload[rpc_len] = 16;
-        rpc_len += 1;
+            // Bytes TL string with fixed 16-byte ad tag + 3-byte align padding.
+            rpc_payload[rpc_len] = 16;
+            rpc_len += 1;
 
-        // Write exactly 16 bytes (use user's ad_tag if valid, else pad with zeroes)
-        var safe_ad_tag = [_]u8{0} ** 16;
-        if (self.ad_tag.len == 16) {
-            @memcpy(&safe_ad_tag, self.ad_tag[0..16]);
+            @memcpy(rpc_payload[rpc_len .. rpc_len + 16], &ad_tag);
+            rpc_len += 16;
+
+            const aligner = [_]u8{ 0x00, 0x00, 0x00 };
+            @memcpy(rpc_payload[rpc_len .. rpc_len + 3], &aligner);
+            rpc_len += 3;
         }
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 16], &safe_ad_tag);
-        rpc_len += 16;
-
-        const aligner = [_]u8{ 0x00, 0x00, 0x00 };
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 3], &aligner);
-        rpc_len += 3;
 
         // Append client_data
         @memcpy(rpc_payload[rpc_len .. rpc_len + client_data.len], client_data);
@@ -366,18 +369,45 @@ pub const MiddleProxyContext = struct {
 
         var out_pos: usize = 0;
 
-        // Parse fully decrypted MTProto frames
+        // Parse fully decrypted MTProto frames.
+        // Mirrors telemt behavior: parse by frame_len, treat 0x04 words as NO-OP,
+        // keep decrypt stream running continuously across arbitrary read boundaries.
         while (self.s2c_decrypted_len >= 4) {
             const frame_len = std.mem.readInt(u32, self.s2c_buf[0..4], .little);
 
-            // Total bytes an MTProtoFrame occupies depends on CBC padding to 16 byte boundary
-            const padded_len = if (frame_len % 16 == 0) frame_len else frame_len + (16 - (frame_len % 16));
+            // MTProto CBC stream may contain standalone NO-OP padding words
+            // (0x04 00 00 00). Python reference reader skips them.
+            if (frame_len == 4) {
+                if (self.s2c_len < 4 or self.s2c_decrypted_len < 4) break;
+                const remaining_noop = self.s2c_len - 4;
+                if (remaining_noop > 0) {
+                    std.mem.copyForwards(u8, self.s2c_buf[0..remaining_noop], self.s2c_buf[4..self.s2c_len]);
+                }
+                self.s2c_len = remaining_noop;
+                self.s2c_decrypted_len -= 4;
+                continue;
+            }
 
-            if (self.s2c_decrypted_len < padded_len) {
+            if (frame_len < 12 or frame_len > (1 << 24)) {
+                // Do not hard-fail on bad len; drop current decrypted window and resync.
+                // This matches telemt strategy and avoids tearing down long-lived sessions
+                // due to a single malformed/partial decrypted window.
+                self.s2c_len = 0;
+                self.s2c_decrypted_len = 0;
+                break;
+            }
+
+            if (self.s2c_decrypted_len < frame_len) {
                 break; // Not enough decrypted data yet
             }
 
-            if (frame_len < 12) return error.BadMiddleProxyFrameSize;
+            const expected_checksum = std.mem.readInt(u32, self.s2c_buf[frame_len - 4 ..][0..4], .little);
+            const computed_checksum = crc32(self.s2c_buf[0 .. frame_len - 4]);
+            if (expected_checksum != computed_checksum) return error.BadMiddleProxyChecksum;
+
+            const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[4..8], .little);
+            if (frame_seq_no != self.read_seq_no) return error.BadMiddleProxySeqNo;
+            self.read_seq_no += 1;
 
             // Payload is after Length (4) and SeqNo (4), and before CRC32 (4)
             const payload = self.s2c_buf[8 .. frame_len - 4];
@@ -442,10 +472,10 @@ pub const MiddleProxyContext = struct {
             // Ignore other RPC types (e.g. RPC_SIMPLE_ACK, RPC_CLOSE_EXT)
 
             // Shift buffer
-            const remaining = self.s2c_len - padded_len;
-            std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[padded_len..self.s2c_len]);
+            const remaining = self.s2c_len - frame_len;
+            std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[frame_len..self.s2c_len]);
             self.s2c_len = remaining;
-            self.s2c_decrypted_len -= padded_len;
+            self.s2c_decrypted_len -= frame_len;
         }
 
         return self.s2c_out_buf[0..out_pos];
@@ -463,6 +493,7 @@ pub fn executeHandshake(
     proto_tag: constants.ProtoTag,
     client_addr: net.Address,
     proxy_secret_bytes: []const u8,
+    ad_tag: ?[16]u8,
 ) !MiddleProxyContext {
     _ = dc_addr;
 
@@ -613,6 +644,7 @@ pub fn executeHandshake(
         client_addr,
         local_addr,
         proto_tag,
+        ad_tag,
     );
 }
 
@@ -714,6 +746,7 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
         std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
         std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
+        null,
     );
     defer ctx.deinit(allocator);
 
@@ -732,4 +765,197 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
     const payload = encrypted_out[8 .. total_len - 4];
     try std.testing.expect(payload.len >= 4);
     try std.testing.expectEqualSlices(u8, &rpc_proxy_req, payload[0..4]);
+}
+
+test "encapsulated c2s omits ad_tag block when absent" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    const client_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var encrypted_out: [512]u8 = undefined;
+
+    const written = try ctx.encapsulateSingleMessageC2S(client_data[0..], false, encrypted_out[0..]);
+    try std.testing.expect(written >= 16);
+
+    var decryptor = crypto.AesCbc.init(&key, &iv);
+    try decryptor.decryptInPlace(encrypted_out[0..written]);
+
+    const total_len = std.mem.readInt(u32, encrypted_out[0..4], .little);
+    const payload = encrypted_out[8 .. total_len - 4];
+
+    const flags = std.mem.readInt(u32, payload[4..8], .little);
+    try std.testing.expect((flags & Flag.has_ad_tag) == 0);
+    try std.testing.expectEqual(@as(usize, 56 + client_data.len), payload.len);
+}
+
+test "encapsulated c2s includes ad_tag block when present" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+    const ad_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        ad_tag,
+    );
+    defer ctx.deinit(allocator);
+
+    const client_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var encrypted_out: [512]u8 = undefined;
+
+    const written = try ctx.encapsulateSingleMessageC2S(client_data[0..], false, encrypted_out[0..]);
+    try std.testing.expect(written >= 16);
+
+    var decryptor = crypto.AesCbc.init(&key, &iv);
+    try decryptor.decryptInPlace(encrypted_out[0..written]);
+
+    const total_len = std.mem.readInt(u32, encrypted_out[0..4], .little);
+    const payload = encrypted_out[8 .. total_len - 4];
+
+    const flags = std.mem.readInt(u32, payload[4..8], .little);
+    try std.testing.expect((flags & Flag.has_ad_tag) != 0);
+
+    const extra_size = std.mem.readInt(u32, payload[56..60], .little);
+    try std.testing.expectEqual(@as(u32, 24), extra_size);
+    const proxy_tag = [_]u8{ 0xae, 0x26, 0x1e, 0xdb };
+    try std.testing.expectEqualSlices(u8, &proxy_tag, payload[60..64]);
+    try std.testing.expectEqual(@as(u8, 16), payload[64]);
+    try std.testing.expectEqualSlices(u8, &ad_tag, payload[65..81]);
+}
+
+test "decapsulate s2c skips noop padding words" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    // Build plaintext stream:
+    // - one full 16-byte NO-OP block (4x uint32(4))
+    // - one RPC_SIMPLE_ACK frame (len=28, padded to 32)
+    var plain: [48]u8 = undefined;
+    var off: usize = 0;
+
+    // 16-byte NO-OP block
+    var i: usize = 0;
+    while (i < 16) : (i += 4) {
+        std.mem.writeInt(u32, plain[off + i ..][0..4], 4, .little);
+    }
+    off += 16;
+
+    // RPC_SIMPLE_ACK frame: total_len=28, payload=16
+    const total_len: u32 = 28;
+    std.mem.writeInt(u32, plain[off..][0..4], total_len, .little);
+    std.mem.writeInt(i32, plain[off + 4 ..][0..4], 0, .little);
+
+    // payload: type(4) + conn_id(8) + confirm(4)
+    @memcpy(plain[off + 8 .. off + 12], &rpc_simple_ack);
+    @memset(plain[off + 12 .. off + 20], 0);
+    const confirm = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    @memcpy(plain[off + 20 .. off + 24], &confirm);
+
+    const checksum = crc32(plain[off .. off + 24]);
+    std.mem.writeInt(u32, plain[off + 24 ..][0..4], checksum, .little);
+
+    // Padded tail for len=28 -> 32
+    std.mem.writeInt(u32, plain[off + 28 ..][0..4], 4, .little);
+
+    // Encrypt the full stream as one CBC chain
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    const out = try ctx.decapsulateS2C(wire[0..]);
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expectEqualSlices(u8, &confirm, out);
+}
+
+test "decapsulate s2c validates seq and checksum" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    // Build one plaintext RPC_PROXY_ANS frame with seq=0 and 4-byte body.
+    var plain: [32]u8 = undefined;
+    const total_len: u32 = 32;
+    std.mem.writeInt(u32, plain[0..4], total_len, .little);
+    std.mem.writeInt(i32, plain[4..8], 0, .little);
+    @memcpy(plain[8..12], &rpc_proxy_ans);
+    std.mem.writeInt(u32, plain[12..16], 0, .little); // flags
+    @memset(plain[16..24], 0); // conn_id
+    std.mem.writeInt(u32, plain[24..28], 0x12345678, .little); // data
+    const checksum = crc32(plain[0..28]);
+    std.mem.writeInt(u32, plain[28..32], checksum, .little);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    const out = try ctx.decapsulateS2C(wire[0..]);
+    try std.testing.expectEqual(@as(usize, 8), out.len); // len(4) + data(4)
+
+    // Send a second valid frame with wrong seq (5 instead of expected 1)
+    var plain2: [32]u8 = undefined;
+    std.mem.writeInt(u32, plain2[0..4], total_len, .little);
+    std.mem.writeInt(i32, plain2[4..8], 5, .little);
+    @memcpy(plain2[8..12], &rpc_proxy_ans);
+    std.mem.writeInt(u32, plain2[12..16], 0, .little);
+    @memset(plain2[16..24], 0);
+    std.mem.writeInt(u32, plain2[24..28], 0x01020304, .little);
+    const checksum2 = crc32(plain2[0..28]);
+    std.mem.writeInt(u32, plain2[28..32], checksum2, .little);
+
+    var wire2 = plain2;
+    try enc.encryptInPlace(wire2[0..]);
+
+    try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..]));
 }

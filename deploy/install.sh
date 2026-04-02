@@ -83,6 +83,11 @@ fi
 cp zig-out/bin/mtproto-proxy "$INSTALL_DIR/mtproto-proxy"
 chmod +x "$INSTALL_DIR/mtproto-proxy"
 
+# Keep helper scripts locally for future maintenance/update operations
+cp "$TMPBUILD/deploy"/*.sh "$INSTALL_DIR/"
+cp "$TMPBUILD/deploy/capture_template.py" "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR"/*.sh
+
 # ── Generate config (if not exists) ─────────────────────────
 if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     SECRET=$(openssl rand -hex 16)

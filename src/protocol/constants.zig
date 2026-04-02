@@ -22,6 +22,18 @@ pub const tg_datacenters_v6 = [5]std.net.Address{
     std.net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
 };
 
+pub const tg_middle_proxy_port: u16 = 8888;
+
+/// Default MiddleProxy endpoints per primary DC (1..5).
+/// Refreshed at runtime from getProxyConfig when available.
+pub const tg_middle_proxies_v4 = [5]std.net.Address{
+    std.net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 149, 154, 161, 144 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 91, 108, 4, 136 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 91, 108, 56, 183 }, tg_middle_proxy_port),
+};
+
 /// Resolves physical Datacenter IP by its index, handling special media DCs.
 pub fn getDcAddressV4(abs_dc: usize) std.net.Address {
     if (abs_dc == 203) {
@@ -142,4 +154,3 @@ test "invalid proto tag" {
     try std.testing.expect(ProtoTag.fromBytes(.{ 0, 0, 0, 0 }) == null);
     try std.testing.expect(ProtoTag.fromBytes(.{ 0xff, 0xff, 0xff, 0xff }) == null);
 }
-

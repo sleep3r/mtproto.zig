@@ -19,6 +19,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 [Features](#-features) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
+[Update](#-update-existing-server) &nbsp;&bull;&nbsp;
 [Docker](#docker-image) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
@@ -37,7 +38,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients to a real domain |
 | **Fast Mode** | Zero-copy S2C | Drastically reduces CPU usage by delegating Server-to-Client AES encryption to the DC |
-| **MiddleProxy** | DC203 Media Relay | Handles media DC203 via `RPC_PROXY_REQ/ANS` encapsulation over AES-CBC |
+| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for regular DC1..5 (`use_middle_proxy`) + required DC203 media relay |
 | **Auto Refresh** | Telegram Metadata | Periodically updates MiddleProxy endpoint and secret from Telegram core endpoints |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
@@ -90,10 +91,45 @@ make test
 | `make test` | Run unit tests |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format all Zig source files |
-| `make deploy` | Cross-compile, upload to VPS, restart service |
+| `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
+| `make update-server SERVER=<ip> [VERSION=vX.Y.Z]` | Update server binary from GitHub Release artifacts |
 
 </details>
+
+## &nbsp; Update existing server
+
+The easiest way to upgrade an already installed proxy is to pull a prebuilt binary from GitHub Releases and restart the service.
+
+From your local machine:
+
+```bash
+make update-server SERVER=<SERVER_IP>
+```
+
+Pin to a specific version:
+
+```bash
+make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
+```
+
+What `update-server` does on the VPS:
+1. Downloads the latest (or pinned) release artifact for server architecture.
+2. Stops `mtproto-proxy`, replaces binary, and keeps `config.toml`/`env.sh` untouched.
+3. Refreshes helper scripts and service unit from the same release tag.
+4. Restarts service and rolls back binary automatically if restart fails.
+
+If you are already on the server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
+```
+
+Or pinned version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
+```
 
 ## Docker image
 
@@ -327,6 +363,10 @@ sudo systemctl stop mtproto-proxy
 Create a `config.toml` in the project root:
 
 ```toml
+[general]
+use_middle_proxy = true                         # Telemt-compatible ME mode for promo parity
+ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
+
 [server]
 port = 443
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
@@ -348,6 +388,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
+| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5 (recommended for promo-channel parity) |
+| `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
@@ -359,11 +401,13 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 </details>
 
+> **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
+
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
 
-> **Note** &nbsp; Media DC203 settings (MiddleProxy address + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with a bundled fallback.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media DC203 endpoint + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with a bundled fallback.
 
 ## &nbsp; Troubleshooting ("Updating...")
 
