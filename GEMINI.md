@@ -268,6 +268,20 @@ Implemented a 100% loopback test capability:
 ### Re-enabling DRS
 Once iPhone connectivity is stable, test with the `DRS` ramp enabled (shifting to 16384-byte records after a threshold).
 
+### Advanced Anti-DPI Research
+Based on continuous updates from DPI developers (e.g., VAS Experts/EcoSnat), bypass development remains a cat-and-mouse game. Notably, they actively maintain a detailed public changelog tracking new blocking capabilities: [VAS Experts DPI Changelog](https://wiki.vasexperts.ru/doku.php?id=dpi:changelog:versions:beta).
+
+Recent shifts (like DPI version 14.2) show active targeting of FakeTLS, explicit MTProto fingerprinting, and blacklisting of specific hosting subnetworks (e.g., Hetzner). Even clean VLESS (sing-box) can be blocked based on the destination IP or SNI mismatch ("pessimization" logic).
+Ideas for future countermeasures to explore:
+- **Rigorous SNI Selection**: Tuning SNI domains to perfectly match the traffic profile of the destination IP, as generic/mismatched domains combined with QUIC are now actively penalized.
+- **Podkop-style "Garbage Injection"**: Injecting junk data into streams to disrupt the "fuzzy logic" state machines of modern DPIs.
+- **Alternative Exotic Transports**:
+  - TCP over VK Voice Calls (exploiting permitted domestic WebRTC/STUN traffic).
+  - TCP over Emails (SMTP tunnels, e.g., `x011/smtp-tunnel-proxy`).
+  - TCP over DNS (e.g., `yarrick/iodine`).
+  - TCP over ICMP / Max.
+  - Mesh Networks.
+
 ---
 
 ## ТСПУ / DPI Evasion (Russian ISP Blocking)
