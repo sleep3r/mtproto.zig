@@ -1,5 +1,6 @@
 .git
 .github
+.idea
 .zig-cache
 zig-out
 *.md

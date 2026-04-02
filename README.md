@@ -133,7 +133,7 @@ curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/upd
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs (startup banner resolves the public IP via `curl`).
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs (startup banner resolves the public IP via `curl`). The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
@@ -184,7 +184,7 @@ docker buildx build \
 
 ### Run
 
-Mount your `config.toml` and publish the listen port from the config (default `config.toml.example` uses `443`):
+Publish the listen port from your config (the bundled example listens on `443`). For production, mount your `config.toml` over the default:
 
 ```bash
 docker run --rm \
@@ -192,6 +192,8 @@ docker run --rm \
   -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
   mtproto-zig
 ```
+
+`docker run --rm -p 443:443 mtproto-zig` also works using the in-image example config (replace example user secrets before exposing the service).
 
 If your config sets `server.port = 8443`, publish `-p 8443:8443` instead.
 
