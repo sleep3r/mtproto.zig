@@ -156,7 +156,7 @@ pub const ProxyState = struct {
 
     /// Maximum concurrent connections before rejecting new ones.
     /// Prevents thread exhaustion under load.
-    const max_connections: u32 = 8192;
+    const max_connections: u32 = 65535;
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
