@@ -19,7 +19,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 [Features](#-features) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
-[Releases](#-releases) &nbsp;&bull;&nbsp;
+[Update](#-update-existing-server) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
 [Troubleshooting](#-troubleshooting-updating)
@@ -92,37 +92,43 @@ make test
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
-| `make release-manual VERSION=vX.Y.Z` | Manual fallback: tag HEAD and publish GitHub Release |
+| `make update-server SERVER=<ip> [VERSION=vX.Y.Z]` | Update server binary from GitHub Release artifacts |
 
 </details>
 
-## &nbsp; Releases
+## &nbsp; Update existing server
 
-Automated releases are managed by GitHub Actions and `release-please`.
+The easiest way to upgrade an already installed proxy is to pull a prebuilt binary from GitHub Releases and restart the service.
 
-Before enabling required status checks on release PRs, create repository secret `RELEASE_PLEASE_TOKEN` (PAT with access to this repo). This allows CI to run on release-please PRs.
-
-### Recommended flow (automatic)
-
-1. Merge commits into `main` using Conventional Commit prefixes.
-2. `Release Please` opens or updates a release PR when a version bump is needed.
-3. Merge that release PR to create tag `vX.Y.Z`, update `CHANGELOG.md`, and publish a GitHub release.
-4. The same `Release Please` workflow builds Linux binaries and attaches `.tar.gz` artifacts when a release is created.
-
-Version bump rules:
-- `fix:` -> patch (`v1.2.3` -> `v1.2.4`)
-- `feat:` -> minor (`v1.2.3` -> `v1.3.0`)
-- `feat!:` or `BREAKING CHANGE:` -> major (`v1.2.3` -> `v2.0.0`)
-
-### Manual fallback from CLI
-
-If GitHub automation is unavailable, you can publish a release directly from your terminal:
+From your local machine:
 
 ```bash
-make release-manual VERSION=v1.2.3
+make update-server SERVER=<SERVER_IP>
 ```
 
-This tags current `HEAD`, pushes the tag, and creates a GitHub release with generated notes.
+Pin to a specific version:
+
+```bash
+make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
+```
+
+What `update-server` does on the VPS:
+1. Downloads the latest (or pinned) release artifact for server architecture.
+2. Stops `mtproto-proxy`, replaces binary, and keeps `config.toml`/`env.sh` untouched.
+3. Refreshes helper scripts and service unit from the same release tag.
+4. Restarts service and rolls back binary automatically if restart fails.
+
+If you are already on the server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
+```
+
+Or pinned version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
+```
 
 ## &nbsp; Deploy to Server
 

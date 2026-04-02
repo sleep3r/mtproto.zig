@@ -1,4 +1,4 @@
-.PHONY: build release run test clean fmt deploy migrate update-dns release-manual
+.PHONY: build release run test clean fmt deploy update-server migrate update-dns release-manual
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -50,6 +50,14 @@ deploy:
 		rm .env.tmp_deploy; \
 	fi
 	ssh root@$(SERVER) 'systemctl start mtproto-proxy && systemctl status mtproto-proxy --no-pager'
+
+update-server:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-server SERVER=<ip> [VERSION=vX.Y.Z]"; exit 1; fi
+	@if [ -n "$(VERSION)" ]; then \
+		ssh root@$(SERVER) 'bash -s -- $(VERSION)' < deploy/update.sh; \
+	else \
+		ssh root@$(SERVER) 'bash -s' < deploy/update.sh; \
+	fi
 
 migrate:
 	@if [ -z "$(SERVER)" ]; then echo "Usage: make migrate SERVER=<ip> [PASSWORD=<pass>]"; exit 1; fi

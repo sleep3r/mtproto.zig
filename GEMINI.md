@@ -42,6 +42,7 @@ src/
 │   └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
 deploy/
 ├── install.sh            # One-line VPS bootstrap (Zig + build + systemd + TCPMSS + IPv6)
+├── update.sh             # In-place server updater from GitHub Release artifacts
 ├── ipv6-hop.sh           # IPv6 address rotation (Cloudflare API)
 ├── mtproto-proxy.service # systemd unit file
 ├── update_dns.sh         # Cloudflare DNS A-record updater
@@ -86,7 +87,19 @@ make release                                           # Release build (native)
 make release_linux                                     # Cross-compile for Linux
 make test                                              # Run unit tests
 make deploy                                            # Cross-compile + stop + scp + start
+make update-server SERVER=<ip> [VERSION=vX.Y.Z]       # Update VPS from GitHub Release
 ```
+
+### Release Workflow (GitHub)
+
+- Release automation is handled by `release-please` in `.github/workflows/release-please.yml`.
+- It updates/opens one release PR, not one release per commit.
+- A real GitHub release is created only when the release PR is merged.
+- Bump policy follows Conventional Commits:
+  - `fix:` -> patch
+  - `feat:` -> minor
+  - `BREAKING CHANGE:` / `!` -> major
+- To keep required checks compatible with release PRs, repository secret `RELEASE_PLEASE_TOKEN` must be set (PAT with `Contents`, `Pull requests`, `Issues` read/write for this repo).
 
 > [!NOTE]
 > On macOS 26 (Tahoe), `zig build` is broken due to Zig 0.15.2's linker not supporting the new TBD format.
@@ -102,6 +115,38 @@ make deploy                                            # Cross-compile + stop + 
 
 > [!IMPORTANT]
 > You must stop the service before using `scp` because the systemd unit has `ReadOnlyPaths=/opt/mtproto-proxy`, which prevents overwriting the binary while it is running.
+
+### Server Update Path (Recommended for Operators)
+
+For routine production upgrades, users should update from GitHub Releases instead of rebuilding on the VPS.
+
+#### Local orchestrated update
+```bash
+make update-server SERVER=<SERVER_IP>
+make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
+```
+
+This runs `deploy/update.sh` remotely over SSH.
+
+#### Direct update on the VPS
+```bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
+```
+
+#### Update safety guarantees
+- Detects server architecture (`x86_64`/`aarch64`) and downloads matching release artifact.
+- Stops `mtproto-proxy`, installs new binary, updates deploy helper scripts and service unit.
+- Preserves runtime state (`/opt/mtproto-proxy/config.toml`, `/opt/mtproto-proxy/env.sh`).
+- Creates timestamped backup of current binary before replacement.
+- Automatically rolls back to previous binary if restart fails.
+
+#### Operator rollback
+If needed, restore the backup binary printed by `update.sh` and restart:
+```bash
+sudo cp /opt/mtproto-proxy/mtproto-proxy.backup.<timestamp> /opt/mtproto-proxy/mtproto-proxy
+sudo systemctl restart mtproto-proxy
+```
 
 ### Configuration (`config.toml.example`)
 Users can copy `config.toml.example` to `config.toml`. The structure natively supports the new anti-DPI routing fields:
