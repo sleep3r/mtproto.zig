@@ -79,6 +79,22 @@ make run
 make test
 ```
 
+### Performance & Stability Checks
+
+```bash
+# Fast microbenchmark for C2S encapsulation
+make bench
+
+# 30-second multithreaded soak (crash/stability guard)
+make soak
+
+# Custom soak shape
+zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
+```
+
+`bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
+`soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
+
 <details>
 <summary>All Make targets</summary>
 
@@ -88,6 +104,8 @@ make test
 | `make release` | Optimized build (`ReleaseFast`) |
 | `make run CONFIG=<path>` | Run proxy (default: `config.toml`) |
 | `make test` | Run unit tests |
+| `make bench` | Run ReleaseFast encapsulation microbenchmarks |
+| `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |

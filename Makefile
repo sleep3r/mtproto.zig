@@ -1,4 +1,4 @@
-.PHONY: build release run test clean fmt deploy update-server migrate update-dns release-manual
+.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -27,6 +27,12 @@ run:
 
 test:
 	zig build test
+
+bench:
+	zig build -Doptimize=ReleaseFast bench
+
+soak:
+	zig build -Doptimize=ReleaseFast soak -- --seconds=30
 
 fmt:
 	zig fmt src/

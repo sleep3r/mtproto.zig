@@ -282,60 +282,55 @@ pub const MiddleProxyContext = struct {
         }
         if (all_zeros and client_data.len >= 8) flags |= Flag.not_encrypted;
 
-        // Construct inner RPC payload
-        var rpc_payload: [65536]u8 = undefined;
-        var rpc_len: usize = 0;
+        // Write directly into out_buf to avoid fixed-size stack buffer overflow
+        // on large client packets.
+        const extra_len: usize = if (self.ad_tag != null) 28 else 0;
+        const rpc_len = 56 + extra_len + client_data.len;
+        const frame_total_len = rpc_len + 12;
+        const padding_needed = (16 - (frame_total_len % 16)) % 16;
+        const encrypted_len = frame_total_len + padding_needed;
+        if (out_buf.len < encrypted_len) return error.OutBufOverflow;
 
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 4], &rpc_proxy_req);
-        rpc_len += 4;
-        std.mem.writeInt(u32, rpc_payload[rpc_len..][0..4], flags, .little);
-        rpc_len += 4;
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 8], &self.conn_id);
-        rpc_len += 8;
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 20], &self.remote_ip_port);
-        rpc_len += 20;
-        @memcpy(rpc_payload[rpc_len .. rpc_len + 20], &self.our_ip_port);
-        rpc_len += 20;
-
-        if (self.ad_tag) |ad_tag| {
-            // EXTRA_SIZE field + TL proxy_tag bytes (24 bytes total)
-            const extra_size: u32 = 24;
-            std.mem.writeInt(u32, rpc_payload[rpc_len..][0..4], extra_size, .little);
-            rpc_len += 4;
-
-            const proxy_tag = [_]u8{ 0xae, 0x26, 0x1e, 0xdb };
-            @memcpy(rpc_payload[rpc_len .. rpc_len + 4], &proxy_tag);
-            rpc_len += 4;
-
-            // Bytes TL string with fixed 16-byte ad tag + 3-byte align padding.
-            rpc_payload[rpc_len] = 16;
-            rpc_len += 1;
-
-            @memcpy(rpc_payload[rpc_len .. rpc_len + 16], &ad_tag);
-            rpc_len += 16;
-
-            const aligner = [_]u8{ 0x00, 0x00, 0x00 };
-            @memcpy(rpc_payload[rpc_len .. rpc_len + 3], &aligner);
-            rpc_len += 3;
-        }
-
-        // Append client_data
-        @memcpy(rpc_payload[rpc_len .. rpc_len + client_data.len], client_data);
-        rpc_len += client_data.len;
-
-        // Wrap in MTProtoFrame
-        const frame_total_len: u32 = @intCast(rpc_len + 12);
-
-        // Let's write the frame directly to out_buf
         var out_len: usize = 0;
-        std.mem.writeInt(u32, out_buf[out_len..][0..4], frame_total_len, .little);
+        std.mem.writeInt(u32, out_buf[out_len..][0..4], @intCast(frame_total_len), .little);
         out_len += 4;
         std.mem.writeInt(i32, out_buf[out_len..][0..4], self.seq_no, .little);
         out_len += 4;
         self.seq_no += 1;
 
-        @memcpy(out_buf[out_len .. out_len + rpc_len], rpc_payload[0..rpc_len]);
-        out_len += rpc_len;
+        @memcpy(out_buf[out_len .. out_len + 4], &rpc_proxy_req);
+        out_len += 4;
+        std.mem.writeInt(u32, out_buf[out_len..][0..4], flags, .little);
+        out_len += 4;
+        @memcpy(out_buf[out_len .. out_len + 8], &self.conn_id);
+        out_len += 8;
+        @memcpy(out_buf[out_len .. out_len + 20], &self.remote_ip_port);
+        out_len += 20;
+        @memcpy(out_buf[out_len .. out_len + 20], &self.our_ip_port);
+        out_len += 20;
+
+        if (self.ad_tag) |ad_tag| {
+            const extra_size: u32 = 24;
+            std.mem.writeInt(u32, out_buf[out_len..][0..4], extra_size, .little);
+            out_len += 4;
+
+            const proxy_tag = [_]u8{ 0xae, 0x26, 0x1e, 0xdb };
+            @memcpy(out_buf[out_len .. out_len + 4], &proxy_tag);
+            out_len += 4;
+
+            out_buf[out_len] = 16;
+            out_len += 1;
+
+            @memcpy(out_buf[out_len .. out_len + 16], &ad_tag);
+            out_len += 16;
+
+            const aligner = [_]u8{ 0x00, 0x00, 0x00 };
+            @memcpy(out_buf[out_len .. out_len + 3], &aligner);
+            out_len += 3;
+        }
+
+        @memcpy(out_buf[out_len .. out_len + client_data.len], client_data);
+        out_len += client_data.len;
 
         // CRC32 of length + seq + payload (which starts at out_buf[0])
         const checksum = crc32(out_buf[0..out_len]);
@@ -343,7 +338,6 @@ pub const MiddleProxyContext = struct {
         out_len += 4;
 
         // AES CBC Padding requires NO-OP length markers (0x04000000)
-        const padding_needed = (16 - (out_len % 16)) % 16;
         var i: usize = 0;
         while (i < padding_needed) : (i += 4) {
             std.mem.writeInt(u32, out_buf[out_len + i ..][0..4], 4, .little);
@@ -958,4 +952,44 @@ test "decapsulate s2c validates seq and checksum" {
     try enc.encryptInPlace(wire2[0..]);
 
     try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..]));
+}
+
+test "encapsulate c2s supports payloads larger than 64KiB" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    const payload_len = 96 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 0x42);
+
+    const out_buf = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(out_buf);
+
+    const written = try ctx.encapsulateSingleMessageC2S(payload, false, out_buf);
+    try std.testing.expect(written > payload_len);
+
+    var decryptor = crypto.AesCbc.init(&key, &iv);
+    try decryptor.decryptInPlace(out_buf[0..written]);
+
+    const total_len = std.mem.readInt(u32, out_buf[0..4], .little);
+    try std.testing.expectEqual(@as(usize, total_len), 56 + payload_len + 12);
+
+    const rpc_payload = out_buf[8 .. total_len - 4];
+    try std.testing.expectEqualSlices(u8, &rpc_proxy_req, rpc_payload[0..4]);
 }
