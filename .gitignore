@@ -8,3 +8,4 @@ config.toml
 .env
 .ruff_cache/
 *.session
+.vscode/

@@ -189,6 +189,31 @@ bash "$TMPBUILD/deploy/setup_nfqws.sh" || warn "nfqws setup failed"
 systemctl restart "$SERVICE_NAME"
 ok "Advanced OS-Level DPI Evasion and Masking successfully configured!"
 
+# Validate masking configuration after restart
+MASK_PORT="$(awk '
+    BEGIN { in_censorship = 0 }
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+        in_censorship = ($0 ~ /^[[:space:]]*\[censorship\][[:space:]]*$/)
+        next
+    }
+    in_censorship && /^[[:space:]]*mask_port[[:space:]]*=/ {
+        line = $0
+        sub(/#.*/, "", line)
+        split(line, parts, "=")
+        value = parts[2]
+        gsub(/[[:space:]]/, "", value)
+        print value
+    }
+' "$INSTALL_DIR/config.toml" | tail -1)"
+
+if [[ -z "$MASK_PORT" ]]; then
+    warn "mask_port is not set in [censorship] — masking may fall back to remote tls_domain:443"
+elif curl -sk --max-time 5 "https://127.0.0.1:${MASK_PORT}/" >/dev/null 2>&1; then
+    ok "Masking validation passed (127.0.0.1:${MASK_PORT} responds over TLS)"
+else
+    warn "Masking validation failed: https://127.0.0.1:${MASK_PORT}/ is not responding"
+fi
+
 # ── Cleanup ─────────────────────────────────────────────────
 rm -rf "$TMPBUILD"
 

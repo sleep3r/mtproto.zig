@@ -152,13 +152,59 @@ fi
 # ── Update mtproto config ──────────────────────────────────
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
 if [[ -f "$CONFIG_FILE" ]]; then
-    # Check if mask_port is already set
-    if grep -q "mask_port" "$CONFIG_FILE"; then
-        sed -i "s/^mask_port.*/mask_port = ${NGINX_PORT}/" "$CONFIG_FILE"
+    TMP_CONFIG="$(mktemp)"
+    if awk -v mask_port="${NGINX_PORT}" '
+        BEGIN {
+            in_censorship = 0;
+            saw_censorship = 0;
+            wrote_mask_port = 0;
+        }
+
+        function emit_mask_port() {
+            if (!wrote_mask_port) {
+                print "mask_port = " mask_port;
+                wrote_mask_port = 1;
+            }
+        }
+
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            if (in_censorship) {
+                emit_mask_port();
+            }
+            in_censorship = ($0 ~ /^[[:space:]]*\[censorship\][[:space:]]*$/);
+            if (in_censorship) {
+                saw_censorship = 1;
+                wrote_mask_port = 0;
+            }
+            print;
+            next;
+        }
+
+        {
+            if (in_censorship && $0 ~ /^[[:space:]]*mask_port[[:space:]]*=/) {
+                emit_mask_port();
+                next;
+            }
+            print;
+        }
+
+        END {
+            if (in_censorship) {
+                emit_mask_port();
+            }
+            if (!saw_censorship) {
+                print "";
+                print "[censorship]";
+                print "mask_port = " mask_port;
+            }
+        }
+    ' "$CONFIG_FILE" > "$TMP_CONFIG"; then
+        mv "$TMP_CONFIG" "$CONFIG_FILE"
     else
-        # Add mask_port after the mask line in [censorship] section
-        sed -i "/^mask\s*=\s*true/a mask_port = ${NGINX_PORT}" "$CONFIG_FILE"
+        rm -f "$TMP_CONFIG"
+        fail "Failed to update ${CONFIG_FILE} with mask_port=${NGINX_PORT}"
     fi
+
     ok "Updated ${CONFIG_FILE} with mask_port = ${NGINX_PORT}"
     info "Restart the proxy to apply: systemctl restart mtproto-proxy"
 else

@@ -113,6 +113,8 @@ pub const Config = struct {
                         cfg.tls_domain = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "mask_port")) {
+                        cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         cfg.desync = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
