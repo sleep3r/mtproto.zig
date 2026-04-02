@@ -344,6 +344,8 @@ pub const MiddleProxyContext = struct {
         }
         out_len += padding_needed;
 
+        std.debug.assert(out_len == encrypted_len);
+
         try self.encryptor.encryptInPlace(out_buf[0..out_len]);
         return out_len;
     }
