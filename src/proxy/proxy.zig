@@ -171,15 +171,16 @@ pub const ProxyState = struct {
         // Resolve mask domain DNS at startup (avoids getaddrinfo on small-stack threads)
         var resolved_addr: ?net.Address = null;
         if (cfg.mask) {
-            const list = net.getAddressList(allocator, cfg.tls_domain, cfg.mask_port) catch |err| blk: {
-                log.err("Failed to resolve mask domain '{s}': {any}", .{ cfg.tls_domain, err });
+            const mask_target = if (cfg.mask_port != 443) "127.0.0.1" else cfg.tls_domain;
+            const list = net.getAddressList(allocator, mask_target, cfg.mask_port) catch |err| blk: {
+                log.err("Failed to resolve mask target '{s}': {any}", .{ mask_target, err });
                 break :blk null;
             };
             if (list) |al| {
                 defer al.deinit();
                 if (al.addrs.len > 0) {
                     resolved_addr = al.addrs[0];
-                    log.info("Mask domain '{s}' resolved at startup", .{cfg.tls_domain});
+                    log.info("Mask target '{s}' resolved at startup", .{mask_target});
                 }
             }
         }
