@@ -30,6 +30,7 @@ High-performance MTProto proxy that mimics TLS 1.3 handshakes (domain fronting) 
 ```text
 src/
 ├── main.zig              # Entry point, banner, public IP detection, custom logger
+├── bench.zig             # Performance microbench + multithreaded soak runner
 ├── config.zig            # TOML config parser
 ├── proxy/
 │   └── proxy.zig         # Core: accept loop, client handler, relay, DRS, Split-TLS desync
@@ -86,6 +87,8 @@ make build                                             # Debug build (native)
 make release                                           # Release build (native)
 make release_linux                                     # Cross-compile for Linux
 make test                                              # Run unit tests
+make bench                                             # ReleaseFast encapsulation microbench
+make soak                                              # ReleaseFast 30s multithreaded soak stress
 make deploy                                            # Cross-compile + stop + scp + start
 make update-server SERVER=<ip> [VERSION=vX.Y.Z]       # Update VPS from GitHub Release
 ```
@@ -290,6 +293,12 @@ All relay sockets use these settings:
 - Runtime updates are protected by `std.Thread.RwLock` and applied per new connection.
 - If fetching fails, bundled defaults remain active.
 
+### MiddleProxy C2S Frame Safety
+- `encapsulateSingleMessageC2S` previously built RPC payload in a fixed 64KiB stack buffer.
+- Under large client packets, this could overflow the local buffer and crash with `SIGSEGV`.
+- Fixed by writing RPC payload directly into `out_buf` with precomputed frame size and explicit bounds checks (`error.OutBufOverflow`).
+- Added regression test for payloads larger than 64KiB.
+
 ---
 
 ## Chronological Bug Fixes
@@ -317,6 +326,8 @@ All relay sockets use these settings:
 22. **Telemt promo parity**: Added `[general].use_middle_proxy` support for regular DC1..5 and `[general].ad_tag` alias; ME path now injects ad tag into `RPC_PROXY_REQ` when configured.
 23. **Deploy config parity**: `make deploy` now uploads runtime `config.toml` (via `CONFIG`) to `/opt/mtproto-proxy/config.toml` to avoid stale server config after binary-only deploys.
 24. **Production log normalization**: reverted temporary relay diagnostics (`DIAG C2S/S2C`, `Relay ended`, common reset/EOF errors) back to debug level to reduce log I/O noise and keep warning/error logs actionable under high mobile churn.
+25. **MiddleProxy C2S overflow fix**: removed fixed 64KiB stack RPC buffer in `encapsulateSingleMessageC2S`, switched to direct write into output buffer with explicit bounds checks.
+26. **Bench/Soak tooling**: added built-in `bench` and multithreaded `soak` runners (`src/bench.zig`, `zig build bench`, `zig build soak`, `make bench`, `make soak`) for repeatable local performance and stability validation.
 
 ---
 
@@ -329,6 +340,12 @@ Implemented a 100% loopback test capability:
 
 ### Re-enabling DRS
 Once iPhone connectivity is stable, test with the `DRS` ramp enabled (shifting to 16384-byte records after a threshold).
+
+### Soak Gate in CI
+Current soak runner is local-first (`make soak`) and already useful for manual release checks. Future work:
+- add CI profile for short/medium soak tiers (e.g., 10s on PR, 60s on main)
+- keep host-specific throughput baselines and fail on statistically significant regressions
+- publish bench/soak artifacts per run to track perf drift over time
 
 ### Advanced Anti-DPI Research
 Based on continuous updates from DPI developers (e.g., VAS Experts/EcoSnat), bypass development remains a cat-and-mouse game. Notably, they actively maintain a detailed public changelog tracking new blocking capabilities: [VAS Experts DPI Changelog](https://wiki.vasexperts.ru/doku.php?id=dpi:changelog:versions:beta).
