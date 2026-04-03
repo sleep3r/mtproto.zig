@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/sleep3r/mtproto.zig/compare/v0.2.2...v0.3.0) (2026-04-03)
+
+
+### Features
+
+* make tcp listen backlog configurable ([#38](https://github.com/sleep3r/mtproto.zig/issues/38)) ([e6bb285](https://github.com/sleep3r/mtproto.zig/commit/e6bb285801dab0bd671a25a3625c87ec1a125437))
+
+
+### Bug Fixes
+
+* **proxy:** stabilize Ubuntu reconnect and MiddleProxy routing ([#36](https://github.com/sleep3r/mtproto.zig/issues/36)) ([4ec90b0](https://github.com/sleep3r/mtproto.zig/commit/4ec90b0fbc6362bbec0edc67fe004c5df7e7c7d8))
+
 ## [0.2.2](https://github.com/sleep3r/mtproto.zig/compare/v0.2.1...v0.2.2) (2026-04-02)
 
 
