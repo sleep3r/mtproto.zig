@@ -230,7 +230,7 @@ pub const ProxyState = struct {
         );
         var server = try address.listen(.{
             .reuse_address = true,
-            .kernel_backlog = self.config.backlog,
+            .kernel_backlog = @intCast(self.config.backlog),
         });
         defer server.deinit();
 
