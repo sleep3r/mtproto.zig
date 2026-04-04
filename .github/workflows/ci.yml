@@ -34,3 +34,38 @@ jobs:
         run: |
           ls -lh zig-out/bin/mtproto-proxy
           file zig-out/bin/mtproto-proxy
+
+  bench:
+    name: Bench & Soak
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Run microbenchmark
+        run: zig build -Doptimize=ReleaseFast bench 2>&1 | tee bench-output.txt
+
+      - name: Run soak test
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SOAK_SECONDS=10
+          else
+            SOAK_SECONDS=60
+          fi
+          echo "Running soak for ${SOAK_SECONDS}s"
+          zig build -Doptimize=ReleaseFast soak -- --seconds=${SOAK_SECONDS} 2>&1 | tee soak-output.txt
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-soak-results
+          path: |
+            bench-output.txt
+            soak-output.txt
+          retention-days: 90
