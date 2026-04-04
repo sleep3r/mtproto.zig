@@ -54,15 +54,15 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 > VPS benchmark (1 vCPU / 1 GB RAM, Ubuntu 24.04, April 2026). Each proxy tested in isolation after page-cache flush.
 
-| Proxy | Language | Binary | Idle RSS | Startup | Dependencies | LoC (Files) | Max ESTABLISHED | Max stable target | RSS at peak connections |
-|-------|----------|--------|----------|---------|--------------|-------------|------------------|-------------------|--------------------------|
-| **mtproto.zig** | Zig | **177 KB** | **256 KB** ⚡ | **< 10 ms**\* | **0** | **5.5k** (9) | **12,000** | **12,000** | **144.3 MB** |
-| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | C | 524 KB | 8.3 MB | < 10 ms | openssl, zlib | 29.6k (87) | 12,000 | 12,000 | 72.4 MB |
-| [Teleproxy](https://github.com/teleproxy/teleproxy) | C | 14 MB | 4.6 MB | ~ 30 ms | openssl, zlib, libc | 40.5k (120) | 12,000 | 12,000 | 76.1 MB |
-| [Telemt](https://github.com/telemt/telemt) | Rust | 15 MB | 16 MB | > 15 s | 423 crates (total) | 106.6k (231) | 8,000 | 8,000 | 50.7 MB |
-| [mtg](https://github.com/9seconds/mtg) | Go | 13 MB | 12.5 MB | ~ 30 ms | 78 modules | 17.8k (205) | 8,172 | 4,000 | 124.0 MB |
-| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | Python | N/A (script) | 35 MB | ~ 800 ms | python3 (~30 MB) | 3.3k (6) | 8,000 | 8,000 | 92.0 MB |
-| [mtproto_proxy](https://github.com/seriyps/mtproto_proxy) | Erlang | N/A (release)| 88 MB | ~ 6 s | erlang (~200 MB) | 7.8k (43) | 2,000 | 2,000 | 138.7 MB |
+| Proxy | Language | Binary | Idle RSS | Startup | Dependencies | LoC (Files) |
+|-------|----------|--------|----------|---------|--------------|-------------|
+| **mtproto.zig** | Zig | **177 KB** | **256 KB** ⚡ | **< 10 ms**\* | **0** | **5.5k** (9) |
+| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | C | 524 KB | 8.3 MB | < 10 ms | openssl, zlib | 29.6k (87) |
+| [Teleproxy](https://github.com/teleproxy/teleproxy) | C | 14 MB | 4.6 MB | ~ 30 ms | openssl, zlib, libc | 40.5k (120) |
+| [Telemt](https://github.com/telemt/telemt) | Rust | 15 MB | 16 MB | > 15 s | 423 crates (total) | 106.6k (231) |
+| [mtg](https://github.com/9seconds/mtg) | Go | 13 MB | 12.5 MB | ~ 30 ms | 78 modules | 17.8k (205) |
+| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | Python | N/A (script) | 35 MB | ~ 800 ms | python3 (~30 MB) | 3.3k (6) |
+| [mtproto_proxy](https://github.com/seriyps/mtproto_proxy) | Erlang | N/A (release)| 88 MB | ~ 6 s | erlang (~200 MB) | 7.8k (43) |
 
 \* `mtproto.zig` also performs online bootstrap at startup (public IP detection + Telegram metadata refresh). On this VPS, cold boot is typically ~0.4 s; warm/steady restart remains sub-10 ms.
 
