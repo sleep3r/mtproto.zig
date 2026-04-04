@@ -49,7 +49,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
-> **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, see [GEMINI.md](GEMINI.md) (Engineering Notes).
+> **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, refer to the `.agent/skills` and `.agent/workflows` directories.
 
 ## &nbsp; Quick Start
 
