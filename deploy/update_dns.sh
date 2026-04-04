@@ -2,7 +2,7 @@
 set -eo pipefail
 
 NEW_IP="$1"
-DNS_NAME="proxy.sleep3r.ru"
+DNS_NAME="proxy.xxcipherx.ru"
 
 if [ -z "$NEW_IP" ]; then
     echo "Usage: $0 <new_ip>"

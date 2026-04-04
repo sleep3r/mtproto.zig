@@ -22,7 +22,7 @@ set -euo pipefail
 # ── Configuration ────────────────────────────────────────────────
 IPV6_PREFIX="2a01:48a0:4301:bf"   # Your /64 prefix (no trailing ::)
 INTERFACE="eth0"
-DNS_NAME="proxy.sleep3r.ru"
+DNS_NAME="proxy.xxcipherx.ru"
 CLOUDFLARE_TOKEN="${CF_TOKEN:-}"   # export CF_TOKEN=your_token
 CF_ZONE_ID="${CF_ZONE:-}"          # export CF_ZONE=your_zone_id
 STATE_FILE="/tmp/mtproto-ipv6-current"

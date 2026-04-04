@@ -61,7 +61,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ```bash
 # Clone
-git clone https://github.com/sleep3r/mtproto.zig.git
+git clone https://github.com/XXcipherX/mtproto.zig.git
 cd mtproto.zig
 
 # Build (debug)
@@ -111,43 +111,18 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
-| `make update-server SERVER=<ip> [VERSION=vX.Y.Z]` | Update server binary from GitHub Release artifacts |
 
 </details>
 
 ## &nbsp; Update existing server
 
-The easiest way to upgrade an already installed proxy is to pull a prebuilt binary from GitHub Releases and restart the service.
-
-From your local machine:
+To update an already installed proxy, simply re-run the same install command:
 
 ```bash
-make update-server SERVER=<SERVER_IP>
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-Pin to a specific version:
-
-```bash
-make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
-```
-
-What `update-server` does on the VPS:
-1. Downloads the latest (or pinned) release artifact for server architecture.
-2. Stops `mtproto-proxy`, replaces binary, and keeps `config.toml`/`env.sh` untouched.
-3. Refreshes helper scripts and service unit from the same release tag.
-4. Restarts service and rolls back binary automatically if restart fails.
-
-If you are already on the server:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
-```
-
-Or pinned version:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
-```
+The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml` and `env.sh`. User secrets and connection links remain unchanged.
 
 ## Docker image
 
@@ -222,7 +197,7 @@ OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not
 ### One-line install (Ubuntu/Debian)
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | sudo bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
 This will:
@@ -254,7 +229,7 @@ To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must
 You can either pass variables directly inline:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | \
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | \
   sudo CF_TOKEN=<your_cf_token> CF_ZONE=<your_zone_id> bash
 ```
 
@@ -262,7 +237,7 @@ Or, for a cleaner and more secure approach, create a `.env` file first (you can 
 
 ```bash
 export $(cat .env | xargs)
-curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | sudo -E bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo -E bash
 ```
 
 ### Manual deploy
@@ -285,7 +260,7 @@ zig version   # → 0.15.2
 **2. Build the proxy**
 
 ```bash
-git clone https://github.com/sleep3r/mtproto.zig.git
+git clone https://github.com/XXcipherX/mtproto.zig.git
 cd mtproto.zig
 zig build -Doptimize=ReleaseFast
 ```
@@ -473,4 +448,4 @@ On startup the proxy now refreshes DC203 metadata from Telegram automatically. I
 
 ## &nbsp; License
 
-[MIT](LICENSE) &copy; 2026 Aleksandr Kalashnikov
+[MIT](LICENSE) &copy; 2026 XXcipherX

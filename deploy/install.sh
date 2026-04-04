@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 #
-# MTProto Proxy — one-line installer for Linux (Ubuntu/Debian)
+# MTProto Proxy — one-line installer & updater for Linux (Ubuntu/Debian)
 #
-# Usage:
-#   curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/install.sh | sudo bash
+# Usage (fresh install or update):
+#   curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
+#
+# The script is idempotent:
+#   - On first run: installs Zig, builds proxy, generates config, sets up systemd + DPI bypass.
+#   - On subsequent runs: rebuilds from latest source, replaces binary, preserves config.toml.
 #
 # What it does:
 #   1. Installs Zig 0.15.2 (if not present)
-#   2. Clones and builds the proxy
-#   3. Generates a random user secret
+#   2. Clones and builds the proxy from latest source
+#   3. Generates a random user secret (only on first install)
 #   4. Creates a systemd service
 #   5. Opens port 443 in ufw (if active)
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
@@ -19,8 +23,10 @@ set -euo pipefail
 
 ZIG_VERSION="0.15.2"
 INSTALL_DIR="/opt/mtproto-proxy"
-REPO_URL="https://github.com/sleep3r/mtproto.zig.git"
+REPO_URL="https://github.com/XXcipherX/mtproto.zig.git"
 SERVICE_NAME="mtproto-proxy"
+IS_UPDATE=false
+[[ -f "$INSTALL_DIR/mtproto-proxy" ]] && IS_UPDATE=true
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -230,7 +236,11 @@ EE_SECRET="ee${SECRET}${DOMAIN_HEX}"
 
 echo ""
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
+if $IS_UPDATE; then
+echo -e "${BOLD}  MTProto Proxy updated successfully!${RESET}"
+else
 echo -e "${BOLD}  MTProto Proxy installed successfully!${RESET}"
+fi
 echo -e "${CYAN}══════════════════════════════════════════════════${RESET}"
 echo ""
 echo -e "  ${DIM}Status:${RESET}  systemctl status $SERVICE_NAME"

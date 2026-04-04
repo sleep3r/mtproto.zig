@@ -1,4 +1,4 @@
-.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual
+.PHONY: build release run test bench soak clean fmt deploy migrate update-dns
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -8,19 +8,6 @@ build:
 
 release:
 	zig build -Doptimize=ReleaseFast
-
-release-manual:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "Usage: make release-manual VERSION=v1.2.3"; \
-		exit 1; \
-	fi
-	@if git rev-parse "$(VERSION)" >/dev/null 2>&1; then \
-		echo "Tag $(VERSION) already exists"; \
-		exit 1; \
-	fi
-	git tag "$(VERSION)"
-	git push origin "$(VERSION)"
-	gh release create "$(VERSION)" --title "$(VERSION)" --generate-notes
 
 run:
 	zig build run -- $(CONFIG)
@@ -56,14 +43,6 @@ deploy:
 		rm .env.tmp_deploy; \
 	fi
 	ssh root@$(SERVER) 'systemctl start mtproto-proxy && systemctl status mtproto-proxy --no-pager'
-
-update-server:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-server SERVER=<ip> [VERSION=vX.Y.Z]"; exit 1; fi
-	@if [ -n "$(VERSION)" ]; then \
-		ssh root@$(SERVER) 'bash -s -- $(VERSION)' < deploy/update.sh; \
-	else \
-		ssh root@$(SERVER) 'bash -s' < deploy/update.sh; \
-	fi
 
 migrate:
 	@if [ -z "$(SERVER)" ]; then echo "Usage: make migrate SERVER=<ip> [PASSWORD=<pass>]"; exit 1; fi

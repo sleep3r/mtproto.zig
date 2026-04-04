@@ -1,6 +1,6 @@
 [Unit]
 Description=MTProto Proxy (Zig)
-Documentation=https://github.com/sleep3r/mtproto.zig
+Documentation=https://github.com/XXcipherX/mtproto.zig
 After=network-online.target
 Wants=network-online.target
 
