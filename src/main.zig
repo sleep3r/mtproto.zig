@@ -4,6 +4,7 @@
 //! obfuscated connections to Telegram datacenters.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
@@ -115,6 +116,73 @@ fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
+const CapacityEstimate = struct {
+    total_ram_bytes: u64,
+    per_conn_bytes: u64,
+    safe_connections: u32,
+};
+
+fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
+    if (builtin.os.tag != .linux) return null;
+
+    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 16 * 1024) catch return null;
+    defer allocator.free(content);
+
+    const key = "MemTotal:";
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+
+        var i: usize = key.len;
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+        const start = i;
+        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {}
+        if (i == start) return null;
+
+        const total_kib = std.fmt.parseInt(u64, line[start..i], 10) catch return null;
+        return total_kib * 1024;
+    }
+
+    return null;
+}
+
+fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
+    const stack_bytes: u64 = @intCast(cfg.threadStackBytes());
+
+    // Approximate per-connection user-space working set:
+    // - thread stack
+    // - handshake + relay TLS buffers
+    // - optional middle-proxy stream buffers (4 buffers)
+    // - allocator/socket bookkeeping cushion
+    const tls_working_bytes: u64 = @intCast(
+        constants.max_tls_ciphertext_size * 3 +
+            (constants.max_tls_plaintext_size + 5) * 2,
+    );
+    const middleproxy_bytes: u64 = if (cfg.use_middle_proxy)
+        @intCast(cfg.middleProxyBufferBytes() * 4)
+    else
+        0;
+    const overhead_bytes: u64 = 64 * 1024;
+    const per_conn_bytes = stack_bytes + tls_working_bytes + middleproxy_bytes + overhead_bytes;
+
+    // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
+    const usable_bytes = (total_ram_bytes * 70) / 100;
+    const reserve_bytes = @max(@as(u64, 256 * 1024 * 1024), (total_ram_bytes * 10) / 100);
+    const budget_bytes = if (usable_bytes > reserve_bytes) usable_bytes - reserve_bytes else 0;
+
+    const raw_cap = if (per_conn_bytes > 0) budget_bytes / per_conn_bytes else 0;
+    const safe_connections_u64 = @max(@as(u64, 32), @min(raw_cap, @as(u64, std.math.maxInt(u32))));
+
+    return .{
+        .total_ram_bytes = total_ram_bytes,
+        .per_conn_bytes = per_conn_bytes,
+        .safe_connections = @intCast(safe_connections_u64),
+    };
+}
+
 // ============= Startup Banner =============
 
 /// Print a stylish startup banner with config summary and connection links.
@@ -162,6 +230,21 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
         writeRaw(yellow ++ "disabled");
     }
     writeRaw(R ++ "\n\n");
+
+    if (detectTotalRamBytes(allocator)) |total_ram| {
+        const est = estimateCapacity(&cfg, total_ram);
+        writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CAPACITY" ++ R ++ " " ++ D ++ "────────────────────────────────────" ++ R ++ "\n");
+        writeStdout("      Host RAM     " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.total_ram_bytes / (1024 * 1024)});
+        writeStdout("      Per conn     ~{d} KiB ({s})\n", .{
+            est.per_conn_bytes / 1024,
+            if (cfg.use_middle_proxy) "middleproxy mode" else "direct mode",
+        });
+        writeStdout("      Safe cap     " ++ B ++ "~{d}" ++ R ++ " connections\n", .{est.safe_connections});
+        if (cfg.max_connections > est.safe_connections) {
+            writeStdout("      " ++ yellow ++ "max_connections={d} is above safe estimate" ++ R ++ "\n", .{cfg.max_connections});
+        }
+        writeRaw("\n");
+    }
 
     // ─── USERS ──────────────────────────────────────
     writeStdout("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "USERS" ++ R ++ " ({d}) " ++ D ++ "────────────────────────────────────" ++ R ++ "\n", .{cfg.users.count()});
