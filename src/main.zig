@@ -77,9 +77,9 @@ fn writeRaw(s: []const u8) void {
 fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
     // Try multiple services in order
     const services = [_][]const []const u8{
-        &.{ "curl", "-s", "--max-time", "3", "https://ifconfig.me" },
-        &.{ "curl", "-s", "--max-time", "3", "https://api.ipify.org" },
-        &.{ "curl", "-s", "--max-time", "3", "https://icanhazip.com" },
+        &.{ "curl", "-4", "-s", "--max-time", "3", "https://ifconfig.me" },
+        &.{ "curl", "-4", "-s", "--max-time", "3", "https://api.ipify.org" },
+        &.{ "curl", "-4", "-s", "--max-time", "3", "https://icanhazip.com" },
     };
 
     for (services) |argv| {

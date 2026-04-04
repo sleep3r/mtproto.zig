@@ -254,8 +254,16 @@ rm -rf "$TMPBUILD"
 # This section MUST always run, so disable errexit for safety
 set +e
 
-PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "<SERVER_IP>")
-PORT=$(grep -oP 'port\s*=\s*\K[0-9]+' "$INSTALL_DIR/config.toml" 2>/dev/null || echo "443")
+PUBLIC_IP=$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "<SERVER_IP>")
+# Match only 'port' in [server] section, not 'mask_port' in [censorship]
+PORT=$(awk '
+    /^[[:space:]]*\[server\]/ { in_server=1; next }
+    /^[[:space:]]*\[/ { in_server=0 }
+    in_server && /^[[:space:]]*port[[:space:]]*=/ {
+        sub(/.*=[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print; exit
+    }
+' "$INSTALL_DIR/config.toml" 2>/dev/null)
+PORT="${PORT:-443}"
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
