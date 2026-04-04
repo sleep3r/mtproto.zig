@@ -23,13 +23,12 @@ src/
 ├── config.zig            # TOML config parser
 ├── proxy/
 │   └── proxy.zig         # Core: accept loop, client handler, relay, DRS, Split-TLS desync
-├── protocol/
-│   ├── tls.zig           # FakeTLS 1.3: ClientHello validation, Nginx template ServerHello
-│   ├── obfuscation.zig   # MTProto handshake parsing, key derivation, nonce generation
-│   ├── middleproxy.zig   # Telegram MiddleProxy transport (RPC_PROXY_REQ/ANS over AES-CBC)
-│   └── constants.zig     # DC addresses, protocol tags, TLS constants
-├── crypto/
-│   └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
+├── protocol/             # Handshake & header definitions
+│   ├── constants.zig     # Handshake magics, DC addresses, buffer sizes
+│   ├── middleproxy.zig   # MiddleProxy (mtprotoproxy.py) auth & encapsulation
+│   ├── obfuscation.zig   # Handshake tag parsing and AES-CTR key derivation
+│   └── tls.zig           # ClientHello/ServerHello verification and anti-DPI
+├── crypto/               # AES-CTR and SHA256/HMAC primitives
 deploy/
 ├── install.sh            # One-line VPS bootstrap & updater (Zig + build + systemd + TCPMSS + IPv6)
 ├── ipv6-hop.sh           # IPv6 address rotation (Cloudflare API)

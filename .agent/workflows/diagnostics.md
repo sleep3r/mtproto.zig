@@ -35,7 +35,7 @@ ssh root@<SERVER_IP> 'cat /var/log/mtproto-ipv6-hop.log | tail -20'
 ssh root@<SERVER_IP> 'cat /tmp/mtproto-ipv6-current'
 
 # Check short-read diagnostics (fragmented ClientHello / partial reads)
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep "DIAG: readExact"'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep "DIAG: Short read"'
 
 # Check MiddleProxy route instability for media/non-media
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "MiddleProxy connect|DC4 MiddleProxy timeout|DC203 MiddleProxy timeout"'

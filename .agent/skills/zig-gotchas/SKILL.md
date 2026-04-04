@@ -24,7 +24,7 @@ Zig's default logger (`std.log.defaultLog`) acquires a global `stderr_mutex` (`s
 **The Cascade:**
 1. Hundreds of connections spawn threads.
 2. Each thread logs debug messages, contending on the single `stderr_mutex`.
-3. Contention stalls connection processing → timeouts → more error logs.
+3. **Concurrency Limit**: `max_connections = 65535` is enforced in the accept loop to prevent thread exhaustion.
 4. CPU hits 99%, and `CLOSE-WAIT` sockets accumulate.
 
 **Evidence from `/proc` analysis:**
