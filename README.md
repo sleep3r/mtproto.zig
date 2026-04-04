@@ -7,12 +7,12 @@
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
 <p align="center">
-  <strong>126 KB binary. ~120 KB RAM. Boots in <2 ms. Zero dependencies.</strong>
+  <strong>177 KB binary. ~256 KB RAM. Boots in <10 ms. Zero dependencies.</strong>
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
-[![LOC](https://img.shields.io/badge/lines_of_code-1.7k-informational)](src/)
+[![LOC](https://img.shields.io/badge/lines_of_code-5.5k-informational)](src/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
 ---
@@ -49,7 +49,21 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
-> **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, refer to the `.agent/skills` and `.agent/workflows` directories.
+## &nbsp; Benchmark Snapshot
+
+> VPS benchmark (1 vCPU / 1 GB RAM, Ubuntu 24.04, April 2026). Each proxy tested in isolation after page-cache flush.
+
+| Proxy | Language | Binary | Idle RSS | Startup | Dependencies | LoC (Files) |
+|-------|----------|--------|----------|---------|--------------|-------------|
+| **mtproto.zig** | Zig | **177 KB** | **256 KB** ⚡ | **< 10 ms**\* | **0** | **5.5k** (9) |
+| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | C | 524 KB | 8.3 MB | < 10 ms | openssl, zlib | 29.6k (87) |
+| [Teleproxy](https://github.com/teleproxy/teleproxy) | C | 14 MB | 4.6 MB | ~ 30 ms | openssl, zlib, libc | 40.5k (120) |
+| [Telemt](https://github.com/telemt/telemt) | Rust | 15 MB | 16 MB | > 15 s | 423 crates (total) | 106.6k (231) |
+| [mtg](https://github.com/9seconds/mtg) | Go | 13 MB | 12.5 MB | ~ 30 ms | 78 modules | 17.8k (205) |
+| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | Python | N/A (script) | 35 MB | ~ 800 ms | python3 (~30 MB) | 3.3k (6) |
+| [mtproto_proxy](https://github.com/seriyps/mtproto_proxy) | Erlang | N/A (release)| 88 MB | ~ 6 s | erlang (~200 MB) | 7.8k (43) |
+
+\* `mtproto.zig` also performs online bootstrap at startup (public IP detection + Telegram metadata refresh). On this VPS, cold boot is typically ~0.4 s; warm/steady restart remains sub-10 ms.
 
 ## &nbsp; Quick Start
 
