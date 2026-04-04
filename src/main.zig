@@ -40,7 +40,7 @@ fn lockFreeLog(
 
 const log = std.log.scoped(.mtproto);
 
-const version = "0.1.0";
+
 
 // ============= Output Helpers (Zig 0.15 compatible) =============
 
@@ -145,7 +145,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
     writeRaw("      | |  | | | | |  __/| | | (_) | || (_) |\n");
     writeRaw("      |_|  |_| |_| |_|   |_|  \\___/ \\__\\___/\n");
     writeRaw(R);
-    writeStdout("      {s}{s}proxy · zig edition · v{s}{s}\n\n", .{ D, white, version, R });
+    writeStdout("      {s}{s}zig edition{s}\n\n", .{ D, white, R });
 
     // ─── SERVER ─────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
