@@ -14,6 +14,14 @@ pub const Config = struct {
     port: u16 = 443,
     /// TCP listen(2) backlog for client-facing sockets
     backlog: u32 = 4096,
+    /// Hard cap for concurrently handled client connections
+    max_connections: u32 = 65535,
+    /// Per-connection thread stack size in KiB (minimum 256)
+    thread_stack_kb: u32 = 256,
+    /// Pre-handshake idle timeout: wait for first client byte
+    idle_timeout_sec: u32 = 300,
+    /// Handshake read timeout after first byte arrives
+    handshake_timeout_sec: u32 = 60,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
     users: std.StringHashMap([16]u8),
@@ -34,6 +42,10 @@ pub const Config = struct {
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
+    }
+
+    pub fn threadStackBytes(self: *const Config) usize {
+        return @as(usize, self.thread_stack_kb) * 1024;
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -109,6 +121,18 @@ pub const Config = struct {
                         cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "backlog")) {
                         cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
+                    } else if (std.mem.eql(u8, key, "max_connections")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.max_connections;
+                        cfg.max_connections = @max(@as(u32, 32), parsed);
+                    } else if (std.mem.eql(u8, key, "thread_stack_kb")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.thread_stack_kb;
+                        cfg.thread_stack_kb = @max(@as(u32, 256), parsed);
+                    } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
+                        cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
+                    } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.handshake_timeout_sec;
+                        cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
                     } else if (std.mem.eql(u8, key, "tag")) {
                         if (value.len == 32) {
                             var tag: [16]u8 = undefined;
@@ -181,6 +205,10 @@ test "parse config - valid complete" {
         \\[server]
         \\port = 8443
         \\backlog = 8192
+        \\max_connections = 6000
+        \\thread_stack_kb = 320
+        \\idle_timeout_sec = 180
+        \\handshake_timeout_sec = 30
         \\fast_mode = true
         \\
         \\[censorship]
@@ -198,6 +226,10 @@ test "parse config - valid complete" {
 
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
+    try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
+    try std.testing.expectEqual(@as(u32, 320), cfg.thread_stack_kb);
+    try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
@@ -220,6 +252,10 @@ test "parse config - missing fields defaults" {
 
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
+    try std.testing.expectEqual(@as(u32, 65535), cfg.max_connections);
+    try std.testing.expectEqual(@as(u32, 256), cfg.thread_stack_kb);
+    try std.testing.expectEqual(@as(u32, 300), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 60), cfg.handshake_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
@@ -257,6 +293,26 @@ test "parse config - middleproxy buffer lower bound" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 64), cfg.middleproxy_buffer_kb);
+}
+
+test "parse config - server runtime tunables lower bounds" {
+    const content =
+        \\[server]
+        \\max_connections = 1
+        \\thread_stack_kb = 16
+        \\idle_timeout_sec = 1
+        \\handshake_timeout_sec = 1
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 32), cfg.max_connections);
+    try std.testing.expectEqual(@as(u32, 256), cfg.thread_stack_kb);
+    try std.testing.expectEqual(@as(u32, 5), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 5), cfg.handshake_timeout_sec);
 }
 
 test "parse config - spaces and tabs" {
