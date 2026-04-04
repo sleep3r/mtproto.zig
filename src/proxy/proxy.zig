@@ -269,10 +269,13 @@ pub const ProxyState = struct {
 
             const conn_id = self.connection_count.fetchAdd(1, .monotonic);
 
-            // Overload protection: reject if too many concurrent connections
-            const active = self.active_connections.load(.monotonic);
-            if (active >= self.config.max_connections) {
-                log.warn("[{d}] Connection rejected: at capacity ({d}/{d})", .{ conn_id, active, self.config.max_connections });
+            // Overload protection: reserve a slot before spawning the worker.
+            // Without this, a burst can overshoot max_connections because worker
+            // threads increment the counter asynchronously after spawn.
+            const active_before_reserve = self.active_connections.fetchAdd(1, .monotonic);
+            if (active_before_reserve >= self.config.max_connections) {
+                _ = self.active_connections.fetchSub(1, .monotonic);
+                log.warn("[{d}] Connection rejected: at capacity ({d}/{d})", .{ conn_id, active_before_reserve, self.config.max_connections });
                 conn.stream.close();
                 continue;
             }
@@ -282,6 +285,7 @@ pub const ProxyState = struct {
                 .stack_size = self.config.threadStackBytes(),
             }, handleConnection, .{ self, conn.stream, conn.address, conn_id }) catch |err| {
                 log.err("[{d}] Spawn error: {any}", .{ conn_id, err });
+                _ = self.active_connections.fetchSub(1, .monotonic);
                 conn.stream.close();
                 continue;
             };
@@ -630,8 +634,7 @@ fn handleConnection(
 ) void {
     defer client_stream.close();
 
-    // Track active connections for overload protection
-    _ = state.active_connections.fetchAdd(1, .monotonic);
+    // Slot is reserved in the accept loop before spawning this thread.
     defer _ = state.active_connections.fetchSub(1, .monotonic);
 
     // Format peer IP for logging
