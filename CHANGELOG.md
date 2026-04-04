@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.1](https://github.com/sleep3r/mtproto.zig/compare/v0.5.0...v0.5.1) (2026-04-04)
+
+
+### Bug Fixes
+
+* enforce strict max_connections reservation before spawn ([#56](https://github.com/sleep3r/mtproto.zig/issues/56)) ([74db0c3](https://github.com/sleep3r/mtproto.zig/commit/74db0c3b88a4ce5acf865792ccff1e1a011e6679))
+
+
+### Performance Improvements
+
+* apply dynamic record sizing and connection backlog scaling ([#53](https://github.com/sleep3r/mtproto.zig/issues/53)) ([e62b56e](https://github.com/sleep3r/mtproto.zig/commit/e62b56e278b50ad10755f93ee9b6f4bc64c9e7c6))
+
 ## [0.5.0](https://github.com/sleep3r/mtproto.zig/compare/v0.4.1...v0.5.0) (2026-04-05)
 
 ### Features
