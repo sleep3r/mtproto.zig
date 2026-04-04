@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0](https://github.com/sleep3r/mtproto.zig/compare/v0.4.1...v0.5.0) (2026-04-05)
+
+### Features
+
+* **docs:** remove extra capacity columns from root benchmark table for better readability
+
 ## [0.4.1](https://github.com/sleep3r/mtproto.zig/compare/v0.4.0...v0.4.1) (2026-04-04)
 
 
