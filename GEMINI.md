@@ -164,6 +164,7 @@ tls_domain = "wb.ru"
 mask = true
 mask_port = 8443                           # Zero-RTT override
 desync = true                              # TCP desync: split ServerHello (1-byte + rest)
+drs = false                                # Dynamic Record Sizing: ramp 1369→16384 bytes
 fast_mode = true
 
 [access.users]
@@ -242,34 +243,51 @@ Everything else is `log.debug` (compiled out in `ReleaseFast`):
 
 ---
 
-## iOS vs Desktop Telegram Differences
+## Telegram Client Behavior Matrix (WIP)
 
-### Connection Pooling (iOS)
-iOS Telegram aggressively pre-warms TCP connection pools, opening 2-5+ idle sockets that sit empty until needed. A short timeout kills these, causing iOS to mark the proxy as unstable.
+We currently keep this section strict: no behavior claims without either (a) reproducible captures/logs, or (b) direct links to client source code with an explicit version/tag/commit.
 
-**Fix (Two-stage timeout):**
-- **Stage 1 (Idle Phase)**: `poll()` with a 5-minute timeout. Sleeping threads consume zero CPU.
-- **Stage 2 (Active Phase)**: `SO_RCVTIMEO` 10s once data starts arriving.
+### iOS (Telegram iOS)
+- **Field evidence (our captures/logs)**: iOS pre-warms multiple idle sockets, can fragment the 64-byte obfuscation handshake across TLS records, and may delay first payload after `ServerHello`.
+- **Version-pinned source snapshot**: `TelegramMessenger/Telegram-iOS` tag `build-26855` (target commit `b16d9acdffa9b3f88db68e26b77a3713e87a92e3`).
+- In this source snapshot, TCP connect timeout is `12s` in `submodules/MtProtoKit/Sources/MTTcpConnection.m:980`.
+- Response watchdog is based on `MTMinTcpResponseTimeout = 12.0` (`submodules/MtProtoKit/Sources/MTTcpConnection.m:576`) plus payload-dependent term (`submodules/MtProtoKit/Sources/MTTcpConnection.m:1339`), and is reset on partial reads (`submodules/MtProtoKit/Sources/MTTcpConnection.m:1398`).
+- Transport-level connection watchdog is `20s` in `submodules/MtProtoKit/Sources/MTTcpTransport.m:312`.
+- Reconnect backoff in `submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m:66` is stepped (`1s` for early retries, then `4s`, then `8s`).
 
-### Fragmented MTProto Handshake (iOS)
-Desktop sends the 64-byte MTProto handshake in a single TLS `AppData` record. iOS may split it across multiple records or interleave `CCS` records.
+**Proxy-side handling used for iOS compatibility:**
+- Two-stage timeout model: `poll()` idle phase (5 min), then active `SO_RCVTIMEO=10s` after payload starts.
+- Handshake assembly loop collects full 64 bytes before switching relay into normal mode.
+- Handshake-stage receive timeout widened to 60s before tightening to normal relay timeout.
+- TLS S2C record size currently pinned to 1369 bytes (MSS-sized) until broader cross-client validation is completed.
 
-**Fix:** Assembly loop that reads TLS records until 64 bytes of handshake are collected. Extra bytes are treated as pipelined data.
+### Android (Telegram Android)
+- **Version-pinned source snapshot**: `DrKLO/Telegram` tag `release-11.4.2-5469` (commit `fb2e545101f41303f1e2712de2e7611a9335f1c3`).
+- Socket setup in `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:571` enables `TCP_NODELAY` (`TMessagesProj/jni/tgnet/ConnectionSocket.cpp:574`), switches socket to `O_NONBLOCK` (`TMessagesProj/jni/tgnet/ConnectionSocket.cpp:587`), and uses `connect(..., EINPROGRESS)` with edge-triggered epoll (`EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLERR|EPOLLET`, `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:596`).
+- Timeout handling is internal logical timeout (`setTimeout`/`checkTimeout`) in `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:1066` and `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:1076`.
+- Per-connection-type timeout profile is explicitly assigned in `TMessagesProj/jni/tgnet/Connection.cpp:368` and after first useful data in `TMessagesProj/jni/tgnet/Connection.cpp:131`.
+- Connection type split is explicit (`ConnectionTypeGeneric/Download/Upload/Push/Temp/Proxy`) in `TMessagesProj/jni/tgnet/Defines.h:68`, with multiple parallel slots (`PROXY_CONNECTIONS_COUNT=4`, `DOWNLOAD_CONNECTIONS_COUNT=2`, `UPLOAD_CONNECTIONS_COUNT=4`) in `TMessagesProj/jni/tgnet/Defines.h:26`.
+- Datacenter keeps separate connection objects/arrays per type in `TMessagesProj/jni/tgnet/Datacenter.h:88` and lazily creates/connects them in `TMessagesProj/jni/tgnet/Datacenter.cpp:835` and `TMessagesProj/jni/tgnet/Datacenter.cpp:1311`.
 
-### Handshake Timeout (iOS)
-A tight 10s `SO_RCVTIMEO` was previously armed too early. iOS may delay the MTProto handshake after `ServerHello`.
+### Windows (Telegram Desktop)
+- **Version-pinned source snapshot**: `telegramdesktop/tdesktop` tag `v6.7.2` (commit `085c4ba65d1f8aa13abf0fd7fc8489f094552542`).
+- MTProto layer prepares multiple "test connections" across endpoint/protocol variants in `Telegram/SourceFiles/mtproto/session_private.cpp:1010` and `Telegram/SourceFiles/mtproto/session_private.cpp:1065`, then selects by priority from `appendTestConnection` (`Telegram/SourceFiles/mtproto/session_private.cpp:192`, priority formula at `Telegram/SourceFiles/mtproto/session_private.cpp:199`).
+- Connection wait timeout starts from `kMinConnectedTimeout = 1000ms` (`Telegram/SourceFiles/mtproto/session_private.cpp:34`), scheduled via `_waitForConnectedTimer.callOnce(_waitForConnected)` (`Telegram/SourceFiles/mtproto/session_private.cpp:1111`), and grows up to max in `waitConnectedFailed` (`Telegram/SourceFiles/mtproto/session_private.cpp:1236`).
+- Transport full-connect timeout in TCP path is `8s` (`Telegram/SourceFiles/mtproto/connection_tcp.cpp:21`, `Telegram/SourceFiles/mtproto/connection_tcp.cpp:581`), and HTTP path is `8s` (`Telegram/SourceFiles/mtproto/connection_http.cpp:18`, `Telegram/SourceFiles/mtproto/connection_http.cpp:242`).
+- Resolving wrapper uses per-IP timeout `kOneConnectionTimeout = 4000` (`Telegram/SourceFiles/mtproto/connection_resolving.cpp:16`) and multiplies by number of resolved IPs in `Telegram/SourceFiles/mtproto/connection_resolving.cpp:187`.
+- After first success, Desktop may wait `kWaitForBetterTimeout = 2000ms` for a better candidate (`Telegram/SourceFiles/mtproto/session_private.cpp:33`, `Telegram/SourceFiles/mtproto/session_private.cpp:2336`).
 
-**Fix:** Use a generous 60s timeout during the handshake phase. The 10s timeout is only applied after the full 64-byte handshake is assembled.
+### Ubuntu/Linux (Telegram Desktop)
+- Source-backed connection behavior currently maps to the same `tdesktop` MTProto files referenced in the Windows section above (`Telegram/SourceFiles/mtproto/*`, tag `v6.7.2`).
+- In reviewed files, we did not find OS-specific branching for the listed connect/retry timeout logic.
+- TODO: add package/channel-specific validation (Snap/DEB/Flatpak build differences) with explicit tested build IDs.
 
-### Fragmented ClientHello (Desktop/Android)
-Large Telegram ClientHello records can exceed a single TCP segment. Earlier logic could read only one chunk and drop the connection (`got 1443, expected > 1600`).
+### macOS (Telegram Desktop)
+- Source-backed baseline is currently the same `tdesktop` MTProto layer (`v6.7.2`) used for the Windows/Ubuntu notes above.
+- TODO: add version-pinned macOS binary/build validation and capture-backed deltas (if any).
 
-**Fix:** `readExact` was hardened to keep reading until target length is assembled, including proper `poll()` retry behavior and short-read diagnostics.
-
-### TLS Record Sizing (S2C)
-`DynamicRecordSizer` previously ramped record sizes from 1369 to 16384 bytes. Desktop handles this, but it may cause issues on iOS.
-
-**Fix:** Frozen at 1369 bytes (MSS-sized) for iOS compatibility. Ramp will be re-enabled after further testing.
+### Placeholder: Other clients (WebK/WebZ/TDLib-based)
+- TODO: Add entries only after source/capture-backed verification with explicit version.
 
 ---
 
@@ -345,6 +363,8 @@ All relay sockets use these settings:
 28. **MiddleProxy candidate rotation**: parse and cache multiple `proxy_for` endpoints for `dc=4` and `dc=203`, deduplicate by `ip:port`, and retry across candidates per connection.
 29. **Reconnect stability tuning**: reverted an experimental short desktop first-byte timeout that caused Ubuntu regressions; kept long two-stage timeout semantics and moved resilience to upstream retry logic.
 30. **Media/non-media routing split**: retain fast direct fallback for non-media timeouts while keeping media paths on MiddleProxy transport to preserve media load behavior.
+31. **Soak Gate in CI**: added `bench` job to `.github/workflows/ci.yml` that runs microbenchmarks and soak stress tests after unit tests pass. Tiered durations: 10s on PRs, 60s on main. Results uploaded as artifacts for perf drift tracking.
+32. **DRS re-enabled**: restored Dynamic Record Sizing ramp logic (1369→16384 bytes after 8 records or 128KB), gated by `drs = true` config flag in `[censorship]`. Default off for backward compatibility.
 
 ---
 
@@ -365,19 +385,17 @@ Expected outcome: significantly lower per-connection memory overhead and higher 
 
 Note: buffer downsizing is intentionally deferred until after event-loop migration to avoid coupling two risk-heavy changes in one phase.
 
-### Local E2E Testing Topology
+### ~~Local E2E Testing Topology~~ ✅
 Implemented a 100% loopback test capability:
 - **DPI Masking**: Mock Google server spins up, proxy directs failed validations cleanly to it.
 - **Handshakes**: Emulated MTProto drop & relay parsing flows, securely tested via internal `datacenter_override`.
 
-### Re-enabling DRS
-Once iPhone connectivity is stable, test with the `DRS` ramp enabled (shifting to 16384-byte records after a threshold).
+### ~~Re-enabling DRS~~ ✅
+Restored DRS ramp logic gated by `drs = true` in `[censorship]` config. Default off. When enabled, TLS S2C records start at 1369 bytes (MSS-sized) and ramp to 16384 after 8 records or 128KB — mimicking Chrome/Firefox initial TLS behavior.
 
-### Soak Gate in CI
-Current soak runner is local-first (`make soak`) and already useful for manual release checks. Future work:
-- add CI profile for short/medium soak tiers (e.g., 10s on PR, 60s on main)
+### ~~Soak Gate in CI~~ ✅
+Implemented in `.github/workflows/ci.yml` — `bench` job runs after tests, with 10s soak on PRs / 60s on main. Results published as CI artifacts. Remaining future work:
 - keep host-specific throughput baselines and fail on statistically significant regressions
-- publish bench/soak artifacts per run to track perf drift over time
 
 ### Advanced Anti-DPI Research
 Based on continuous updates from DPI developers (e.g., VAS Experts/EcoSnat), bypass development remains a cat-and-mouse game. Notably, they actively maintain a detailed public changelog tracking new blocking capabilities: [VAS Experts DPI Changelog](https://wiki.vasexperts.ru/doku.php?id=dpi:changelog:versions:beta).

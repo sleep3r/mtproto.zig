@@ -328,6 +328,7 @@ tls_domain = "wb.ru"
 mask = true
 mask_port = 8443
 desync = true
+drs = false
 fast_mode = true
 
 [access.users]
@@ -349,6 +350,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
 | `[censorship]` | `mask_port` | `443` | Non-standard port override for masking locally (e.g. `8443` for zero-RTT local Nginx) |
 | `[censorship]` | `desync` | `true` | Application-level Split-TLS (1-byte chunking) for passive DPI evasion |
+| `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended**. Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 
