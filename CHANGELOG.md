@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/sleep3r/mtproto.zig/compare/v0.4.0...v0.4.1) (2026-04-04)
+
+
+### Bug Fixes
+
+* add stability harness and tune middleproxy buffers ([#47](https://github.com/sleep3r/mtproto.zig/issues/47)) ([4e98bbe](https://github.com/sleep3r/mtproto.zig/commit/4e98bbeb293c95ef9a74e8ce780fe180156d27e5))
+
 ## [0.4.0](https://github.com/sleep3r/mtproto.zig/compare/v0.3.1...v0.4.0) (2026-04-04)
 
 
