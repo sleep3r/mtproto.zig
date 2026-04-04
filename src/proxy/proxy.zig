@@ -20,15 +20,6 @@ const tls_header_len = 5;
 const max_tls_payload = constants.max_tls_ciphertext_size;
 /// Idle timeout for relay poll() and write backpressure (5 minutes)
 const relay_timeout_ms = 5 * 60 * 1000;
-/// Idle Phase: wait for first byte from client (5 minutes).
-/// Mobile clients (iOS Telegram) aggressively pre-warm TCP connection pools,
-/// opening 2-5 idle sockets that sit empty until the app needs to send data.
-/// A short timeout here kills these pooled connections, causing iOS to mark
-/// the proxy as unstable and enter long reconnect cycles.
-const idle_timeout_ms: i32 = 5 * 60 * 1000;
-/// Active Phase: once data starts arriving, apply tight SO_RCVTIMEO
-/// to protect against Slowloris-style attacks (seconds).
-const active_timeout_sec: u32 = 10;
 /// Maximum connection lifetime (30 minutes). Hard cap to prevent thread
 /// accumulation from long-lived connections or half-open sockets that
 /// somehow survive keepalive probes.
@@ -168,10 +159,6 @@ pub const ProxyState = struct {
     /// Valid length of middle_proxy_secret bytes.
     middle_proxy_secret_len: usize,
 
-    /// Maximum concurrent connections before rejecting new ones.
-    /// Prevents thread exhaustion under load.
-    const max_connections: u32 = 65535;
-
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
         var it = @constCast(&cfg.users).iterator();
@@ -284,18 +271,15 @@ pub const ProxyState = struct {
 
             // Overload protection: reject if too many concurrent connections
             const active = self.active_connections.load(.monotonic);
-            if (active >= max_connections) {
-                log.warn("[{d}] Connection rejected: at capacity ({d}/{d})", .{ conn_id, active, max_connections });
+            if (active >= self.config.max_connections) {
+                log.warn("[{d}] Connection rejected: at capacity ({d}/{d})", .{ conn_id, active, self.config.max_connections });
                 conn.stream.close();
                 continue;
             }
 
             const thread = std.Thread.spawn(.{
-                // Proxy threads shuffle bytes between sockets + AES-CTR (no deep recursion).
-                // 256 KB is plenty with safety margin for stack-heavy operations.
-                // Default 8-16 MB per thread would exhaust memory with thousands
-                // of idle iOS pool connections (e.g. 4000 threads * 8 MB = 32 GB virtual memory).
-                .stack_size = 256 * 1024,
+                // Tunable via [server].thread_stack_kb.
+                .stack_size = self.config.threadStackBytes(),
             }, handleConnection, .{ self, conn.stream, conn.address, conn_id }) catch |err| {
                 log.err("[{d}] Spawn error: {any}", .{ conn_id, err });
                 conn.stream.close();
@@ -681,20 +665,11 @@ fn handleConnectionInner(
     peer_str: []const u8,
     conn_id: u64,
 ) !void {
-    // === Two-Stage Timeout (Split Timeout) ===
-    //
-    // Stage 1 — Idle Phase: wait for the first byte with a long timeout.
-    // Mobile clients (iOS Telegram) pre-warm TCP connection pools by opening
-    // several idle sockets. Killing them too early causes reconnect storms.
-    // A sleeping thread in poll() consumes zero CPU.
-    //
-    // Stage 2 — Active Phase: once data arrives, apply a tight SO_RCVTIMEO
-    // to catch real Slowloris attacks (slow-drip partial sends).
-
+    // Stage 1 (idle pool): wait for first byte.
+    // Keep this path tiny on stack because benchmark/real clients may hold
+    // many idle pooled sockets concurrently.
     const fd = client_stream.handle;
-
-    // Stage 1: wait for first byte (idle pool phase)
-    const first_byte_timeout_ms: i32 = idle_timeout_ms;
+    const first_byte_timeout_ms = secondsToPollTimeoutMs(state.config.idle_timeout_sec);
 
     var poll_fds = [_]posix.pollfd{
         .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
@@ -709,12 +684,32 @@ fn handleConnectionInner(
         return error.IdleConnectionClosed;
     }
 
-    // Stage 2: data is coming — apply generous handshake timeout.
+    try handleConnectionActive(state, client_stream, client_addr, peer_str, conn_id);
+}
+
+fn handleConnectionActive(
+    state: *ProxyState,
+    client_stream: net.Stream,
+    client_addr: net.Address,
+    peer_str: []const u8,
+    conn_id: u64,
+) !void {
+    // Stage 2 (active): once data starts arriving, apply handshake timeout.
+    const fd = client_stream.handle;
+
+    // Data is coming — apply generous handshake timeout.
     // DON'T use the tight 10s timeout yet — iOS Telegram may delay the
     // MTProto handshake after ServerHello (pool warming, timing differences).
     // Tight timeout is applied after the full 64-byte handshake is assembled.
-    const handshake_timeout_sec: u32 = 60;
-    setRecvTimeout(fd, handshake_timeout_sec);
+    setRecvTimeout(fd, state.config.handshake_timeout_sec);
+
+    // Keep large handshake/record buffers off thread stack so low stack sizes
+    // remain stable under load.
+    const app_body_buf = try state.allocator.alloc(u8, constants.max_tls_ciphertext_size);
+    defer state.allocator.free(app_body_buf);
+
+    const pipelined_buf = try state.allocator.alloc(u8, constants.max_tls_ciphertext_size);
+    defer state.allocator.free(pipelined_buf);
 
     // Read first 5 bytes to determine TLS vs direct
     var first_bytes: [5]u8 = undefined;
@@ -738,9 +733,12 @@ fn handleConnectionInner(
         return;
     }
 
-    var client_hello_buf: [5 + constants.max_tls_plaintext_size]u8 = undefined;
+    const client_hello_len: usize = 5 + record_len;
+    const client_hello_buf = try state.allocator.alloc(u8, client_hello_len);
+    defer state.allocator.free(client_hello_buf);
+
     @memcpy(client_hello_buf[0..5], &first_bytes);
-    const body_n = try readExact(client_stream, client_hello_buf[5..][0..record_len]);
+    const body_n = try readExact(client_stream, client_hello_buf[5..client_hello_len]);
     if (body_n < record_len) {
         log.info("[{d}] ({s}) DIAG: Short read on ClientHello body (got {d}, expected {d}), dropping.", .{ conn_id, peer_str, body_n, record_len });
         maskConnection(state, client_stream, peer_str, conn_id, client_hello_buf[0 .. 5 + body_n], null);
@@ -820,7 +818,6 @@ fn handleConnectionInner(
     // Desktop typically sends all 64 bytes in one AppData record, but we must not assume that.
     var handshake_assembly: [constants.handshake_len]u8 = undefined;
     var hs_pos: usize = 0;
-    var pipelined_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
     var pipelined_len: usize = 0;
     var app_records_used: u8 = 0;
 
@@ -846,8 +843,8 @@ fn handleConnectionInner(
             },
             constants.tls_record_application => {
                 if (body_len == 0 or body_len > constants.max_tls_ciphertext_size) return;
-                var body_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
-                if (try readExact(client_stream, body_buf[0..body_len]) < body_len) {
+                const body_buf = app_body_buf[0..body_len];
+                if (try readExact(client_stream, body_buf) < body_len) {
                     log.debug("[{d}] ({s}) Short read on AppData body, dropping.", .{ conn_id, peer_str });
                     return;
                 }
@@ -1254,6 +1251,7 @@ fn handleConnectionInner(
     }
 
     relayBidirectional(
+        state.allocator,
         client_stream,
         dc_stream,
         &client_decryptor,
@@ -1287,6 +1285,7 @@ const RelayProgress = enum {
 ///   C2S: TLS record → unwrap → AES-CTR decrypt (client) → AES-CTR encrypt (DC) → DC
 ///   S2C: DC → AES-CTR decrypt (DC) → AES-CTR encrypt (client) → TLS record wrap → client
 fn relayBidirectional(
+    allocator: std.mem.Allocator,
     client: net.Stream,
     dc: net.Stream,
     client_decryptor: *crypto.AesCtr,
@@ -1307,7 +1306,8 @@ fn relayBidirectional(
     // State for reading TLS records from client
     var tls_hdr_buf: [tls_header_len]u8 = undefined;
     var tls_hdr_pos: usize = 0;
-    var tls_body_buf: [max_tls_payload]u8 = undefined;
+    const tls_body_buf = try allocator.alloc(u8, max_tls_payload);
+    defer allocator.free(tls_body_buf);
     var tls_body_pos: usize = 0;
     var tls_body_len: usize = 0;
 
@@ -1316,6 +1316,9 @@ fn relayBidirectional(
 
     // Buffer for DC → client direction
     var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
+
+    const tls_record_buf = try allocator.alloc(u8, tls_header_len + constants.max_tls_plaintext_size);
+    defer allocator.free(tls_record_buf);
 
     // Byte counters for diagnostics
     var c2s_bytes: u64 = initial_c2s_bytes;
@@ -1366,7 +1369,7 @@ fn relayBidirectional(
                 middle_proxy,
                 &tls_hdr_buf,
                 &tls_hdr_pos,
-                &tls_body_buf,
+                tls_body_buf,
                 &tls_body_pos,
                 &tls_body_len,
                 &c2s_bytes,
@@ -1386,6 +1389,7 @@ fn relayBidirectional(
                 if (fast_mode) null else client_encryptor,
                 middle_proxy,
                 &dc_read_buf,
+                tls_record_buf,
                 &drs,
                 &s2c_bytes,
             ) catch |err| {
@@ -1453,7 +1457,7 @@ fn relayClientToDc(
     middle_proxy: ?*middleproxy.MiddleProxyContext,
     tls_hdr_buf: *[tls_header_len]u8,
     tls_hdr_pos: *usize,
-    tls_body_buf: *[max_tls_payload]u8,
+    tls_body_buf: []u8,
     tls_body_pos: *usize,
     tls_body_len: *usize,
     bytes_counter: *u64,
@@ -1576,6 +1580,7 @@ fn relayDcToClient(
     client_encryptor: ?*crypto.AesCtr,
     middle_proxy: ?*middleproxy.MiddleProxyContext,
     dc_read_buf: *[constants.default_buffer_size]u8,
+    tls_record_buf: []u8,
     drs: *DynamicRecordSizer,
     bytes_counter: *u64,
 ) !RelayProgress {
@@ -1596,19 +1601,18 @@ fn relayDcToClient(
         if (client_encryptor) |enc| enc.apply(payload);
 
         // Wrap in TLS Application Data record(s)
-        var record_buf: [tls_header_len + constants.max_tls_plaintext_size]u8 = undefined;
         var offset: usize = 0;
         while (offset < payload.len) {
             const max_chunk = drs.nextRecordSize();
             const chunk_len = @min(payload.len - offset, max_chunk);
 
-            record_buf[0] = constants.tls_record_application;
-            record_buf[1] = constants.tls_version[0];
-            record_buf[2] = constants.tls_version[1];
-            std.mem.writeInt(u16, record_buf[3..5], @intCast(chunk_len), .big);
-            @memcpy(record_buf[tls_header_len..][0..chunk_len], payload[offset..][0..chunk_len]);
+            tls_record_buf[0] = constants.tls_record_application;
+            tls_record_buf[1] = constants.tls_version[0];
+            tls_record_buf[2] = constants.tls_version[1];
+            std.mem.writeInt(u16, tls_record_buf[3..5], @intCast(chunk_len), .big);
+            @memcpy(tls_record_buf[tls_header_len..][0..chunk_len], payload[offset..][0..chunk_len]);
 
-            try writeAll(client, record_buf[0 .. tls_header_len + chunk_len]);
+            try writeAll(client, tls_record_buf[0 .. tls_header_len + chunk_len]);
             drs.recordSent(chunk_len);
             offset += chunk_len;
         }
@@ -1628,20 +1632,19 @@ fn relayDcToClient(
     // Wrap in TLS Application Data record(s) using DRS-controlled sizes.
     // Header and body are written in a single writeAll call to reduce syscalls
     // and ensure atomic TLS record delivery (avoids tiny 5-byte header packets).
-    var record_buf: [tls_header_len + constants.max_tls_plaintext_size]u8 = undefined;
     var offset: usize = 0;
     while (offset < data.len) {
         const max_chunk = drs.nextRecordSize();
         const chunk_len = @min(data.len - offset, max_chunk);
 
         // Build TLS record: header + payload in one buffer
-        record_buf[0] = constants.tls_record_application;
-        record_buf[1] = constants.tls_version[0];
-        record_buf[2] = constants.tls_version[1];
-        std.mem.writeInt(u16, record_buf[3..5], @intCast(chunk_len), .big);
-        @memcpy(record_buf[tls_header_len..][0..chunk_len], data[offset..][0..chunk_len]);
+        tls_record_buf[0] = constants.tls_record_application;
+        tls_record_buf[1] = constants.tls_version[0];
+        tls_record_buf[2] = constants.tls_version[1];
+        std.mem.writeInt(u16, tls_record_buf[3..5], @intCast(chunk_len), .big);
+        @memcpy(tls_record_buf[tls_header_len..][0..chunk_len], data[offset..][0..chunk_len]);
 
-        try writeAll(client, record_buf[0 .. tls_header_len + chunk_len]);
+        try writeAll(client, tls_record_buf[0 .. tls_header_len + chunk_len]);
 
         drs.recordSent(chunk_len);
         offset += chunk_len;
@@ -1772,6 +1775,12 @@ fn setNonBlocking(fd: posix.fd_t) void {
 fn setRecvTimeout(fd: posix.fd_t, timeout_sec: u32) void {
     const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch return;
+}
+
+fn secondsToPollTimeoutMs(timeout_sec: u32) i32 {
+    const max_i32_u32: u32 = @intCast(std.math.maxInt(i32));
+    const capped = @min(timeout_sec, max_i32_u32 / 1000);
+    return @as(i32, @intCast(capped * 1000));
 }
 
 /// Set SO_SNDTIMEO on a socket to prevent write hangs on dead peers.

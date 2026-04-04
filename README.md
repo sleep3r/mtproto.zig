@@ -65,6 +65,8 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 \* `mtproto.zig` also performs online bootstrap at startup (public IP detection + Telegram metadata refresh). On this VPS, cold boot is typically ~0.4 s; warm/steady restart remains sub-10 ms.
 
+Connection-capacity methodology and command profiles: `test/README.md`.
+
 ## &nbsp; Quick Start
 
 ### Prerequisites

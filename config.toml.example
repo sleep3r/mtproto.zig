@@ -9,6 +9,16 @@ use_middle_proxy = true
 port = 443
 # TCP listen queue size (default is 4096)
 # backlog = 4096
+# Hard cap for concurrently served client sockets (default 65535)
+# max_connections = 65535
+# Per-connection handler stack in KiB (default/minimum 256)
+# Values below 256 are clamped for stability.
+# thread_stack_kb = 256
+# Idle timeout before first byte from client in seconds (default 300)
+# Keep high enough for mobile pre-warmed pools.
+# idle_timeout_sec = 300
+# Handshake timeout after first byte arrives in seconds (default 60)
+# handshake_timeout_sec = 60
 # MiddleProxy per-connection stream buffers in KiB (4 buffers per active ME connection)
 # Lower for small VPS RAM, raise for high-throughput media paths
 # middleproxy_buffer_kb = 256
