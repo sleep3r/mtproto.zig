@@ -66,6 +66,22 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 \* `mtproto.zig` also performs online bootstrap at startup (public IP detection + Telegram metadata refresh). On this VPS, cold boot is typically ~0.4 s; warm/steady restart remains sub-10 ms.
 
+### Connection Capacity (same benchmark host)
+
+- Stable through **12,000** held concurrent sockets (`ESTABLISHED`).
+- Practical ceiling around **13,000** on this 1 vCPU / 1 GB VPS profile.
+
+Memory growth while holding connections (mtproto.zig RSS):
+
+| Held sockets | RSS |
+|--------------|-----|
+| 5,000 | 60.6 MB |
+| 8,000 | 96.5 MB |
+| 10,000 | 120.5 MB |
+| 12,000 | 144.3 MB |
+
+Full capacity methodology and command profiles: `test/README.md`.
+
 ## &nbsp; Quick Start
 
 ### Prerequisites
@@ -110,26 +126,6 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
-
-## &nbsp; Benchmark Snapshot
-
-Capacity measurements are documented in `test/README.md` and produced by `test/capacity_connections_probe.py`.
-
-Latest mtproto.zig snapshot on benchmark host `38.180.236.207` (1 vCPU / 1 GB):
-
-- stable through **12,000** concurrent held sockets
-- practical ceiling around **13,000** (14,000 becomes unstable on this host)
-
-Memory growth for held sockets (RSS):
-
-| Held sockets | RSS |
-|--------------|-----|
-| 5,000 | 60.6 MB |
-| 8,000 | 96.5 MB |
-| 10,000 | 120.5 MB |
-| 12,000 | 144.3 MB |
-
-For full methodology, command profiles, and cross-implementation table, see `test/README.md`.
 
 <details>
 <summary>All Make targets</summary>
