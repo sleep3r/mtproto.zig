@@ -22,6 +22,8 @@ const tls_header_len = 5;
 const event_loop_wait_ms = 37;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
+const stats_log_interval_s: i64 = 10;
+const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.ns_per_s;
 const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
@@ -909,6 +911,9 @@ const EventLoop = struct {
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
+    stats_next_log_ns: i128,
+    accepted_since_log: u64,
+    closed_since_log: u64,
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -921,6 +926,9 @@ const EventLoop = struct {
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
             .accept_paused = false,
             .accept_resume_ns = 0,
+            .stats_next_log_ns = std.time.nanoTimestamp() + stats_log_interval_ns,
+            .accepted_since_log = 0,
+            .closed_since_log = 0,
         };
         errdefer loop.pool.deinit();
 
@@ -975,6 +983,9 @@ const EventLoop = struct {
             if (now_ns >= next_timer_tick_ns) {
                 self.runTimers();
                 next_timer_tick_ns = now_ns + timer_tick_ns;
+            }
+            if (now_ns >= self.stats_next_log_ns) {
+                self.logPeriodicStats(now_ns);
             }
         }
     }
@@ -1057,10 +1068,32 @@ const EventLoop = struct {
                     self.closeSlot(slot, "fd map failed");
                     continue;
                 };
+                self.accepted_since_log += 1;
             } else |_| {
                 self.closeSlot(slot, "epoll add client failed");
                 continue;
             }
+        }
+    }
+
+    fn logPeriodicStats(self: *EventLoop, now_ns: i128) void {
+        const active = self.state.active_connections.load(.monotonic);
+        const accepted_total = self.state.connection_count.load(.monotonic);
+        log.info("conn stats: active={d}/{d} accepted+={d} closed+={d} tracked_fds={d} total={d} accept_paused={}", .{
+            active,
+            self.state.config.max_connections,
+            self.accepted_since_log,
+            self.closed_since_log,
+            self.pool.fd_to_slot.count(),
+            accepted_total,
+            self.accept_paused,
+        });
+
+        self.accepted_since_log = 0;
+        self.closed_since_log = 0;
+
+        while (self.stats_next_log_ns <= now_ns) {
+            self.stats_next_log_ns += stats_log_interval_ns;
         }
     }
 
@@ -2429,6 +2462,7 @@ const EventLoop = struct {
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
             slot.active_reserved = false;
+            self.closed_since_log += 1;
         }
 
         slot.phase = .idle;
