@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/sleep3r/mtproto.zig/compare/v0.6.2...v0.7.0) (2026-04-05)
+
+
+### Features
+
+* AmneziaWG tunnel deployment for blocked regions ([#74](https://github.com/sleep3r/mtproto.zig/issues/74)) ([ba0cffc](https://github.com/sleep3r/mtproto.zig/commit/ba0cffc4b5f8dafae8a06a3c017a78bce3c6a0d4))
+
 ## [0.6.2](https://github.com/sleep3r/mtproto.zig/compare/v0.6.1...v0.6.2) (2026-04-05)
 
 
