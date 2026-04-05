@@ -22,6 +22,7 @@ const tls_header_len = 5;
 const event_loop_wait_ms = 37;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
+const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
@@ -728,8 +729,24 @@ pub const ProxyState = struct {
             }
         }
 
-        const needed_fds = @as(usize, self.config.max_connections) * 2 + 512;
-        checkNofileLimit(@max(needed_fds, min_nofile_soft));
+        if (getNofileSoftLimit()) |soft| {
+            const configured_max = self.config.max_connections;
+            const needed_fds = requiredFdsForConnections(configured_max);
+            if (soft < needed_fds) {
+                const clamped = maxConnectionsForNofile(soft);
+                if (clamped < configured_max) {
+                    self.config.max_connections = clamped;
+                    log.warn("max_connections clamped from {d} to {d} due to RLIMIT_NOFILE soft={d}", .{
+                        configured_max,
+                        clamped,
+                        soft,
+                    });
+                }
+            }
+        }
+
+        const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
+        checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
         var loop = try EventLoop.init(self, server.stream.handle);
         defer loop.deinit();
@@ -1057,7 +1074,7 @@ const EventLoop = struct {
         };
 
         self.accept_paused = true;
-        const needed = @as(usize, self.state.config.max_connections) * 2 + 512;
+        const needed = requiredFdsForConnections(self.state.config.max_connections);
         log.warn("fd quota reached ({any}); pausing accepts for {d}ms (recommended LimitNOFILE >= {d})", .{
             err,
             accept_backoff_ms,
@@ -2612,23 +2629,40 @@ fn epollCreate() !posix.fd_t {
     }
 }
 
-fn checkNofileLimit(required: usize) void {
-    if (builtin.os.tag != .linux) return;
+fn requiredFdsForConnections(max_connections: u32) usize {
+    return @as(usize, max_connections) * 2 + nofile_fd_overhead;
+}
+
+fn maxConnectionsForNofile(soft_nofile: usize) u32 {
+    if (soft_nofile <= nofile_fd_overhead + 2) return 32;
+
+    const cap = (soft_nofile - nofile_fd_overhead) / 2;
+    const capped_u32: u32 = @intCast(@min(cap, @as(usize, std.math.maxInt(u32))));
+    return @max(@as(u32, 32), capped_u32);
+}
+
+fn getNofileSoftLimit() ?usize {
+    if (builtin.os.tag != .linux) return null;
 
     var lim: linux.rlimit = undefined;
     const rc = linux.getrlimit(.NOFILE, &lim);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
-        else => return,
+        else => return null,
     }
 
-    const soft: usize = @intCast(lim.cur);
+    return @intCast(lim.cur);
+}
+
+fn checkNofileLimit(required: usize, max_connections: u32) void {
+    const soft = getNofileSoftLimit() orelse return;
+
     if (soft >= required) return;
 
     log.warn("RLIMIT_NOFILE soft limit is {d}, recommended >= {d} for max_connections={d}", .{
         soft,
         required,
-        required / 2,
+        max_connections,
     });
 }
 
@@ -3089,4 +3123,10 @@ test "epoll hangup helper" {
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
+}
+
+test "fd requirement helpers" {
+    try std.testing.expectEqual(@as(usize, 131582), requiredFdsForConnections(65535));
+    try std.testing.expectEqual(@as(u32, 65535), maxConnectionsForNofile(131582));
+    try std.testing.expectEqual(@as(u32, 32511), maxConnectionsForNofile(65535));
 }

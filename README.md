@@ -455,6 +455,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
+| `[server]` | `max_connections` | `65535` | Concurrent connection cap. On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
 | `[server]` | `middleproxy_buffer_kb` | `256` | MiddleProxy per-connection buffer size in KiB (4 buffers allocated for active ME sessions) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
@@ -468,6 +469,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 </details>
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
+
+> **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` (fits `max_connections=65535` with reserve). If your host applies a lower limit, the proxy auto-clamps effective `max_connections` at startup and logs a warning.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 
