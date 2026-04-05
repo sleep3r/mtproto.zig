@@ -5,15 +5,17 @@ description: Version-pinned Telegram client connection behavior notes for proxy 
 
 # MTProto Client Behavior Matrix
 
-Use this skill when behavior differs by client platform (iOS/Android/Desktop) or when tuning relay/handshake timeouts.
+Use this skill when behavior differs by platform (iOS/Android/Desktop) or when tuning handshake/relay expectations.
 
 ## Evidence Policy
 
 - Do not publish behavior claims without evidence.
-- Accept only:
-  - reproducible local captures/logs, or
-  - direct client source links pinned to a tag and commit.
+- Accept only reproducible local captures/logs, or direct client source links pinned to tag + commit.
 - Mark each claim as `source-backed` or `field-capture`.
+
+## Proxy Runtime Context
+
+Current proxy runtime is a Linux single-thread `epoll` event loop with timer-driven stage control (`idle_timeout_sec`, `handshake_timeout_sec`). Interpret client behavior against that model, not legacy `poll` or thread-per-connection assumptions.
 
 ## iOS (Telegram iOS)
 
@@ -25,27 +27,29 @@ Version snapshot:
 Source-backed behavior:
 
 - TCP connect timeout: `12s`
-  - https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L980
 - Response watchdog base: `MTMinTcpResponseTimeout = 12.0`
-  - https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L576
 - Response timeout includes payload-dependent term and resets on partial reads
-  - https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1339
-  - https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1398
 - Transport-level watchdog: `20s`
-  - https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpTransport.m#L312
-- Reconnect backoff steps (`1s`, then `4s`, then `8s`)
-  - https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m#L66
+- Reconnect backoff: `1s`, then `4s`, then `8s`
 
-Field-capture behavior (proxy-side observations):
+References:
+
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L980
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L576
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1339
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1398
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpTransport.m#L312
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m#L66
+
+Field-capture behavior:
 
 - Pre-warms multiple idle sockets.
-- Can split 64-byte obfuscation handshake across TLS records.
+- Can split the 64-byte obfuscation handshake across TLS records.
 - May delay first payload after `ServerHello`.
 
 Proxy implications:
 
-- Assemble handshake bytes until full 64-byte payload is complete.
-- Keep generous handshake stage timeout; tighten only after relay is active.
+- Continue assembling MTProto handshake until full 64 bytes are collected.
 - Do not treat short idle prewarmed sockets as protocol failure.
 
 ## Android (Telegram Android)
@@ -57,20 +61,23 @@ Version snapshot:
 
 Source-backed behavior:
 
-- Enables `TCP_NODELAY`, switches socket to `O_NONBLOCK`, uses `connect(..., EINPROGRESS)` with edge-triggered epoll.
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L571
-- Timeout model is logical/internal (`setTimeout` / `checkTimeout`).
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1066
-- Explicit connection-type split (`Generic`, `Download`, `Upload`, `Push`, `Temp`, `Proxy`) and multiple parallel slots.
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L68
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L26
+- Uses `TCP_NODELAY`, non-blocking connect (`EINPROGRESS`), and edge-triggered epoll.
+- Timeout model is handled by internal logic (`setTimeout` / `checkTimeout`).
+- Uses connection-type split (`Generic`, `Download`, `Upload`, `Push`, `Temp`, `Proxy`) with parallel slots.
+
+References:
+
+- https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L571
+- https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1066
+- https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L68
+- https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L26
 
 Proxy implications:
 
-- Expect several concurrent connection attempts from one device/session.
-- Treat connect churn as normal; optimize for quick accept + cheap close path.
+- Expect parallel connection attempts and frequent connect churn.
+- Keep accept/close path cheap and non-blocking.
 
-## Desktop (Windows/Linux/macOS via Telegram Desktop)
+## Desktop (Telegram Desktop)
 
 Version snapshot:
 
@@ -79,33 +86,29 @@ Version snapshot:
 
 Source-backed behavior:
 
-- Builds multiple test connections and chooses by priority.
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1010
-- Wait-for-connected starts at `1000ms` and grows on failures.
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L34
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1236
-- TCP/HTTP transport full-connect timeout: `8s`.
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_tcp.cpp#L21
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_http.cpp#L18
-- Resolver path uses per-IP timeout `4000ms` and scales by resolved IP count.
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_resolving.cpp#L16
-- After first success, may wait `2000ms` for a better candidate.
-  - https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L33
+- Builds multiple test connections and picks by priority.
+- Wait-for-connected starts at `1000ms` and can grow after failures.
+- TCP/HTTP transport full-connect timeout around `8s`.
+- Resolver uses per-IP timeout `4000ms` and scales by resolved count.
+- May wait `2000ms` for a better candidate after first success.
 
-Linux/macOS note:
+References:
 
-- In reviewed MTProto sources, timeout/retry logic is shared with Windows path (no observed OS-specific branching there).
-- Validate package/channel specifics separately (Snap/DEB/Flatpak/macOS build IDs) before asserting behavioral deltas.
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1010
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L34
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1236
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_tcp.cpp#L21
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_http.cpp#L18
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_resolving.cpp#L16
+- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L33
 
 Proxy implications:
 
-- Expect candidate racing and early cancellation patterns.
-- Keep reconnect path cheap and non-blocking.
-- Do not overfit timeout policy to a single desktop platform.
+- Candidate racing and early cancellation are expected patterns.
+- Keep reconnect path cheap and avoid blocking work in event loop callbacks.
 
-## Practical Use Checklist
+## Practical Checklist
 
-- If one platform fails and others pass, first compare known timeout model for that client.
-- Verify whether failures happen pre-handshake, in 64-byte obfuscation phase, or after relay starts.
-- Inspect whether client behavior is expected parallel racing vs actual proxy regression.
-- Update this skill only with pinned sources or reproducible captures.
+- If only one platform fails, compare that platform's timeout/race model first.
+- Determine failure stage: pre-TLS, MTProto 64-byte assembly, or active relay.
+- Validate whether behavior is normal client racing vs proxy regression.

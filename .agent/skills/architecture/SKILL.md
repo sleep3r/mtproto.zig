@@ -3,181 +3,101 @@ name: MTProto Proxy Architecture
 description: Core architecture, DPI evasion techniques, client behavior matrix, and networking rules for the Zig MTProto proxy.
 ---
 
-# MTProto Proxy Architecture & Core Concepts
+# MTProto Proxy Architecture and Core Concepts
 
-A production-grade Telegram MTProto proxy implemented in Zig, featuring TLS-fronted obfuscated connections. Runs on a Linux VPS, cross-compiled from Mac.
+Production MTProto proxy implemented in Zig with FakeTLS entry and obfuscated MTProto relay.
 
 ## Tech Stack
-- **Language**: Zig 0.15.2
-- **Networking**: `std.net` for TCP, `std.posix` for `poll()`-based I/O
-- **Cryptography**: `std.crypto` for SHA256, HMAC, AES-256-CTR
-- **Build System**: Zig Build System (`build.zig`)
-- **Deployment**: `systemd` service on Linux VPS, cross-compiled from macOS
 
-## Architecture
+- Language: Zig 0.15.2
+- Networking: `std.net` sockets + Linux `epoll`
+- Cryptography: `std.crypto` primitives (SHA256/HMAC/AES-CTR) plus project protocol layers
+- Build: `build.zig` + `Makefile`
+- Deployment: Linux VPS + systemd (`deploy/mtproto-proxy.service`)
+
+## Runtime Model
+
+- Relay path is a single-threaded Linux `epoll` event loop.
+- Connections are represented by pooled `ConnectionSlot` state objects.
+- File descriptors are tracked via epoll + fd-to-slot mapping.
+- A background updater thread refreshes MiddleProxy metadata from Telegram core endpoints once per 24h.
+
+Code anchors:
+
+- `src/proxy/proxy.zig` (`EventLoop`, `ConnectionSlot`, `runTimers`, `buildDcConnectPlan`)
+- `src/main.zig` (startup banner, capacity estimate, lock-free logger)
+
+## Connection Flow
+
+1. Client connects to proxy listener (`[::]:port` with IPv4 fallback).
+2. Proxy reads TLS record header/body and validates FakeTLS digest against configured user secrets.
+3. On valid auth:
+- Builds fake `ServerHello` from template.
+- Optional desync mode splits write into `1 byte + ~3ms + rest`.
+4. Proxy assembles 64-byte MTProto obfuscation handshake from TLS appdata records.
+5. Proxy derives MTProto crypto params and chooses upstream strategy:
+- Direct DC path.
+- MiddleProxy path (`use_middle_proxy=true` and endpoint available).
+- Media path (`dc=203` or negative index) prefers MiddleProxy endpoint when available.
+6. If MiddleProxy connect/handshake fails on non-media path, proxy can reconnect directly to the DC fallback endpoint.
+7. Bidirectional relay starts (`relaying` phase).
+
+## MiddleProxy Routing and Refresh
+
+- Config text source: `https://core.telegram.org/getProxyConfig`
+- Secret source: `https://core.telegram.org/getProxySecret`
+- Refresh cadence: every 24h in updater thread.
+- Bundled defaults are used when refresh fails.
+- Candidate sets are kept for DC4 and DC203; selection can test reachability.
+
+Important behavior:
+
+- If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic to avoid dropping valid users.
+
+## Fast Mode
+
+`fast_mode` applies to direct path (non-MiddleProxy) and delegates S2C crypto work to Telegram DC by embedding client S2C key material into outbound nonce flow. MiddleProxy relay stays encapsulated in its own framing/crypto path.
+
+## Timeout Model
+
+Current runtime timeout control is event-loop based:
+
+- `idle_timeout_sec`: pre-first-byte wait and relay idle timeout.
+- `handshake_timeout_sec`: timeout for handshake stages after first byte.
+
+There is no active `SO_RCVTIMEO`-driven relay timeout model in current code.
+
+## Capacity Model (as implemented)
+
+Startup banner computes a safety estimate from host RAM:
 
 ```text
-src/
-├── main.zig              # Entry point, banner, public IP detection, custom logger
-├── bench.zig             # Performance microbench + multithreaded soak runner
-├── config.zig            # TOML config parser
-├── proxy/
-│   └── proxy.zig         # Core: accept loop, client handler, relay, DRS, Split-TLS desync
-├── protocol/             # Handshake & header definitions
-│   ├── constants.zig     # Handshake magics, DC addresses, buffer sizes
-│   ├── middleproxy.zig   # MiddleProxy (mtprotoproxy.py) auth & encapsulation
-│   ├── obfuscation.zig   # Handshake tag parsing and AES-CTR key derivation
-│   └── tls.zig           # ClientHello/ServerHello verification and anti-DPI
-├── crypto/               # AES-CTR and SHA256/HMAC primitives
-deploy/
-├── install.sh            # One-line VPS bootstrap & updater (Zig + build + systemd + TCPMSS + IPv6)
-├── ipv6-hop.sh           # IPv6 address rotation (Cloudflare API)
-├── mtproto-proxy.service # systemd unit file
-├── update_dns.sh         # Cloudflare DNS A-record updater
-├── capture_template.py   # Capture real Nginx ServerHello for template verification
-├── setup_masking.sh      # Local Nginx for zero-RTT DPI masking
-└── setup_nfqws.sh        # zapret nfqws OS-level TCP desync
+tls_working_bytes = ~6 KiB
+middleproxy_bytes = middleproxy_buffer_kb * 1024 * 4 (if ME enabled)
+overhead_bytes    = ~2 KiB
+per_conn_bytes    = tls_working_bytes + middleproxy_bytes + overhead_bytes
+
+usable_bytes  = RAM * 70%
+reserve_bytes = max(256 MiB, RAM * 10%)
+budget_bytes  = max(0, usable_bytes - reserve_bytes)
+safe_connections = max(32, budget_bytes / per_conn_bytes)
 ```
 
-### Connection Flow
-**Client → TCP → Proxy (port 443)**
-1. Client sends TLS 1.3 `ClientHello` (with HMAC-SHA256 auth in SNI digest).
-2. Proxy validates HMAC, sends `ServerHello`.
-3. Client sends `CCS` + 64-byte MTProto obfuscation handshake (in TLS `AppData`).
-4. Proxy derives AES-CTR keys, connects to Telegram DC.
-5. In direct mode (`use_middle_proxy = false`), proxy sends 64-byte obfuscated nonce to regular DCs.
-6. If `use_middle_proxy = true` (or `dc=203`), proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
-7. Promotion tag is carried in ME path as `ad_tag` TL block inside `RPC_PROXY_REQ` and in direct path via promo RPC (`0xaeaf0c42` + 16-byte tag).
-8. **Bidirectional relay**: Client ↔ Proxy ↔ DC
-   - **C2S**: TLS unwrap → AES-CTR decrypt(client) → AES-CTR encrypt(DC) → DC
-   - **S2C (classic DC)**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
-   - **S2C (DC203)**: DC AES-CBC frame → decapsulate `RPC_PROXY_ANS`/`RPC_SIMPLE_ACK` → TLS wrap → Client
+If `max_connections` exceeds safe estimate, startup prints a warning.
 
-### Threading & Memory Model
-- **Event-loop based (epoll)**: Replaced the legacy thread-per-connection model. A single or small number of localized event loops handle all I/O via non-blocking sockets.
-- **Atomic Slot Reservation**: The `accept` loop reserves a slot before accepting further operations. If `max_connections` is hit, it immediately rejects.
-- **Heap-over-Stack Buffers**: The proxy uses `ProxyState.allocator` to dynamically allocate large working buffers (TLS ciphertext, TLS plaintext, pipe buffers) only on demand, preventing excess baseline memory layout.
-- **Chained blocks**: The socket write path utilizes chained queue blocks and `writev` to minimize allocations and syscalls.
-- No global mutable state — `ProxyState` passed by reference.
-- Proxy binds on `[::]` (IPv6 wildcard) — automatically accepts both IPv4 and IPv6 connections.
+## DPI Evasion Components
 
-### Capacity Estimation & RAM Detection
-At startup, `src/main.zig` detects the total Host RAM via `/proc/meminfo` (Linux).
-- **Safe Capacity Formula**:
-  ```text
-  budget_bytes = (Host_RAM * 0.70) - max(256MB, Host_RAM * 0.10)
-  tls_working  = max_tls_ciphertext_size * 3 + (max_tls_plaintext_size + 5) * 2
-  per_conn     = ~50KB (idle baseline) + tls_working + middleproxy_buffers(if ME)
-  safe_connections = budget_bytes / per_conn
-  ```
-- **Banner Warning**: If `max_connections` exceeds the `safe_connections` estimate, the proxy prints a yellow warning on startup.
+- FakeTLS ServerHello template with runtime digest patching.
+- Anti-replay cache keyed by canonical HMAC digest.
+- Optional masking for unauthenticated clients to `tls_domain`/`mask_port`.
+- TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.
+- Split-TLS desync (`desync=true`) as split write of fake ServerHello.
+- Optional local masking endpoint (`127.0.0.1:8443`) through `setup_masking.sh`.
 
-## Telegram Client Behavior Matrix (WIP)
+## What To Verify During Changes
 
-We currently keep this section strict: no behavior claims without either (a) reproducible captures/logs, or (b) direct links to client source code with an explicit version/tag/commit.
+- `epoll` interests and queue flushing remain non-blocking and symmetric.
+- Direct/MiddleProxy fallback logic still preserves media and non-media expectations.
+- Timeout behavior remains controlled by config timers.
+- Docs remain aligned with code paths and log messages.
 
-### iOS (Telegram iOS)
-- **Field evidence (our captures/logs)**: iOS pre-warms multiple idle sockets, can fragment the 64-byte obfuscation handshake across TLS records, and may delay first payload after `ServerHello`.
-- **Version-pinned source snapshot**: `TelegramMessenger/Telegram-iOS` tag `build-26855` (target commit `b16d9acdffa9b3f88db68e26b77a3713e87a92e3`).
-- In this source snapshot, TCP connect timeout is `12s`. Response watchdog is reset on partial reads. Transport-level connection watchdog is `20s`. 
-- Reconnect backoff is stepped (`1s` for early retries, then `4s`, then `8s`).
-
-**Proxy-side handling used for iOS compatibility:**
-- Two-stage timeout model: `poll()` idle phase (5 min), then active `SO_RCVTIMEO=10s` after payload starts.
-- Handshake assembly loop collects full 64 bytes before switching relay into normal mode.
-- Handshake-stage receive timeout widened to 60s before tightening to normal relay timeout.
-
-### Android (Telegram Android)
-- **Version-pinned source snapshot**: `DrKLO/Telegram` tag `release-11.4.2-5469`.
-- Socket setup uses `TCP_NODELAY`, `O_NONBLOCK`, edge-triggered epoll.
-- Connection type split is explicit (`ConnectionTypeGeneric/Download/Upload/Push/Temp/Proxy`).
-- Datacenter keeps separate connection objects/arrays per type and lazily creates/connects them.
-
-### Windows / Linux (Telegram Desktop)
-- **Version-pinned source snapshot**: `telegramdesktop/tdesktop` tag `v6.7.2`.
-- MTProto layer prepares multiple "test connections" across endpoint/protocol variants and selects by priority.
-- Initial TCP path transport full-connect timeout is `8s`.
-- After first success, Desktop may wait `kWaitForBetterTimeout = 2000ms` for a better candidate.
-
-## ТСПУ / DPI Evasion (Russian ISP Blocking)
-
-### Anatomy of the Block
-Российский ТСПУ работает в **два этапа**:
-1. **Пассивный анализ**: видит FakeTLS ClientHello с SNI `wb.ru` к неизвестному VPS → SNI-IP mismatch → IP ставится в очередь на проверку.
-2. **Активные пробы («Ревизор»)**: через 5-10 минут сканер РКН подключается к серверу и делает Replay Attack.
-3. IP улетает в BGP-blackhole за ~20 минут.
-
-### Solution 1: Anti-Replay Cache (код в `proxy.zig`)
-`ReplayCache` использует каноничное значение HMAC как ключ, блокируя Ревизора на этапе валидации. В ответ маскируется подключение на реальный домен (например, wb.ru).
-
-### Solution 2: TCPMSS Clamping (iptables на сервере)
-```bash
-iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
-```
-Объявляет MSS=88 байт. iOS дробит ClientHello. Реплики не собирают.
-
-### Solution 3: IPv6 Address Hopping (`deploy/ipv6-hop.sh`)
-Генерирует случайный IPv6 из `/64` каждые N минут. Обновляет Cloudflare AAAA-запись через API (TTL=60s).
-
-### Solution 4: Nginx Template ServerHello (код в `tls.zig`)
-Comptime-шаблон генерирует структуру Nginx ServerHello. Правильный порядок расширений, фиксированный размер AppData=2878 байт, детерминированное тело.
-
-### Solution 5: Split-TLS Desync (код в `proxy.zig`)
-Серверный аналог zapret split — разбивает ServerHello на два TCP-сегмента (1 байт и оставшаяся часть) с паузой 3ms.
-
-### Solution 6: nfqws OS-Level Desync (`deploy/setup_nfqws.sh`)
-Для максимальной защиты — OS-level TCP desync через zapret `nfqws`.
-
-### Solution 7: Local Nginx Masking (`deploy/setup_masking.sh`)
-
-Timing side-channel: при маскировке bad clients проксирование на удалённый `wb.ru:443` добавляет 30-60ms RTT. DPI может сравнить RTT «нашего wb.ru» с реальным и обнаружить аномалию.
-
-Решение: локальный Nginx на `127.0.0.1:8443` с self-signed (или Let's Encrypt) сертификатом. RTT маскировки < 1ms — неотличимо от реального сервера.
-
-```bash
-sudo bash deploy/setup_masking.sh wb.ru
-```
-
-### Конфигурация для работы с ТСПУ (Серверные Тюнинги)
-```toml
-[server]
-max_connections = 65535         # Жесткий лимит соединений (защита от перегрузки памяти/ФД)
-idle_timeout_sec = 300          # Таймаут ожидания первого байта (важно для iOS)
-handshake_timeout_sec = 60      # Таймаут на сборку 64-байтового рукопожатия
-
-[censorship]
-tls_domain = "wb.ru"   # ВАЖНО: должен совпадать с hex-суффиксом в ee-секрете
-mask = true             # Прозрачный проброс на реальный wb.ru для неизвестных клиентов
-```
-
-### Статистика производительности (на 1 vCPU / 1 GB RAM)
-Благодаря переходу на `epoll`, потребление памяти в простое кардинально снижено:
-| Реализация | Соединений (ESTABLISHED) | Стабильность | Память (RSS) |
-|------------|-------------------------|--------------|--------------|
-| **mtproto.zig (idle)** | **12,000** | **100%** | **49 MB** |
-| Official MTProxy | 12,000 | 100% | 74 MB |
-| Telemt | 8,000 | 100% | 70 MB |
-| mtg | 4,000 | 100% | 97 MB |
-
-*Полная методология и профили в [test/README.md](file:///c:/Users/Dmitry/Antigravity/mtproto.zig/test/README.md).*
-
-### Хронология блокировок
-- **IP сжигается**: ~10 мин после первого FakeTLS соединения (пассивный детект)
-- **BGP-blackhole**: ~20 мин (0 пакетов до сервера)
-- **IPv6 не блокируется**: /64-подсети не трогают — слишком большой риск collateral damage
-
-### Commercial / Premium VPNs Filtering
-If connecting to the proxy while behind a **Commercial/Premium VPN**, the VPN provider's firewall often drops MTProto traffic by design:
-- **DPI**: They perform Deep Packet Inspection and drop FakeTLS connections that do not act identically to standard browsers.
-- **IP Blocking**: They silently block TCP routing to Telegram Datacenter IPs.
-- **Symptoms**: Proxy sits in "Updating..." state indefinitely. The proxy instance receives 0 packets from the VPN exit node.
-- **Solution**: Use self-hosted VPNs (like the co-located AmneziaWG above) which do not perform traffic filtering or DPI on outbound connections.
-
-## Co-located AmneziaVPN / WireGuard
-When the proxy and AmneziaVPN run on the same server, iOS VPN clients cannot reach `host:443` by default.
-**Fix**:
-```bash
-iptables -I DOCKER-USER -s 10.8.1.0/24 -p tcp --dport 443 -j ACCEPT
-iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
-netfilter-persistent save
-```

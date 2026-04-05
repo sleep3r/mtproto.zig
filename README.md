@@ -37,21 +37,27 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients to a real domain |
-| **Fast Mode** | Zero-copy S2C | Drastically reduces CPU usage by delegating Server-to-Client AES encryption to the DC |
-| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for regular DC1..5 (`use_middle_proxy`) + required DC203 media relay |
+| **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
+| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); media-path traffic prefers ME endpoints with direct fallback when unavailable |
 | **Auto Refresh** | Telegram Metadata | Periodically updates MiddleProxy endpoint and secret from Telegram core endpoints |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing) |
-| **Split-TLS** | DPI Evasion | 1-byte Application-level record chunking to defeat passive DPI signatures |
+| **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
 | **Zero-RTT** | DPI Evasion | Local Nginx server deployed on-the-fly (`127.0.0.1:8443`) to defeat active probing timing analysis |
-| **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
+| **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
 > **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, refer to the `.agent/skills` and `.agent/workflows` directories.
 
 Connection-capacity methodology and command profiles: `test/README.md`.
+
+## Runtime Model
+
+- Client relay is handled by a single-threaded Linux `epoll` event loop.
+- A background updater thread periodically refreshes MiddleProxy metadata from Telegram core endpoints.
+- Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
 
 ## &nbsp; Quick Start
 
@@ -395,7 +401,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
-| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5 (recommended for promo-channel parity) |
+| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5. Media-path requests still prefer ME endpoints when available; direct fallback can be used if ME endpoints are unavailable |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
@@ -407,9 +413,9 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
 | `[censorship]` | `mask_port` | `443` | Non-standard port override for masking locally (e.g. `8443` for zero-RTT local Nginx) |
-| `[censorship]` | `desync` | `true` | Application-level Split-TLS (1-byte chunking) for passive DPI evasion |
+| `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
-| `[censorship]` | `fast_mode` | `false` | **Recommended**. Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC |
+| `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 
 </details>
@@ -420,11 +426,15 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
 
-> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media DC203 endpoint + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with a bundled fallback.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with bundled defaults as fallback.
 
 ## &nbsp; Troubleshooting ("Updating...")
 
 If your Telegram app is stuck on "Updating...", your provider or network is dropping the connection.
+
+### 0. Runtime expectations (important)
+
+This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts are controlled by config (`idle_timeout_sec`, `handshake_timeout_sec`) and event-loop timers. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
 
 ### 1. AAAA exists, but server IPv6 is not actually working
 

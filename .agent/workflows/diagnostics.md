@@ -1,110 +1,83 @@
 ---
-description: Useful commands for diagnosing proxy anomalies or connection issues
+description: Useful commands for diagnosing proxy anomalies or connection issues.
 ---
 
 # Proxy Diagnostics Workflow
 
-Use these diagnostic commands to investigate service statuses, monitor logs, and analyze process health on the VPS where the proxy is deployed.
+Use these checks on the deployed VPS to inspect service health, routing, and fallback behavior.
 
-## Service & Process Monitoring
+## Service and Process Health
 
 ```bash
-# Check service status
+# Service status
 ssh root@<SERVER_IP> 'systemctl status mtproto-proxy --no-pager'
 
-# Check active connections (IPv4 + IPv6)
+# Active sockets
 ssh root@<SERVER_IP> 'ss -tnp | grep mtproto'
 
-# Check process stats (CPU, threads, memory)
+# Process footprint
 ssh root@<SERVER_IP> 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
 ```
 
-## Log Analysis
+## Log Checks (current message patterns)
 
 ```bash
-# Check recent logs
+# Recent logs
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
-# Check for Replay attacks detected (ТСПУ Revisor)
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --no-pager | grep "Replay attack"'
+# Connect-path and fallback signals
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "middle-proxy exhausted|middle-proxy handshake failed|media path connect failed|epoll hup/err"'
 
-# Check IPv6 hopping log
-ssh root@<SERVER_IP> 'cat /var/log/mtproto-ipv6-hop.log | tail -20'
+# Timeout signals from event-loop timers
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "idle pre-first-byte timeout|handshake timeout|relay idle timeout"'
 
-# Check current active IPv6
-ssh root@<SERVER_IP> 'cat /tmp/mtproto-ipv6-current'
-
-# Check short-read diagnostics (fragmented ClientHello / partial reads)
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep "DIAG: Short read"'
-
-# Check MiddleProxy route instability for media/non-media
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "MiddleProxy connect|DC4 MiddleProxy timeout|DC203 MiddleProxy timeout"'
+# MiddleProxy metadata refresh state
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "24 hours ago" --no-pager | grep -E "Middle-proxy cache updated|Initial middle-proxy refresh failed|Middle-proxy refresh failed"'
 ```
 
-## IPv6 Hopping Scripts
+Note:
+
+- Older grep patterns like `DIAG: Short read`, `DC4 MiddleProxy timeout`, `DC203 MiddleProxy timeout` are legacy and not emitted by current code.
+
+## IPv6 Hopping and DNS
 
 ```bash
-# Manual hop to new IPv6 address
-ssh root@<SERVER_IP> '/opt/mtproto-proxy/ipv6-hop.sh'
+# Last hop log lines
+ssh root@<SERVER_IP> 'tail -20 /var/log/mtproto-ipv6-hop.log'
 
-# Check hop status
-ssh root@<SERVER_IP> '/opt/mtproto-proxy/ipv6-hop.sh --check'
+# Current active IPv6
+ssh root@<SERVER_IP> 'cat /tmp/mtproto-ipv6-current'
 
-# Check cron job
+# Cron wiring
 ssh root@<SERVER_IP> 'cat /etc/cron.d/mtproto-ipv6'
 ```
 
-## Low-level Debugging
+## Low-level Network Checks
 
 ```bash
-# Check for CLOSE-WAIT sockets
+# CLOSE-WAIT sockets
 ssh root@<SERVER_IP> 'ss -tnp state close-wait | grep mtproto'
 
-# Check thread states in Linux /proc
+# Process state summary
 ssh root@<SERVER_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
 
-# Verify TCPMSS clamping rule (against DPI)
+# TCPMSS clamp rule
 ssh root@<SERVER_IP> 'iptables -t mangle -L OUTPUT -n -v | grep TCPMSS'
 ```
 
-## Capacity & Performance Check
-
-Check the startup banner for the **CAPACITY** section to ensure your `max_connections` setting is safe for your VPS RAM.
-
-### 1. Check startup banner
-```bash
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 50'
-```
-Look for:
-- **`Host RAM`**: Detected total memory.
-- **`Per conn`**: Estimated memory footprint per user session.
-- **`Safe cap`**: Calculated limit for stable operation.
-
-> [!WARNING]
-> If you see `max_connections=X is above safe estimate` in yellow, your server may OOM under peak load. Reduce `max_connections` in `config.toml`.
-
-### 2. Run automated capacity probe
-To find the absolute ceiling of your VPS:
+## Capacity and Stability
 
 ```bash
+# Startup banner with RAM/capacity estimate
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 80 --no-pager'
+
+# Idle capacity probe
+ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode idle'
+
+# Active (TLS-auth) capacity probe
 ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 500,1000,1500,2000 --open-budget-sec 14 --hold-seconds 0.8 --settle-seconds 1.0 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
-```
 
-For strict handshake response sanity:
-
-```bash
-ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth-full --tls-domain google.com --levels 100,200 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
-```
-Watch for `max_established_observed` and `rss_kb` growth.
-
-### 3. Stability Harness
-
-```bash
+# Stability harness
 ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/connection_stability_check.py --host 127.0.0.1 --port 443 --pid $(pgrep -f mtproto-proxy | head -n1) --idle-connections 6000 --idle-cycles 3 --churn-total 30000 --churn-concurrency 300'
 ```
 
-### 4. Useful Failure Signatures
-
-- Frequent `startup_failed` in benchmark output: binary/config/runtime mismatch.
-- `payload_ok` high but `established_server_side` low in strict modes: expected in masking/deny scenarios, verify traffic-mode semantics.
-- Repeating `epoll hup/err` close reasons with low throughput: investigate peer behavior and kernel socket limits.

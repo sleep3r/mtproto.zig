@@ -1,45 +1,59 @@
 ---
-description: Guide on how to migrate the MTProto proxy server
+description: Guide on how to migrate the MTProto proxy server.
 ---
 
 # Server Migration Guide
 
-If the current VPS is permanently blocked or blacklisted by the ISP, migrating to a new VPS requires these steps to maintain seamless connectivity for clients without changing their proxy links.
+Use this flow when old VPS IP is blocked and you need a controlled cutover without changing client secrets.
 
-## Step 1: Deploy to New VPS
+## Step 1: Provision New VPS
 
-Use the `install.sh` script to set up Zig, clone the proxy, compile it, and enable DPI bypass metrics (TCPMSS).
-*The `--auto` mode for IPv6 hopping requires Cloudflare API credentials.*
+Install/update proxy with official installer:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "bash"
+```
+
+If you use IPv6 auto-hopping, provide Cloudflare vars during install:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "export CF_TOKEN='...'; export CF_ZONE='...'; bash"
 ```
 
-## Step 2: Migrate Configuration
+## Step 2: Preserve Access Secrets
 
-It is crucial to keep the `[access.users]` secrets identical so the client connection strings (`tg://proxy?server=...&secret=...`) remain valid.
+Keep `[access.users]` secrets identical so existing `tg://` links remain valid.
 
-1. Copy `/opt/mtproto-proxy/config.toml` from the old server to the new one.
-2. Restart the proxy on the new server.
+1. Copy old `/opt/mtproto-proxy/config.toml` to new host.
+2. Restart proxy on new host.
 
 ```bash
-# On the new server
-systemctl restart mtproto-proxy
+ssh root@<NEW_VPS_IP> 'systemctl restart mtproto-proxy'
 ```
 
-## Step 3: Update DNS Records
+## Step 3: Switch DNS
 
-To ensure transparent failover without changing the immutable client link:
+- Update `A` record to new VPS IPv4.
+- If IPv6 hopping is enabled, run hop script once to force AAAA update from new host:
 
-- Update the **A record** (`proxy.xxcipherx.ru`) to point to the new `<NEW_VPS_IP>` using the Cloudflare Dashboard or API.
-- Run `/opt/mtproto-proxy/ipv6-hop.sh` on the new server to force an immediate **AAAA record** overwrite to the new server's IPv6 pool.
-
-## Step 4: Verify Connectivity & Validation
-
-1. Check `systemctl status mtproto-proxy`.
-2. Verify that the Cloudflare DNS now resolves to the new IP addresses using `dig +short proxy.xxcipherx.ru`.
-3. Validate traffic capacity before decommissioning the old host:
 ```bash
+ssh root@<NEW_VPS_IP> '/opt/mtproto-proxy/ipv6-hop.sh'
+```
+
+## Step 4: Validate Before Decommission
+
+```bash
+# Service is healthy
+ssh root@<NEW_VPS_IP> 'systemctl status mtproto-proxy --no-pager'
+
+# Capacity smoke
 ssh root@<NEW_VPS_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 200,500 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+
+# Fallback/refresh visibility
+ssh root@<NEW_VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "Middle-proxy cache updated|Initial middle-proxy refresh failed|middle-proxy exhausted|middle-proxy handshake failed"'
 ```
-4. Telegram clients will automatically pick up the new IPs from the existing proxy link.
+
+Operational note:
+
+- If `core.telegram.org` is temporarily unreachable, proxy continues with bundled MiddleProxy defaults and should still start.
+

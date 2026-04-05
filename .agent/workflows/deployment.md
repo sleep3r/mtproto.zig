@@ -1,51 +1,53 @@
 ---
-description: How to build, run and deploy the MTProto Zig Proxy
+description: How to build, run, and deploy the MTProto Zig proxy.
 ---
 
 # Deployment Workflow
 
-This workflow documents how to build, deploy, and update the MTProto proxy, along with configuration handling.
+This workflow documents current build and deploy paths as implemented in `Makefile` and `deploy/install.sh`.
 
-## Building and Running
+## Prerequisites
 
-### Prerequisites
-- Zig 0.15.2
-- SSH access to VPS for deployment
+- Zig 0.15.2 for local builds
+- SSH access to VPS
+- systemd on target host
 
-### Key Commands
+## Key Commands
 
-- `make build` : Debug build (native)
-- `make release` : Release build (native)
-- `make deploy` : Cross-compile for Linux + stop + scp + start
-- `make migrate` : Fresh setup on new VPS (uses install.sh)
-- `make test` : Run unit tests
-- `make bench` : ReleaseFast encapsulation microbench
-- `make soak` : ReleaseFast 30s multithreaded soak stress
+- `make build` : debug build
+- `make release` : release build (`ReleaseFast`)
+- `make run CONFIG=<path>` : run proxy with selected config
+- `make test` : run unit tests
+- `make bench` : encapsulation microbench
+- `make soak` : 30s multithreaded soak
+- `make deploy SERVER=<ip>` : cross-compile and deploy to VPS
+- `make migrate SERVER=<ip>` : bootstrap + push config + deploy
 
-### Deployment Execution
+## `make deploy` (current behavior)
 
-`make deploy` performs the following steps:
-1. Cross-compile for Linux (`x86_64-linux`).
-2. `systemctl stop mtproto-proxy`.
-3. `scp` binary and deploy scripts to VPS.
-4. If `$(CONFIG)` exists locally, upload it as `/opt/mtproto-proxy/config.toml`.
-5. `systemctl start mtproto-proxy`.
+1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux`.
+2. Stops remote service (`systemctl stop mtproto-proxy`).
+3. Uploads binary and deploy scripts via `scp`.
+4. Uploads config when local config file exists.
+5. Starts service and prints status.
 
-> [!IMPORTANT]
-> You must stop the service before using `scp` because the systemd unit has `ReadOnlyPaths=/opt/mtproto-proxy`, which prevents overwriting the binary while it is running.
+Why service stop is required:
 
-## Server Update Path (Recommended for Operators)
+- Unit file contains `ProtectSystem=strict` and `ReadOnlyPaths=/opt/mtproto-proxy`.
+- Replacing binaries safely is simplest when service is stopped first.
 
-To update an already installed proxy, re-run the same install command:
+## One-line operator update path
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-The script is idempotent: it rebuilds from latest source, replaces the binary, and preserves existing `config.toml` and `env.sh`.
+The installer is idempotent and preserves existing operational config/secrets on update.
 
-## Systemd Unit (`deploy/mtproto-proxy.service`)
-Key performance and security settings:
-- `LimitNOFILE=65535`: Enough file descriptors for thousands of concurrent connections.
-- `TasksMax=65535`: Enough threads for the one-thread-per-connection model.
-- `ReadOnlyPaths=/opt/mtproto-proxy`: Security hardening.
+## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
+
+- `LimitNOFILE=65535` for high socket count.
+- `TasksMax=65535` kept as operational headroom.
+- Runtime relay model is still single-thread `epoll` in proxy core.
+- `ReadOnlyPaths=/opt/mtproto-proxy` and capability bounds for privileged port binding.
+
