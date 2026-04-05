@@ -517,6 +517,7 @@ const ConnectionPool = struct {
     slots: []?*ConnectionSlot,
     free_stack: []u32,
     free_count: u32,
+    allocated_hi: u32,
     fd_to_slot: std.AutoHashMapUnmanaged(posix.fd_t, u32) = .{},
 
     fn init(allocator: std.mem.Allocator, capacity: u32) !ConnectionPool {
@@ -540,6 +541,7 @@ const ConnectionPool = struct {
             .slots = slots,
             .free_stack = free_stack,
             .free_count = capacity,
+            .allocated_hi = 0,
             .fd_to_slot = .{},
         };
         try pool.fd_to_slot.ensureTotalCapacity(allocator, @as(u32, capacity * 2));
@@ -569,6 +571,8 @@ const ConnectionPool = struct {
             };
             fresh.* = .{};
             self.slots[idx] = fresh;
+            const hi = idx + 1;
+            if (hi > self.allocated_hi) self.allocated_hi = hi;
         }
 
         const slot = self.slots[idx].?;
@@ -915,6 +919,8 @@ const EventLoop = struct {
 
     fn run(self: *EventLoop) !void {
         var events: [256]linux.epoll_event = undefined;
+        const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
+        var next_timer_tick_ns: i128 = std.time.nanoTimestamp();
 
         while (true) {
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
@@ -939,7 +945,11 @@ const EventLoop = struct {
                 self.processSlotEvent(slot, fd, ev_flags);
             }
 
-            self.runTimers();
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns >= next_timer_tick_ns) {
+                self.runTimers();
+                next_timer_tick_ns = now_ns + timer_tick_ns;
+            }
         }
     }
 
@@ -957,7 +967,7 @@ const EventLoop = struct {
                 self.onClientReadable(slot);
             }
         } else if (fd == slot.upstream_fd) {
-            if ((events & linux.EPOLL.OUT) != 0) {
+            if ((events & linux.EPOLL.OUT) != 0 or (slot.phase == .connecting_upstream and fatal_hangup)) {
                 self.onUpstreamWritable(slot);
             }
             if (slot.phase == .idle) return;
@@ -2212,7 +2222,8 @@ const EventLoop = struct {
         const now_ms = std.time.milliTimestamp();
         const now_ns = std.time.nanoTimestamp();
 
-        for (self.pool.slots) |slot_opt| {
+        const hi: usize = @intCast(self.pool.allocated_hi);
+        for (self.pool.slots[0..hi]) |slot_opt| {
             const slot = slot_opt orelse continue;
             if (slot.phase == .idle) continue;
 
