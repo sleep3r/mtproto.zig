@@ -22,6 +22,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [Update](#-update-existing-server) &nbsp;&bull;&nbsp;
 [Docker](#docker-image) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
+[Tunnel](#-amneziawg-tunnel-blocked-regions) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
 [Troubleshooting](#-troubleshooting-updating)
 
@@ -121,6 +122,8 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
+| `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>]` | Full migration + AmneziaWG tunnel for blocked regions |
+| `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path>` | Add AmneziaWG tunnel to existing installation |
 
 </details>
 
@@ -366,6 +369,91 @@ sudo systemctl restart mtproto-proxy
 
 # Stop
 sudo systemctl stop mtproto-proxy
+```
+
+## &nbsp; AmneziaWG Tunnel (Blocked Regions)
+
+If your server is in a country that blocks Telegram at the network level (e.g., Russia — ТСПУ blocks TCP to Telegram DCs), you can route proxy traffic through an **AmneziaWG VPN tunnel** inside an isolated **network namespace**.
+
+```
+Client ──→ VPS:443 ──→ [iptables DNAT] ──→ 10.200.200.2:443
+              (host)        (host)              (tg_proxy_ns)
+                                                     │
+                                                mtproto-proxy
+                                                     │
+                                               awg0 (tunnel)
+                                                     │
+                                             Telegram DC servers
+```
+
+**Key design:** the tunnel runs strictly inside a network namespace. Host SSH and other services are completely unaffected.
+
+### Prerequisites
+
+- An **AmneziaWG client config file** (`.conf`) — export it from the AmneziaVPN app or get it from your VPN provider
+- The `.conf` must contain `[Interface]` (with `PrivateKey`, AmneziaWG junk fields) and `[Peer]` (with `Endpoint`)
+- A VPS with **Ubuntu 24.04** in the target region
+
+### One-command deploy (new server)
+
+From your workstation:
+
+```bash
+make deploy-tunnel SERVER=<VPS_IP> AWG_CONF=awg.conf PASSWORD=<root_password>
+```
+
+This will:
+1. Set up SSH key, install deps, build and deploy the proxy (via `make migrate`)
+2. Install **amneziawg-tools** (DKMS kernel module + userspace tools)
+3. Create network namespace `tg_proxy_ns` with AmneziaWG tunnel inside
+4. Set up **DNAT** (incoming `:443` → namespace) and **policy routing** (responses go back to client, not into tunnel)
+5. Patch the systemd service to run the proxy inside the namespace in **direct mode**
+6. Validate connectivity to all 5 Telegram DCs through the tunnel
+7. Print the ready-to-use `tg://` link
+
+### Add tunnel to existing proxy
+
+If the proxy is already installed and running:
+
+```bash
+make deploy-tunnel-only SERVER=<VPS_IP> AWG_CONF=awg.conf
+```
+
+### On the server directly
+
+```bash
+scp awg.conf root@<VPS_IP>:/tmp/awg.conf
+ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf'
+```
+
+### How it works
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `awg0` | Inside `tg_proxy_ns` | Encrypted tunnel to Telegram DCs |
+| `veth_main` ↔ `veth_ns` | Host ↔ Namespace | Bridge for client traffic |
+| iptables DNAT | Host | Forwards `:443` → `10.200.200.2:443` |
+| Policy routing (`from 10.200.200.2 table 100`) | Inside namespace | Response packets return via veth (not via tunnel) |
+| `mtproto-proxy` | Inside `tg_proxy_ns` | Listens on `:443`, connects to Telegram via `awg0` |
+
+> **Note** &nbsp; The tunnel setup automatically switches the proxy to **direct mode** (`use_middle_proxy = false`). Middleproxy mode requires per-IP registration with `@MTProxyBot`, which doesn't work when the proxy's outgoing IP is the VPN exit node.
+
+> **Note** &nbsp; To check tunnel status: `ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'`
+
+### Managing the tunnel
+
+```bash
+# Check tunnel status
+ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'
+
+# Check proxy logs
+ssh root@<VPS_IP> 'journalctl -u mtproto-proxy -f'
+
+# Restart (recreates namespace + tunnel)
+ssh root@<VPS_IP> 'systemctl restart mtproto-proxy'
+
+# Test DC connectivity through tunnel
+ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns nc -zw3 149.154.167.50 443 && echo OK'
 ```
 
 ## &nbsp; Configuration

@@ -1,7 +1,8 @@
-.PHONY: build release run test bench soak clean fmt deploy migrate update-dns stability-check stability-check-load capacity-probe-idle capacity-probe-active
+.PHONY: build release run test bench soak clean fmt deploy migrate update-dns stability-check stability-check-load capacity-probe-idle capacity-probe-active deploy-tunnel deploy-tunnel-only
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
+AWG_CONF ?=
 HOST ?= 127.0.0.1
 PORT ?= 443
 PID ?=
@@ -67,6 +68,25 @@ migrate:
 		$(MAKE) update-dns SERVER=$(SERVER); \
 	fi
 	@echo "--- MIGRATION COMPLETE ---"
+
+# Full migration + AmneziaWG tunnel (for servers where Telegram is blocked)
+deploy-tunnel:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>]"; exit 1; fi
+	@if [ -z "$(AWG_CONF)" ]; then echo "AWG_CONF is required (path to AmneziaWG client config)"; exit 1; fi
+	@if [ ! -f "$(AWG_CONF)" ]; then echo "AWG_CONF file not found: $(AWG_CONF)"; exit 1; fi
+	$(MAKE) migrate SERVER=$(SERVER) PASSWORD=$(PASSWORD)
+	@echo "--- Setting up AmneziaWG tunnel ---"
+	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
+	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
+	ssh root@$(SERVER) 'bash /tmp/setup_tunnel.sh /tmp/awg_client.conf && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh'
+
+# Add tunnel to existing installation
+deploy-tunnel-only:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path>"; exit 1; fi
+	@if [ -z "$(AWG_CONF)" ]; then echo "AWG_CONF is required (path to AmneziaWG client config)"; exit 1; fi
+	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
+	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
+	ssh root@$(SERVER) 'bash /tmp/setup_tunnel.sh /tmp/awg_client.conf && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh'
 
 update-dns:
 	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi
