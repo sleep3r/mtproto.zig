@@ -58,6 +58,7 @@ deploy:
 		ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh'; \
 		rm .env.tmp_deploy; \
 	fi
+	ssh root@$(SERVER) 'chown -R mtproto:mtproto /opt/mtproto-proxy/'
 	ssh root@$(SERVER) 'systemctl start mtproto-proxy && systemctl status mtproto-proxy --no-pager'
 
 update-server:

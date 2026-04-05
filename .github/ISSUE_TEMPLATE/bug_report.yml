@@ -1,0 +1,131 @@
+name: "🐛 Bug Report"
+description: "Proxy doesn't connect, crashes, or behaves unexpectedly."
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before you open this issue
+
+        Most connection problems are caused by **environment misconfiguration**, not proxy bugs.
+        Please go through the checklist below — every checkbox is **mandatory**.
+        Issues without a completed checklist will be closed automatically.
+
+  # ── Version & Environment ───────────────────────────────
+  - type: input
+    id: version
+    attributes:
+      label: Proxy version
+      description: "Output of `mtproto-proxy --version` or the version you downloaded."
+      placeholder: "0.6.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS & kernel
+      description: "Output of `uname -sr`."
+      placeholder: "Linux 6.1.0-18-amd64"
+    validations:
+      required: true
+
+  - type: input
+    id: telegram-client
+    attributes:
+      label: Telegram client & version
+      description: "Which client are you connecting from?"
+      placeholder: "Telegram Desktop 6.7.2 / Android 12.6.4 / iOS 11.8"
+    validations:
+      required: true
+
+  # ── Mandatory Self-Diagnostics ──────────────────────────
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-flight checklist
+      description: "You **must** confirm every item. If an item does not apply, explain why in the description."
+      options:
+        - label: "I am running the **latest release** (checked [Releases](https://github.com/sleep3r/mtproto.zig/releases))."
+          required: true
+        - label: "System clock is synchronized (`timedatectl status` shows `NTP synchronized: yes`)."
+          required: true
+        - label: "The proxy port (default 443) is open in the firewall (`ss -tlnp | grep <port>` shows LISTEN)."
+          required: true
+        - label: "I can reach the proxy port from the outside (`curl -v --connect-timeout 5 https://<server-ip>:<port>` returns a TLS error, not a timeout)."
+          required: true
+        - label: "Secret key in config.toml matches the tg:// link I use on the client (I re-checked byte-for-byte)."
+          required: true
+        - label: "`RLIMIT_NOFILE` warning (if present) is just a warning — I understand it does **not** block connections."
+          required: true
+        - label: "I have read the logs with `journalctl -u mtproto-proxy -n 200 --no-pager` and the **full** output is attached below."
+          required: true
+
+  # ── Config ──────────────────────────────────────────────
+  - type: textarea
+    id: config
+    attributes:
+      label: config.toml (secrets redacted)
+      description: |
+        Paste your full `config.toml` with secrets replaced by `***`.
+        **Do not skip sections** — omitting config lines makes debugging impossible.
+      render: toml
+      placeholder: |
+        [general]
+        ad_tag = "***"
+        use_middle_proxy = true
+
+        [server]
+        port = 443
+
+        [censorship]
+        tls_domain = "google.com"
+        desync = true
+        mask = true
+
+        [access.users]
+        user = "***"
+    validations:
+      required: true
+
+  # ── Logs ────────────────────────────────────────────────
+  - type: textarea
+    id: logs
+    attributes:
+      label: Full proxy log (last 200 lines)
+      description: |
+        `journalctl -u mtproto-proxy -n 200 --no-pager`
+        Do **not** cherry-pick single lines — paste the full block.
+      render: text
+    validations:
+      required: true
+
+  # ── Diagnostics output ─────────────────────────────────
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics output
+      description: |
+        Run these commands and paste the combined output:
+        ```bash
+        echo "=== date ===" && date -u
+        echo "=== timedatectl ===" && timedatectl status 2>/dev/null || echo "N/A"
+        echo "=== ulimit ===" && ulimit -n
+        echo "=== ss ===" && ss -tlnp | grep -E '443|mtproto'
+        echo "=== uname ===" && uname -a
+        echo "=== memory ===" && free -h
+        echo "=== systemctl ===" && systemctl status mtproto-proxy --no-pager -l 2>/dev/null || echo "N/A"
+        ```
+      render: text
+    validations:
+      required: true
+
+  # ── Extra context ───────────────────────────────────────
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: "Anything else: screenshots, network topology, VPS provider, etc."
+    validations:
+      required: false
