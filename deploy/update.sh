@@ -109,6 +109,9 @@ install -m 0644 "${TMP_DIR}/capture_template.py" "${INSTALL_DIR}/capture_templat
 install -m 0644 "${TMP_DIR}/mtproto-proxy.service" "/etc/systemd/system/mtproto-proxy.service"
 systemctl daemon-reload
 
+# Fix permissions up in case config or dir was modified as root
+chown -R mtproto:mtproto "$INSTALL_DIR" 2>/dev/null || true
+
 info "Starting ${SERVICE_NAME}..."
 if ! systemctl restart "$SERVICE_NAME"; then
     warn "Service failed to start after update"

@@ -189,6 +189,7 @@ info "Setting up zapret nfqws TCP desync..."
 bash "$TMPBUILD/deploy/setup_nfqws.sh" || warn "nfqws setup failed"
 
 # Restart proxy to apply Mask Port and NFQUEUE capabilities
+chown -R mtproto:mtproto "$INSTALL_DIR"
 systemctl restart "$SERVICE_NAME"
 ok "Advanced OS-Level DPI Evasion and Masking successfully configured!"
 

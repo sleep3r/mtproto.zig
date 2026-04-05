@@ -206,6 +206,8 @@ if [[ -f "$CONFIG_FILE" ]]; then
         }
     ' "$CONFIG_FILE" > "$TMP_CONFIG"; then
         mv "$TMP_CONFIG" "$CONFIG_FILE"
+        chmod 0644 "$CONFIG_FILE"
+        chown mtproto:mtproto "$CONFIG_FILE" 2>/dev/null || true
     else
         rm -f "$TMP_CONFIG"
         fail "Failed to update ${CONFIG_FILE} with mask_port=${NGINX_PORT}"
