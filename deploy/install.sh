@@ -119,7 +119,6 @@ if ! id -u mtproto &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin mtproto
     ok "Created system user 'mtproto'"
 fi
-chown -R mtproto:mtproto "$INSTALL_DIR"
 
 # ── Install systemd service ─────────────────────────────────
 cp "$TMPBUILD/deploy/mtproto-proxy.service" /etc/systemd/system/
@@ -216,6 +215,8 @@ elif curl -sk --max-time 5 "https://127.0.0.1:${MASK_PORT}/" >/dev/null 2>&1; th
 else
     warn "Masking validation failed: https://127.0.0.1:${MASK_PORT}/ is not responding"
 fi
+
+chown -R mtproto:mtproto "$INSTALL_DIR"
 
 # ── Cleanup ─────────────────────────────────────────────────
 rm -rf "$TMPBUILD"
