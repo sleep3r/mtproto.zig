@@ -10,3 +10,6 @@ config.toml
 *.session
 .idea
 .vscode/
+__pycache__
+*.json
+*.log

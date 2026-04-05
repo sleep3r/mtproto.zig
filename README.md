@@ -7,7 +7,7 @@
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
 <p align="center">
-  <strong>177 KB binary. ~256 KB RAM. Boots in <10 ms. Zero dependencies.</strong>
+  <strong>177 KB binary. Sub-1 MB baseline RSS. Boots in <10 ms. Zero dependencies.</strong>
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -51,21 +51,44 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ## &nbsp; Benchmark Snapshot
 
-> VPS benchmark (1 vCPU / 1 GB RAM, Ubuntu 24.04, April 2026). Each proxy tested in isolation after page-cache flush.
+> Final validation run on VPS (1 vCPU / 1 GB RAM, Ubuntu 24.04, April 2026). Proxies were tested in isolation with the same probe harness. Full methodology and commands: `test/README.md`.
+> Dataset sources: `test/capacity_connections_tls_auth.final_all.json` and `test/capacity_connections_idle.final_all.json`.
 
-| Proxy | Language | Binary | Idle RSS | Startup | Dependencies | LoC (Files) |
-|-------|----------|--------|----------|---------|--------------|-------------|
-| **mtproto.zig** | Zig | **177 KB** | **256 KB** ⚡ | **< 10 ms**\* | **0** | **5.5k** (9) |
-| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | C | 524 KB | 8.3 MB | < 10 ms | openssl, zlib | 29.6k (87) |
-| [Teleproxy](https://github.com/teleproxy/teleproxy) | C | 14 MB | 4.6 MB | ~ 30 ms | openssl, zlib, libc | 40.5k (120) |
-| [Telemt](https://github.com/telemt/telemt) | Rust | 15 MB | 16 MB | > 15 s | 423 crates (total) | 106.6k (231) |
-| [mtg](https://github.com/9seconds/mtg) | Go | 13 MB | 12.5 MB | ~ 30 ms | 78 modules | 17.8k (205) |
-| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | Python | N/A (script) | 35 MB | ~ 800 ms | python3 (~30 MB) | 3.3k (6) |
-| [mtproto_proxy](https://github.com/seriyps/mtproto_proxy) | Erlang | N/A (release)| 88 MB | ~ 6 s | erlang (~200 MB) | 7.8k (43) |
+### Baseline Footprint
+
+| Proxy | Language | Binary | Baseline RSS | Startup | Dependencies | LoC (Files) |
+|---|---|---:|---:|---|---|---:|
+| **mtproto.zig** | Zig | **177 KB** | **0.75 MB** | **< 10 ms**\* | **0** | **5.5k** (9) |
+| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | C | 524 KB | 8.0 MB | < 10 ms | openssl, zlib | 29.6k (87) |
+| [Teleproxy](https://github.com/teleproxy/teleproxy) | C | 14 MB | 4.5 MB | ~ 30 ms | openssl, zlib, libc | 40.5k (120) |
+| [Telemt](https://github.com/telemt/telemt) | Rust | 15 MB | 12.1 MB | ~ 5-6 s | 423 crates (total) | 106.6k (231) |
+| [mtg](https://github.com/9seconds/mtg) | Go | 13 MB | 11.6 MB | ~ 30 ms | 78 modules | 17.8k (205) |
+| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | Python | N/A (script) | 34.9 MB | ~ 800 ms | python3 (~30 MB) | 3.3k (6) |
+| [mtproto_proxy](https://github.com/seriyps/mtproto_proxy) | Erlang | N/A (release) | 91.6 MB | idle: starts / tls-auth: startup_exited | erlang (~200 MB) | 7.8k (43) |
 
 \* `mtproto.zig` also performs online bootstrap at startup (public IP detection + Telegram metadata refresh). On this VPS, cold boot is typically ~0.4 s; warm/steady restart remains sub-10 ms.
 
-Connection-capacity methodology and command profiles: `test/README.md`.
+### TLS-auth active memory @ 2000 connections
+
+| Proxy | RSS @ 2000 | Established | Status |
+|---|---:|---:|---|
+| **mtproto.zig** | **8,832 KB** | **2,000** | ✅ stable |
+| [Teleproxy](https://github.com/teleproxy/teleproxy) | 20,952 KB | 2,000 | ✅ stable |
+| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | 23,296 KB | 2,000 | ✅ stable |
+| [Telemt](https://github.com/telemt/telemt) | 38,272 KB | 2,000 | ✅ stable |
+| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | 50,944 KB | 2,000 | ✅ stable |
+| [mtg](https://github.com/9seconds/mtg) | 55,296 KB | 0 | ⚠ partial (payload OK, sockets not held) |
+
+### Idle memory @ 12000 held sockets
+
+| Proxy | RSS @ 12000 | Established | Status |
+|---|---:|---:|---|
+| **mtproto.zig** | **49,024 KB** | **12,000** | ✅ stable |
+| [Telemt](https://github.com/telemt/telemt) | 70,032 KB | 11,023 | ⚠ partial @12000 (stable up to 8000) |
+| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | 74,116 KB | 12,000 | ✅ stable |
+| [Teleproxy](https://github.com/teleproxy/teleproxy) | 77,864 KB | 12,000 | ✅ stable |
+| [mtg](https://github.com/9seconds/mtg) | 97,792 KB | 7,287 | ⚠ partial @12000 (stable up to 4000) |
+| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | 123,724 KB | 12,000 | ✅ stable |
 
 ## &nbsp; Quick Start
 
@@ -123,6 +146,8 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make test` | Run unit tests |
 | `make bench` | Run ReleaseFast encapsulation microbenchmarks |
 | `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
+| `make capacity-probe-idle` | Run idle-socket capacity probe for `mtproto.zig` |
+| `make capacity-probe-active` | Run TLS-auth (active) capacity probe for `mtproto.zig` |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
@@ -455,7 +480,23 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 If your Telegram app is stuck on "Updating...", your provider or network is dropping the connection.
 
-### 1. Home Wi-Fi restricts IPv4
+### 1. AAAA exists, but server IPv6 is not actually working
+
+This proxy supports IPv6, but your VPS must have real end-to-end IPv6 routing.
+If DNS has an `AAAA` record and the server has no usable global IPv6 route, iOS often tries IPv6 first, waits for timeout, then falls back to IPv4. This usually looks like a ~3-8 second connect delay.
+
+Quick checks:
+
+```bash
+dig +short proxy.example.com A
+dig +short proxy.example.com AAAA
+ip -6 addr show scope global
+ip -6 route
+```
+
+If `AAAA` exists but the server has no working global IPv6/default route, remove `AAAA` and keep only `A` until IPv6 is fully configured.
+
+### 2. Home Wi-Fi restricts IPv4
 
 Often, mobile networks will connect instantly because they use **IPv6**, but Home Wi-Fi internet providers block the destination's IPv4 address directly at the gateway.
 **Solution:** Enable **IPv6 Prefix Delegation** on your home Wi-Fi router. 
@@ -464,14 +505,14 @@ Often, mobile networks will connect instantly because they use **IPv6**, but Hom
 - Enable `IPv6`, and specifically check **IA_PD** (Prefix Delegation) for the WAN/DHCP client, and **IA_NA** for the LAN/DHCP Server.
 - Reboot the router and verify your phone gets an IPv6 address at [test-ipv6.com](https://test-ipv6.com). 
 
-### 2. Commercial / Premium VPNs Block Traffic
+### 3. Commercial / Premium VPNs Block Traffic
 
 If your iPhone is connected to a **commercial/premium VPN** and stuck on "Updating...", the VPN provider is actively dropping the MTProto TLS traffic using their own DPI.
 **Solutions**:
 - **Switch Protocol**: Try switching the VPN protocol (e.g., Xray/VLESS to WireGuard).
 - **Self-Host**: Use a self-hosted VPN (like AmneziaWG) on your own server.
 
-### 3. Co-located WireGuard (Docker routing)
+### 4. Co-located WireGuard (Docker routing)
 
 If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on the same server**, iOS clients will route proxy traffic inside the VPN tunnel, and Docker will drop the bridge packets.
 **Solution**: Allow traffic from the VPN Docker subnet:
@@ -479,7 +520,7 @@ If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on
 iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
 ```
 
-### 4. DC203 media resets
+### 5. DC203 media resets
 
 If only media-heavy sessions fail on non-premium clients, check MiddleProxy logs first:
 

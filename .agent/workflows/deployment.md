@@ -1,84 +1,65 @@
 ---
-description: How to build, run and deploy the MTProto Zig Proxy
+description: Build, deploy, update, and validate workflow for mtproto.zig.
 ---
 
 # Deployment Workflow
 
-This workflow documents how to build, deploy, and update the MTProto proxy, along with configuration handling.
+## Build and Verify Locally
 
-## Building and Running
+```bash
+make release
+make test
+```
 
-### Prerequisites
-- Zig 0.15.0+
-- SSH access to VPS for deployment
+Or explicit Linux build:
 
-### Key Commands
+```bash
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+```
 
-- `make build` : Debug build (native)
-- `make release` : Release build (native)
-- `make release_linux` : Cross-compile for Linux
-- `make test` : Run unit tests
-- `make bench`  : ReleaseFast encapsulation microbench
-- `make soak` : ReleaseFast 30s multithreaded soak stress
-- `make deploy` : Cross-compile + stop + scp + start
-- `make update-server SERVER=<ip> [VERSION=vX.Y.Z]` : Update VPS from GitHub Release
+## Deploy to Server
 
-### Deployment Execution
+```bash
+make deploy SERVER=<SERVER_IP>
+```
 
-`make deploy` performs the following steps:
-1. Cross-compile for Linux.
-2. `systemctl stop mtproto-proxy`.
-3. `scp` binary and deploy scripts to VPS.
-4. If `$(CONFIG)` exists locally, upload it as `/opt/mtproto-proxy/config.toml`.
-5. `systemctl start mtproto-proxy`.
+Typical flow:
 
-> [!IMPORTANT]
-> You must stop the service before using `scp` because the systemd unit has `ReadOnlyPaths=/opt/mtproto-proxy`, which prevents overwriting the binary while it is running.
+1. Cross-compile Linux binary.
+2. Upload binary and deploy assets.
+3. Restart `mtproto-proxy` service.
+4. Verify service status.
 
-## Server Update Path (Recommended for Operators)
+## Update Existing Server (Release Artifact Path)
 
-For routine production upgrades, users should update from GitHub Releases instead of rebuilding on the VPS.
+Recommended for operators:
 
-### Local orchestrated update
 ```bash
 make update-server SERVER=<SERVER_IP>
-make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
+make update-server SERVER=<SERVER_IP> VERSION=vX.Y.Z
 ```
 
-This runs `deploy/update.sh` remotely over SSH.
+Directly on host:
 
-### Direct update on the VPS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
-curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash -s -- v0.1.0
 ```
 
-### Update safety guarantees
-- Detects server architecture (`x86_64`/`aarch64`) and downloads matching release artifact.
-- Stops `mtproto-proxy`, installs new binary, updates deploy helper scripts and service unit.
-- Preserves runtime state (`/opt/mtproto-proxy/config.toml`, `/opt/mtproto-proxy/env.sh`).
-- Creates timestamped backup of current binary before replacement.
-- Automatically rolls back to previous binary if restart fails.
+## Post-Deploy Validation
 
-### Operator rollback
-If needed, restore the backup binary printed by `update.sh` and restart:
 ```bash
-sudo cp /opt/mtproto-proxy/mtproto-proxy.backup.<timestamp> /opt/mtproto-proxy/mtproto-proxy
-sudo systemctl restart mtproto-proxy
+ssh root@<SERVER_IP> 'systemctl status mtproto-proxy --no-pager'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "10 minutes ago" --no-pager'
 ```
 
-## Systemd Unit (`deploy/mtproto-proxy.service`)
-Key performance and security settings:
-- `LimitNOFILE=65535`: Enough file descriptors for thousands of concurrent connections.
-- `TasksMax=65535`: Enough threads for the one-thread-per-connection model.
-- `ReadOnlyPaths=/opt/mtproto-proxy`: Security hardening.
+Quick capacity sanity:
 
-## Release Workflow (GitHub)
-- Release automation is handled by `release-please` in `.github/workflows/release-please.yml`.
-- It updates/opens one release PR, not one release per commit.
-- A real GitHub release is created only when the release PR is merged.
-- Bump policy follows Conventional Commits:
-  - `fix:` -> patch
-  - `feat:` -> minor
-  - `BREAKING CHANGE:` / `!` -> major
-- To keep required checks compatible with release PRs, repository secret `RELEASE_PLEASE_TOKEN` must be set (PAT with `Contents`, `Pull requests`, `Issues` read/write for this repo).
+```bash
+ssh root@<SERVER_IP> 'python3 /root/benchmarks/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 500,1000 --open-budget-sec 10 --hold-seconds 0.6 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+```
+
+## Operational Notes
+
+- Runtime target is Linux.
+- Keep config secrets in deployed config file, not in repository defaults.
+- If benchmark modes change, keep `test/README.md` and main `README.md` synchronized.

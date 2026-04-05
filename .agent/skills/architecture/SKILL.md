@@ -1,128 +1,72 @@
 ---
 name: MTProto Proxy Architecture
-description: Core architecture, DPI evasion techniques, client behavior matrix, and networking rules for the Zig MTProto proxy.
+description: Current architecture and design rules for the Linux epoll-based Zig MTProto proxy.
 ---
 
-# MTProto Proxy Architecture & Core Concepts
+# MTProto Proxy Architecture (Current)
 
-A production-grade Telegram MTProto proxy implemented in Zig, featuring TLS-fronted obfuscated connections. Runs on a Linux VPS, cross-compiled from Mac.
+This project is a production MTProto proxy in Zig with FakeTLS fronting, active anti-replay protection, and Linux-first deployment.
 
-## Tech Stack
-- **Language**: Zig 0.15
-- **Networking**: `std.net` for TCP, `std.posix` for `poll()`-based I/O
-- **Cryptography**: `std.crypto` for SHA256, HMAC, AES-256-CTR
-- **Build System**: Zig Build System (`build.zig`)
-- **Deployment**: `systemd` service on Linux VPS, cross-compiled from macOS
+## Runtime Model
 
-## Architecture
+- **Single-threaded network core**: one Linux `epoll` event loop handles socket I/O.
+- **No thread-per-connection**: connection handling is state-machine driven.
+- **Connection slots** are allocated lazily and reused.
+- **Per-connection heavy buffers** are on-demand, not permanently embedded in idle slots.
 
-```text
-src/
-├── main.zig              # Entry point, banner, public IP detection, custom logger
-├── bench.zig             # Performance microbench + multithreaded soak runner
-├── config.zig            # TOML config parser
-├── proxy/
-│   └── proxy.zig         # Core: accept loop, client handler, relay, DRS, Split-TLS desync
-├── protocol/
-│   ├── tls.zig           # FakeTLS 1.3: ClientHello validation, Nginx template ServerHello
-│   ├── obfuscation.zig   # MTProto handshake parsing, key derivation, nonce generation
-│   ├── middleproxy.zig   # Telegram MiddleProxy transport (RPC_PROXY_REQ/ANS over AES-CBC)
-│   └── constants.zig     # DC addresses, protocol tags, TLS constants
-├── crypto/
-│   └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
-deploy/
-├── install.sh            # One-line VPS bootstrap (Zig + build + systemd + TCPMSS + IPv6)
-├── update.sh             # In-place server updater from GitHub Release artifacts
-├── ipv6-hop.sh           # IPv6 address rotation (Cloudflare API)
-├── mtproto-proxy.service # systemd unit file
-├── update_dns.sh         # Cloudflare DNS A-record updater
-├── capture_template.py   # Capture real Nginx ServerHello for template verification
-├── setup_masking.sh      # Local Nginx for zero-RTT DPI masking
-└── setup_nfqws.sh        # zapret nfqws OS-level TCP desync
-```
+Primary file: `src/proxy/proxy.zig`.
 
-### Connection Flow
-**Client → TCP → Proxy (port 443)**
-1. Client sends TLS 1.3 `ClientHello` (with HMAC-SHA256 auth in SNI digest).
-2. Proxy validates HMAC, sends `ServerHello`.
-3. Client sends `CCS` + 64-byte MTProto obfuscation handshake (in TLS `AppData`).
-4. Proxy derives AES-CTR keys, connects to Telegram DC.
-5. In direct mode (`use_middle_proxy = false`), proxy sends 64-byte obfuscated nonce to regular DCs.
-6. If `use_middle_proxy = true` (or `dc=203`), proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
-7. Promotion tag is carried in ME path as `ad_tag` TL block inside `RPC_PROXY_REQ` and in direct path via promo RPC (`0xaeaf0c42` + 16-byte tag).
-8. **Bidirectional relay**: Client ↔ Proxy ↔ DC
-   - **C2S**: TLS unwrap → AES-CTR decrypt(client) → AES-CTR encrypt(DC) → DC
-   - **S2C (classic DC)**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
-   - **S2C (DC203)**: DC AES-CBC frame → decapsulate `RPC_PROXY_ANS`/`RPC_SIMPLE_ACK` → TLS wrap → Client
+## Core Flow
 
-### Threading Model
-- One thread per connection (spawned from accept loop).
-- **256KB stack per thread**: Prevents OOM when handling thousands of iOS pool connections.
-- Non-blocking sockets + `poll()` in relay loop.
-- No global mutable state — `ProxyState` passed by reference.
-- Proxy binds on `[::]` (IPv6 wildcard) — automatically accepts both IPv4 and IPv6 connections.
+1. Accept client socket (non-blocking).
+2. Parse TLS ClientHello record header/body incrementally.
+3. Validate TLS-auth HMAC.
+4. Validate SNI against configured `tls_domain`.
+5. Build/send fake `ServerHello` (+ optional split/desync behavior).
+6. Read 64-byte MTProto obfuscation handshake.
+7. Resolve route: direct DC or MiddleProxy route.
+8. Enter relay mode (C2S/S2C transform pipeline).
 
-## Telegram Client Behavior Matrix (WIP)
+## Relay Pipeline
 
-We currently keep this section strict: no behavior claims without either (a) reproducible captures/logs, or (b) direct links to client source code with an explicit version/tag/commit.
+### C2S
 
-### iOS (Telegram iOS)
-- **Field evidence (our captures/logs)**: iOS pre-warms multiple idle sockets, can fragment the 64-byte obfuscation handshake across TLS records, and may delay first payload after `ServerHello`.
-- **Version-pinned source snapshot**: `TelegramMessenger/Telegram-iOS` tag `build-26855` (target commit `b16d9acdffa9b3f88db68e26b77a3713e87a92e3`).
-- In this source snapshot, TCP connect timeout is `12s`. Response watchdog is reset on partial reads. Transport-level connection watchdog is `20s`. 
-- Reconnect backoff is stepped (`1s` for early retries, then `4s`, then `8s`).
+- TLS unwrap
+- client AES-CTR decrypt
+- transport encapsulation:
+  - direct DC: AES-CTR encrypt for DC
+  - MiddleProxy: `RPC_PROXY_REQ` framing + CBC layer
 
-**Proxy-side handling used for iOS compatibility:**
-- Two-stage timeout model: `poll()` idle phase (5 min), then active `SO_RCVTIMEO=10s` after payload starts.
-- Handshake assembly loop collects full 64 bytes before switching relay into normal mode.
-- Handshake-stage receive timeout widened to 60s before tightening to normal relay timeout.
+### S2C
 
-### Android (Telegram Android)
-- **Version-pinned source snapshot**: `DrKLO/Telegram` tag `release-11.4.2-5469`.
-- Socket setup uses `TCP_NODELAY`, `O_NONBLOCK`, edge-triggered epoll.
-- Connection type split is explicit (`ConnectionTypeGeneric/Download/Upload/Push/Temp/Proxy`).
-- Datacenter keeps separate connection objects/arrays per type and lazily creates/connects them.
+- transport decapsulation/decrypt
+- client-side AES-CTR encrypt (unless fast-mode path)
+- TLS application record wrapping
 
-### Windows / Linux (Telegram Desktop)
-- **Version-pinned source snapshot**: `telegramdesktop/tdesktop` tag `v6.7.2`.
-- MTProto layer prepares multiple "test connections" across endpoint/protocol variants and selects by priority.
-- Initial TCP path transport full-connect timeout is `8s`.
-- After first success, Desktop may wait `kWaitForBetterTimeout = 2000ms` for a better candidate.
+## MiddleProxy
 
-## ТСПУ / DPI Evasion (Russian ISP Blocking)
+- Runtime path is non-blocking and event-loop integrated.
+- Legacy blocking handshake helpers were removed.
+- Endpoint/secret metadata refresh is periodic.
 
-### Anatomy of the Block
-Российский ТСПУ работает в **два этапа**:
-1. **Пассивный анализ**: видит FakeTLS ClientHello с SNI `wb.ru` к неизвестному VPS → SNI-IP mismatch → IP ставится в очередь на проверку.
-2. **Активные пробы («Ревизор»)**: через 5-10 минут сканер РКН подключается к серверу и делает Replay Attack.
-3. IP улетает в BGP-blackhole за ~20 минут.
+## Anti-Replay
 
-### Solution 1: Anti-Replay Cache (код в `proxy.zig`)
-`ReplayCache` хранит 4096 последних виденных `client_digest`. При повторении выносится решение, что это Ревизор. В ответ маскируется подключение на реальный домен (например, wb.ru).
+- Handshake digest is validated with timestamp skew window.
+- Replay cache key uses canonical HMAC value from validation path.
 
-### Solution 2: TCPMSS Clamping (iptables на сервере)
-```bash
-iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
-```
-Объявляет MSS=88 байт. iOS дробит ClientHello. Реплики не собирают.
+## Message Queue Strategy
 
-### Solution 3: IPv6 Address Hopping (`deploy/ipv6-hop.sh`)
-Генерирует случайный IPv6 из `/64` каждые N минут. Обновляет Cloudflare AAAA-запись через API (TTL=60s).
+- Write path uses chained blocks + `writev` flush.
+- Queue head uses index progression (not repeated `orderedRemove(0)` hot-path shifts).
 
-### Solution 4: Nginx Template ServerHello (код в `tls.zig`)
-Comptime-шаблон генерирует структуру Nginx ServerHello. Правильный порядок расширений, фиксированный размер AppData=2878 байт, детерминированное тело.
+## Platform Scope
 
-### Solution 5: Split-TLS Desync (код в `proxy.zig`)
-Серверный аналог zapret split — разбивает ServerHello на два TCP-сегмента (1 байт и оставшаяся часть) с паузой 3ms.
+- **Linux-only runtime target**.
+- macOS is supported for development/cross-compile, not for production runtime.
 
-### Solution 6: nfqws OS-Level Desync (`deploy/setup_nfqws.sh`)
-Для максимальной защиты — OS-level TCP desync через zapret `nfqws`.
+## Design Principles
 
-## Co-located AmneziaVPN / WireGuard
-When the proxy and AmneziaVPN run on the same server, iOS VPN clients cannot reach `host:443` by default.
-**Fix**:
-```bash
-iptables -I DOCKER-USER -s 10.8.1.0/24 -p tcp --dport 443 -j ACCEPT
-iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
-netfilter-persistent save
-```
+- Keep the hot path non-blocking.
+- Favor explicit state transitions over hidden control flow.
+- Keep security checks in the handshake path strict and cheap.
+- Avoid stale parallel implementations of the same protocol path.

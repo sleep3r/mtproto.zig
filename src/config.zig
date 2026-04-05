@@ -16,8 +16,6 @@ pub const Config = struct {
     backlog: u32 = 4096,
     /// Hard cap for concurrently handled client connections
     max_connections: u32 = 65535,
-    /// Per-connection thread stack size in KiB (minimum 256)
-    thread_stack_kb: u32 = 256,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 300,
     /// Handshake read timeout after first byte arrives
@@ -42,10 +40,6 @@ pub const Config = struct {
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
-    }
-
-    pub fn threadStackBytes(self: *const Config) usize {
-        return @as(usize, self.thread_stack_kb) * 1024;
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -124,9 +118,6 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "max_connections")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.max_connections;
                         cfg.max_connections = @max(@as(u32, 32), parsed);
-                    } else if (std.mem.eql(u8, key, "thread_stack_kb")) {
-                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.thread_stack_kb;
-                        cfg.thread_stack_kb = @max(@as(u32, 256), parsed);
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
                         cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
@@ -206,7 +197,6 @@ test "parse config - valid complete" {
         \\port = 8443
         \\backlog = 8192
         \\max_connections = 6000
-        \\thread_stack_kb = 320
         \\idle_timeout_sec = 180
         \\handshake_timeout_sec = 30
         \\fast_mode = true
@@ -227,7 +217,6 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
-    try std.testing.expectEqual(@as(u32, 320), cfg.thread_stack_kb);
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
@@ -253,7 +242,6 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
     try std.testing.expectEqual(@as(u32, 65535), cfg.max_connections);
-    try std.testing.expectEqual(@as(u32, 256), cfg.thread_stack_kb);
     try std.testing.expectEqual(@as(u32, 300), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 60), cfg.handshake_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
@@ -299,7 +287,6 @@ test "parse config - server runtime tunables lower bounds" {
     const content =
         \\[server]
         \\max_connections = 1
-        \\thread_stack_kb = 16
         \\idle_timeout_sec = 1
         \\handshake_timeout_sec = 1
         \\[access.users]
@@ -310,7 +297,6 @@ test "parse config - server runtime tunables lower bounds" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 32), cfg.max_connections);
-    try std.testing.expectEqual(@as(u32, 256), cfg.thread_stack_kb);
     try std.testing.expectEqual(@as(u32, 5), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 5), cfg.handshake_timeout_sec);
 }

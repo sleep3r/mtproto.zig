@@ -150,23 +150,17 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
 }
 
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
-    const stack_bytes: u64 = @intCast(cfg.threadStackBytes());
-
-    // Approximate per-connection user-space working set:
-    // - thread stack
-    // - handshake + relay TLS buffers
+    // Approximate per-connection user-space working set in the epoll model:
+    // - preallocated slot state and small relay buffers
     // - optional middle-proxy stream buffers (4 buffers)
     // - allocator/socket bookkeeping cushion
-    const tls_working_bytes: u64 = @intCast(
-        constants.max_tls_ciphertext_size * 3 +
-            (constants.max_tls_plaintext_size + 5) * 2,
-    );
+    const tls_working_bytes: u64 = @intCast(6 * 1024);
     const middleproxy_bytes: u64 = if (cfg.use_middle_proxy)
         @intCast(cfg.middleProxyBufferBytes() * 4)
     else
         0;
-    const overhead_bytes: u64 = 64 * 1024;
-    const per_conn_bytes = stack_bytes + tls_working_bytes + middleproxy_bytes + overhead_bytes;
+    const overhead_bytes: u64 = 2 * 1024;
+    const per_conn_bytes = tls_working_bytes + middleproxy_bytes + overhead_bytes;
 
     // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
     const usable_bytes = (total_ram_bytes * 70) / 100;

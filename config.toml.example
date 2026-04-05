@@ -1,50 +1,62 @@
 [general]
-# Telemt compatibility: route regular DC traffic via MiddleProxy transport (required for promo parity)
+# Route regular DC traffic via Telegram MiddleProxy transport.
+# Required when using a promotion tag from @MTProxybot.
 use_middle_proxy = true
 
-# Optional telemt-compatible alias for promotion tag from @MTProxybot
+# Telemt-compatible alias for promotion tag (alternative to [server].tag).
+# If both are set, [server].tag takes priority.
 # ad_tag = "1234567890abcdef1234567890abcdef"
 
 [server]
 port = 443
-# TCP listen queue size (default is 4096)
-# backlog = 4096
-# Hard cap for concurrently served client sockets (default 65535)
-# max_connections = 65535
-# Per-connection handler stack in KiB (default/minimum 256)
-# Values below 256 are clamped for stability.
-# thread_stack_kb = 256
-# Idle timeout before first byte from client in seconds (default 300)
-# Keep high enough for mobile pre-warmed pools.
-# idle_timeout_sec = 300
-# Handshake timeout after first byte arrives in seconds (default 60)
-# handshake_timeout_sec = 60
-# MiddleProxy per-connection stream buffers in KiB (4 buffers per active ME connection)
-# Lower for small VPS RAM, raise for high-throughput media paths
-# middleproxy_buffer_kb = 256
-# Optional: 32 hex-char promotion tag from @MTProxybot
+
+# 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).
 # tag = "1234567890abcdef1234567890abcdef"
 
+# TCP listen queue depth. Higher values absorb connection bursts better.
+# backlog = 4096
+
+# Maximum concurrent client connections. With lazy pool allocation,
+# raising this does NOT increase idle memory — slots are created on demand.
+# max_connections = 65535
+
+# Seconds to wait for the first byte from a new client before dropping.
+# Keep high (300) to accommodate mobile pre-warmed connection pools.
+# idle_timeout_sec = 300
+
+# Seconds to complete TLS+MTProto handshake after first byte arrives.
+# handshake_timeout_sec = 60
+
+# Per-connection MiddleProxy stream buffer size in KiB.
+# Lower (64–128) for RAM-constrained VPS, raise (256–512) for high-throughput media.
+# middleproxy_buffer_kb = 256
+
 [censorship]
-# Domain to impersonate / forward bad clients to
+# Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
+# Choose a popular, high-traffic domain in the target region.
 tls_domain = "google.com"
 
-# Forward unauthenticated connections to tls_domain to defeat DPI
+# Forward unauthenticated / invalid connections to tls_domain (active probing defense).
 mask = true
 
-# Non-standard port override for masking locally (e.g. 8443 for zero-RTT local Nginx)
+# Local port override for mask forwarding (e.g. 8443 for zero-RTT local Nginx).
+# When unset, connects to tls_domain:443 directly.
 # mask_port = 8443
 
-# TCP desync: split ServerHello into 1-byte + rest to evade passive DPI signatures
-desync = true
+# Split ServerHello into 1-byte + 3ms delay + rest (defeats passive DPI signatures).
+# Enabled by default.
+# desync = true
 
-# Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes (mimics real browser behavior)
+# Dynamic Record Sizing: ramp TLS records from 1369 → 16384 bytes to mimic browser behavior.
+# Improves throughput after initial handshake, may help evade statistical traffic analysis.
 # drs = false
 
-# Recommended: Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC
+# Delegate S2C AES encryption to the Telegram DC (reduces CPU and memory usage).
+# Recommended for all deployments.
 fast_mode = true
 
 [access.users]
-# 32 hex-char secret (16 bytes) per user. Generate with: openssl rand -hex 16
+# 32 hex-char secret (16 bytes) per user.
+# Generate with: openssl rand -hex 16
 user1 = "00112233445566778899aabbccddeeff"
 user2 = "ffeeddccbbaa99887766554433221100"

@@ -20,6 +20,8 @@ pub const TlsValidation = struct {
     session_id: []const u8,
     /// Client digest for response generation
     digest: [constants.tls_digest_len]u8,
+    /// Canonical HMAC before timestamp XOR masking (for replay protection)
+    canonical_hmac: [constants.tls_digest_len]u8,
     /// Timestamp extracted from digest
     timestamp: u32,
     /// The 16-byte user secret that matched (needed for ServerHello HMAC)
@@ -87,6 +89,7 @@ pub fn validateTlsHandshake(
             .user = entry.name,
             .session_id = handshake[session_id_start .. session_id_start + session_id_len],
             .digest = digest,
+            .canonical_hmac = computed,
             .timestamp = timestamp,
             .secret = entry.secret,
         };
@@ -551,4 +554,30 @@ test "extractSni - malformed returns null" {
     try std.testing.expect(extractSni(&[_]u8{ 0x16, 0x03, 0x01, 0x00 }) == null);
     // Not a handshake type
     try std.testing.expect(extractSni(&[_]u8{ 0x17, 0x03, 0x01, 0x00, 0x00 }) == null);
+}
+
+test "validateTlsHandshake returns canonical_hmac" {
+    const allocator = std.testing.allocator;
+
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var handshake = [_]u8{0x00} ** 64;
+
+    var hmac_input = std.mem.zeroes([64]u8);
+    hmac_input[43] = 4;
+    hmac_input[44] = 0xaa;
+
+    const computed_mac = crypto.sha256Hmac(&secrets[0].secret, &hmac_input);
+    @memcpy(&handshake, &hmac_input);
+    @memcpy(handshake[constants.tls_digest_pos..][0..28], computed_mac[0..28]);
+
+    const timestamp: u32 = 0x01020304;
+    const ts_bytes = std.mem.toBytes(timestamp);
+    handshake[constants.tls_digest_pos + 28] = computed_mac[28] ^ ts_bytes[0];
+    handshake[constants.tls_digest_pos + 29] = computed_mac[29] ^ ts_bytes[1];
+    handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
+    handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
+
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualSlices(u8, &computed_mac, &result.?.canonical_hmac);
 }

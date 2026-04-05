@@ -1,4 +1,4 @@
-.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual stability-check stability-check-load
+.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual stability-check stability-check-load capacity-probe-idle capacity-probe-active
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -101,3 +101,11 @@ stability-check:
 # Load-only mode (no /proc assertions, useful for quick local smoke)
 stability-check-load:
 	python3 test/connection_stability_check.py --host $(HOST) --port $(PORT)
+
+# Capacity probe (idle sockets; FD/socket ceiling)
+capacity-probe-idle:
+	python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode idle
+
+# Capacity probe (authenticated traffic; memory-efficiency comparison)
+capacity-probe-active:
+	python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth
