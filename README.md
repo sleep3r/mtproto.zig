@@ -52,7 +52,6 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 ## &nbsp; Benchmark Snapshot
 
 > Final validation run on VPS (1 vCPU / 1 GB RAM, Ubuntu 24.04, April 2026). Proxies were tested in isolation with the same probe harness. Full methodology and commands: `test/README.md`.
-> Dataset sources: `test/capacity_connections_tls_auth.final_all.json` and `test/capacity_connections_idle.final_all.json`.
 
 ### Baseline Footprint
 
