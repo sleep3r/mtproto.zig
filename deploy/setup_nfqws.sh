@@ -99,8 +99,8 @@ else
     info "Building nfqws..."
     cd "${ZAPRET_DIR}/nfq"
     make clean >/dev/null 2>&1 || true
-    make >/dev/null 2>&1
-    [[ -x nfqws ]] || fail "nfqws build failed"
+    make >/dev/null 2>&1 || true
+    [[ -x nfqws ]] || fail "nfqws build failed (check make logs)"
     ok "nfqws built successfully"
 fi
 
@@ -109,11 +109,15 @@ info "Setting up NFQUEUE rules..."
 
 # Remove old rules (idempotent)
 iptables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
-ip6tables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
 
 # Add NFQUEUE rules — intercept outbound TCP from port 443
 iptables -t mangle -A OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM"
-ip6tables -t mangle -A OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM"
+
+# Safely handle IPv6 (may be disabled on some kernels)
+if command -v ip6tables &>/dev/null; then
+    ip6tables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
+    ip6tables -t mangle -A OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
+fi
 
 # Persist rules
 mkdir -p /etc/iptables
