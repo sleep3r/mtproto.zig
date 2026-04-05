@@ -107,13 +107,10 @@ sudo -E python3 test/capacity_connections_probe.py \
 
 ## Final Snapshot (Current)
 
-Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
+Host: (1 vCPU / 1 GB RAM)
 
 Notes:
 
-- Primary publication datasets:
-  - `test/capacity_connections_tls_auth.final_all.json`
-  - `test/capacity_connections_idle.final_all.json`
 - Startup failures are now classified as `startup_exited` vs `startup_timeout` and include `log_tail` for root-cause visibility.
 
 ### TLS-auth @ 2000
