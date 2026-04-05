@@ -66,3 +66,27 @@ ssh root@<SERVER_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Thre
 # Verify TCPMSS clamping rule (against DPI)
 ssh root@<SERVER_IP> 'iptables -t mangle -L OUTPUT -n -v | grep TCPMSS'
 ```
+
+## Capacity & Performance Check
+
+Check the startup banner for the **CAPACITY** section to ensure your `max_connections` setting is safe for your VPS RAM.
+
+### 1. Check startup banner
+```bash
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 50'
+```
+Look for:
+- **`Host RAM`**: Detected total memory.
+- **`Per conn`**: Estimated memory footprint per user session.
+- **`Safe cap`**: Calculated limit for stable operation.
+
+> [!WARNING]
+> If you see `max_connections=X is above safe estimate` in yellow, your server may OOM under peak load. Reduce `max_connections` in `config.toml`.
+
+### 2. Run automated capacity probe
+To find the absolute ceiling of your VPS:
+
+```bash
+ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig'
+```
+Watch for `max_established_observed` and `rss_kb` growth.

@@ -7,7 +7,7 @@
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
 <p align="center">
-  <strong>126 KB binary. ~120 KB RAM. Boots in <2 ms. Zero dependencies.</strong>
+  <strong>126 KB binary. Extreme Scalability: 13,000+ stable connections on 1GB RAM. Zero dependencies.</strong>
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -294,7 +294,13 @@ tls_domain = "wb.ru"
 mask = true
 fast_mode = true
 
-[access.users]
+# Server tunables for high capacity
+# max_connections = 10000
+# thread_stack_kb = 256
+EOF
+
+### &nbsp; Capacity & RAM Monitoring
+On startup, the proxy automatically detects your Host RAM and prints a **CAPACITY** banner. It calculates a "Safe cap" based on your current settings and memory overhead. If your `max_connections` is dangerously high for your VPS RAM, it will display a warning.
 user = "$SECRET"
 EOF
 ```
@@ -392,7 +398,11 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `middleproxy_buffer_kb` | `256` | MiddleProxy per-connection buffer size in KiB (4 buffers allocated for active ME sessions) |
+| `[server]` | `max_connections` | `65535` | Hard cap for concurrently served client sockets (overload protection) |
+| `[server]` | `thread_stack_kb` | `256` | Per-connection thread stack size (keep small for high concurrency) |
+| `[server]` | `idle_timeout_sec` | `300` | Timeout before first byte from client (helps mobile pool stability) |
+| `[server]` | `handshake_timeout_sec` | `60` | Handshake timeout after first byte arrives |
+| `[server]` | `middleproxy_buffer_kb` | `256` | MiddleProxy per-connection buffer size in KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |

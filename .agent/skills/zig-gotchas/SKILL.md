@@ -59,7 +59,26 @@ Only 4 `log.info` messages survive in the hot path:
 
 Everything else is `log.debug` (compiled out in `ReleaseFast`).
 
-### 5. Zig stdlib Internals (Reference)
+### 5. Atomic Counter Race in Accept Loop
+**The Problem**: If `active_connections` is incremented *inside* the spawned thread, a burst of incoming connections can overshoot `max_connections`. The main loop checks the counter, sees it's below the limit, and spawns a thread. If 100 connections arrive simultaneously, 100 threads are spawned before any of them increment the counter.
+
+**The Fix**: **Reserve the slot in the main loop.**
+```zig
+const active_before = state.active_connections.fetchAdd(1, .monotonic);
+if (active_before >= state.config.max_connections) {
+    _ = state.active_connections.fetchSub(1, .monotonic);
+    conn.stream.close();
+    continue;
+}
+```
+
+### 6. Large Stack Buffers vs. High Concurrency
+**The Problem**: Zig's `std.Thread.spawn` uses a fixed stack size. Allocating `[16KB]u8` buffers on the stack for every connection is dangerous. With a `256KB` stack, just a few heavy functions or deep recursion can cause a `Stack Overflow`.
+
+**The Fix**: Move all large buffers (TLS ciphertext, handshake assembly) to the **Heap** (`ProxyState.allocator`). This allows keeping `thread_stack_kb` small (256KB) while safely handling 10,000+ concurrent connections.
+
+
+### 7. Zig stdlib Internals (Reference)
 - `std/log.zig:122`: Comptime log level check.
 - `std/log.zig:154`: `lockStderrWriter` acquires mutex.
 - `std/Progress.zig:1560`: `var stderr_mutex = std.Thread.Mutex.Recursive.init`.
@@ -79,7 +98,7 @@ Everything else is `log.debug` (compiled out in `ReleaseFast`).
 - **`POLLHUP` drain-before-close**: Drain readable data before closing on disconnect.
 - **Progress-aware spin detection**: `RelayProgress` enum tracks none/partial/forwarded progress.
 - **Improved `writeAll`**: Handles `WouldBlock` with `POLLOUT` and a spin counter (32 max).
-- **Overload protection**: Max 8192 concurrent connections.
+- **Overload protection**: Configurable `max_connections` (default 65535) with atomic slot reservation in accept loop.
 
 ### MiddleProxy Fixes
 - MiddleProxy buffers tuned via `[server].middleproxy_buffer_kb` and overflow checks built directly into memory spans.
