@@ -109,17 +109,24 @@ sudo -E python3 test/capacity_connections_probe.py \
 
 Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
 
+Notes:
+
+- Primary publication datasets:
+  - `test/capacity_connections_tls_auth.final_all.json`
+  - `test/capacity_connections_idle.final_all.json`
+- Startup failures are now classified as `startup_exited` vs `startup_timeout` and include `log_tail` for root-cause visibility.
+
 ### TLS-auth @ 2000
 
 | Proxy | RSS (KB) | Established | Stable |
 |---|---:|---:|---|
 | **mtproto.zig** | **8,832** | **2,000** | ✅ |
 | Official MTProxy | 23,296 | 2,000 | ✅ |
-| Teleproxy | 21,024 | 2,000 | ✅ |
-| Telemt | startup_failed | - | - |
-| mtg | 72,192 | 0 | ❌ |
+| Teleproxy | 20,952 | 2,000 | ✅ |
+| Telemt | 38,272 | 2,000 | ✅ |
+| mtg | 55,296 | 0 | ⚠ partial (payload_ok=2000, established=0) |
 | mtprotoproxy | 50,944 | 2,000 | ✅ |
-| mtproto_proxy | startup_failed | - | - |
+| mtproto_proxy | startup_exited | - | - |
 
 `mtproto.zig` vs historical baseline (`84,544 KB`): **-89.55% RSS** at 2000.
 
@@ -128,12 +135,12 @@ Host: `38.180.236.207` (1 vCPU / 1 GB RAM)
 | Proxy | RSS (KB) | Established | Stable |
 |---|---:|---:|---|
 | **mtproto.zig** | **49,024** | **12,000** | ✅ |
-| Official MTProxy | 74,224 | 12,000 | ✅ |
-| Teleproxy | 77,964 | 12,000 | ✅ |
-| Telemt | 70,108 | 11,023 | ❌ |
-| mtg | 106,368 | 7,339 | ❌ |
-| mtprotoproxy | 115,888 | 9,088 | ❌ |
-| mtproto_proxy | startup_failed | - | - |
+| Telemt | 70,032 | 11,023 | ⚠ partial @12000 (stable up to 8000) |
+| Official MTProxy | 74,116 | 12,000 | ✅ |
+| Teleproxy | 77,864 | 12,000 | ✅ |
+| mtg | 97,792 | 7,287 | ⚠ partial @12000 (stable up to 4000) |
+| mtprotoproxy | 123,724 | 12,000 | ✅ |
+| mtproto_proxy | 396,328 | 12,000 | ✅ (idle-only; TLS-auth startup_exited) |
 
 ## Interpreting Results Correctly
 

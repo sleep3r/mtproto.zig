@@ -190,12 +190,19 @@ def tree_rss_kb(pid: int) -> int:
 
 
 def listener_pid(port: int) -> Optional[int]:
+    ids = listener_pids(port)
+    if not ids:
+        return None
+    return ids[0]
+
+
+def listener_pids(port: int) -> list[int]:
     try:
         out = subprocess.check_output(
             ["ss", "-ltnp"], text=True, stderr=subprocess.DEVNULL
         )
     except (subprocess.SubprocessError, FileNotFoundError):
-        return None
+        return []
 
     ids: list[int] = []
     needle = f":{port} "
@@ -205,8 +212,8 @@ def listener_pid(port: int) -> Optional[int]:
         ids.extend(int(m.group(1)) for m in re.finditer(r"pid=(\d+)", line))
 
     if not ids:
-        return None
-    return sorted(ids)[0]
+        return []
+    return sorted(set(ids))
 
 
 def established_count(port: int) -> int:
@@ -258,8 +265,80 @@ def kill_tree(root_pid: Optional[int]) -> None:
 
 
 def cleanup_port(port: int) -> None:
-    kill_tree(listener_pid(port))
-    time.sleep(0.15)
+    for _ in range(3):
+        pids = listener_pids(port)
+        if not pids:
+            break
+        for pid in pids:
+            kill_tree(pid)
+        time.sleep(0.15)
+
+
+def read_cmdline_args(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    if not raw:
+        return []
+    parts = [p for p in raw.split(b"\x00") if p]
+    out: list[str] = []
+    for part in parts:
+        try:
+            out.append(part.decode("utf-8", errors="replace"))
+        except Exception:
+            out.append("")
+    return out
+
+
+def command_matches_profile(pid_args: list[str], profile_cmd: list[str]) -> bool:
+    if not pid_args or not profile_cmd:
+        return False
+
+    target0 = profile_cmd[0]
+    if target0.startswith("/"):
+        return target0 in pid_args
+
+    target0_base = os.path.basename(target0)
+    pid0_base = os.path.basename(pid_args[0])
+    if target0_base.startswith("python"):
+        script_markers = [x for x in profile_cmd[1:] if x.endswith(".py")]
+        if not script_markers:
+            return False
+        return pid0_base.startswith("python") and all(
+            m in pid_args for m in script_markers
+        )
+
+    return pid0_base == target0_base
+
+
+def kill_profile_processes(
+    profile: Profile, exclude: Optional[set[int]] = None
+) -> None:
+    excluded = exclude or set()
+    matched: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in excluded or pid == os.getpid():
+            continue
+        pid_args = read_cmdline_args(pid)
+        if command_matches_profile(pid_args, profile.command):
+            matched.append(pid)
+
+    for pid in matched:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if matched:
+        time.sleep(0.2)
+    for pid in matched:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def wait_for_listen(port: int, timeout_sec: float) -> bool:
@@ -274,6 +353,34 @@ def wait_for_listen(port: int, timeout_sec: float) -> bool:
             s.close()
         time.sleep(0.02)
     return False
+
+
+def wait_for_profile_listen(
+    process: subprocess.Popen[object], port: int, timeout_sec: float
+) -> tuple[bool, str]:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        listen_pid = listener_pid(port)
+        if listen_pid is not None:
+            if listen_pid in descendants(process.pid):
+                return True, "ok"
+
+        if process.poll() is not None:
+            return False, "exited"
+
+        time.sleep(0.02)
+
+    return False, "timeout"
+
+
+def read_log_tail(path: Path, max_lines: int = 30) -> list[str]:
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+    return lines[-max_lines:]
 
 
 def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
@@ -630,6 +737,8 @@ def run_profile(
     profile: Profile, args: argparse.Namespace, results_dir: Path
 ) -> dict[str, object]:
     cleanup_port(profile.port)
+    kill_profile_processes(profile)
+    cleanup_port(profile.port)
 
     if profile.prep == "set_low_pid":
         try:
@@ -668,16 +777,31 @@ def run_profile(
     with log_path.open("w") as log_file:
         process = subprocess.Popen(profile.command, stdout=log_file, stderr=log_file)
 
-    if not wait_for_listen(profile.port, args.startup_timeout_sec):
+    startup_wait_total = args.startup_timeout_sec
+    started, startup_state = wait_for_profile_listen(
+        process, profile.port, args.startup_timeout_sec
+    )
+    if (not started) and startup_state != "exited" and args.startup_grace_sec > 0:
+        startup_wait_total += args.startup_grace_sec
+        started, startup_state = wait_for_profile_listen(
+            process, profile.port, args.startup_grace_sec
+        )
+
+    if not started:
         rc = process.poll()
+        err = "startup_exited" if startup_state == "exited" else "startup_timeout"
         if rc is None:
             kill_tree(process.pid)
             rc = -999
+        kill_profile_processes(profile, exclude={process.pid})
+        tail = read_log_tail(log_path)
         return {
             "name": profile.name,
             "ok": False,
-            "error": "startup_failed",
+            "error": err,
             "rc": rc,
+            "startup_wait_sec": startup_wait_total,
+            "log_tail": tail,
             "log": str(log_path),
             "command": profile.command,
         }
@@ -751,6 +875,7 @@ def run_profile(
 
     kill_tree(root_pid)
     kill_tree(process.pid)
+    kill_profile_processes(profile, exclude={process.pid, root_pid})
     cleanup_port(profile.port)
 
     return {
@@ -811,6 +936,12 @@ def main() -> int:
         help="Stable threshold: established >= target * ratio",
     )
     parser.add_argument("--startup-timeout-sec", type=float, default=45.0)
+    parser.add_argument(
+        "--startup-grace-sec",
+        type=float,
+        default=45.0,
+        help="Extra listen wait after startup timeout before declaring failure",
+    )
     parser.add_argument(
         "--traffic-mode",
         choices=["idle", "tls-auth", "tls-auth-full", "tls-clienthello"],
