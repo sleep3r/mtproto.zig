@@ -20,6 +20,8 @@ const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
 const event_loop_wait_ms = 37;
+const accept_backoff_ms: i64 = 500;
+const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
@@ -888,6 +890,8 @@ const EventLoop = struct {
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
     pool: ConnectionPool,
+    accept_paused: bool,
+    accept_resume_ns: i128,
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -898,6 +902,8 @@ const EventLoop = struct {
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
+            .accept_paused = false,
+            .accept_resume_ns = 0,
         };
         errdefer loop.pool.deinit();
 
@@ -946,6 +952,9 @@ const EventLoop = struct {
             }
 
             const now_ns = std.time.nanoTimestamp();
+            if (self.accept_paused and now_ns >= self.accept_resume_ns) {
+                self.resumeAccepting();
+            }
             if (now_ns >= next_timer_tick_ns) {
                 self.runTimers();
                 next_timer_tick_ns = now_ns + timer_tick_ns;
@@ -994,8 +1003,14 @@ const EventLoop = struct {
             var client_addr: net.Address = undefined;
             var client_len: posix.socklen_t = @sizeOf(net.Address);
             const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
-                if (err == error.WouldBlock) return;
-                return err;
+                switch (err) {
+                    error.WouldBlock => return,
+                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+                        self.pauseAccepting(err);
+                        return;
+                    },
+                    else => return err,
+                }
             };
 
             const active_before = self.state.active_connections.fetchAdd(1, .monotonic);
@@ -1030,6 +1045,37 @@ const EventLoop = struct {
                 continue;
             }
         }
+    }
+
+    fn pauseAccepting(self: *EventLoop, err: anyerror) void {
+        self.accept_resume_ns = std.time.nanoTimestamp() + accept_backoff_ns;
+        if (self.accept_paused) return;
+
+        self.modFd(self.listen_fd, false, false) catch |mod_err| {
+            log.err("failed to pause accepts after fd quota error: {any}", .{mod_err});
+            return;
+        };
+
+        self.accept_paused = true;
+        const needed = @as(usize, self.state.config.max_connections) * 2 + 512;
+        log.warn("fd quota reached ({any}); pausing accepts for {d}ms (recommended LimitNOFILE >= {d})", .{
+            err,
+            accept_backoff_ms,
+            needed,
+        });
+    }
+
+    fn resumeAccepting(self: *EventLoop) void {
+        if (!self.accept_paused) return;
+
+        self.modFd(self.listen_fd, true, false) catch |err| {
+            self.accept_resume_ns = std.time.nanoTimestamp() + accept_backoff_ns;
+            log.warn("failed to resume accepts; retry in {d}ms: {any}", .{ accept_backoff_ms, err });
+            return;
+        };
+
+        self.accept_paused = false;
+        self.accept_resume_ns = 0;
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
