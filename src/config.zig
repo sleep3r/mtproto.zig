@@ -34,13 +34,46 @@ pub const Config = struct {
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
-    /// Per-connection MiddleProxy stream buffers size, in KiB (applies to 4 buffers)
-    middleproxy_buffer_kb: u32 = 256,
+    /// Per-connection MiddleProxy stream buffers size, in KiB (applies to 4 buffers).
+    /// Minimum 1024 recommended — lower values cause MiddleProxyBufferOverflow on media
+    /// downloads (Stories, video messages) through middle proxy.
+    middleproxy_buffer_kb: u32 = 1024,
+    /// Runtime log level: "debug", "info" (default), "warn", "err"
+    log_level: std.log.Level = .info,
+    /// Max new connections per second per /24 subnet (0 = disabled).
+    /// Limits scanner/flood/DPI-probe impact. Generous for legitimate Telegram clients
+    /// which open 3-6 connections at startup and hold them.
+    rate_limit_per_subnet: u8 = 8,
+    /// When true, disables auto-clamping of max_connections to the RAM-safe estimate.
+    /// Use only if you know your host has enough memory for the configured limits.
+    unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
+    }
+
+    /// Emit startup warnings for configuration values known to cause issues.
+    pub fn emitWarnings(self: *const Config) void {
+        if (self.use_middle_proxy and self.middleproxy_buffer_kb < 1024) {
+            const log = std.log.scoped(.config);
+            log.warn(
+                "middleproxy_buffer_kb={d} is below recommended minimum (1024). " ++
+                    "This may cause MiddleProxyBufferOverflow errors on media-heavy " ++
+                    "traffic (Stories, video downloads). Consider increasing to 1024+.",
+                .{self.middleproxy_buffer_kb},
+            );
+        }
+        if (self.use_middle_proxy and self.max_connections > 2000) {
+            const log = std.log.scoped(.config);
+            const mem_per_conn_mb = (self.middleProxyBufferBytes() * 4) / (1024 * 1024);
+            log.warn(
+                "max_connections={d} with middleproxy_buffer_kb={d} may require " ++
+                    "up to {d} MB of RAM at full capacity. Ensure your VPS has sufficient memory.",
+                .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections },
+            );
+        }
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -138,6 +171,20 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.middleproxy_buffer_kb;
                         cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
+                    } else if (std.mem.eql(u8, key, "log_level")) {
+                        if (std.mem.eql(u8, value, "debug")) {
+                            cfg.log_level = .debug;
+                        } else if (std.mem.eql(u8, value, "info")) {
+                            cfg.log_level = .info;
+                        } else if (std.mem.eql(u8, value, "warn")) {
+                            cfg.log_level = .warn;
+                        } else if (std.mem.eql(u8, value, "err")) {
+                            cfg.log_level = .err;
+                        }
+                    } else if (std.mem.eql(u8, key, "rate_limit_per_subnet")) {
+                        cfg.rate_limit_per_subnet = std.fmt.parseInt(u8, value, 10) catch cfg.rate_limit_per_subnet;
+                    } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
+                        cfg.unsafe_override_limits = std.mem.eql(u8, value, "true");
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
@@ -250,8 +297,10 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expect(!cfg.fast_mode); // Default is false
-    try std.testing.expectEqual(@as(u32, 256), cfg.middleproxy_buffer_kb);
-    try std.testing.expectEqual(@as(usize, 256 * 1024), cfg.middleProxyBufferBytes());
+    try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
+    try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
+    try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
 }
 
@@ -282,6 +331,46 @@ test "parse config - middleproxy buffer lower bound" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 64), cfg.middleproxy_buffer_kb);
+}
+
+test "parse config - log_level debug" {
+    const content =
+        \\[server]
+        \\log_level = "debug"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.log.Level.debug, cfg.log_level);
+}
+
+test "parse config - log_level warn" {
+    const content =
+        \\[server]
+        \\log_level = "warn"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.log.Level.warn, cfg.log_level);
+}
+
+test "parse config - log_level default is info" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.log.Level.info, cfg.log_level);
 }
 
 test "parse config - server runtime tunables lower bounds" {
@@ -433,4 +522,194 @@ test "parse config - server tag overrides general ad_tag" {
     try std.testing.expect(cfg.tag != null);
     const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
     try std.testing.expectEqual(expected_tag, cfg.tag.?);
+}
+
+test "parse config - rate_limit_per_subnet custom" {
+    const content =
+        \\[server]
+        \\rate_limit_per_subnet = 20
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u8, 20), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - rate_limit_per_subnet disabled" {
+    const content =
+        \\[server]
+        \\rate_limit_per_subnet = 0
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - unsafe_override_limits true" {
+    const content =
+        \\[server]
+        \\unsafe_override_limits = true
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.unsafe_override_limits);
+}
+
+test "parse config - unsafe_override_limits default false" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(!cfg.unsafe_override_limits);
+}
+
+test "parse config - full production-like config" {
+    const content =
+        \\[general]
+        \\use_middle_proxy = true
+        \\
+        \\[server]
+        \\port = 443
+        \\tag = 9649114fbafd6fe2ae98ca635c4e4007
+        \\middleproxy_buffer_kb = 1024
+        \\max_connections = 512
+        \\idle_timeout_sec = 120
+        \\handshake_timeout_sec = 15
+        \\backlog = 8192
+        \\log_level = "info"
+        \\rate_limit_per_subnet = 8
+        \\
+        \\[censorship]
+        \\tls_domain = "wb.ru"
+        \\mask = true
+        \\fast_mode = true
+        \\mask_port = 8443
+        \\drs = true
+        \\
+        \\[access.users]
+        \\alexander = "0b513f6e83524354984a8835939fa9af"
+        \\debug_user = "c8f31d0a8b7f4d2c91e6a5b3d4f8e102"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.use_middle_proxy);
+    try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expect(cfg.tag != null);
+    try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
+    try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
+    try std.testing.expectEqual(std.log.Level.info, cfg.log_level);
+    try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
+    try std.testing.expect(!cfg.unsafe_override_limits);
+    try std.testing.expectEqualStrings("wb.ru", cfg.tls_domain);
+    try std.testing.expect(cfg.mask);
+    try std.testing.expect(cfg.fast_mode);
+    try std.testing.expectEqual(@as(u16, 8443), cfg.mask_port);
+    try std.testing.expect(cfg.drs);
+    try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
+    try std.testing.expect(cfg.users.contains("alexander"));
+    try std.testing.expect(cfg.users.contains("debug_user"));
+}
+
+test "parse config - log_level err" {
+    const content =
+        \\[server]
+        \\log_level = "err"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.log.Level.err, cfg.log_level);
+}
+
+test "parse config - invalid log_level keeps default" {
+    const content =
+        \\[server]
+        \\log_level = "banana"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(std.log.Level.info, cfg.log_level);
+}
+
+test "parse config - invalid rate_limit keeps default" {
+    const content =
+        \\[server]
+        \\rate_limit_per_subnet = notanumber
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - censorship section booleans" {
+    const content =
+        \\[censorship]
+        \\mask = false
+        \\desync = false
+        \\drs = true
+        \\fast_mode = true
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(!cfg.mask);
+    try std.testing.expect(!cfg.desync);
+    try std.testing.expect(cfg.drs);
+    try std.testing.expect(cfg.fast_mode);
+}
+
+test "parse config - multiple users" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\bob = "aabbccddeeff00112233445566778899"
+        \\charlie = "ffeeddccbbaa99887766554433221100"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.users.count());
+    try std.testing.expect(cfg.users.contains("alice"));
+    try std.testing.expect(cfg.users.contains("bob"));
+    try std.testing.expect(cfg.users.contains("charlie"));
+
+    // Verify secret bytes are correct
+    const alice_secret = cfg.users.get("alice").?;
+    try std.testing.expectEqual(@as(u8, 0x00), alice_secret[0]);
+    try std.testing.expectEqual(@as(u8, 0xff), alice_secret[15]);
 }

@@ -28,8 +28,26 @@ port = 443
 # handshake_timeout_sec = 60
 
 # Per-connection MiddleProxy stream buffer size in KiB.
-# Lower (64–128) for RAM-constrained VPS, raise (256–512) for high-throughput media.
-# middleproxy_buffer_kb = 256
+# 1024 (default) is the validated minimum for reliable media downloads (Stories, video).
+# Values below 1024 may cause MiddleProxyBufferOverflow on media-heavy sessions.
+# Raise to 2048 for high-throughput media; values below 512 are not recommended.
+# middleproxy_buffer_kb = 1024
+
+# Runtime log verbosity: debug, info (default), warn, err.
+# Set to "debug" to see DC routing, relay errors, and connection lifecycle details.
+# Change takes effect on restart — no recompilation needed.
+# log_level = "info"
+
+# Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet.
+# Limits scanner/flood/DPI-probe impact. Default of 8 is generous for
+# legitimate Telegram clients (3-6 connections at startup, then hold).
+# Set to 0 to disable rate limiting entirely.
+# rate_limit_per_subnet = 8
+
+# By default, max_connections is auto-clamped to a RAM-safe estimate on startup.
+# Set to true to disable this safety mechanism (only if you're sure your host
+# has enough memory for the configured limits).
+# unsafe_override_limits = false
 
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.

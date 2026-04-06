@@ -35,6 +35,61 @@ const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
 
+/// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
+/// Fixed 256-bucket hash table — zero heap allocation.
+/// Token bucket per subnet: each second refills up to max_per_sec tokens.
+const SubnetRateLimit = struct {
+    const BUCKETS = 256;
+    const Entry = struct {
+        subnet_key: u32 = 0,
+        tokens: u8 = 0,
+        last_refill_s: i64 = 0,
+    };
+    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+
+    /// Returns true if the connection is allowed, false if rate-limited.
+    fn check(self: *SubnetRateLimit, addr: net.Address, max_per_sec: u8) bool {
+        if (max_per_sec == 0) return true;
+        const key = subnetKey(addr);
+        const idx = key % BUCKETS;
+        const e = &self.entries[idx];
+        const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
+
+        if (e.subnet_key != key or now_s - e.last_refill_s > 60) {
+            // New subnet or stale entry — reset
+            e.* = .{ .subnet_key = key, .tokens = max_per_sec -| 1, .last_refill_s = now_s };
+            return true;
+        }
+
+        // Refill tokens based on elapsed seconds
+        const elapsed = now_s - e.last_refill_s;
+        if (elapsed > 0) {
+            const refill: u16 = @intCast(@min(elapsed, 255));
+            e.tokens = @min(max_per_sec, e.tokens +| @as(u8, @intCast(@min(refill * @as(u16, max_per_sec), 255))));
+            e.last_refill_s = now_s;
+        }
+
+        if (e.tokens > 0) {
+            e.tokens -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn subnetKey(addr: net.Address) u32 {
+        if (addr.any.family == posix.AF.INET) {
+            // /24 subnet: mask off last octet
+            const ip_bytes = std.mem.asBytes(&addr.in.sa.addr);
+            return @as(u32, ip_bytes[0]) << 16 | @as(u32, ip_bytes[1]) << 8 | @as(u32, ip_bytes[2]);
+        } else if (addr.any.family == posix.AF.INET6) {
+            // /48 subnet: first 6 bytes hashed to u32
+            const ip6 = &addr.in6.sa.addr;
+            return @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]) ^ (@as(u32, ip6[4]) << 8 | @as(u32, ip6[5]));
+        }
+        return 0;
+    }
+};
+
 const MsgBlockClass = enum(u2) {
     tiny = 0,
     small = 1,
@@ -621,8 +676,17 @@ pub const ProxyState = struct {
     user_secrets: []const obfuscation.UserSecret,
     connection_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
+    handshakes_inflight: std.atomic.Value(u32),
     mask_addr: ?net.Address,
     replay_cache: ReplayCache,
+
+    // Degradation counters (monotonic totals, delta'd in stats log)
+    stats_dropped_cap: std.atomic.Value(u64),
+    stats_dropped_saturation: std.atomic.Value(u64),
+    stats_dropped_rate_limit: std.atomic.Value(u64),
+    stats_dropped_hs_budget: std.atomic.Value(u64),
+    stats_hs_timeout: std.atomic.Value(u64),
+    stats_mp_fallback: std.atomic.Value(u64),
 
     middle_proxy_lock: std.Thread.RwLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
@@ -679,8 +743,15 @@ pub const ProxyState = struct {
             .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
             .connection_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
+            .handshakes_inflight = std.atomic.Value(u32).init(0),
             .mask_addr = resolved_addr,
             .replay_cache = .{},
+            .stats_dropped_cap = std.atomic.Value(u64).init(0),
+            .stats_dropped_saturation = std.atomic.Value(u64).init(0),
+            .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
+            .stats_dropped_hs_budget = std.atomic.Value(u64).init(0),
+            .stats_hs_timeout = std.atomic.Value(u64).init(0),
+            .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
             .middle_proxy_addrs_dc4 = [_]net.Address{constants.tg_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_middle_proxies_v4[3]} ** 15),
@@ -924,10 +995,19 @@ const EventLoop = struct {
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
+    saturation_paused: bool,
     timer_scan_cursor: u32,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
+    subnet_limiter: SubnetRateLimit,
+    // Snapshot of degradation counters for delta logging
+    prev_dropped_cap: u64,
+    prev_dropped_saturation: u64,
+    prev_dropped_rate_limit: u64,
+    prev_dropped_hs_budget: u64,
+    prev_hs_timeout: u64,
+    prev_mp_fallback: u64,
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -940,10 +1020,18 @@ const EventLoop = struct {
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
             .accept_paused = false,
             .accept_resume_ns = 0,
+            .saturation_paused = false,
             .timer_scan_cursor = 0,
             .stats_next_log_ns = std.time.nanoTimestamp() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
+            .subnet_limiter = .{},
+            .prev_dropped_cap = 0,
+            .prev_dropped_saturation = 0,
+            .prev_dropped_rate_limit = 0,
+            .prev_dropped_hs_budget = 0,
+            .prev_hs_timeout = 0,
+            .prev_mp_fallback = 0,
         };
         errdefer loop.pool.deinit();
 
@@ -995,6 +1083,14 @@ const EventLoop = struct {
             if (self.accept_paused and now_ns >= self.accept_resume_ns) {
                 self.resumeAccepting();
             }
+            // Saturation hysteresis: resume accepting when active drops below 80%
+            if (self.saturation_paused) {
+                const active = self.state.active_connections.load(.monotonic);
+                const resume_threshold = (self.state.config.max_connections * 8) / 10;
+                if (active <= resume_threshold) {
+                    self.resumeSaturation();
+                }
+            }
             if (now_ns >= next_timer_tick_ns) {
                 self.runTimers();
                 next_timer_tick_ns = now_ns + timer_tick_ns;
@@ -1042,6 +1138,18 @@ const EventLoop = struct {
     }
 
     fn acceptNewConnections(self: *EventLoop) !void {
+        // Saturation hysteresis: if active > 90% of max, stop accepting entirely.
+        // Resume only when active drops below 80% (checked in run() loop).
+        const active_now = self.state.active_connections.load(.monotonic);
+        const max = self.state.config.max_connections;
+        if (active_now >= (max * 9) / 10) {
+            if (!self.saturation_paused) {
+                self.pauseSaturation();
+            }
+            _ = self.state.stats_dropped_saturation.fetchAdd(1, .monotonic);
+            return;
+        }
+
         var accepted_this_round: usize = 0;
         while (accepted_this_round < accept_batch_limit) {
             var client_addr: net.Address = undefined;
@@ -1058,14 +1166,35 @@ const EventLoop = struct {
             };
             accepted_this_round += 1;
 
+            // Per-/24 subnet rate limit (before we allocate any slot)
+            if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
+                _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
+                posix.close(cfd);
+                continue;
+            }
+
             const active_before = self.state.active_connections.fetchAdd(1, .monotonic);
             if (active_before >= self.state.config.max_connections) {
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
+                _ = self.state.stats_dropped_cap.fetchAdd(1, .monotonic);
+                posix.close(cfd);
+                continue;
+            }
+
+            // Handshake inflight budget: cap at 30% of max_connections.
+            // Prevents churn (scanners/probes) from starving established relay sessions.
+            const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
+            const hs_max = (self.state.config.max_connections * 3) / 10;
+            if (hs_max > 0 and hs_inflight >= hs_max) {
+                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
                 posix.close(cfd);
                 continue;
             }
 
             const slot = self.pool.acquire() orelse {
+                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 posix.close(cfd);
                 continue;
@@ -1095,16 +1224,50 @@ const EventLoop = struct {
 
     fn logPeriodicStats(self: *EventLoop, now_ns: i128) void {
         const active = self.state.active_connections.load(.monotonic);
+        const hs = self.state.handshakes_inflight.load(.monotonic);
         const accepted_total = self.state.connection_count.load(.monotonic);
-        log.info("conn stats: active={d}/{d} accepted+={d} closed+={d} tracked_fds={d} total={d} accept_paused={}", .{
+
+        // Snapshot degradation counters and compute deltas
+        const cur_cap = self.state.stats_dropped_cap.load(.monotonic);
+        const cur_sat = self.state.stats_dropped_saturation.load(.monotonic);
+        const cur_rate = self.state.stats_dropped_rate_limit.load(.monotonic);
+        const cur_hs = self.state.stats_dropped_hs_budget.load(.monotonic);
+        const cur_hst = self.state.stats_hs_timeout.load(.monotonic);
+        const cur_mpf = self.state.stats_mp_fallback.load(.monotonic);
+
+        const d_cap = cur_cap - self.prev_dropped_cap;
+        const d_sat = cur_sat - self.prev_dropped_saturation;
+        const d_rate = cur_rate - self.prev_dropped_rate_limit;
+        const d_hs = cur_hs - self.prev_dropped_hs_budget;
+        const d_hst = cur_hst - self.prev_hs_timeout;
+        const d_mpf = cur_mpf - self.prev_mp_fallback;
+
+        self.prev_dropped_cap = cur_cap;
+        self.prev_dropped_saturation = cur_sat;
+        self.prev_dropped_rate_limit = cur_rate;
+        self.prev_dropped_hs_budget = cur_hs;
+        self.prev_hs_timeout = cur_hst;
+        self.prev_mp_fallback = cur_mpf;
+
+        const has_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
+
+        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{}", .{
             active,
             self.state.config.max_connections,
+            hs,
             self.accepted_since_log,
             self.closed_since_log,
             self.pool.fd_to_slot.count(),
             accepted_total,
             self.accept_paused,
+            self.saturation_paused,
         });
+
+        if (has_drops) {
+            log.info("  drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
+                d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf,
+            });
+        }
 
         self.accepted_since_log = 0;
         self.closed_since_log = 0;
@@ -1143,6 +1306,38 @@ const EventLoop = struct {
 
         self.accept_paused = false;
         self.accept_resume_ns = 0;
+    }
+
+    fn pauseSaturation(self: *EventLoop) void {
+        if (self.saturation_paused) return;
+
+        self.modFd(self.listen_fd, false, false) catch |mod_err| {
+            log.err("failed to pause accepts for saturation: {any}", .{mod_err});
+            return;
+        };
+
+        self.saturation_paused = true;
+        const active = self.state.active_connections.load(.monotonic);
+        const max = self.state.config.max_connections;
+        log.warn(
+            "connection saturation: active={d}/{d} (>{d}%); pausing new accepts. " ++
+                "Will resume when active drops below {d} ({d}%). " ++
+                "To handle more clients, increase max_connections or upgrade VPS RAM.",
+            .{ active, max, @as(u32, 90), (max * 8) / 10, @as(u32, 80) },
+        );
+    }
+
+    fn resumeSaturation(self: *EventLoop) void {
+        if (!self.saturation_paused) return;
+
+        self.modFd(self.listen_fd, true, false) catch |err| {
+            log.warn("failed to resume accepts after saturation ease: {any}", .{err});
+            return;
+        };
+
+        self.saturation_paused = false;
+        const active = self.state.active_connections.load(.monotonic);
+        log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -1542,6 +1737,21 @@ const EventLoop = struct {
         slot.direct_fallback_addr = plan.direct_fallback;
         slot.direct_fallback_used = false;
 
+        // Log DC routing decisions at debug level (enable with log_level = "debug" in config)
+        if (plan.is_media_path) {
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = formatAddress(plan.candidates[0], &addr_buf);
+            log.debug("[{d}] route: dc_idx={d} dc_abs={d} media={} middle_proxy={} candidates={d} -> {s}", .{
+                slot.conn_id,
+                slot.dc_idx,
+                dc_abs,
+                plan.is_media_path,
+                plan.use_middle_proxy,
+                plan.count,
+                addr_str,
+            });
+        }
+
         if (slot.upstream_candidates) |old| {
             self.state.allocator.free(old);
             slot.upstream_candidates = null;
@@ -1611,7 +1821,12 @@ const EventLoop = struct {
                 return;
             }
 
-            log.debug("[{d}] connect completion failed: {any}", .{ slot.conn_id, err });
+            log.debug("[{d}] connect completion failed: dc_idx={d} media={} err={any}", .{
+                slot.conn_id,
+                slot.dc_idx,
+                slot.is_media_path,
+                err,
+            });
             self.closeSlot(slot, "connect failed");
             return;
         }
@@ -1630,6 +1845,8 @@ const EventLoop = struct {
                     return;
                 }
             }
+            // Handshake complete (mask path) — release from handshake budget
+            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
             slot.phase = .mask_relaying;
             return;
         }
@@ -1813,6 +2030,8 @@ const EventLoop = struct {
     }
 
     fn startRelay(self: *EventLoop, slot: *ConnectionSlot) void {
+        // Handshake complete — release from handshake budget
+        _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
         slot.phase = .relaying;
 
         if (slot.pipelined_data) |buf| {
@@ -1845,7 +2064,12 @@ const EventLoop = struct {
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
 
-        const progress = relayClientToUpstreamStep(slot, self.state.allocator) catch {
+        const progress = relayClientToUpstreamStep(slot, self.state.allocator) catch |err| {
+            if (slot.is_media_path) {
+                log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
+                    slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
+                });
+            }
             self.closeSlot(slot, "relay c2s failed");
             return;
         };
@@ -1857,7 +2081,12 @@ const EventLoop = struct {
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
-        const progress = relayUpstreamToClientStep(slot, self.state.allocator) catch {
+        const progress = relayUpstreamToClientStep(slot, self.state.allocator) catch |err| {
+            if (slot.is_media_path) {
+                log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
+                    slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
+                });
+            }
             self.closeSlot(slot, "relay s2c failed");
             return;
         };
@@ -2197,6 +2426,7 @@ const EventLoop = struct {
 
         _ = slot.obf_params orelse return false;
         slot.direct_fallback_used = true;
+        _ = self.state.stats_mp_fallback.fetchAdd(1, .monotonic);
         slot.use_middle_proxy = false;
         slot.mp_step = .none;
         slot.mp_enc = null;
@@ -2390,6 +2620,7 @@ const EventLoop = struct {
                         continue;
                     }
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
+                    _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
@@ -2485,7 +2716,15 @@ const EventLoop = struct {
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
-        log.debug("[{d}] closing: {s}", .{ slot.conn_id, reason });
+        log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
+            slot.conn_id,
+            slot.dc_idx,
+            slot.is_media_path,
+            @tagName(slot.phase),
+            reason,
+            slot.c2s_bytes,
+            slot.s2c_bytes,
+        });
 
         if (slot.client_fd != -1) {
             _ = self.delFd(slot.client_fd) catch {};
@@ -2505,6 +2744,10 @@ const EventLoop = struct {
 
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
+            // If connection was still in handshake phase, release from handshake budget
+            if (slot.handshakeInProgress()) {
+                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            }
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
@@ -3259,4 +3502,104 @@ test "parse ipv4 literal" {
     try std.testing.expectEqual([4]u8{ 179, 43, 141, 146 }, parsed);
     try std.testing.expect(parseIpv4Literal("179.43.141") == null);
     try std.testing.expect(parseIpv4Literal("179.43.141.999") == null);
+}
+
+test "subnet rate limit - subnet key groups /24 IPv4" {
+    // 10.0.1.5 and 10.0.1.200 should have the same /24 key
+    const addr1 = net.Address.initIp4(.{ 10, 0, 1, 5 }, 443);
+    const addr2 = net.Address.initIp4(.{ 10, 0, 1, 200 }, 443);
+    const addr3 = net.Address.initIp4(.{ 10, 0, 2, 5 }, 443);
+
+    const key1 = SubnetRateLimit.subnetKey(addr1);
+    const key2 = SubnetRateLimit.subnetKey(addr2);
+    const key3 = SubnetRateLimit.subnetKey(addr3);
+
+    try std.testing.expectEqual(key1, key2); // same /24
+    try std.testing.expect(key1 != key3); // different /24
+}
+
+test "subnet rate limit - allows up to max then blocks" {
+    var limiter = SubnetRateLimit{};
+    const addr = net.Address.initIp4(.{ 192, 168, 1, 100 }, 443);
+
+    // max_per_sec = 3 → should allow 3 then block
+    // First call resets entry with tokens = max-1 = 2, returns true
+    try std.testing.expect(limiter.check(addr, 3));
+    // Two more with existing tokens
+    try std.testing.expect(limiter.check(addr, 3));
+    try std.testing.expect(limiter.check(addr, 3));
+    // Now should be blocked
+    try std.testing.expect(!limiter.check(addr, 3));
+    try std.testing.expect(!limiter.check(addr, 3));
+}
+
+test "subnet rate limit - disabled when max_per_sec is 0" {
+    var limiter = SubnetRateLimit{};
+    const addr = net.Address.initIp4(.{ 1, 2, 3, 4 }, 443);
+
+    // With max_per_sec = 0, always allows
+    for (0..100) |_| {
+        try std.testing.expect(limiter.check(addr, 0));
+    }
+}
+
+test "subnet rate limit - stale entry resets" {
+    var limiter = SubnetRateLimit{};
+    const addr = net.Address.initIp4(.{ 10, 20, 30, 40 }, 443);
+
+    // Drain tokens
+    _ = limiter.check(addr, 1);
+    try std.testing.expect(!limiter.check(addr, 1));
+
+    // Make entry stale (>60s old)
+    const key = SubnetRateLimit.subnetKey(addr);
+    const idx = key % SubnetRateLimit.BUCKETS;
+    limiter.entries[idx].last_refill_s -= 61;
+
+    // Should reset and allow again
+    try std.testing.expect(limiter.check(addr, 1));
+}
+
+test "subnet rate limit - different subnets are independent" {
+    var limiter = SubnetRateLimit{};
+    const addr_a = net.Address.initIp4(.{ 10, 0, 1, 100 }, 443);
+    const addr_b = net.Address.initIp4(.{ 10, 0, 2, 100 }, 443);
+
+    // Drain subnet A
+    _ = limiter.check(addr_a, 1);
+    try std.testing.expect(!limiter.check(addr_a, 1));
+
+    // Subnet B should still work
+    try std.testing.expect(limiter.check(addr_b, 1));
+}
+
+test "handshakeInProgress - phases" {
+    var slot: ConnectionSlot = undefined;
+
+    const hs_phases = [_]ConnectionPhase{
+        .reading_tls_header,
+        .reading_client_hello_body,
+        .writing_server_hello_first,
+        .desync_wait,
+        .writing_server_hello_rest,
+        .reading_mtproto_tls_header,
+        .reading_mtproto_tls_body,
+        .connecting_upstream,
+        .writing_dc_nonce,
+        .middle_proxy_handshake,
+    };
+    for (hs_phases) |phase| {
+        slot.phase = phase;
+        try std.testing.expect(slot.handshakeInProgress());
+    }
+
+    // Non-handshake phases
+    slot.phase = .idle;
+    try std.testing.expect(!slot.handshakeInProgress());
+    slot.phase = .relaying;
+    try std.testing.expect(!slot.handshakeInProgress());
+    slot.phase = .mask_relaying;
+    try std.testing.expect(!slot.handshakeInProgress());
+    slot.phase = .closing;
+    try std.testing.expect(!slot.handshakeInProgress());
 }
