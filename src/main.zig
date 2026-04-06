@@ -18,11 +18,14 @@ const proxy = @import("proxy/proxy.zig");
 // don't interleave. This avoids the global stderr_mutex that Zig's
 // default logger uses, which causes catastrophic contention under
 // hundreds of concurrent threads.
+// Runtime log level, set from config.toml at startup.
+// Checked by lockFreeLog to filter messages without recompilation.
+pub var runtime_log_level: std.log.Level = .info;
+
 pub const std_options = std.Options{
-    // Do NOT set log_level here. In ReleaseFast, Zig's default is .info,
-    // which eliminates all log.debug calls at comptime (zero overhead).
-    // Setting .debug here floods stderr with thousands of messages/sec
-    // under heavy load, even with the lock-free logger.
+    // Set comptime level to .debug so all log calls are compiled in.
+    // Runtime filtering is done in lockFreeLog via runtime_log_level.
+    .log_level = .debug,
     .logFn = lockFreeLog,
 };
 
@@ -32,6 +35,9 @@ fn lockFreeLog(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Runtime filter: skip messages below configured level
+    if (@intFromEnum(message_level) > @intFromEnum(runtime_log_level)) return;
+
     const level_txt = comptime message_level.asText();
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     var buf: [4096]u8 = undefined;
@@ -302,15 +308,41 @@ pub fn main() !void {
     const config_path = args.next() orelse "config.toml";
 
     // Parse config
-    const cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
+    var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
         writeStderr("\n  Usage: mtproto-proxy [config.toml]\n\n", .{});
         return;
     };
     defer cfg.deinit(allocator);
 
+    // Apply runtime log level from config
+    runtime_log_level = cfg.log_level;
+
+    // Auto-clamp max_connections to RAM-safe estimate (unless explicitly opted out)
+    if (detectTotalRamBytes(allocator)) |total_ram| {
+        const est = estimateCapacity(&cfg, total_ram);
+        if (cfg.max_connections > est.safe_connections and !cfg.unsafe_override_limits) {
+            const log_main = std.log.scoped(.config);
+            log_main.warn(
+                "auto-clamping max_connections from {d} to {d} " ++
+                    "(host has {d} MiB RAM, ~{d} KiB/connection). " ++
+                    "To disable this safety clamp, set unsafe_override_limits = true in [server].",
+                .{
+                    cfg.max_connections,
+                    est.safe_connections,
+                    est.total_ram_bytes / (1024 * 1024),
+                    est.per_conn_bytes / 1024,
+                },
+            );
+            cfg.max_connections = est.safe_connections;
+        }
+    }
+
     // Print the startup banner (includes IP detection)
     printBanner(allocator, cfg);
+
+    // Emit config warnings (e.g. buffer too small, memory concerns)
+    cfg.emitWarnings();
 
     // Create shared state (DI — no globals)
     var state = proxy.ProxyState.init(allocator, cfg);
