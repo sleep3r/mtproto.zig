@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/sleep3r/mtproto.zig/compare/v0.7.0...v0.7.1) (2026-04-06)
+
+
+### Bug Fixes
+
+* **proxy:** stabilize tunnel middleproxy and tune small-VPS defaults ([#78](https://github.com/sleep3r/mtproto.zig/issues/78)) ([5304be3](https://github.com/sleep3r/mtproto.zig/commit/5304be3c4defd9609707a0a934ff7eb26f778dd7))
+
 ## [0.7.0](https://github.com/sleep3r/mtproto.zig/compare/v0.6.2...v0.7.0) (2026-04-05)
 
 
