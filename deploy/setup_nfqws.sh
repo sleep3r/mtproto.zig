@@ -83,9 +83,12 @@ fi
 
 # ── Install dependencies ────────────────────────────────────
 info "Installing build dependencies..."
-apt-get update -qq < /dev/null || true
-apt-get install -y build-essential git libnetfilter-queue-dev \
-    libcap-dev iptables libmnl-dev zlib1g-dev < /dev/null >/dev/null 2>&1
+DEBIAN_FRONTEND=noninteractive apt-get update -qq < /dev/null || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    build-essential git libnetfilter-queue-dev libcap-dev iptables libmnl-dev zlib1g-dev \
+    < /dev/null >/dev/null 2>&1
 ok "Dependencies installed"
 
 # ── Clone and build zapret ──────────────────────────────────
