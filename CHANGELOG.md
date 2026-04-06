@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/sleep3r/mtproto.zig/compare/v0.7.1...v0.8.0) (2026-04-06)
+
+
+### Features
+
+* implement proxy resilience optimizations ([#81](https://github.com/sleep3r/mtproto.zig/issues/81)) ([71fb157](https://github.com/sleep3r/mtproto.zig/commit/71fb1577c26d4f53dd8ee34f5151481947141b19))
+
 ## [0.7.1](https://github.com/sleep3r/mtproto.zig/compare/v0.7.0...v0.7.1) (2026-04-06)
 
 
