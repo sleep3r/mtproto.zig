@@ -152,8 +152,8 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
-| `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>]` | Full migration + AmneziaWG tunnel for blocked regions |
-| `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path>` | Add AmneziaWG tunnel to existing installation |
+| `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
+| `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Add AmneziaWG tunnel to existing installation |
 | `make update-server SERVER=<ip> [VERSION=vX.Y.Z]` | Update server binary from GitHub Release artifacts |
 
 </details>
@@ -452,12 +452,18 @@ From your workstation:
 make deploy-tunnel SERVER=<VPS_IP> AWG_CONF=awg.conf PASSWORD=<root_password>
 ```
 
+Optionally choose tunnel mode for `use_middle_proxy` handling:
+
+```bash
+make deploy-tunnel SERVER=<VPS_IP> AWG_CONF=awg.conf TUNNEL_MODE=middleproxy
+```
+
 This will:
 1. Set up SSH key, install deps, build and deploy the proxy (via `make migrate`)
 2. Install **amneziawg-tools** (DKMS kernel module + userspace tools)
 3. Create network namespace `tg_proxy_ns` with AmneziaWG tunnel inside
 4. Set up **DNAT** (incoming `:443` → namespace) and **policy routing** (responses go back to client, not into tunnel)
-5. Patch the systemd service to run the proxy inside the namespace in **direct mode**
+5. Patch the systemd service to run the proxy inside the namespace and apply selected tunnel mode (`direct` by default)
 6. Validate connectivity to all 5 Telegram DCs through the tunnel
 7. Print the ready-to-use `tg://` link
 
@@ -469,11 +475,17 @@ If the proxy is already installed and running:
 make deploy-tunnel-only SERVER=<VPS_IP> AWG_CONF=awg.conf
 ```
 
+With explicit mode:
+
+```bash
+make deploy-tunnel-only SERVER=<VPS_IP> AWG_CONF=awg.conf TUNNEL_MODE=preserve
+```
+
 ### On the server directly
 
 ```bash
 scp awg.conf root@<VPS_IP>:/tmp/awg.conf
-ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf'
+ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf middleproxy'
 ```
 
 ### How it works
@@ -486,7 +498,7 @@ ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf'
 | Policy routing (`from 10.200.200.2 table 100`) | Inside namespace | Response packets return via veth (not via tunnel) |
 | `mtproto-proxy` | Inside `tg_proxy_ns` | Listens on `:443`, connects to Telegram via `awg0` |
 
-> **Note** &nbsp; The tunnel setup automatically switches the proxy to **direct mode** (`use_middle_proxy = false`). Middleproxy mode requires per-IP registration with `@MTProxyBot`, which doesn't work when the proxy's outgoing IP is the VPN exit node.
+> **Note** &nbsp; Tunnel setup supports three modes: `direct` (default, sets `use_middle_proxy=false`), `preserve` (keeps current config), and `middleproxy` (sets `use_middle_proxy=true`). Use `middleproxy` if you need promo-tag parity and stable media behavior on non-premium clients.
 
 > **Note** &nbsp; To check tunnel status: `ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'`
 
@@ -519,6 +531,9 @@ ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 port = 443
 backlog = 4096                             # TCP listen queue size
 middleproxy_buffer_kb = 256               # Per-connection ME buffers (4x this size), tune for VPS RAM
+max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
+idle_timeout_sec = 120
+handshake_timeout_sec = 15
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 
 [censorship]
@@ -543,7 +558,9 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `65535` | Concurrent connection cap. On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
+| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
+| `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
+| `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte |
 | `[server]` | `middleproxy_buffer_kb` | `256` | MiddleProxy per-connection buffer size in KiB (4 buffers allocated for active ME sessions) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
@@ -558,7 +575,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
 
-> **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` (fits `max_connections=65535` with reserve). If your host applies a lower limit, the proxy auto-clamps effective `max_connections` at startup and logs a warning.
+> **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 

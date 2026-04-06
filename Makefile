@@ -3,6 +3,7 @@
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
 AWG_CONF ?=
+TUNNEL_MODE ?= direct
 HOST ?= 127.0.0.1
 PORT ?= 443
 PID ?=
@@ -93,22 +94,24 @@ migrate:
 
 # Full migration + AmneziaWG tunnel (for servers where Telegram is blocked)
 deploy-tunnel:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>]"; exit 1; fi
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]"; exit 1; fi
 	@if [ -z "$(AWG_CONF)" ]; then echo "AWG_CONF is required (path to AmneziaWG client config)"; exit 1; fi
 	@if [ ! -f "$(AWG_CONF)" ]; then echo "AWG_CONF file not found: $(AWG_CONF)"; exit 1; fi
+	@case "$(TUNNEL_MODE)" in direct|preserve|middleproxy) ;; *) echo "Invalid TUNNEL_MODE: $(TUNNEL_MODE). Allowed: direct, preserve, middleproxy"; exit 1 ;; esac
 	$(MAKE) migrate SERVER=$(SERVER) PASSWORD=$(PASSWORD)
 	@echo "--- Setting up AmneziaWG tunnel ---"
 	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
 	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
-	ssh root@$(SERVER) 'bash /tmp/setup_tunnel.sh /tmp/awg_client.conf && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh'
+	ssh root@$(SERVER) "bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh"
 
 # Add tunnel to existing installation
 deploy-tunnel-only:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path>"; exit 1; fi
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct|preserve|middleproxy]"; exit 1; fi
 	@if [ -z "$(AWG_CONF)" ]; then echo "AWG_CONF is required (path to AmneziaWG client config)"; exit 1; fi
+	@case "$(TUNNEL_MODE)" in direct|preserve|middleproxy) ;; *) echo "Invalid TUNNEL_MODE: $(TUNNEL_MODE). Allowed: direct, preserve, middleproxy"; exit 1 ;; esac
 	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
 	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
-	ssh root@$(SERVER) 'bash /tmp/setup_tunnel.sh /tmp/awg_client.conf && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh'
+	ssh root@$(SERVER) "bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh"
 
 update-dns:
 	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi
