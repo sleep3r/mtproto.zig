@@ -5,7 +5,7 @@ description: Core architecture, DPI evasion techniques, client behavior matrix, 
 
 # MTProto Proxy Architecture and Core Concepts
 
-Production MTProto proxy implemented in Zig with FakeTLS entry and obfuscated MTProto relay.
+Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTProto relay, and optional AmneziaWG tunnel deployment for blocked regions.
 
 ## Tech Stack
 
@@ -13,19 +13,21 @@ Production MTProto proxy implemented in Zig with FakeTLS entry and obfuscated MT
 - Networking: `std.net` sockets + Linux `epoll`
 - Cryptography: `std.crypto` primitives (SHA256/HMAC/AES-CTR) plus project protocol layers
 - Build: `build.zig` + `Makefile`
-- Deployment: Linux VPS + systemd (`deploy/mtproto-proxy.service`)
+- Deployment: Linux VPS + systemd (`deploy/mtproto-proxy.service`), with optional tunnel setup from `deploy/setup_tunnel.sh`
 
 ## Runtime Model
 
 - Relay path is a single-threaded Linux `epoll` event loop.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - File descriptors are tracked via epoll + fd-to-slot mapping.
+- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, and low-noise periodic connection stats.
 - A background updater thread refreshes MiddleProxy metadata from Telegram core endpoints once per 24h.
 
 Code anchors:
 
-- `src/proxy/proxy.zig` (`EventLoop`, `ConnectionSlot`, `runTimers`, `buildDcConnectPlan`)
+- `src/proxy/proxy.zig` (`EventLoop`, `ConnectionSlot`, `runTimers`, `logPeriodicStats`, `requiredFdsForConnections`, `buildDcConnectPlan`)
 - `src/main.zig` (startup banner, capacity estimate, lock-free logger)
+- `deploy/setup_tunnel.sh` (namespace + AmneziaWG deployment path)
 
 ## Connection Flow
 
@@ -53,6 +55,7 @@ Code anchors:
 Important behavior:
 
 - If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic to avoid dropping valid users.
+- Tunnel deployment forces direct mode and removes `tag`, because the effective source IP becomes the AWG exit node.
 
 ## Fast Mode
 
@@ -99,5 +102,5 @@ If `max_connections` exceeds safe estimate, startup prints a warning.
 - `epoll` interests and queue flushing remain non-blocking and symmetric.
 - Direct/MiddleProxy fallback logic still preserves media and non-media expectations.
 - Timeout behavior remains controlled by config timers.
+- Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.
-

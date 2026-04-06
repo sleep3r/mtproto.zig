@@ -59,6 +59,8 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Client relay is handled by a single-threaded Linux `epoll` event loop.
 - A background updater thread periodically refreshes MiddleProxy metadata from Telegram core endpoints.
 - Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
+- Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
+- Timer maintenance runs on a fixed cadence and scans only the allocated connection-slot prefix; production builds also emit aggregated `conn stats` every 10 seconds.
 
 ## &nbsp; Quick Start
 
@@ -512,6 +514,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` (fits `max_connections=65535` with reserve). If your host applies a lower limit, the proxy auto-clamps effective `max_connections` at startup and logs a warning.
 
+> **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. Watch for `accept_paused=true` in periodic `conn stats` lines if the host is under FD pressure.
+
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
@@ -526,7 +530,29 @@ If your Telegram app is stuck on "Updating...", your provider or network is drop
 
 This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts are controlled by config (`idle_timeout_sec`, `handshake_timeout_sec`) and event-loop timers. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
 
-### 1. AAAA exists, but server IPv6 is not actually working
+### 1. Check runtime health and fd pressure first
+
+Before chasing client/network hypotheses, inspect the new low-noise runtime signals:
+
+```bash
+ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|max_connections clamped|fd quota reached|failed to resume accepts"'
+ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files"'
+```
+
+Interpretation:
+
+- `max_connections clamped ...` means runtime reduced configured capacity to fit current `RLIMIT_NOFILE`.
+- `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
+- `conn stats ... accept_paused=true` means the backoff window is active; raise `LimitNOFILE`, lower `max_connections`, or inspect other open FDs before blaming client behavior.
+
+If you use the AmneziaWG tunnel deployment path, also confirm the namespace tunnel is up:
+
+```bash
+ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'
+ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns nc -zw3 149.154.167.50 443 && echo OK'
+```
+
+### 2. AAAA exists, but server IPv6 is not actually working
 
 This proxy supports IPv6, but your VPS must have real end-to-end IPv6 routing.
 If DNS has an `AAAA` record and the server has no usable global IPv6 route, iOS often tries IPv6 first, waits for timeout, then falls back to IPv4. This usually looks like a ~3-8 second connect delay.
@@ -542,7 +568,7 @@ ip -6 route
 
 If `AAAA` exists but the server has no working global IPv6/default route, remove `AAAA` and keep only `A` until IPv6 is fully configured.
 
-### 2. Home Wi-Fi restricts IPv4
+### 3. Home Wi-Fi restricts IPv4
 
 Often, mobile networks will connect instantly because they use **IPv6**, but Home Wi-Fi internet providers block the destination's IPv4 address directly at the gateway.
 **Solution:** Enable **IPv6 Prefix Delegation** on your home Wi-Fi router. 
@@ -551,14 +577,14 @@ Often, mobile networks will connect instantly because they use **IPv6**, but Hom
 - Enable `IPv6`, and specifically check **IA_PD** (Prefix Delegation) for the WAN/DHCP client, and **IA_NA** for the LAN/DHCP Server.
 - Reboot the router and verify your phone gets an IPv6 address at [test-ipv6.com](https://test-ipv6.com). 
 
-### 3. Commercial / Premium VPNs Block Traffic
+### 4. Commercial / Premium VPNs Block Traffic
 
 If your iPhone is connected to a **commercial/premium VPN** and stuck on "Updating...", the VPN provider is actively dropping the MTProto TLS traffic using their own DPI.
 **Solutions**:
 - **Switch Protocol**: Try switching the VPN protocol (e.g., Xray/VLESS to WireGuard).
 - **Self-Host**: Use a self-hosted VPN (like AmneziaWG) on your own server.
 
-### 4. Co-located WireGuard (Docker routing)
+### 5. Co-located WireGuard (Docker routing)
 
 If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on the same server**, iOS clients will route proxy traffic inside the VPN tunnel, and Docker will drop the bridge packets.
 **Solution**: Allow traffic from the VPN Docker subnet:
@@ -566,7 +592,7 @@ If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on
 iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
 ```
 
-### 5. DC203 media resets
+### 6. DC203 media resets
 
 If only media-heavy sessions fail on non-premium clients, check MiddleProxy logs first:
 

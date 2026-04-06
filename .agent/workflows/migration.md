@@ -56,4 +56,3 @@ ssh root@<NEW_VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pag
 Operational note:
 
 - If `core.telegram.org` is temporarily unreachable, proxy continues with bundled MiddleProxy defaults and should still start.
-
