@@ -15,11 +15,12 @@ pub const Config = struct {
     /// TCP listen(2) backlog for client-facing sockets
     backlog: u32 = 4096,
     /// Hard cap for concurrently handled client connections
-    max_connections: u32 = 65535,
+    /// Default tuned for 1 vCPU / 1 GB VPS profile.
+    max_connections: u32 = 512,
     /// Pre-handshake idle timeout: wait for first client byte
-    idle_timeout_sec: u32 = 300,
+    idle_timeout_sec: u32 = 120,
     /// Handshake read timeout after first byte arrives
-    handshake_timeout_sec: u32 = 60,
+    handshake_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
     users: std.StringHashMap([16]u8),
@@ -241,9 +242,9 @@ test "parse config - missing fields defaults" {
 
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
-    try std.testing.expectEqual(@as(u32, 65535), cfg.max_connections);
-    try std.testing.expectEqual(@as(u32, 300), cfg.idle_timeout_sec);
-    try std.testing.expectEqual(@as(u32, 60), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
+    try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true

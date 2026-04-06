@@ -110,6 +110,9 @@ if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     cat > "$INSTALL_DIR/config.toml" << EOF
 [server]
 port = 443
+max_connections = 512
+idle_timeout_sec = 120
+handshake_timeout_sec = 15
 
 [censorship]
 tls_domain = "$TLS_DOMAIN"
