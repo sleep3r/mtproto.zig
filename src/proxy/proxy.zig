@@ -22,8 +22,10 @@ const tls_header_len = 5;
 const event_loop_wait_ms = 37;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
+const accept_batch_limit: usize = 256;
 const stats_log_interval_s: i64 = 10;
 const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.ns_per_s;
+const timer_scan_budget: usize = 512;
 const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
@@ -631,6 +633,7 @@ pub const ProxyState = struct {
     middle_proxy_addrs_203_len: usize,
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
+    middle_proxy_nat_ip4: ?[4]u8,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -661,6 +664,15 @@ pub const ProxyState = struct {
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
+        const detected_nat_ip4 = if (cfg.datacenter_override == null)
+            detectPublicIpv4(allocator)
+        else
+            null;
+        if (detected_nat_ip4) |ip| {
+            var ip_buf: [16]u8 = undefined;
+            log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+        }
+
         return .{
             .allocator = allocator,
             .config = cfg,
@@ -677,6 +689,7 @@ pub const ProxyState = struct {
             .middle_proxy_addrs_203_len = 1,
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
+            .middle_proxy_nat_ip4 = detected_nat_ip4,
         };
     }
 
@@ -911,6 +924,7 @@ const EventLoop = struct {
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
+    timer_scan_cursor: u32,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
@@ -926,6 +940,7 @@ const EventLoop = struct {
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
             .accept_paused = false,
             .accept_resume_ns = 0,
+            .timer_scan_cursor = 0,
             .stats_next_log_ns = std.time.nanoTimestamp() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
@@ -1027,7 +1042,8 @@ const EventLoop = struct {
     }
 
     fn acceptNewConnections(self: *EventLoop) !void {
-        while (true) {
+        var accepted_this_round: usize = 0;
+        while (accepted_this_round < accept_batch_limit) {
             var client_addr: net.Address = undefined;
             var client_len: posix.socklen_t = @sizeOf(net.Address);
             const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
@@ -1040,6 +1056,7 @@ const EventLoop = struct {
                     else => return err,
                 }
             };
+            accepted_this_round += 1;
 
             const active_before = self.state.active_connections.fetchAdd(1, .monotonic);
             if (active_before >= self.state.config.max_connections) {
@@ -1671,7 +1688,7 @@ const EventLoop = struct {
             return true;
         }
 
-        if (!slot.direct_fallback_used and slot.direct_fallback_addr != null and slot.use_middle_proxy and !slot.is_media_path) {
+        if (!slot.direct_fallback_used and slot.direct_fallback_addr != null and slot.use_middle_proxy) {
             slot.direct_fallback_used = true;
             slot.use_middle_proxy = false;
             const fallback = slot.direct_fallback_addr.?;
@@ -2003,6 +2020,7 @@ const EventLoop = struct {
                     self.closeSlot(slot, "mp getsockname failed");
                     return;
                 };
+                var middle_local_addr = local_addr;
 
                 var tg_port: [2]u8 = undefined;
                 var my_port: [2]u8 = undefined;
@@ -2020,6 +2038,12 @@ const EventLoop = struct {
                     var my_ip_v4: [4]u8 = undefined;
                     @memcpy(&my_ip_v4, std.mem.asBytes(&local_addr.in.sa.addr));
                     std.mem.reverse(u8, &my_ip_v4);
+
+                    if (self.state.middle_proxy_nat_ip4) |nat_ip| {
+                        my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
+                        middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
+                    }
+
                     my_ip_v4_opt = my_ip_v4;
 
                     std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in.sa.port), .little);
@@ -2133,6 +2157,13 @@ const EventLoop = struct {
                     return;
                 };
 
+                var middle_local_addr = local_addr;
+                if (self.state.middle_proxy_nat_ip4) |nat_ip| {
+                    if (local_addr.any.family == posix.AF.INET) {
+                        middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
+                    }
+                }
+
                 var conn_id: [8]u8 = undefined;
                 crypto.randomBytes(&conn_id);
 
@@ -2143,7 +2174,7 @@ const EventLoop = struct {
                     conn_id,
                     slot.mp_write_seq_no,
                     slot.peer_addr,
-                    local_addr,
+                    middle_local_addr,
                     slot.proto_tag,
                     self.state.config.tag,
                     self.state.config.middleProxyBufferBytes(),
@@ -2319,7 +2350,18 @@ const EventLoop = struct {
         const now_ns = std.time.nanoTimestamp();
 
         const hi: usize = @intCast(self.pool.allocated_hi);
-        for (self.pool.slots[0..hi]) |slot_opt| {
+        if (hi == 0) return;
+
+        var idx: usize = @intCast(self.timer_scan_cursor);
+        if (idx >= hi) idx = 0;
+
+        const budget = @min(hi, timer_scan_budget);
+        var scanned: usize = 0;
+        while (scanned < budget) : (scanned += 1) {
+            const slot_opt = self.pool.slots[idx];
+            idx += 1;
+            if (idx >= hi) idx = 0;
+
             const slot = slot_opt orelse continue;
             if (slot.phase == .idle) continue;
 
@@ -2363,6 +2405,8 @@ const EventLoop = struct {
                 self.closeSlot(slot, "sync interest error");
             };
         }
+
+        self.timer_scan_cursor = @intCast(idx);
     }
 
     fn syncInterests(self: *EventLoop, slot: *ConnectionSlot) !void {
@@ -2797,6 +2841,49 @@ fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     return runCurl(allocator, &strict_argv);
 }
 
+fn parseIpv4Literal(text: []const u8) ?[4]u8 {
+    var parts = std.mem.splitScalar(u8, text, '.');
+    var ip: [4]u8 = undefined;
+    var idx: usize = 0;
+
+    while (parts.next()) |part| {
+        if (idx >= ip.len or part.len == 0 or part.len > 3) return null;
+        const octet = std.fmt.parseInt(u16, part, 10) catch return null;
+        if (octet > 255) return null;
+        ip[idx] = @intCast(octet);
+        idx += 1;
+    }
+
+    if (idx != ip.len) return null;
+    return ip;
+}
+
+fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
+    const services = [_][]const []const u8{
+        &.{ "curl", "-fsSL", "--max-time", "3", "https://api.ipify.org" },
+        &.{ "curl", "-fsSL", "--max-time", "3", "https://ifconfig.me" },
+        &.{ "curl", "-fsSL", "--max-time", "3", "https://ipv4.icanhazip.com" },
+    };
+
+    for (services) |argv| {
+        const stdout = runCurl(allocator, argv) catch continue;
+        const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+        const parsed = parseIpv4Literal(trimmed);
+        allocator.free(stdout);
+        if (parsed) |ip| return ip;
+    }
+
+    return null;
+}
+
+fn formatIpv4Bytes(ip: [4]u8, buf: *[16]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?.?.?.?";
+}
+
+fn ipv4NetworkToHostBytes(ip: [4]u8) [4]u8 {
+    return .{ ip[3], ip[2], ip[1], ip[0] };
+}
+
 fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
     if (a.any.family != b.any.family) return false;
 
@@ -2883,8 +2970,10 @@ fn buildDcConnectPlan(
         return plan;
     }
 
-    // Non-media paths may fall back to direct DC if all middle-proxy candidates fail.
-    plan.direct_fallback = if (!plan.is_media_path) constants.getDcAddressV4(dc_abs) else null;
+    // If middle-proxy connect/handshake fails, retry the same DC via direct mode.
+    // This keeps media paths functional in environments where middle-proxy transport
+    // itself is degraded (for example due to strict NAT behavior in upstream tunnels).
+    plan.direct_fallback = constants.getDcAddressV4(dc_abs);
     return plan;
 }
 
@@ -3163,4 +3252,11 @@ test "fd requirement helpers" {
     try std.testing.expectEqual(@as(usize, 131582), requiredFdsForConnections(65535));
     try std.testing.expectEqual(@as(u32, 65535), maxConnectionsForNofile(131582));
     try std.testing.expectEqual(@as(u32, 32511), maxConnectionsForNofile(65535));
+}
+
+test "parse ipv4 literal" {
+    const parsed = parseIpv4Literal("179.43.141.146") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual([4]u8{ 179, 43, 141, 146 }, parsed);
+    try std.testing.expect(parseIpv4Literal("179.43.141") == null);
+    try std.testing.expect(parseIpv4Literal("179.43.141.999") == null);
 }

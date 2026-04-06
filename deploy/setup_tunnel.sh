@@ -6,10 +6,10 @@
 # so Telegram DCs become reachable while the host keeps normal connectivity.
 #
 # Usage (on server):
-#   bash setup_tunnel.sh /path/to/awg-client.conf
+#   bash setup_tunnel.sh /path/to/awg-client.conf [direct|preserve|middleproxy]
 #
 # Usage (via Makefile from workstation):
-#   make deploy-tunnel SERVER=<ip> AWG_CONF=awg.conf
+#   make deploy-tunnel SERVER=<ip> AWG_CONF=awg.conf [TUNNEL_MODE=direct|preserve|middleproxy]
 #
 # Prerequisites:
 #   - mtproto-proxy already installed via install.sh or make deploy
@@ -22,7 +22,7 @@
 #   4. Sets up DNAT so incoming :443 traffic is forwarded into the namespace
 #   5. Adds policy routing so response packets go back to clients (not into tunnel)
 #   6. Patches the systemd service to run the proxy inside the namespace
-#   7. Switches config to direct mode (middleproxy requires per-IP registration)
+#   7. Applies selected tunnel mode for use_middle_proxy (direct/preserve/middleproxy)
 #   8. Restarts the proxy
 #
 # Architecture:
@@ -59,9 +59,41 @@ fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 
 # ── Argument parsing ────────────────────────────────────────
 AWG_CONF="${1:-}"
-[[ -n "$AWG_CONF" ]] || fail "Usage: bash setup_tunnel.sh /path/to/awg-client.conf"
+TUNNEL_MODE="${2:-direct}"
+
+[[ -n "$AWG_CONF" ]] || fail "Usage: bash setup_tunnel.sh /path/to/awg-client.conf [direct|preserve|middleproxy]"
 [[ -f "$AWG_CONF" ]] || fail "Config file not found: $AWG_CONF"
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_tunnel.sh ..."
+
+case "$TUNNEL_MODE" in
+    direct|preserve|middleproxy) ;;
+    *) fail "Invalid tunnel mode '$TUNNEL_MODE'. Allowed: direct, preserve, middleproxy" ;;
+esac
+
+set_use_middle_proxy() {
+    local value="$1"
+    local cfg="$INSTALL_DIR/config.toml"
+
+    if grep -Eq '^[[:space:]]*use_middle_proxy[[:space:]]*=' "$cfg"; then
+        sed -i "0,/^[[:space:]]*use_middle_proxy[[:space:]]*=/{s/^[[:space:]]*use_middle_proxy[[:space:]]*=.*/use_middle_proxy = ${value}/}" "$cfg"
+        return
+    fi
+
+    if grep -Eq '^[[:space:]]*\[general\][[:space:]]*$' "$cfg"; then
+        sed -i "0,/^[[:space:]]*\[general\][[:space:]]*$/s//[general]\nuse_middle_proxy = ${value}/" "$cfg"
+        return
+    fi
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp)"
+    {
+        echo "[general]"
+        echo "use_middle_proxy = ${value}"
+        echo ""
+        cat "$cfg"
+    } > "$tmp_cfg"
+    mv "$tmp_cfg" "$cfg"
+}
 
 # ── Validate proxy is installed ─────────────────────────────
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] || fail "mtproto-proxy not found at $INSTALL_DIR. Run install.sh first."
@@ -180,15 +212,38 @@ SVC_EOF
 systemctl daemon-reload
 ok "Systemd service patched for tunnel mode"
 
-# ── Step 5: Switch to direct mode ───────────────────────────
-info "Switching config to direct mode..."
-if grep -q 'use_middle_proxy\s*=\s*true' "$INSTALL_DIR/config.toml"; then
-    sed -i 's/use_middle_proxy\s*=\s*true/use_middle_proxy = false/' "$INSTALL_DIR/config.toml"
-    # Remove tag (not needed in direct mode)
-    sed -i '/^\s*tag\s*=/d' "$INSTALL_DIR/config.toml"
-    ok "Switched to direct mode (middleproxy requires per-IP registration with @MTProxyBot)"
-else
-    ok "Already in direct mode"
+# ── Step 5: Apply selected tunnel mode ──────────────────────
+info "Applying tunnel mode: $TUNNEL_MODE..."
+MODE_STATUS=""
+case "$TUNNEL_MODE" in
+    direct)
+        set_use_middle_proxy false
+        MODE_STATUS="Direct mode for regular DC traffic (media keeps MiddleProxy path when available)"
+        ;;
+    preserve)
+        MODE_STATUS="Preserved existing use_middle_proxy setting from config"
+        ;;
+    middleproxy)
+        set_use_middle_proxy true
+        MODE_STATUS="MiddleProxy mode enabled for regular and media traffic"
+        ;;
+esac
+ok "$MODE_STATUS"
+
+if grep -Eq '^[[:space:]]*tag[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
+    ok "Promotion tag preserved"
+fi
+
+if ! grep -Eq '^[[:space:]]*tag[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
+    if [[ -f "$INSTALL_DIR/env.sh" ]]; then
+        TAG_FROM_ENV="$(awk -F= '/^[[:space:]]*export[[:space:]]+TAG[[:space:]]*=/{gsub(/"/,"",$2); gsub(/[[:space:]]/,"",$2); print tolower($2)}' "$INSTALL_DIR/env.sh" | head -1)"
+        if [[ "$TAG_FROM_ENV" =~ ^[0-9a-f]{32}$ ]]; then
+            if grep -Eq '^[[:space:]]*\[server\][[:space:]]*$' "$INSTALL_DIR/config.toml"; then
+                sed -i "0,/^[[:space:]]*\[server\][[:space:]]*$/s//[server]\ntag = \"${TAG_FROM_ENV}\"/" "$INSTALL_DIR/config.toml"
+                ok "Promotion tag restored from env.sh"
+            fi
+        fi
+    fi
 fi
 
 # ── Step 6: Restart proxy ───────────────────────────────────
@@ -251,6 +306,6 @@ echo ""
 echo -e "  ${BOLD}Architecture:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Proxy runs inside isolated network namespace"
 echo -e "  ${GREEN}✓${RESET} AmneziaWG tunnel active (host network untouched)"
-echo -e "  ${GREEN}✓${RESET} Direct mode (no middleproxy registration needed)"
+echo -e "  ${GREEN}✓${RESET} ${MODE_STATUS}"
 echo -e "  ${GREEN}✓${RESET} SSH and host services unaffected by tunnel"
 echo ""

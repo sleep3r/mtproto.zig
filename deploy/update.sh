@@ -83,6 +83,12 @@ for file in install.sh update.sh update_dns.sh ipv6-hop.sh setup_masking.sh setu
     curl -fsSL "${RAW_BASE}/${file}" -o "${TMP_DIR}/${file}" || fail "Failed to download ${file}"
 done
 
+if curl -fsSL "${RAW_BASE}/setup_tunnel.sh" -o "${TMP_DIR}/setup_tunnel.sh"; then
+    ok "Downloaded setup_tunnel.sh"
+else
+    warn "setup_tunnel.sh is missing in ${TAG}, keeping existing local copy if present"
+fi
+
 [[ -d "$INSTALL_DIR" ]] || fail "Install directory not found: $INSTALL_DIR"
 
 if [[ -f "${INSTALL_DIR}/mtproto-proxy" ]]; then
@@ -104,6 +110,9 @@ install -m 0755 "${TMP_DIR}/update_dns.sh" "${INSTALL_DIR}/update_dns.sh"
 install -m 0755 "${TMP_DIR}/ipv6-hop.sh" "${INSTALL_DIR}/ipv6-hop.sh"
 install -m 0755 "${TMP_DIR}/setup_masking.sh" "${INSTALL_DIR}/setup_masking.sh"
 install -m 0755 "${TMP_DIR}/setup_nfqws.sh" "${INSTALL_DIR}/setup_nfqws.sh"
+if [[ -f "${TMP_DIR}/setup_tunnel.sh" ]]; then
+    install -m 0755 "${TMP_DIR}/setup_tunnel.sh" "${INSTALL_DIR}/setup_tunnel.sh"
+fi
 install -m 0644 "${TMP_DIR}/capture_template.py" "${INSTALL_DIR}/capture_template.py"
 
 install -m 0644 "${TMP_DIR}/mtproto-proxy.service" "/etc/systemd/system/mtproto-proxy.service"
