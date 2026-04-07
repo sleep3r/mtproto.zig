@@ -39,10 +39,10 @@ function showTooltip(e, canvas, padLeft, dataArr, formatCb) {
   tt.innerHTML = `<div class="tooltip-ts">${tStr}</div>` + formatCb(item);
   
   // Position tooltip safely
-  let tx = e.pageX + 15;
-  let ty = e.pageY + 15;
-  if (tx + 120 > window.innerWidth) tx = e.pageX - 130;
-  if (ty + 50 > window.innerHeight) ty = e.pageY - 60;
+  let tx = e.clientX + 15;
+  let ty = e.clientY + 15;
+  if (tx + 120 > window.innerWidth) tx = e.clientX - 130;
+  if (ty + 50 > window.innerHeight) ty = e.clientY - 60;
   
   tt.style.left = tx + 'px';
   tt.style.top = ty + 'px';

@@ -330,7 +330,7 @@ body::after {
 
 /* ── Tooltips ── */
 .chart-tooltip {
-  position: absolute; pointer-events: none;
+  position: fixed; pointer-events: none;
   background: rgba(18, 22, 30, 0.9);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(247,164,29,0.15);
