@@ -55,11 +55,16 @@ systemctl restart "${SERVICE_NAME}"
 sleep 2
 
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [ -z "${server_ip}" ]; then
+    server_ip="<SERVER_IP>"
+  fi
+
   echo ""
   echo "✅ Monitor running on 127.0.0.1:${PORT}"
   echo ""
   echo "Access via SSH tunnel:"
-  echo "  ssh -L ${PORT}:localhost:${PORT} root@\$(hostname -I | awk '{print \$1}')"
+  echo "  ssh -L ${PORT}:localhost:${PORT} root@${server_ip}"
   echo "  open http://localhost:${PORT}"
 else
   echo "❌ Failed to start. Check: journalctl -u ${SERVICE_NAME} --no-pager -n 20"
