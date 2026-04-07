@@ -22,6 +22,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [Update](#-update-existing-server) &nbsp;&bull;&nbsp;
 [Docker](#docker-image) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
+[Monitoring](#-monitoring) &nbsp;&bull;&nbsp;
 [Tunnel](#-amneziawg-tunnel-blocked-regions) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
 [Troubleshooting](#-troubleshooting-updating)
@@ -155,6 +156,8 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
 | `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Add AmneziaWG tunnel to existing installation |
 | `make update-server SERVER=<ip> [VERSION=vX.Y.Z]` | Update server binary from GitHub Release artifacts |
+| `make deploy-monitor SERVER=<ip>` | Deploy monitoring dashboard to server |
+| `make monitor SERVER=<ip>` | Open SSH tunnel to monitoring dashboard |
 
 </details>
 
@@ -419,6 +422,53 @@ sudo systemctl restart mtproto-proxy
 
 # Stop
 sudo systemctl stop mtproto-proxy
+```
+
+## &nbsp; Monitoring
+
+The project includes a lightweight, Zig-themed web dashboard for real-time server monitoring. It runs as a separate systemd service (~30 MB RAM) and is accessible via SSH tunnel — no ports are exposed to the internet.
+
+**Features:**
+- **CPU & Memory** — live gauges with sparkline history charts (0–100% Y-axis)
+- **Network** — realtime RX/TX throughput graph with auto-scaling Y-axis labels
+- **Proxy stats** — active connections, handshakes, total served, drops breakdown
+- **Live logs** — WebSocket-streamed `journalctl` output with color-coded log levels, search, and filters
+- **Poll controls** — adjustable refresh interval (1s–10s), pause/resume, data freshness indicator
+
+### Deploy
+
+```bash
+make deploy-monitor SERVER=<SERVER_IP>
+```
+
+This uploads `deploy/monitor/` (Python FastAPI backend + static frontend), installs Python dependencies (`fastapi`, `uvicorn`, `psutil`, `websockets`), creates a `proxy-monitor` systemd service, and starts it on `127.0.0.1:61208`.
+
+### Access
+
+The dashboard binds to `127.0.0.1` only — access it via SSH tunnel:
+
+```bash
+make monitor SERVER=<SERVER_IP>
+# Then open http://localhost:61208
+```
+
+Or manually:
+
+```bash
+ssh -L 61208:localhost:61208 root@<SERVER_IP>
+# open http://localhost:61208
+```
+
+### Structure
+
+```
+deploy/monitor/
+├── server.py          # FastAPI backend (stats API + WebSocket log streaming)
+├── install.sh         # Server-side install script
+└── static/
+    ├── index.html     # Dashboard markup
+    ├── style.css      # Zig-themed dark UI
+    └── app.js         # Charts, gauges, live logs, poll controls
 ```
 
 ## &nbsp; AmneziaWG Tunnel (Blocked Regions)
