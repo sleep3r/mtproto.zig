@@ -79,25 +79,44 @@ fn writeRaw(s: []const u8) void {
 
 // ============= Public IP Detection =============
 
+fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const uri = try std.Uri.parse(url);
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = @enumFromInt(3),
+        .keep_alive = false,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer req.deinit();
+
+    try req.sendBodiless();
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status.class() != .success) return error.HttpRequestFailed;
+
+    var transfer_buf: [4 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+    return reader.allocRemaining(allocator, .limited(64 * 1024));
+}
+
 /// Try to detect the server's public IP address via external services.
 /// Returns the IP string (caller owns memory) or null on failure.
 fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
     // Try multiple services in order
-    const services = [_][]const []const u8{
-        &.{ "curl", "-4", "-s", "--max-time", "3", "https://ifconfig.me" },
-        &.{ "curl", "-4", "-s", "--max-time", "3", "https://api.ipify.org" },
-        &.{ "curl", "-4", "-s", "--max-time", "3", "https://icanhazip.com" },
+    const services = [_][]const u8{
+        "https://ifconfig.me",
+        "https://api.ipify.org",
+        "https://icanhazip.com",
     };
 
-    for (services) |argv| {
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = argv,
-        }) catch continue;
-
-        defer allocator.free(result.stderr);
-
-        const stdout = result.stdout;
+    for (services) |url| {
+        const stdout = fetchUrlBytes(allocator, url) catch continue;
         // Trim whitespace/newlines
         const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\n', '\r' });
         if (trimmed.len == 0 or trimmed.len > 45) {
@@ -158,20 +177,27 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
     // Approximate per-connection user-space working set in the epoll model:
     // - preallocated slot state and small relay buffers
-    // - optional middle-proxy stream buffers (4 buffers)
+    // - optional middle-proxy stream buffers (2 per-connection buffers)
     // - allocator/socket bookkeeping cushion
     const tls_working_bytes: u64 = @intCast(6 * 1024);
-    const middleproxy_bytes: u64 = if (cfg.use_middle_proxy)
-        @intCast(cfg.middleProxyBufferBytes() * 4)
+    const middleproxy_per_conn_bytes: u64 = if (cfg.use_middle_proxy)
+        @intCast(cfg.middleProxyBufferBytes() * 2)
+    else
+        0;
+    // Event loop also keeps 2 shared scratch buffers for middle-proxy
+    // encapsulate/decapsulate temporary output.
+    const middleproxy_shared_bytes: u64 = if (cfg.use_middle_proxy)
+        @intCast(cfg.middleProxyBufferBytes() * 2)
     else
         0;
     const overhead_bytes: u64 = 2 * 1024;
-    const per_conn_bytes = tls_working_bytes + middleproxy_bytes + overhead_bytes;
+    const per_conn_bytes = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes;
 
     // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
     const usable_bytes = (total_ram_bytes * 70) / 100;
     const reserve_bytes = @max(@as(u64, 256 * 1024 * 1024), (total_ram_bytes * 10) / 100);
-    const budget_bytes = if (usable_bytes > reserve_bytes) usable_bytes - reserve_bytes else 0;
+    const fixed_overhead_bytes = reserve_bytes + middleproxy_shared_bytes;
+    const budget_bytes = if (usable_bytes > fixed_overhead_bytes) usable_bytes - fixed_overhead_bytes else 0;
 
     const raw_cap = if (per_conn_bytes > 0) budget_bytes / per_conn_bytes else 0;
     const safe_connections_u64 = @max(@as(u64, 32), @min(raw_cap, @as(u64, std.math.maxInt(u32))));
@@ -317,6 +343,15 @@ pub fn main() !void {
 
     // Apply runtime log level from config
     runtime_log_level = cfg.log_level;
+
+    if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
+        const log_main = std.log.scoped(.config);
+        log_main.warn(
+            "AES backend is software-only for this build/target. MiddleProxy video traffic will be CPU-heavy. " ++
+                "Rebuild with CPU features enabled (example: -Dcpu=native or -Dcpu=x86_64_v3).",
+            .{},
+        );
+    }
 
     // Auto-clamp max_connections to RAM-safe estimate (unless explicitly opted out)
     if (detectTotalRamBytes(allocator)) |total_ram| {

@@ -117,12 +117,10 @@ pub const MiddleProxyContext = struct {
     s2c_buf: []u8,
     s2c_len: usize = 0,
     s2c_decrypted_len: usize = 0,
-    s2c_out_buf: []u8,
 
     // For C2S fragment parsing
     c2s_buf: []u8,
     c2s_len: usize = 0,
-    c2s_out_buf: []u8,
 
     pub const default_stream_buffer_size: usize = 128 * 1024;
 
@@ -192,14 +190,8 @@ pub const MiddleProxyContext = struct {
         const s2c_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(s2c_buf);
 
-        const s2c_out_buf = try allocator.alloc(u8, buffer_size);
-        errdefer allocator.free(s2c_out_buf);
-
         const c2s_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(c2s_buf);
-
-        const c2s_out_buf = try allocator.alloc(u8, buffer_size);
-        errdefer allocator.free(c2s_out_buf);
 
         return .{
             .encryptor = encryptor,
@@ -212,23 +204,19 @@ pub const MiddleProxyContext = struct {
             .proto_tag = proto_tag,
             .ad_tag = ad_tag,
             .s2c_buf = s2c_buf,
-            .s2c_out_buf = s2c_out_buf,
             .c2s_buf = c2s_buf,
-            .c2s_out_buf = c2s_out_buf,
         };
     }
 
     pub fn deinit(self: *MiddleProxyContext, allocator: std.mem.Allocator) void {
         allocator.free(self.s2c_buf);
-        allocator.free(self.s2c_out_buf);
         allocator.free(self.c2s_buf);
-        allocator.free(self.c2s_out_buf);
     }
 
     /// Takes arbitrary bytes from the client stream, wraps them in RPC_PROXY_REQ,
     /// frames them into MTProtoFrame(s), encrypts with AES-CBC, and stores them in `out_buf`.
     /// Returns the number of bytes written to `out_buf` (which must be sent to the DC).
-    pub fn encapsulateC2S(self: *MiddleProxyContext, client_data: []const u8) ![]const u8 {
+    pub fn encapsulateC2S(self: *MiddleProxyContext, client_data: []const u8, out_buf: []u8) ![]const u8 {
         if (self.c2s_len + client_data.len > self.c2s_buf.len) return error.MiddleProxyBufferOverflow;
         @memcpy(self.c2s_buf[self.c2s_len .. self.c2s_len + client_data.len], client_data);
         self.c2s_len += client_data.len;
@@ -281,7 +269,7 @@ pub const MiddleProxyContext = struct {
             const payload = self.c2s_buf[pos + header_len .. pos + header_len + actual_payload_len];
 
             // 3. Pass is_quickack to the encapsulator
-            const written = try self.encapsulateSingleMessageC2S(payload, is_quickack, self.c2s_out_buf[total_written..]);
+            const written = try self.encapsulateSingleMessageC2S(payload, is_quickack, out_buf[total_written..]);
             total_written += written;
 
             // Note: Advance `pos` by the FULL payload_len so we safely consume/discard the padding bytes
@@ -296,10 +284,12 @@ pub const MiddleProxyContext = struct {
             self.c2s_len = remaining;
         }
 
-        return self.c2s_out_buf[0..total_written];
+        return out_buf[0..total_written];
     }
 
     pub fn encapsulateSingleMessageC2S(self: *MiddleProxyContext, client_data: []const u8, is_quickack: bool, out_buf: []u8) !usize {
+        if ((client_data.len & 3) != 0) return error.InvalidPayloadLength;
+
         var flags = Flag.magic | Flag.extmode2;
         if (self.ad_tag != null) {
             flags |= Flag.has_ad_tag;
@@ -390,35 +380,34 @@ pub const MiddleProxyContext = struct {
 
     /// Takes raw AES-CBC bytes from DC, decrypts them block by block, parses MTProtoFrames,
     /// strips RPC_PROXY_ANS, and writes the inner payload into `out_buf`.
-    pub fn decapsulateS2C(self: *MiddleProxyContext, dc_chunk: []const u8) ![]u8 {
+    pub fn decapsulateS2C(self: *MiddleProxyContext, dc_chunk: []const u8, out_buf: []u8) ![]u8 {
         if (self.s2c_len + dc_chunk.len > self.s2c_buf.len) return error.MiddleProxyBufferOverflow;
         @memcpy(self.s2c_buf[self.s2c_len .. self.s2c_len + dc_chunk.len], dc_chunk);
         self.s2c_len += dc_chunk.len;
 
-        // Decrypt any new full 16-byte blocks
-        while (self.s2c_decrypted_len + 16 <= self.s2c_len) {
-            try self.decryptor.decryptInPlace(self.s2c_buf[self.s2c_decrypted_len .. self.s2c_decrypted_len + 16]);
-            self.s2c_decrypted_len += 16;
+        // Decrypt any newly arrived full 16-byte blocks in one batch.
+        const undec_len = self.s2c_len - self.s2c_decrypted_len;
+        const decrypt_len = undec_len - (undec_len % 16);
+        if (decrypt_len > 0) {
+            const start = self.s2c_decrypted_len;
+            const end = start + decrypt_len;
+            try self.decryptor.decryptInPlace(self.s2c_buf[start..end]);
+            self.s2c_decrypted_len = end;
         }
 
         var out_pos: usize = 0;
+        var parse_pos: usize = 0;
 
         // Parse fully decrypted MTProto frames.
         // Mirrors telemt behavior: parse by frame_len, treat 0x04 words as NO-OP,
         // keep decrypt stream running continuously across arbitrary read boundaries.
-        while (self.s2c_decrypted_len >= 4) {
-            const frame_len = std.mem.readInt(u32, self.s2c_buf[0..4], .little);
+        while (self.s2c_decrypted_len - parse_pos >= 4) {
+            const frame_len = std.mem.readInt(u32, self.s2c_buf[parse_pos..][0..4], .little);
 
             // MTProto CBC stream may contain standalone NO-OP padding words
             // (0x04 00 00 00). Python reference reader skips them.
             if (frame_len == 4) {
-                if (self.s2c_len < 4 or self.s2c_decrypted_len < 4) break;
-                const remaining_noop = self.s2c_len - 4;
-                if (remaining_noop > 0) {
-                    std.mem.copyForwards(u8, self.s2c_buf[0..remaining_noop], self.s2c_buf[4..self.s2c_len]);
-                }
-                self.s2c_len = remaining_noop;
-                self.s2c_decrypted_len -= 4;
+                parse_pos += 4;
                 continue;
             }
 
@@ -431,26 +420,27 @@ pub const MiddleProxyContext = struct {
                 break;
             }
 
-            if (self.s2c_decrypted_len < frame_len) {
+            if (self.s2c_decrypted_len - parse_pos < frame_len) {
                 break; // Not enough decrypted data yet
             }
 
-            const expected_checksum = std.mem.readInt(u32, self.s2c_buf[frame_len - 4 ..][0..4], .little);
-            const computed_checksum = crc32(self.s2c_buf[0 .. frame_len - 4]);
+            const frame_end = parse_pos + frame_len;
+            const expected_checksum = std.mem.readInt(u32, self.s2c_buf[frame_end - 4 ..][0..4], .little);
+            const computed_checksum = crc32(self.s2c_buf[parse_pos .. frame_end - 4]);
             if (expected_checksum != computed_checksum) return error.BadMiddleProxyChecksum;
 
-            const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[4..8], .little);
+            const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[parse_pos + 4 ..][0..4], .little);
             if (frame_seq_no != self.read_seq_no) return error.BadMiddleProxySeqNo;
             self.read_seq_no += 1;
 
             // Payload is after Length (4) and SeqNo (4), and before CRC32 (4)
-            const payload = self.s2c_buf[8 .. frame_len - 4];
+            const payload = self.s2c_buf[parse_pos + 8 .. frame_end - 4];
 
             if (payload.len >= 16 and std.mem.eql(u8, payload[0..4], &rpc_simple_ack)) {
                 // RPC_SIMPLE_ACK format: type(4) + conn_id(8) + confirm(4)
                 const confirm = payload[12..16];
-                if (out_pos + confirm.len > self.s2c_out_buf.len) return error.OutBufOverflow;
-                @memcpy(self.s2c_out_buf[out_pos .. out_pos + confirm.len], confirm);
+                if (out_pos + confirm.len > out_buf.len) return error.OutBufOverflow;
+                @memcpy(out_buf[out_pos .. out_pos + confirm.len], confirm);
                 out_pos += confirm.len;
             } else if (payload.len >= 4 and std.mem.eql(u8, payload[0..4], &rpc_close_ext)) {
                 return error.ConnectionReset;
@@ -490,29 +480,34 @@ pub const MiddleProxyContext = struct {
                     },
                 }
 
-                if (out_pos + header_len + conn_data.len + pad_len > self.s2c_out_buf.len) return error.OutBufOverflow;
+                if (out_pos + header_len + conn_data.len + pad_len > out_buf.len) return error.OutBufOverflow;
 
-                @memcpy(self.s2c_out_buf[out_pos .. out_pos + header_len], header_buf[0..header_len]);
+                @memcpy(out_buf[out_pos .. out_pos + header_len], header_buf[0..header_len]);
                 out_pos += header_len;
 
-                @memcpy(self.s2c_out_buf[out_pos .. out_pos + conn_data.len], conn_data);
+                @memcpy(out_buf[out_pos .. out_pos + conn_data.len], conn_data);
                 out_pos += conn_data.len;
 
                 if (pad_len > 0) {
-                    @memcpy(self.s2c_out_buf[out_pos .. out_pos + pad_len], pad_buf[0..pad_len]);
+                    @memcpy(out_buf[out_pos .. out_pos + pad_len], pad_buf[0..pad_len]);
                     out_pos += pad_len;
                 }
             }
             // Ignore other RPC types (e.g. RPC_SIMPLE_ACK, RPC_CLOSE_EXT)
 
-            // Shift buffer
-            const remaining = self.s2c_len - frame_len;
-            std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[frame_len..self.s2c_len]);
-            self.s2c_len = remaining;
-            self.s2c_decrypted_len -= frame_len;
+            parse_pos = frame_end;
         }
 
-        return self.s2c_out_buf[0..out_pos];
+        if (parse_pos > 0 and parse_pos <= self.s2c_len) {
+            const remaining = self.s2c_len - parse_pos;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[parse_pos..self.s2c_len]);
+            }
+            self.s2c_len = remaining;
+            self.s2c_decrypted_len -= parse_pos;
+        }
+
+        return out_buf[0..out_pos];
     }
 };
 
@@ -590,6 +585,34 @@ test "encapsulated c2s omits ad_tag block when absent" {
     const flags = std.mem.readInt(u32, payload[4..8], .little);
     try std.testing.expect((flags & Flag.has_ad_tag) == 0);
     try std.testing.expectEqual(@as(usize, 56 + client_data.len), payload.len);
+}
+
+test "encapsulate c2s rejects unaligned payload length" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    const client_data = [_]u8{ 0xde, 0xad, 0xbe };
+    var encrypted_out: [128]u8 = undefined;
+
+    try std.testing.expectError(
+        error.InvalidPayloadLength,
+        ctx.encapsulateSingleMessageC2S(client_data[0..], false, encrypted_out[0..]),
+    );
 }
 
 test "encapsulated c2s includes ad_tag block when present" {
@@ -689,7 +712,8 @@ test "decapsulate s2c skips noop padding words" {
     var wire = plain;
     try enc.encryptInPlace(wire[0..]);
 
-    const out = try ctx.decapsulateS2C(wire[0..]);
+    var out_buf: [128]u8 = undefined;
+    const out = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
     try std.testing.expectEqual(@as(usize, 4), out.len);
     try std.testing.expectEqualSlices(u8, &confirm, out);
 }
@@ -729,7 +753,8 @@ test "decapsulate s2c validates seq and checksum" {
     var wire = plain;
     try enc.encryptInPlace(wire[0..]);
 
-    const out = try ctx.decapsulateS2C(wire[0..]);
+    var out_buf: [128]u8 = undefined;
+    const out = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
     try std.testing.expectEqual(@as(usize, 8), out.len); // len(4) + data(4)
 
     // Send a second valid frame with wrong seq (5 instead of expected 1)
@@ -746,7 +771,7 @@ test "decapsulate s2c validates seq and checksum" {
     var wire2 = plain2;
     try enc.encryptInPlace(wire2[0..]);
 
-    try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..]));
+    try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..], out_buf[0..]));
 }
 
 test "encapsulate c2s supports payloads larger than 64KiB" {

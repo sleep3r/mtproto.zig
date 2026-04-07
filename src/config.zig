@@ -11,6 +11,9 @@ pub const Config = struct {
     /// Route regular DC traffic via Telegram MiddleProxy transport.
     /// Mirrors telemt's [general].use_middle_proxy behavior.
     use_middle_proxy: bool = false,
+    /// Force media-path traffic (DC203 / negative dc_idx) through MiddleProxy,
+    /// even when use_middle_proxy is false.
+    force_media_middle_proxy: bool = true,
     port: u16 = 443,
     /// TCP listen(2) backlog for client-facing sockets
     backlog: u32 = 4096,
@@ -34,7 +37,9 @@ pub const Config = struct {
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
-    /// Per-connection MiddleProxy stream buffers size, in KiB (applies to 4 buffers).
+    /// MiddleProxy stream buffer size in KiB.
+    /// In current design, each connection keeps 2 such buffers and EventLoop
+    /// keeps 2 shared scratch buffers.
     /// Minimum 1024 recommended — lower values cause MiddleProxyBufferOverflow on media
     /// downloads (Stories, video messages) through middle proxy.
     middleproxy_buffer_kb: u32 = 1024,
@@ -67,11 +72,12 @@ pub const Config = struct {
         }
         if (self.use_middle_proxy and self.max_connections > 2000) {
             const log = std.log.scoped(.config);
-            const mem_per_conn_mb = (self.middleProxyBufferBytes() * 4) / (1024 * 1024);
+            const mem_per_conn_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
+            const shared_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
             log.warn(
                 "max_connections={d} with middleproxy_buffer_kb={d} may require " ++
-                    "up to {d} MB of RAM at full capacity. Ensure your VPS has sufficient memory.",
-                .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections },
+                    "up to {d} MB + {d} MB shared RAM at full capacity. Ensure your VPS has sufficient memory.",
+                .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections, shared_mb },
             );
         }
     }
@@ -131,6 +137,8 @@ pub const Config = struct {
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
                         cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "force_media_middle_proxy")) {
+                        cfg.force_media_middle_proxy = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         // telemt compatibility: [general].fast_mode
                         cfg.fast_mode = std.mem.eql(u8, value, "true");

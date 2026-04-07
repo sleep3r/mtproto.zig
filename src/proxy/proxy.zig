@@ -36,44 +36,102 @@ const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
-/// Fixed 256-bucket hash table — zero heap allocation.
+/// Fixed-size open-addressed hash table — zero heap allocation.
 /// Token bucket per subnet: each second refills up to max_per_sec tokens.
 const SubnetRateLimit = struct {
-    const BUCKETS = 256;
+    const BUCKETS = 65536;
+    const MAX_PROBES = 8;
+    const stale_after_s: i64 = 60;
+
     const Entry = struct {
+        used: bool = false,
         subnet_key: u32 = 0,
         tokens: u8 = 0,
         last_refill_s: i64 = 0,
     };
+
+    hash_seed: u64 = 0,
     entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+
+    fn init() SubnetRateLimit {
+        return .{
+            .hash_seed = std.crypto.random.int(u64),
+        };
+    }
+
+    fn indexFor(self: *const SubnetRateLimit, key: u32) usize {
+        var x = self.hash_seed ^ @as(u64, key);
+        x +%= 0x9E3779B97F4A7C15;
+        x ^= x >> 30;
+        x *%= 0xBF58476D1CE4E5B9;
+        x ^= x >> 27;
+        x *%= 0x94D049BB133111EB;
+        x ^= x >> 31;
+        return @as(usize, @intCast(x & (BUCKETS - 1)));
+    }
+
+    fn findEntry(self: *SubnetRateLimit, key: u32) ?*Entry {
+        const start = self.indexFor(key);
+        var probe: usize = 0;
+        while (probe < MAX_PROBES) : (probe += 1) {
+            const idx = (start + probe) & (BUCKETS - 1);
+            const e = &self.entries[idx];
+            if (!e.used) return null;
+            if (e.subnet_key == key) return e;
+        }
+        return null;
+    }
 
     /// Returns true if the connection is allowed, false if rate-limited.
     fn check(self: *SubnetRateLimit, addr: net.Address, max_per_sec: u8) bool {
         if (max_per_sec == 0) return true;
         const key = subnetKey(addr);
-        const idx = key % BUCKETS;
-        const e = &self.entries[idx];
         const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
 
-        if (e.subnet_key != key or now_s - e.last_refill_s > 60) {
-            // New subnet or stale entry — reset
-            e.* = .{ .subnet_key = key, .tokens = max_per_sec -| 1, .last_refill_s = now_s };
-            return true;
+        const start = self.indexFor(key);
+        var first_stale_idx: ?usize = null;
+        var oldest_idx: usize = start;
+        var oldest_ts: i64 = std.math.maxInt(i64);
+
+        var probe: usize = 0;
+        while (probe < MAX_PROBES) : (probe += 1) {
+            const idx = (start + probe) & (BUCKETS - 1);
+            const e = &self.entries[idx];
+
+            if (!e.used) {
+                e.* = .{ .used = true, .subnet_key = key, .tokens = max_per_sec -| 1, .last_refill_s = now_s };
+                return true;
+            }
+
+            if (e.subnet_key == key) {
+                // Refill tokens based on elapsed seconds
+                const elapsed = now_s - e.last_refill_s;
+                if (elapsed > 0) {
+                    const refill: u16 = @intCast(@min(elapsed, 255));
+                    const topped = @as(u16, e.tokens) + refill * @as(u16, max_per_sec);
+                    e.tokens = @intCast(@min(@as(u16, max_per_sec), topped));
+                    e.last_refill_s = now_s;
+                }
+
+                if (e.tokens > 0) {
+                    e.tokens -= 1;
+                    return true;
+                }
+                return false;
+            }
+
+            if (now_s - e.last_refill_s > stale_after_s and first_stale_idx == null) {
+                first_stale_idx = idx;
+            }
+            if (e.last_refill_s < oldest_ts) {
+                oldest_ts = e.last_refill_s;
+                oldest_idx = idx;
+            }
         }
 
-        // Refill tokens based on elapsed seconds
-        const elapsed = now_s - e.last_refill_s;
-        if (elapsed > 0) {
-            const refill: u16 = @intCast(@min(elapsed, 255));
-            e.tokens = @min(max_per_sec, e.tokens +| @as(u8, @intCast(@min(refill * @as(u16, max_per_sec), 255))));
-            e.last_refill_s = now_s;
-        }
-
-        if (e.tokens > 0) {
-            e.tokens -= 1;
-            return true;
-        }
-        return false;
+        const victim_idx = first_stale_idx orelse oldest_idx;
+        self.entries[victim_idx] = .{ .used = true, .subnet_key = key, .tokens = max_per_sec -| 1, .last_refill_s = now_s };
+        return true;
     }
 
     fn subnetKey(addr: net.Address) u32 {
@@ -227,7 +285,9 @@ const MessageQueue = struct {
             remaining -= blk_left;
             self.offset = 0;
             self.head_idx += 1;
-            try self.recycleBlock(blk);
+            self.recycleBlock(blk) catch {
+                self.allocator.destroy(blk);
+            };
         }
 
         if (self.head_idx > 0 and (self.head_idx >= self.blocks.items.len or self.head_idx >= 64)) {
@@ -367,20 +427,75 @@ const DynamicRecordSizer = struct {
 };
 
 const ReplayCache = struct {
-    mutex: std.Thread.Mutex = .{},
-    entries: [4096][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 4096,
-    idx: usize = 0,
+    const BUCKETS = 8192;
+    const MAX_PROBES = 8;
+    const stale_after_s: i64 = 60 * 60;
+
+    const Entry = struct {
+        used: bool = false,
+        key: u64 = 0,
+        last_seen_s: i64 = 0,
+    };
+
+    hash_seed: u64 = 0,
+    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+
+    fn init() ReplayCache {
+        return .{
+            .hash_seed = std.crypto.random.int(u64),
+        };
+    }
+
+    fn digestKey(digest: *const [32]u8) u64 {
+        return std.mem.readInt(u64, digest[0..8], .little);
+    }
+
+    fn indexFor(self: *const ReplayCache, key: u64) usize {
+        var x = self.hash_seed ^ key;
+        x +%= 0x9E3779B97F4A7C15;
+        x ^= x >> 30;
+        x *%= 0xBF58476D1CE4E5B9;
+        x ^= x >> 27;
+        x *%= 0x94D049BB133111EB;
+        x ^= x >> 31;
+        return @as(usize, @intCast(x & (BUCKETS - 1)));
+    }
 
     pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const key = digestKey(digest);
+        const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
+        const start = self.indexFor(key);
 
-        for (&self.entries) |*cached| {
-            if (std.mem.eql(u8, cached, digest)) return true;
+        var first_stale_idx: ?usize = null;
+        var oldest_idx: usize = start;
+        var oldest_ts: i64 = std.math.maxInt(i64);
+
+        var probe: usize = 0;
+        while (probe < MAX_PROBES) : (probe += 1) {
+            const idx = (start + probe) & (BUCKETS - 1);
+            const e = &self.entries[idx];
+
+            if (!e.used) {
+                e.* = .{ .used = true, .key = key, .last_seen_s = now_s };
+                return false;
+            }
+
+            if (e.key == key) {
+                e.last_seen_s = now_s;
+                return true;
+            }
+
+            if (now_s - e.last_seen_s > stale_after_s and first_stale_idx == null) {
+                first_stale_idx = idx;
+            }
+            if (e.last_seen_s < oldest_ts) {
+                oldest_ts = e.last_seen_s;
+                oldest_idx = idx;
+            }
         }
 
-        self.entries[self.idx] = digest.*;
-        self.idx = (self.idx + 1) % self.entries.len;
+        const victim_idx = first_stale_idx orelse oldest_idx;
+        self.entries[victim_idx] = .{ .used = true, .key = key, .last_seen_s = now_s };
         return false;
     }
 };
@@ -687,6 +802,7 @@ pub const ProxyState = struct {
     handshakes_inflight: std.atomic.Value(u32),
     mask_addr: ?net.Address,
     replay_cache: ReplayCache,
+    tls_server_hello_template: [tls.server_hello_template_len]u8,
 
     // Degradation counters (monotonic totals, delta'd in stats log)
     stats_dropped_cap: std.atomic.Value(u64),
@@ -753,7 +869,8 @@ pub const ProxyState = struct {
             .active_connections = std.atomic.Value(u32).init(0),
             .handshakes_inflight = std.atomic.Value(u32).init(0),
             .mask_addr = resolved_addr,
-            .replay_cache = .{},
+            .replay_cache = ReplayCache.init(),
+            .tls_server_hello_template = tls.buildServerHelloTemplate(null),
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
             .stats_dropped_saturation = std.atomic.Value(u64).init(0),
             .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
@@ -1016,6 +1133,8 @@ const EventLoop = struct {
     prev_dropped_hs_budget: u64,
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
+    mp_c2s_scratch: ?[]u8,
+    mp_s2c_scratch: ?[]u8,
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -1033,13 +1152,15 @@ const EventLoop = struct {
             .stats_next_log_ns = std.time.nanoTimestamp() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
-            .subnet_limiter = .{},
+            .subnet_limiter = SubnetRateLimit.init(),
             .prev_dropped_cap = 0,
             .prev_dropped_saturation = 0,
             .prev_dropped_rate_limit = 0,
             .prev_dropped_hs_budget = 0,
             .prev_hs_timeout = 0,
             .prev_mp_fallback = 0,
+            .mp_c2s_scratch = null,
+            .mp_s2c_scratch = null,
         };
         errdefer loop.pool.deinit();
 
@@ -1055,6 +1176,10 @@ const EventLoop = struct {
                 }
             }
         }
+
+        if (self.mp_c2s_scratch) |buf| self.state.allocator.free(buf);
+        if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
+
         self.pool.deinit();
         posix.close(self.epoll_fd);
     }
@@ -1573,8 +1698,9 @@ const EventLoop = struct {
         slot.validation_user_len = @intCast(ulen);
         @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
 
-        slot.server_hello = tls.buildServerHello(
+        slot.server_hello = tls.buildServerHelloWithTemplate(
             self.state.allocator,
+            self.state.tls_server_hello_template[0..],
             &slot.validation_secret,
             &slot.validation_digest,
             slot.validation_session_id[0..slot.validation_session_id_len],
@@ -1794,28 +1920,28 @@ const EventLoop = struct {
     }
 
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: net.Address, kind: UpstreamKind) !void {
-        slot.current_upstream_addr = addr;
-
         const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-        slot.upstream_fd = fd;
-        slot.upstream_kind = kind;
-        slot.phase = .connecting_upstream;
+        errdefer posix.close(fd);
 
         try self.addFd(fd, false, true);
+        errdefer _ = self.delFd(fd) catch {};
+
         try self.pool.mapFd(fd, slot.index);
+        errdefer self.pool.unmapFd(fd);
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| {
-            if (err == error.WouldBlock or err == error.ConnectionPending) {
-                return;
-            }
-
-            self.pool.unmapFd(fd);
-            _ = self.delFd(fd) catch {};
-            posix.close(fd);
+        slot.upstream_fd = fd;
+        slot.upstream_kind = kind;
+        slot.current_upstream_addr = addr;
+        slot.phase = .connecting_upstream;
+        errdefer {
             slot.upstream_fd = -1;
             slot.upstream_kind = .none;
             slot.current_upstream_addr = null;
-            return err;
+        }
+
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+            error.WouldBlock, error.ConnectionPending => return,
+            else => return err,
         };
 
         self.onUpstreamConnectComplete(slot);
@@ -2046,7 +2172,12 @@ const EventLoop = struct {
             if (slot.client_decryptor) |*dec| dec.apply(buf);
 
             if (slot.middle_ctx) |*mp| {
-                const out_data = mp.encapsulateC2S(buf) catch {
+                const scratch = self.ensureMpC2sScratch() catch {
+                    self.closeSlot(slot, "alloc middleproxy c2s scratch failed");
+                    return;
+                };
+                const out_data = mp.encapsulateC2S(buf, scratch) catch {
+                    self.closeSlot(slot, "encapsulate pipelined middleproxy payload failed");
                     return;
                 };
                 if (out_data.len > 0) {
@@ -2072,7 +2203,15 @@ const EventLoop = struct {
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
 
-        const progress = relayClientToUpstreamStep(slot, self.state.allocator) catch |err| {
+        const mp_c2s_scratch = if (slot.middle_ctx != null)
+            self.ensureMpC2sScratch() catch {
+                self.closeSlot(slot, "alloc middleproxy c2s scratch failed");
+                return;
+            }
+        else
+            null;
+
+        const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2089,7 +2228,15 @@ const EventLoop = struct {
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
-        const progress = relayUpstreamToClientStep(slot, self.state.allocator) catch |err| {
+        const mp_s2c_scratch = if (slot.middle_ctx != null)
+            self.ensureMpS2cScratch() catch {
+                self.closeSlot(slot, "alloc middleproxy s2c scratch failed");
+                return;
+            }
+        else
+            null;
+
+        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2722,6 +2869,20 @@ const EventLoop = struct {
         }
     }
 
+    fn ensureMpC2sScratch(self: *EventLoop) ![]u8 {
+        if (self.mp_c2s_scratch) |buf| return buf;
+        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
+        self.mp_c2s_scratch = buf;
+        return buf;
+    }
+
+    fn ensureMpS2cScratch(self: *EventLoop) ![]u8 {
+        if (self.mp_s2c_scratch) |buf| return buf;
+        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
+        self.mp_s2c_scratch = buf;
+        return buf;
+    }
+
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
         log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
@@ -2816,7 +2977,7 @@ const EventLoop = struct {
     }
 };
 
-fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator) !RelayProgress {
+fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_c2s_scratch: ?[]u8) !RelayProgress {
     const read_buf = try ensureReadBuf(slot, allocator);
     var consumed_any = false;
 
@@ -2879,7 +3040,8 @@ fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
         if (slot.client_decryptor) |*dec| dec.apply(payload);
 
         if (slot.middle_ctx) |*mp| {
-            const out_data = try mp.encapsulateC2S(payload);
+            const scratch = mp_c2s_scratch orelse return error.MissingMiddleProxyScratch;
+            const out_data = try mp.encapsulateC2S(payload, scratch);
             if (out_data.len > 0) {
                 _ = try queueUpstream(slot, allocator, out_data);
             }
@@ -2901,7 +3063,7 @@ fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
     }
 }
 
-fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator) !RelayProgress {
+fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_s2c_scratch: ?[]u8) !RelayProgress {
     const read_buf = try ensureReadBuf(slot, allocator);
     const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
         if (err == error.WouldBlock) return .none;
@@ -2912,7 +3074,8 @@ fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
     const raw = read_buf[0..n];
 
     if (slot.middle_ctx) |*mp| {
-        const payload = try mp.decapsulateS2C(raw);
+        const scratch = mp_s2c_scratch orelse return error.MissingMiddleProxyScratch;
+        const payload = try mp.decapsulateS2C(raw, scratch);
         if (payload.len == 0) return .partial;
         if (slot.client_encryptor) |*enc| enc.apply(payload);
         try queueTlsAppRecords(slot, allocator, payload);
@@ -2932,19 +3095,17 @@ fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
 
 fn queueTlsAppRecords(slot: *ConnectionSlot, allocator: std.mem.Allocator, payload: []u8) !void {
     var off: usize = 0;
+    var header: [tls_header_len]u8 = undefined;
+
     while (off < payload.len) {
         const chunk_len = @min(payload.len - off, slot.drs.nextRecordSize());
-        const frame_len = tls_header_len + chunk_len;
-        var frame = try allocator.alloc(u8, frame_len);
-        errdefer allocator.free(frame);
 
-        frame[0] = constants.tls_record_application;
-        frame[1] = constants.tls_version[0];
-        frame[2] = constants.tls_version[1];
-        std.mem.writeInt(u16, frame[3..5], @intCast(chunk_len), .big);
-        @memcpy(frame[5..], payload[off .. off + chunk_len]);
+        header[0] = constants.tls_record_application;
+        header[1] = constants.tls_version[0];
+        header[2] = constants.tls_version[1];
+        std.mem.writeInt(u16, header[3..5], @intCast(chunk_len), .big);
 
-        _ = try queueClientOwned(slot, allocator, frame);
+        _ = try slotQueueClientPair(slot, allocator, header[0..], payload[off .. off + chunk_len]);
         slot.drs.recordSent(chunk_len);
         off += chunk_len;
     }
@@ -3027,7 +3188,13 @@ fn setTcpKeepalive(fd: posix.fd_t) void {
     posix.setsockopt(fd, sol_tcp, 6, std.mem.asBytes(&count)) catch return;
 }
 
+fn setTcpNoDelay(fd: posix.fd_t) void {
+    const enable: c_int = 1;
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch return;
+}
+
 fn configureRelaySocket(fd: posix.fd_t) void {
+    setTcpNoDelay(fd);
     setTcpKeepalive(fd);
     setSendTimeout(fd, 30);
 }
@@ -3071,25 +3238,30 @@ fn ensureMpFrameBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
     return buf;
 }
 
-fn runCurl(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-    });
-    defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
-
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
-    }
-
-    return result.stdout;
-}
-
 fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    const strict_argv = [_][]const u8{ "curl", "-fsSL", "--max-time", "10", url };
-    return runCurl(allocator, &strict_argv);
+    const uri = try std.Uri.parse(url);
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = @enumFromInt(3),
+        .keep_alive = false,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer req.deinit();
+
+    try req.sendBodiless();
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status.class() != .success) return error.HttpRequestFailed;
+
+    var transfer_buf: [4 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+    return reader.allocRemaining(allocator, .limited(1 * 1024 * 1024));
 }
 
 fn parseIpv4Literal(text: []const u8) ?[4]u8 {
@@ -3110,14 +3282,14 @@ fn parseIpv4Literal(text: []const u8) ?[4]u8 {
 }
 
 fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
-    const services = [_][]const []const u8{
-        &.{ "curl", "-fsSL", "--max-time", "3", "https://api.ipify.org" },
-        &.{ "curl", "-fsSL", "--max-time", "3", "https://ifconfig.me" },
-        &.{ "curl", "-fsSL", "--max-time", "3", "https://ipv4.icanhazip.com" },
+    const services = [_][]const u8{
+        "https://api.ipify.org",
+        "https://ifconfig.me",
+        "https://ipv4.icanhazip.com",
     };
 
-    for (services) |argv| {
-        const stdout = runCurl(allocator, argv) catch continue;
+    for (services) |url| {
+        const stdout = fetchUrlBytes(allocator, url) catch continue;
         const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
         const parsed = parseIpv4Literal(trimmed);
         allocator.free(stdout);
@@ -3180,7 +3352,7 @@ fn buildDcConnectPlan(
         middle_addr = snap.getForDc(dc_abs);
     }
 
-    const force_media_middle_proxy = plan.is_media_path and middle_addr != null;
+    const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
     plan.use_middle_proxy = if (force_media_middle_proxy)
         true
     else
@@ -3331,6 +3503,52 @@ fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool
     return false;
 }
 
+fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
+    if (first.len == 0 and second.len == 0) return true;
+
+    if (queue.isEmpty()) {
+        var iovecs: [2]posix.iovec_const = undefined;
+        var n_iov: usize = 0;
+        if (first.len > 0) {
+            iovecs[n_iov] = .{ .base = first.ptr, .len = first.len };
+            n_iov += 1;
+        }
+        if (second.len > 0) {
+            iovecs[n_iov] = .{ .base = second.ptr, .len = second.len };
+            n_iov += 1;
+        }
+
+        const total_len = first.len + second.len;
+        const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
+            if (err == error.WouldBlock) {
+                try queue.appendCopy(first);
+                try queue.appendCopy(second);
+                return false;
+            }
+            return err;
+        };
+
+        if (n == 0) return error.ConnectionReset;
+        if (n == total_len) return true;
+
+        if (n < first.len) {
+            try queue.appendCopy(first[n..]);
+            try queue.appendCopy(second);
+            return false;
+        }
+
+        const consumed_second = n - first.len;
+        if (consumed_second < second.len) {
+            try queue.appendCopy(second[consumed_second..]);
+        }
+        return false;
+    }
+
+    try queue.appendCopy(first);
+    try queue.appendCopy(second);
+    return false;
+}
+
 fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8) !bool {
     if (owned.len == 0) {
         queue.allocator.free(owned);
@@ -3388,6 +3606,11 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
 fn slotQueueClient(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
     _ = allocator;
     return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data);
+}
+
+fn slotQueueClientPair(slot: *ConnectionSlot, allocator: std.mem.Allocator, first: []const u8, second: []const u8) !bool {
+    _ = allocator;
+    return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second);
 }
 
 fn slotQueueClientOwned(slot: *ConnectionSlot, allocator: std.mem.Allocator, owned: []u8) !bool {
@@ -3571,8 +3794,8 @@ test "subnet rate limit - stale entry resets" {
 
     // Make entry stale (>60s old)
     const key = SubnetRateLimit.subnetKey(addr);
-    const idx = key % SubnetRateLimit.BUCKETS;
-    limiter.entries[idx].last_refill_s -= 61;
+    const entry = limiter.findEntry(key) orelse return error.TestExpectedEqual;
+    entry.last_refill_s -= SubnetRateLimit.stale_after_s + 1;
 
     // Should reset and allow again
     try std.testing.expect(limiter.check(addr, 1));
@@ -3589,6 +3812,23 @@ test "subnet rate limit - different subnets are independent" {
 
     // Subnet B should still work
     try std.testing.expect(limiter.check(addr_b, 1));
+}
+
+test "replay cache detects duplicate digest" {
+    var cache = ReplayCache.init();
+    const digest = [_]u8{0xAB} ** 32;
+
+    try std.testing.expect(!cache.checkAndInsert(&digest));
+    try std.testing.expect(cache.checkAndInsert(&digest));
+}
+
+test "replay cache accepts distinct digests" {
+    var cache = ReplayCache.init();
+    const digest_a = [_]u8{0x11} ** 32;
+    const digest_b = [_]u8{0x22} ** 32;
+
+    try std.testing.expect(!cache.checkAndInsert(&digest_a));
+    try std.testing.expect(!cache.checkAndInsert(&digest_b));
 }
 
 test "handshakeInProgress - phases" {

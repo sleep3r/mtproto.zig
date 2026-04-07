@@ -131,10 +131,22 @@ pub fn buildServerHello(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
 ) ![]u8 {
+    return buildServerHelloWithTemplate(allocator, &nginx_template, secret, client_digest, session_id);
+}
+
+pub fn buildServerHelloWithTemplate(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+) ![]u8 {
+    if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
+
     // 1. Copy the pre-built Nginx template (random and session_id are zeroed in template)
-    const response = try allocator.alloc(u8, nginx_template.len);
+    const response = try allocator.alloc(u8, template.len);
     errdefer allocator.free(response);
-    @memcpy(response, &nginx_template);
+    @memcpy(response, template);
 
     // 2. Patch Session ID (echo from client). Template assumes 32-byte session ID.
     if (session_id.len == 32) {
@@ -192,12 +204,22 @@ const fake_cert_payload_len: u16 = 2878;
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
 const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_len;
+pub const server_hello_template_len: usize = nginx_template_len;
+
+const default_template_seed: u64 = 0x4E67_696E_785F_544C;
 
 /// The pre-built template, constructed at comptime.
-const nginx_template: [nginx_template_len]u8 = buildNginxTemplate();
-
-fn buildNginxTemplate() [nginx_template_len]u8 {
+const nginx_template: [nginx_template_len]u8 = blk: {
     @setEvalBranchQuota(100_000);
+    break :blk buildNginxTemplate(default_template_seed);
+};
+
+pub fn buildServerHelloTemplate(seed: ?u64) [nginx_template_len]u8 {
+    const actual_seed = seed orelse std.crypto.random.int(u64);
+    return buildNginxTemplate(actual_seed);
+}
+
+fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
     var t: [nginx_template_len]u8 = undefined;
     var pos: usize = 0;
 
@@ -301,7 +323,7 @@ fn buildNginxTemplate() [nginx_template_len]u8 {
 
     // Fill with deterministic pseudo-random bytes (SplitMix64).
     // Looks like encrypted data to DPI, same every time like a real cert.
-    var prng_state: u64 = 0x4E67_696E_785F_544C; // "NginX_TL" as seed
+    var prng_state: u64 = seed;
     for (0..fake_cert_payload_len) |i| {
         prng_state +%= 0x9E3779B97F4A7C15;
         var z = prng_state;
@@ -495,6 +517,14 @@ test "buildServerHello deterministic AppData (no random size fingerprint)" {
     // AppData bodies are identical (deterministic PRNG, same "certificate" every time)
     const app_offset = 127 + 6 + 5; // after ServerHello + CCS + AppData header
     try std.testing.expectEqualSlices(u8, r1[app_offset..], r2[app_offset..]);
+}
+
+test "buildServerHelloTemplate depends on seed" {
+    const t1 = buildServerHelloTemplate(0x1111_2222_3333_4444);
+    const t2 = buildServerHelloTemplate(0x5555_6666_7777_8888);
+
+    const app_offset = 127 + 6 + 5;
+    try std.testing.expect(!std.mem.eql(u8, t1[app_offset..], t2[app_offset..]));
 }
 
 test "validateTlsHandshake - valid handshake" {
