@@ -1,4 +1,4 @@
-.PHONY: build release run test bench soak clean fmt deploy migrate update-dns stability-check stability-check-load capacity-probe-idle capacity-probe-active deploy-tunnel deploy-tunnel-only
+.PHONY: build release run test bench soak clean fmt deploy migrate update-dns stability-check stability-check-load capacity-probe-idle capacity-probe-active deploy-tunnel deploy-tunnel-only deploy-monitor monitor
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -33,7 +33,7 @@ clean:
 	rm -rf .zig-cache zig-out
 
 deploy:
-	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
 	ssh root@$(SERVER) 'systemctl stop mtproto-proxy || true'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
 	scp deploy/*.sh root@$(SERVER):/opt/mtproto-proxy/
@@ -111,3 +111,18 @@ capacity-probe-idle:
 # Capacity probe (authenticated traffic; memory-efficiency comparison)
 capacity-probe-active:
 	python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth
+
+# Deploy monitoring dashboard to server
+deploy-monitor:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make deploy-monitor SERVER=<ip>"; exit 1; fi
+	ssh root@$(SERVER) 'mkdir -p /opt/mtproto-proxy/monitor/static'
+	scp deploy/monitor/server.py root@$(SERVER):/opt/mtproto-proxy/monitor/server.py
+	scp deploy/monitor/static/index.html deploy/monitor/static/style.css deploy/monitor/static/app.js root@$(SERVER):/opt/mtproto-proxy/monitor/static/
+	ssh root@$(SERVER) 'bash -s' < deploy/monitor/install.sh
+
+# Open SSH tunnel to monitoring dashboard
+monitor:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make monitor SERVER=<ip>"; exit 1; fi
+	@echo "Opening tunnel to monitor dashboard..."
+	@echo "→ http://localhost:61208"
+	ssh -L 61208:localhost:61208 root@$(SERVER)

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>⚡ MTProto Proxy — Zig Monitor</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="zig-logo">
+        <svg viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+          <path d="M46 320L126 80h104L150 320H46z" fill="#f7a41d"/>
+          <path d="M250 320L330 80h18L268 320h-18z" fill="#f7a41d" opacity="0.7"/>
+          <path d="M160 80l80 0-80 240h-80l80-240z" fill="#f7a41d" opacity="0.4"/>
+        </svg>
+      </div>
+      <h1>
+        <span class="accent">MTProto</span>Proxy
+        <span class="dim">monitor</span>
+      </h1>
+    </div>
+    <div class="header-right">
+      <div class="badge" id="statusBadge"><div class="pulse-dot"></div><span id="proxyUp">—</span></div>
+      <div class="badge data-badge syncing" id="dataBadge"><div class="pulse-dot"></div><span id="dataBadgeText">Syncing...</span></div>
+      <div class="poll-controls">
+        <label for="pollInterval">Refresh</label>
+        <select id="pollInterval" class="ui-select">
+          <option value="1000">1s</option>
+          <option value="3000" selected>3s</option>
+          <option value="5000">5s</option>
+          <option value="10000">10s</option>
+        </select>
+        <button id="pollToggle" class="ui-btn" type="button">Pause</button>
+      </div>
+      <div class="meta">PID <b id="proxyPid">—</b> · <b id="proxyRss">—</b></div>
+      <div class="meta">Uptime <b id="srvUptime">—</b></div>
+      <div class="meta">Last update <b id="lastUpdate">never</b></div>
+    </div>
+  </div>
+
+  <!-- Metrics -->
+  <div class="grid">
+    <!-- CPU -->
+    <div class="card col-3">
+      <div class="card-label">⬡ CPU</div>
+      <div class="gauge-container">
+        <div class="gauge">
+          <svg viewBox="0 0 36 36">
+            <circle class="track" cx="18" cy="18" r="15"/>
+            <circle class="fill" id="cpuArc" cx="18" cy="18" r="15"
+              stroke="var(--zig)" stroke-dasharray="94.2" stroke-dashoffset="94.2"/>
+          </svg>
+          <div class="pct" style="color:var(--zig)" id="cpuPct">0%</div>
+        </div>
+        <div>
+          <div class="card-value" style="color:var(--zig)" id="cpuVal">0<span style="font-size:18px;font-weight:400">%</span></div>
+          <div class="card-sub">utilization</div>
+        </div>
+      </div>
+      <div class="spark-wrap"><canvas id="cpuSpark"></canvas></div>
+    </div>
+
+    <!-- Memory -->
+    <div class="card col-3">
+      <div class="card-label">◈ Memory</div>
+      <div class="gauge-container">
+        <div class="gauge">
+          <svg viewBox="0 0 36 36">
+            <circle class="track" cx="18" cy="18" r="15"/>
+            <circle class="fill" id="memArc" cx="18" cy="18" r="15"
+              stroke="var(--purple)" stroke-dasharray="94.2" stroke-dashoffset="94.2"/>
+          </svg>
+          <div class="pct" style="color:var(--purple)" id="memPct">0%</div>
+        </div>
+        <div>
+          <div class="card-value" style="color:var(--purple)" id="memVal">0<span style="font-size:14px;font-weight:400"> MB</span></div>
+          <div class="card-sub" id="memSub">— / — MB</div>
+        </div>
+      </div>
+      <div class="spark-wrap"><canvas id="memSpark"></canvas></div>
+    </div>
+
+    <!-- Network -->
+    <div class="card col-6">
+      <div class="card-label">◎ Network Throughput</div>
+      <div class="chart-wrap"><canvas id="netChart"></canvas></div>
+      <div class="chart-legend">
+        <span><div class="ldot" style="background:var(--green)"></div>RX <b id="rxRate">—</b></span>
+        <span><div class="ldot" style="background:var(--zig)"></div>TX <b id="txRate">—</b></span>
+        <span style="margin-left:auto">↓<b id="rxTotal">—</b> ↑<b id="txTotal">—</b></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxy stats -->
+  <div class="stat-row">
+    <div class="stat-cell">
+      <div class="val" style="color:var(--green)" id="pxActive">0</div>
+      <div class="lbl">Active / <span id="pxMax">0</span></div>
+    </div>
+    <div class="stat-cell">
+      <div class="val" style="color:var(--cyan)" id="pxHs">0</div>
+      <div class="lbl">Handshakes</div>
+    </div>
+    <div class="stat-cell">
+      <div class="val" style="color:var(--text)" id="pxTotal">0</div>
+      <div class="lbl">Total Connections</div>
+    </div>
+    <div class="stat-cell">
+      <div class="val" id="pxDrops" style="color:var(--text-muted)">0</div>
+      <div class="lbl" id="pxDropLbl">Drops</div>
+    </div>
+  </div>
+
+  <!-- AmneziaWG Tunnel -->
+  <div class="tunnel-card" id="tunnelCard" style="display:none">
+    <div class="tunnel-header">
+      <div class="tunnel-icon">🛡</div>
+      <div class="tunnel-title">AmneziaWG Tunnel</div>
+      <div class="badge" id="awgBadge"><div class="pulse-dot"></div><span id="awgStatus">—</span></div>
+    </div>
+    <div class="tunnel-details">
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">Endpoint</span>
+        <span class="tunnel-val" id="awgEndpoint">—</span>
+      </div>
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">Handshake</span>
+        <span class="tunnel-val" id="awgHandshake">—</span>
+      </div>
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">↓ Received</span>
+        <span class="tunnel-val" id="awgRx">—</span>
+      </div>
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">↑ Sent</span>
+        <span class="tunnel-val" id="awgTx">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Live logs -->
+  <div class="logs-card">
+    <div class="logs-header">
+      <div class="title">▸ Live Logs</div>
+      <div class="ws-badge"><div class="ws-dot off" id="wsDot"></div><span id="wsLabel">connecting…</span></div>
+    </div>
+    <div class="logs-controls">
+      <div class="log-filters">
+        <button class="ui-btn log-filter active" type="button" data-filter="error">Error</button>
+        <button class="ui-btn log-filter active" type="button" data-filter="warn">Warn</button>
+        <button class="ui-btn log-filter active" type="button" data-filter="stats">Stats</button>
+      </div>
+      <input id="logSearch" class="ui-input log-search" type="search" placeholder="Search logs">
+      <button class="ui-btn active" id="autoScrollBtn" type="button">Auto-scroll: on</button>
+      <button class="ui-btn" id="jumpLatestBtn" type="button">Jump to latest</button>
+    </div>
+    <div class="logs-body" id="logsBody"></div>
+  </div>
+
+  <div class="footer">Built with <a href="https://ziglang.org" target="_blank">Zig</a> · proxy.sleep3r.ru</div>
+
+  <!-- Shared tooltip for all charts -->
+  <div id="chartTooltip" class="chart-tooltip"></div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
