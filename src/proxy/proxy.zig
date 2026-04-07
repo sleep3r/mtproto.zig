@@ -299,6 +299,14 @@ const ConnectionPhase = enum {
     closing,
 };
 
+fn shouldCloseOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
+    if (phase == .idle) return false;
+
+    // During connecting_upstream, EPOLLERR on upstream fd is expected and
+    // handled via onUpstreamWritable -> onUpstreamConnectComplete.
+    return !(phase == .connecting_upstream and event_fd == upstream_fd);
+}
+
 const MiddleProxyHandshakeStep = enum {
     none,
     sending_rpc_nonce,
@@ -1124,7 +1132,7 @@ const EventLoop = struct {
             }
         }
 
-        if (slot.phase != .idle and fatal_hangup and slot.phase != .connecting_upstream) {
+        if (fatal_hangup and shouldCloseOnFatalHangup(slot.phase, fd, slot.upstream_fd)) {
             self.closeSlot(slot, "epoll hup/err");
             return;
         }
@@ -3489,6 +3497,16 @@ test "epoll hangup helper" {
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
+}
+
+test "fatal hangup close policy distinguishes client/upstream while connecting" {
+    const client_fd: posix.fd_t = 41;
+    const upstream_fd: posix.fd_t = 42;
+
+    try std.testing.expect(shouldCloseOnFatalHangup(.connecting_upstream, client_fd, upstream_fd));
+    try std.testing.expect(!shouldCloseOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
+    try std.testing.expect(shouldCloseOnFatalHangup(.reading_tls_header, client_fd, upstream_fd));
+    try std.testing.expect(!shouldCloseOnFatalHangup(.idle, client_fd, upstream_fd));
 }
 
 test "fd requirement helpers" {
