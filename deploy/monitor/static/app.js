@@ -5,13 +5,51 @@ const MH = 90;       // max history points
 const MAX_LINES = 300;
 let autoScrollEnabled = true;
 let userScrolledUp = false;
-let rxH = [], txH = [];
 let pollIntervalMs = 3000;
 let pollLoop = null;
 let pollInFlight = false;
 let pollingPaused = false;
 let lastSuccessAt = 0;
 let hasPollError = false;
+let lastData = null; // store last API response for tooltips
+
+const tt = $('chartTooltip');
+function showTooltip(e, canvas, padLeft, dataArr, formatCb) {
+  if (!dataArr || !dataArr.length) return;
+  const r = canvas.getBoundingClientRect();
+  const px = e.clientX - r.left;
+  // Account for padding left in responsive coordinates
+  const pL = (padLeft / canvas.width) * r.width;
+  if (px < pL) { tt.classList.remove('visible'); return; }
+
+  const cw = r.width - pL;
+  const step = cw / (MH - 1);
+  const idx = Math.round((px - pL) / step);
+  const off = MH - dataArr.length;
+  const dataIdx = idx - off;
+
+  if (dataIdx < 0 || dataIdx >= dataArr.length) { tt.classList.remove('visible'); return; }
+
+  const item = dataArr[dataIdx];
+  const d = new Date(item.ts);
+  const tStr = d.getHours().toString().padStart(2, '0') + ':' +
+               d.getMinutes().toString().padStart(2, '0') + ':' +
+               d.getSeconds().toString().padStart(2, '0');
+
+  tt.innerHTML = `<div class="tooltip-ts">${tStr}</div>` + formatCb(item);
+  
+  // Position tooltip safely
+  let tx = e.pageX + 15;
+  let ty = e.pageY + 15;
+  if (tx + 120 > window.innerWidth) tx = e.pageX - 130;
+  if (ty + 50 > window.innerHeight) ty = e.pageY - 60;
+  
+  tt.style.left = tx + 'px';
+  tt.style.top = ty + 'px';
+  tt.classList.add('visible');
+}
+
+function hideTooltip() { tt.classList.remove('visible'); }
 
 const logFilters = { error: true, warn: true, stats: true };
 let logSearchTerm = '';
@@ -37,11 +75,19 @@ resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
 function drawNetChart() {
+  if (!lastData || !lastData.net_history) return;
+  const data = lastData.net_history;
   const w = canvas.width / 2, h = canvas.height / 2;
   ctx.clearRect(0, 0, w, h);
-  if (rxH.length < 2) return;
+  if (data.length < 2) return;
 
-  const peak = Math.max(4096, ...rxH, ...txH) * 1.2;
+  let peak = 4096;
+  for (let i = 0; i < data.length; i++) {
+    if (data[i].rx > peak) peak = data[i].rx;
+    if (data[i].tx > peak) peak = data[i].tx;
+  }
+  peak *= 1.2;
+
   const PAD = 42;           // left padding for Y-axis labels
   const PAD_TOP = 4;        // top padding so labels don't clip
   const PAD_BOT = 18;       // bottom padding for X-axis labels
@@ -57,14 +103,12 @@ function drawNetChart() {
   for (let i = 0; i <= 4; i++) {
     const frac = i / 4;
     const y = PAD_TOP + ch * (1 - frac);
-    // grid line
     ctx.strokeStyle = 'rgba(247,164,29,0.05)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     ctx.moveTo(PAD, y);
     ctx.lineTo(w, y);
     ctx.stroke();
-    // label
     if (i > 0) {
       ctx.fillStyle = 'rgba(124,134,152,0.6)';
       ctx.fillText(fmtShort(peak * frac), PAD - 5, y);
@@ -75,18 +119,23 @@ function drawNetChart() {
   ctx.textAlign = 'left';
   ctx.textBaseline = 'bottom';
   ctx.fillStyle = 'rgba(124,134,152,0.6)';
-  const totalMins = (MH * pollIntervalMs) / 60000;
-  ctx.fillText('-' + totalMins.toFixed(1).replace('.0', '') + 'm', PAD, h - 3);
+  
+  const oldest = new Date(data[0].ts);
+  const newest = new Date(data[data.length - 1].ts);
+  
+  function fTime(d) { return d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0'); }
+  ctx.fillText(fTime(oldest), PAD, h - 3);
   ctx.textAlign = 'right';
-  ctx.fillText('Now', w, h - 3);
+  ctx.fillText(fTime(newest), w, h - 3);
 
-  function drawLine(data, color) {
+  function drawLine(key, color) {
     const off = MH - data.length;
     ctx.beginPath();
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
-    data.forEach((v, i) => {
+    data.forEach((item, i) => {
+      const v = item[key];
       const x = PAD + (off + i) * step;
       const y = PAD_TOP + ch - (v / peak) * ch;
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
@@ -104,9 +153,16 @@ function drawNetChart() {
     ctx.fill();
   }
 
-  drawLine(txH, 'rgb(247,164,29)');
-  drawLine(rxH, 'rgb(52,211,153)');
+  drawLine('tx', 'rgb(247,164,29)');
+  drawLine('rx', 'rgb(52,211,153)');
 }
+
+canvas.addEventListener('mousemove', e => {
+  showTooltip(e, canvas, 42, lastData?.net_history, item => 
+    `<div class="tooltip-val" style="color:var(--green)">RX: ${fmt(item.rx)}</div><div class="tooltip-val" style="color:var(--zig)">TX: ${fmt(item.tx)}</div>`
+  );
+});
+canvas.addEventListener('mouseleave', hideTooltip);
 
 // ── Sparkline with Y-axis ──
 function drawSpark(canvasId, data, color, maxVal, unit) {
@@ -119,9 +175,17 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   x.setTransform(2, 0, 0, 2, 0, 0);
 
   const w = r.width, h = r.height;
-  if (data.length < 2) return;
+  if (!data || data.length < 2) return;
 
-  const peak = maxVal || Math.max(1, ...data) * 1.2;
+  let peak = maxVal;
+  if (!peak) {
+    peak = 1;
+    for (let i = 0; i < data.length; i++) {
+      if (data[i].v > peak) peak = data[i].v;
+    }
+  }
+  peak *= 1.2;
+
   const PAD = 32;       // left padding
   const PAD_TOP = 6;    // top padding
   const cw = w - PAD;
@@ -140,14 +204,12 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   for (const tv of ticks) {
     const frac = tv / peak;
     const y = PAD_TOP + ch * (1 - frac);
-    // grid
     x.strokeStyle = 'rgba(247,164,29,0.05)';
     x.lineWidth = 0.5;
     x.beginPath();
     x.moveTo(PAD, y);
     x.lineTo(w, y);
     x.stroke();
-    // label
     if (tv > 0) {
       x.fillStyle = 'rgba(124,134,152,0.5)';
       x.fillText(unit === '%' ? tv + '%' : tv.toFixed(0), PAD - 4, y);
@@ -159,9 +221,9 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   x.strokeStyle = color;
   x.lineWidth = 1.5;
   x.lineJoin = 'round';
-  data.forEach((v, i) => {
+  data.forEach((item, i) => {
     const px = PAD + (off + i) * step;
-    const py = PAD_TOP + ch - (v / peak) * ch;
+    const py = PAD_TOP + ch - (item.v / peak) * ch;
     i === 0 ? x.moveTo(px, py) : x.lineTo(px, py);
   });
   x.stroke();
@@ -176,6 +238,17 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   x.closePath();
   x.fillStyle = grad;
   x.fill();
+}
+
+const cpuCanvas = $('cpuSpark');
+if (cpuCanvas) {
+  cpuCanvas.addEventListener('mousemove', e => showTooltip(e, cpuCanvas, 32, lastData?.cpu_history, item => `<div class="tooltip-val" style="color:var(--zig)">Util: ${item.v}%</div>`));
+  cpuCanvas.addEventListener('mouseleave', hideTooltip);
+}
+const memCanvas = $('memSpark');
+if (memCanvas) {
+  memCanvas.addEventListener('mousemove', e => showTooltip(e, memCanvas, 32, lastData?.mem_history, item => `<div class="tooltip-val" style="color:var(--purple)">Mem: ${item.v}%</div>`));
+  memCanvas.addEventListener('mouseleave', hideTooltip);
 }
 
 // ── Formatters ──
@@ -200,6 +273,8 @@ async function poll() {
   if (!r.ok) throw new Error('stats request failed: ' + r.status);
   const d = await r.json();
 
+  lastData = d;
+
   // CPU
   setGauge('cpuArc', 'cpuPct', d.cpu);
   $('cpuVal').innerHTML = d.cpu + '<span style="font-size:18px;font-weight:400">%</span>';
@@ -213,8 +288,6 @@ async function poll() {
   if (d.mem_history) drawSpark('memSpark', d.mem_history, 'rgb(167,139,250)', 100, '%');
 
   // Network
-  rxH.push(d.net_rx); txH.push(d.net_tx);
-  if (rxH.length > MH) { rxH.shift(); txH.shift(); }
   drawNetChart();
   $('rxRate').textContent = fmt(d.net_rx);
   $('txRate').textContent = fmt(d.net_tx);

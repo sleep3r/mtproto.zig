@@ -223,9 +223,9 @@ def api_stats():
             tx_rate = (net.bytes_sent - _prev_net["tx"]) / dt
     _prev_net = {"ts": now, "rx": net.bytes_recv, "tx": net.bytes_sent}
 
-    _net_history.append({"rx": rx_rate, "tx": tx_rate})
-    _cpu_history.append(round(cpu, 1))
-    _mem_history.append(round(mem.percent, 1))
+    _net_history.append({"ts": int(now * 1000), "rx": rx_rate, "tx": tx_rate})
+    _cpu_history.append({"ts": int(now * 1000), "v": round(cpu, 1)})
+    _mem_history.append({"ts": int(now * 1000), "v": round(mem.percent, 1)})
     for lst in (_net_history, _cpu_history, _mem_history):
         while len(lst) > MAX_HISTORY:
             lst.pop(0)

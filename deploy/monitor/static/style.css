@@ -328,6 +328,23 @@ body::after {
 }
 .app.stale .tunnel-card { opacity: 0.62; }
 
+/* ── Tooltips ── */
+.chart-tooltip {
+  position: absolute; pointer-events: none;
+  background: rgba(18, 22, 30, 0.9);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(247,164,29,0.15);
+  border-radius: 8px; padding: 6px 10px;
+  font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  color: var(--text); z-index: 100;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  opacity: 0; transition: opacity 0.15s;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.chart-tooltip.visible { opacity: 1; }
+.tooltip-ts { color: var(--text-dim); font-size: 10px; }
+.tooltip-val { font-weight: 600; }
+
 /* ── Live logs ── */
 .logs-card {
   background: var(--card);
