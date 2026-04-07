@@ -344,6 +344,15 @@ pub fn main() !void {
     // Apply runtime log level from config
     runtime_log_level = cfg.log_level;
 
+    if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
+        const log_main = std.log.scoped(.config);
+        log_main.warn(
+            "AES backend is software-only for this build/target. MiddleProxy video traffic will be CPU-heavy. " ++
+                "Rebuild with CPU features enabled (example: -Dcpu=native or -Dcpu=x86_64_v3).",
+            .{},
+        );
+    }
+
     // Auto-clamp max_connections to RAM-safe estimate (unless explicitly opted out)
     if (detectTotalRamBytes(allocator)) |total_ram| {
         const est = estimateCapacity(&cfg, total_ram);
