@@ -34,8 +34,6 @@ const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
-const relay_batch_steps: usize = 16;
-const mask_relay_batch_steps: usize = 8;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed-size open-addressed hash table — zero heap allocation.
@@ -2213,26 +2211,16 @@ const EventLoop = struct {
         else
             null;
 
-        var progressed_any = false;
-        var step: usize = 0;
-        while (step < relay_batch_steps and !slot.hasUpstreamPending()) : (step += 1) {
-            const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch) catch |err| {
-                if (slot.is_media_path) {
-                    log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
-                        slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
-                    });
-                }
-                self.closeSlot(slot, "relay c2s failed");
-                return;
-            };
-
-            switch (progress) {
-                .none => break,
-                .partial, .forwarded => progressed_any = true,
+        const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch) catch |err| {
+            if (slot.is_media_path) {
+                log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
+                    slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
+                });
             }
-        }
-
-        if (progressed_any) {
+            self.closeSlot(slot, "relay c2s failed");
+            return;
+        };
+        if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = std.time.milliTimestamp();
         }
     }
@@ -2248,26 +2236,16 @@ const EventLoop = struct {
         else
             null;
 
-        var progressed_any = false;
-        var step: usize = 0;
-        while (step < relay_batch_steps and !slot.hasClientPending()) : (step += 1) {
-            const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
-                if (slot.is_media_path) {
-                    log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
-                        slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
-                    });
-                }
-                self.closeSlot(slot, "relay s2c failed");
-                return;
-            };
-
-            switch (progress) {
-                .none => break,
-                .partial, .forwarded => progressed_any = true,
+        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
+            if (slot.is_media_path) {
+                log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
+                    slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
+                });
             }
-        }
-
-        if (progressed_any) {
+            self.closeSlot(slot, "relay s2c failed");
+            return;
+        };
+        if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = std.time.milliTimestamp();
         }
     }
@@ -2280,23 +2258,20 @@ const EventLoop = struct {
             return;
         };
 
-        var step: usize = 0;
-        while (step < mask_relay_batch_steps and !slot.hasUpstreamPending()) : (step += 1) {
-            const n = posix.read(slot.client_fd, read_buf) catch |err| {
-                if (err == error.WouldBlock) return;
-                slot.phase = .closing;
-                return;
-            };
-            if (n == 0) {
-                slot.phase = .closing;
-                return;
-            }
-
-            _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
-                slot.phase = .closing;
-                return;
-            };
+        const n = posix.read(slot.client_fd, read_buf) catch |err| {
+            if (err == error.WouldBlock) return;
+            slot.phase = .closing;
+            return;
+        };
+        if (n == 0) {
+            slot.phase = .closing;
+            return;
         }
+
+        _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
+            slot.phase = .closing;
+            return;
+        };
     }
 
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2307,23 +2282,20 @@ const EventLoop = struct {
             return;
         };
 
-        var step: usize = 0;
-        while (step < mask_relay_batch_steps and !slot.hasClientPending()) : (step += 1) {
-            const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
-                if (err == error.WouldBlock) return;
-                slot.phase = .closing;
-                return;
-            };
-            if (n == 0) {
-                slot.phase = .closing;
-                return;
-            }
-
-            _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
-                slot.phase = .closing;
-                return;
-            };
+        const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
+            if (err == error.WouldBlock) return;
+            slot.phase = .closing;
+            return;
+        };
+        if (n == 0) {
+            slot.phase = .closing;
+            return;
         }
+
+        _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
+            slot.phase = .closing;
+            return;
+        };
     }
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
