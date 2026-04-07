@@ -141,6 +141,70 @@ def _proxy_info() -> dict:
     return dict(uptime="offline", pid=0, rss_mb=0, online=False)
 
 
+_awg_cache = {"ts": 0, "data": None}
+AWG_CACHE_TTL = 10  # seconds
+
+
+def _awg_status() -> dict:
+    """Check AmneziaWG tunnel status. Returns None if not installed."""
+    now = time.time()
+    if now - _awg_cache["ts"] < AWG_CACHE_TTL:
+        return _awg_cache["data"]
+
+    import shutil
+    if not shutil.which("awg"):
+        _awg_cache.update(ts=now, data=None)
+        return None
+
+    # Check if namespace exists
+    try:
+        ns_out = subprocess.check_output(["ip", "netns", "list"], text=True, timeout=2, stderr=subprocess.DEVNULL)
+        if "tg_proxy_ns" not in ns_out:
+            result = {"installed": True, "active": False, "reason": "namespace not found"}
+            _awg_cache.update(ts=now, data=result)
+            return result
+    except Exception:
+        _awg_cache.update(ts=now, data=None)
+        return None
+
+    try:
+        out = subprocess.check_output(
+            ["ip", "netns", "exec", "tg_proxy_ns", "awg", "show"],
+            text=True, timeout=3, stderr=subprocess.DEVNULL,
+        )
+        result = {"installed": True, "active": False, "endpoint": None,
+                  "handshake": None, "rx": None, "tx": None}
+
+        m = re.search(r"endpoint:\s*(\S+)", out)
+        if m:
+            result["endpoint"] = m[1]
+
+        m = re.search(r"latest handshake:\s*(.+)", out)
+        if m:
+            hs = m[1].strip()
+            result["handshake"] = hs
+            # Consider active if handshake was within last 3 minutes
+            if "second" in hs or "minute" in hs:
+                try:
+                    val = int(re.search(r"(\d+)", hs)[1])
+                    if "second" in hs or ("minute" in hs and val <= 3):
+                        result["active"] = True
+                except (TypeError, ValueError):
+                    pass
+
+        m = re.search(r"transfer:\s*([\d.]+\s*\S+)\s+received,\s*([\d.]+\s*\S+)\s+sent", out)
+        if m:
+            result["rx"] = m[1]
+            result["tx"] = m[2]
+
+        _awg_cache.update(ts=now, data=result)
+        return result
+    except Exception:
+        result = {"installed": True, "active": False, "reason": "awg show failed"}
+        _awg_cache.update(ts=now, data=result)
+        return result
+
+
 @app.get("/api/stats")
 def api_stats():
     global _prev_net, _net_history, _cpu_history, _mem_history
@@ -175,6 +239,7 @@ def api_stats():
         "net_history": _net_history[-MAX_HISTORY:],
         "uptime": f"{d}d {h}h {rem2 // 60}m",
         "proxy": _proxy_stats(), "proxy_info": _proxy_info(),
+        "awg": _awg_status(),
     })
 
 

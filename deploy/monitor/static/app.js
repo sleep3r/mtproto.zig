@@ -229,6 +229,27 @@ async function poll() {
   $('pxDrops').textContent = drp;
   $('pxDrops').style.color = drp > 0 ? 'var(--amber)' : 'var(--text-muted)';
   $('pxDropLbl').textContent = 'rate +' + drp + ' · cap +' + (p.cap_drops || 0) + ' · hs_t +' + (p.hs_timeout || 0);
+
+  // AmneziaWG tunnel
+  const awg = d.awg;
+  const tc = $('tunnelCard');
+  if (!awg) {
+    tc.style.display = 'none';
+  } else {
+    tc.style.display = '';
+    const badge = $('awgBadge');
+    if (awg.active) {
+      badge.className = 'badge';
+      $('awgStatus').textContent = 'Active';
+    } else {
+      badge.className = 'badge off';
+      $('awgStatus').textContent = awg.reason || 'Down';
+    }
+    $('awgEndpoint').textContent = awg.endpoint || '—';
+    $('awgHandshake').textContent = awg.handshake || '—';
+    $('awgRx').textContent = awg.rx || '—';
+    $('awgTx').textContent = awg.tx || '—';
+  }
 }
 
 function setDataBadge(state, text) {

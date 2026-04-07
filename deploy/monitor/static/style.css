@@ -283,6 +283,51 @@ body::after {
   color: var(--text-dim); margin-top: 6px;
 }
 
+/* ── Tunnel card ── */
+.tunnel-card {
+  background: var(--card);
+  backdrop-filter: blur(24px);
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  margin-bottom: 14px;
+  overflow: hidden;
+  transition: border-color 0.3s;
+}
+.tunnel-card:hover { border-color: var(--card-hover); }
+.tunnel-header {
+  padding: 16px 24px;
+  display: flex; align-items: center; gap: 12px;
+  border-bottom: 1px solid rgba(247,164,29,0.04);
+}
+.tunnel-icon { font-size: 18px; }
+.tunnel-title {
+  font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.4px;
+  color: var(--text-dim);
+  flex: 1;
+}
+.tunnel-details {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 1px; background: rgba(247,164,29,0.03);
+}
+.tunnel-stat {
+  background: var(--card);
+  padding: 14px 24px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.tunnel-lbl {
+  font-size: 10px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-muted);
+}
+.tunnel-val {
+  font-size: 13px; font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.app.stale .tunnel-card { opacity: 0.62; }
+
 /* ── Live logs ── */
 .logs-card {
   background: var(--card);
