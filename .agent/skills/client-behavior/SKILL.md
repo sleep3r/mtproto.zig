@@ -52,18 +52,22 @@ Proxy implications:
 
 Version snapshot:
 
-- Repo/tag: `DrKLO/Telegram` `release-11.4.2-5469`
-- Commit: `fb2e545101f41303f1e2712de2e7611a9335f1c3`
+- Repo/ref: `DrKLO/Telegram` `master` (snapshot: `12.6.4 (6666)`)
+- Commit: `009e97356f966bb81eceba113d210230bf383122`
 
 Source-backed behavior:
 
 - Enables `TCP_NODELAY`, switches socket to `O_NONBLOCK`, uses `connect(..., EINPROGRESS)` with edge-triggered epoll.
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L571
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L618
+- Connect path chooses address family/static flags and sets per-type logical timeouts (`Proxy=5s`, `Generic=8/12s`, `Upload=25/40s`, `Push=20/30s`).
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Connection.cpp#L276
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Connection.cpp#L368
 - Timeout model is logical/internal (`setTimeout` / `checkTimeout`).
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1066
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1105
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1115
 - Explicit connection-type split (`Generic`, `Download`, `Upload`, `Push`, `Temp`, `Proxy`) and multiple parallel slots.
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L68
-  - https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L26
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Defines.h#L68
+  - https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Defines.h#L26
 
 Proxy implications:
 
