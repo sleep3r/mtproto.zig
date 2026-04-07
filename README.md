@@ -429,8 +429,9 @@ sudo systemctl stop mtproto-proxy
 The project includes a lightweight, Zig-themed web dashboard for real-time server monitoring. It runs as a separate systemd service (~30 MB RAM) and is accessible via SSH tunnel — no ports are exposed to the internet.
 
 **Features:**
+- **Interactive Charts** — glassmorphism hover tooltips with exact values and time
 - **CPU & Memory** — live gauges with sparkline history charts (0–100% Y-axis)
-- **Network** — realtime RX/TX throughput graph with auto-scaling Y-axis labels
+- **Network** — realtime RX/TX throughput graph with X-axis timeline and auto-scaling Y-axis labels
 - **Proxy stats** — active connections, handshakes, total served, drops breakdown
 - **AmneziaWG** — tunnel status, endpoint, handshakes, transfer metrics (optional, auto-hides if not installed)
 - **Live logs** — WebSocket-streamed `journalctl` output with color-coded log levels, search, and filters
