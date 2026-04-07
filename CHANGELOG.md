@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/sleep3r/mtproto.zig/compare/v0.8.1...v0.9.0) (2026-04-07)
+
+
+### Features
+
+* lightweight monitoring dashboard ([#86](https://github.com/sleep3r/mtproto.zig/issues/86)) ([8a56fd8](https://github.com/sleep3r/mtproto.zig/commit/8a56fd86dcc6d05df501794e4697999d81abdf1e))
+
 ## [0.8.1](https://github.com/sleep3r/mtproto.zig/compare/v0.8.0...v0.8.1) (2026-04-07)
 
 
