@@ -3353,7 +3353,7 @@ fn buildDcConnectPlan(
         middle_addr = snap.getForDc(dc_abs);
     }
 
-    const force_media_middle_proxy = plan.is_media_path and middle_addr != null;
+    const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
     plan.use_middle_proxy = if (force_media_middle_proxy)
         true
     else

@@ -11,6 +11,9 @@ pub const Config = struct {
     /// Route regular DC traffic via Telegram MiddleProxy transport.
     /// Mirrors telemt's [general].use_middle_proxy behavior.
     use_middle_proxy: bool = false,
+    /// Force media-path traffic (DC203 / negative dc_idx) through MiddleProxy,
+    /// even when use_middle_proxy is false.
+    force_media_middle_proxy: bool = true,
     port: u16 = 443,
     /// TCP listen(2) backlog for client-facing sockets
     backlog: u32 = 4096,
@@ -134,6 +137,8 @@ pub const Config = struct {
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
                         cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "force_media_middle_proxy")) {
+                        cfg.force_media_middle_proxy = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         // telemt compatibility: [general].fast_mode
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
