@@ -177,20 +177,27 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
     // Approximate per-connection user-space working set in the epoll model:
     // - preallocated slot state and small relay buffers
-    // - optional middle-proxy stream buffers (4 buffers)
+    // - optional middle-proxy stream buffers (2 per-connection buffers)
     // - allocator/socket bookkeeping cushion
     const tls_working_bytes: u64 = @intCast(6 * 1024);
-    const middleproxy_bytes: u64 = if (cfg.use_middle_proxy)
-        @intCast(cfg.middleProxyBufferBytes() * 4)
+    const middleproxy_per_conn_bytes: u64 = if (cfg.use_middle_proxy)
+        @intCast(cfg.middleProxyBufferBytes() * 2)
+    else
+        0;
+    // Event loop also keeps 2 shared scratch buffers for middle-proxy
+    // encapsulate/decapsulate temporary output.
+    const middleproxy_shared_bytes: u64 = if (cfg.use_middle_proxy)
+        @intCast(cfg.middleProxyBufferBytes() * 2)
     else
         0;
     const overhead_bytes: u64 = 2 * 1024;
-    const per_conn_bytes = tls_working_bytes + middleproxy_bytes + overhead_bytes;
+    const per_conn_bytes = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes;
 
     // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
     const usable_bytes = (total_ram_bytes * 70) / 100;
     const reserve_bytes = @max(@as(u64, 256 * 1024 * 1024), (total_ram_bytes * 10) / 100);
-    const budget_bytes = if (usable_bytes > reserve_bytes) usable_bytes - reserve_bytes else 0;
+    const fixed_overhead_bytes = reserve_bytes + middleproxy_shared_bytes;
+    const budget_bytes = if (usable_bytes > fixed_overhead_bytes) usable_bytes - fixed_overhead_bytes else 0;
 
     const raw_cap = if (per_conn_bytes > 0) budget_bytes / per_conn_bytes else 0;
     const safe_connections_u64 = @max(@as(u64, 32), @min(raw_cap, @as(u64, std.math.maxInt(u32))));
