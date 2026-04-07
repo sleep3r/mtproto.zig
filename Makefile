@@ -46,7 +46,7 @@ clean:
 	rm -rf .zig-cache zig-out
 
 deploy:
-	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
 	ssh root@$(SERVER) 'systemctl stop mtproto-proxy || true'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
 	scp deploy/*.sh root@$(SERVER):/opt/mtproto-proxy/
