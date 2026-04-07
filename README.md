@@ -69,27 +69,6 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 \* `mtproto.zig` also performs online bootstrap at startup (public IP detection + Telegram metadata refresh). On this VPS, cold boot is typically ~0.4 s; warm/steady restart remains sub-10 ms.
 
-### TLS-auth active memory @ 2000 connections
-
-| Proxy | RSS @ 2000 | Established | Status |
-|---|---:|---:|---|
-| **mtproto.zig** | **8,832 KB** | **2,000** | ✅ stable |
-| [Teleproxy](https://github.com/teleproxy/teleproxy) | 20,952 KB | 2,000 | ✅ stable |
-| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | 23,296 KB | 2,000 | ✅ stable |
-| [Telemt](https://github.com/telemt/telemt) | 38,272 KB | 2,000 | ✅ stable |
-| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | 50,944 KB | 2,000 | ✅ stable |
-| [mtg](https://github.com/9seconds/mtg) | 55,296 KB | 0 | ⚠ partial (payload OK, sockets not held) |
-
-### Idle memory @ 12000 held sockets
-
-| Proxy | RSS @ 12000 | Established | Status |
-|---|---:|---:|---|
-| **mtproto.zig** | **49,024 KB** | **12,000** | ✅ stable |
-| [Telemt](https://github.com/telemt/telemt) | 70,032 KB | 11,023 | ⚠ partial @12000 (stable up to 8000) |
-| [Official MTProxy](https://github.com/TelegramMessenger/MTProxy) | 74,116 KB | 12,000 | ✅ stable |
-| [Teleproxy](https://github.com/teleproxy/teleproxy) | 77,864 KB | 12,000 | ✅ stable |
-| [mtg](https://github.com/9seconds/mtg) | 97,792 KB | 7,287 | ⚠ partial @12000 (stable up to 4000) |
-| [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | 123,724 KB | 12,000 | ✅ stable |
 
 ## &nbsp; Quick Start
 
