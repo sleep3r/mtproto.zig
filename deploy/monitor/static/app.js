@@ -44,8 +44,9 @@ function drawNetChart() {
   const peak = Math.max(4096, ...rxH, ...txH) * 1.2;
   const PAD = 42;           // left padding for Y-axis labels
   const PAD_TOP = 4;        // top padding so labels don't clip
+  const PAD_BOT = 18;       // bottom padding for X-axis labels
   const cw = w - PAD;
-  const ch = h - PAD_TOP;
+  const ch = h - PAD_TOP - PAD_BOT;
   const step = cw / (MH - 1);
 
   // Y-axis grid + labels
@@ -70,6 +71,15 @@ function drawNetChart() {
     }
   }
 
+  // X-axis labels
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'bottom';
+  ctx.fillStyle = 'rgba(124,134,152,0.6)';
+  const totalMins = (MH * pollIntervalMs) / 60000;
+  ctx.fillText('-' + totalMins.toFixed(1).replace('.0', '') + 'm', PAD, h - 3);
+  ctx.textAlign = 'right';
+  ctx.fillText('Now', w, h - 3);
+
   function drawLine(data, color) {
     const off = MH - data.length;
     ctx.beginPath();
@@ -84,11 +94,11 @@ function drawNetChart() {
     ctx.stroke();
     // gradient fill
     const c = color.match(/[\d.]+/g);
-    const grad = ctx.createLinearGradient(0, PAD_TOP, 0, h);
+    const grad = ctx.createLinearGradient(0, PAD_TOP, 0, PAD_TOP + ch);
     grad.addColorStop(0, `rgba(${c[0]},${c[1]},${c[2]},0.1)`);
     grad.addColorStop(1, 'transparent');
-    ctx.lineTo(PAD + (off + data.length - 1) * step, h);
-    ctx.lineTo(PAD + off * step, h);
+    ctx.lineTo(PAD + (off + data.length - 1) * step, PAD_TOP + ch);
+    ctx.lineTo(PAD + off * step, PAD_TOP + ch);
     ctx.closePath();
     ctx.fillStyle = grad;
     ctx.fill();
