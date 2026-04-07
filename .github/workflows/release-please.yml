@@ -50,7 +50,12 @@ jobs:
           version: 0.15.2
 
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-linux" ]; then
+            zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=x86_64_v3
+          else
+            zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          fi
 
       - name: Package artifact
         run: |
