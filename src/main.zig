@@ -79,25 +79,44 @@ fn writeRaw(s: []const u8) void {
 
 // ============= Public IP Detection =============
 
+fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const uri = try std.Uri.parse(url);
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = @enumFromInt(3),
+        .keep_alive = false,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer req.deinit();
+
+    try req.sendBodiless();
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+    if (response.head.status.class() != .success) return error.HttpRequestFailed;
+
+    var transfer_buf: [4 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
+    return reader.allocRemaining(allocator, .limited(64 * 1024));
+}
+
 /// Try to detect the server's public IP address via external services.
 /// Returns the IP string (caller owns memory) or null on failure.
 fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
     // Try multiple services in order
-    const services = [_][]const []const u8{
-        &.{ "curl", "-s", "--max-time", "3", "https://ifconfig.me" },
-        &.{ "curl", "-s", "--max-time", "3", "https://api.ipify.org" },
-        &.{ "curl", "-s", "--max-time", "3", "https://icanhazip.com" },
+    const services = [_][]const u8{
+        "https://ifconfig.me",
+        "https://api.ipify.org",
+        "https://icanhazip.com",
     };
 
-    for (services) |argv| {
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = argv,
-        }) catch continue;
-
-        defer allocator.free(result.stderr);
-
-        const stdout = result.stdout;
+    for (services) |url| {
+        const stdout = fetchUrlBytes(allocator, url) catch continue;
         // Trim whitespace/newlines
         const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\n', '\r' });
         if (trimmed.len == 0 or trimmed.len > 45) {
