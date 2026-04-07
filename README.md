@@ -432,6 +432,7 @@ The project includes a lightweight, Zig-themed web dashboard for real-time serve
 - **CPU & Memory** — live gauges with sparkline history charts (0–100% Y-axis)
 - **Network** — realtime RX/TX throughput graph with auto-scaling Y-axis labels
 - **Proxy stats** — active connections, handshakes, total served, drops breakdown
+- **AmneziaWG** — tunnel status, endpoint, handshakes, transfer metrics (optional, auto-hides if not installed)
 - **Live logs** — WebSocket-streamed `journalctl` output with color-coded log levels, search, and filters
 - **Poll controls** — adjustable refresh interval (1s–10s), pause/resume, data freshness indicator
 
