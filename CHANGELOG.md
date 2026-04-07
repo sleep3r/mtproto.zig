@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/sleep3r/mtproto.zig/compare/v0.8.0...v0.8.1) (2026-04-07)
+
+
+### Bug Fixes
+
+* **proxy:** close slots on client hangup during upstream connect ([#84](https://github.com/sleep3r/mtproto.zig/issues/84)) ([353a9c4](https://github.com/sleep3r/mtproto.zig/commit/353a9c49c3c7f973e5f22326e926005913064c23))
+
 ## [0.8.0](https://github.com/sleep3r/mtproto.zig/compare/v0.7.1...v0.8.0) (2026-04-06)
 
 
