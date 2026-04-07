@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/sleep3r/mtproto.zig/compare/v0.9.0...v0.9.1) (2026-04-07)
+
+
+### Bug Fixes
+
+* **proxy:** harden relay security and reduce middleproxy memory ([#89](https://github.com/sleep3r/mtproto.zig/issues/89)) ([5b36c6d](https://github.com/sleep3r/mtproto.zig/commit/5b36c6dd5b1a3afb5fe76de090b8a1e3a6f6a241))
+
 ## [0.9.0](https://github.com/sleep3r/mtproto.zig/compare/v0.8.1...v0.9.0) (2026-04-07)
 
 
