@@ -392,23 +392,18 @@ pub const MiddleProxyContext = struct {
         }
 
         var out_pos: usize = 0;
+        var parse_pos: usize = 0;
 
         // Parse fully decrypted MTProto frames.
         // Mirrors telemt behavior: parse by frame_len, treat 0x04 words as NO-OP,
         // keep decrypt stream running continuously across arbitrary read boundaries.
-        while (self.s2c_decrypted_len >= 4) {
-            const frame_len = std.mem.readInt(u32, self.s2c_buf[0..4], .little);
+        while (self.s2c_decrypted_len - parse_pos >= 4) {
+            const frame_len = std.mem.readInt(u32, self.s2c_buf[parse_pos..][0..4], .little);
 
             // MTProto CBC stream may contain standalone NO-OP padding words
             // (0x04 00 00 00). Python reference reader skips them.
             if (frame_len == 4) {
-                if (self.s2c_len < 4 or self.s2c_decrypted_len < 4) break;
-                const remaining_noop = self.s2c_len - 4;
-                if (remaining_noop > 0) {
-                    std.mem.copyForwards(u8, self.s2c_buf[0..remaining_noop], self.s2c_buf[4..self.s2c_len]);
-                }
-                self.s2c_len = remaining_noop;
-                self.s2c_decrypted_len -= 4;
+                parse_pos += 4;
                 continue;
             }
 
@@ -421,20 +416,21 @@ pub const MiddleProxyContext = struct {
                 break;
             }
 
-            if (self.s2c_decrypted_len < frame_len) {
+            if (self.s2c_decrypted_len - parse_pos < frame_len) {
                 break; // Not enough decrypted data yet
             }
 
-            const expected_checksum = std.mem.readInt(u32, self.s2c_buf[frame_len - 4 ..][0..4], .little);
-            const computed_checksum = crc32(self.s2c_buf[0 .. frame_len - 4]);
+            const frame_end = parse_pos + frame_len;
+            const expected_checksum = std.mem.readInt(u32, self.s2c_buf[frame_end - 4 ..][0..4], .little);
+            const computed_checksum = crc32(self.s2c_buf[parse_pos .. frame_end - 4]);
             if (expected_checksum != computed_checksum) return error.BadMiddleProxyChecksum;
 
-            const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[4..8], .little);
+            const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[parse_pos + 4 ..][0..4], .little);
             if (frame_seq_no != self.read_seq_no) return error.BadMiddleProxySeqNo;
             self.read_seq_no += 1;
 
             // Payload is after Length (4) and SeqNo (4), and before CRC32 (4)
-            const payload = self.s2c_buf[8 .. frame_len - 4];
+            const payload = self.s2c_buf[parse_pos + 8 .. frame_end - 4];
 
             if (payload.len >= 16 and std.mem.eql(u8, payload[0..4], &rpc_simple_ack)) {
                 // RPC_SIMPLE_ACK format: type(4) + conn_id(8) + confirm(4)
@@ -495,11 +491,16 @@ pub const MiddleProxyContext = struct {
             }
             // Ignore other RPC types (e.g. RPC_SIMPLE_ACK, RPC_CLOSE_EXT)
 
-            // Shift buffer
-            const remaining = self.s2c_len - frame_len;
-            std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[frame_len..self.s2c_len]);
+            parse_pos = frame_end;
+        }
+
+        if (parse_pos > 0 and parse_pos <= self.s2c_len) {
+            const remaining = self.s2c_len - parse_pos;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[parse_pos..self.s2c_len]);
+            }
             self.s2c_len = remaining;
-            self.s2c_decrypted_len -= frame_len;
+            self.s2c_decrypted_len -= parse_pos;
         }
 
         return out_buf[0..out_pos];
