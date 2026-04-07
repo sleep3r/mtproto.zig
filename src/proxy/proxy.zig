@@ -3105,8 +3105,7 @@ fn queueTlsAppRecords(slot: *ConnectionSlot, allocator: std.mem.Allocator, paylo
         header[2] = constants.tls_version[1];
         std.mem.writeInt(u16, header[3..5], @intCast(chunk_len), .big);
 
-        _ = try queueClient(slot, allocator, header[0..]);
-        _ = try queueClient(slot, allocator, payload[off .. off + chunk_len]);
+        _ = try slotQueueClientPair(slot, allocator, header[0..], payload[off .. off + chunk_len]);
         slot.drs.recordSent(chunk_len);
         off += chunk_len;
     }
@@ -3504,6 +3503,52 @@ fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool
     return false;
 }
 
+fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
+    if (first.len == 0 and second.len == 0) return true;
+
+    if (queue.isEmpty()) {
+        var iovecs: [2]posix.iovec_const = undefined;
+        var n_iov: usize = 0;
+        if (first.len > 0) {
+            iovecs[n_iov] = .{ .base = first.ptr, .len = first.len };
+            n_iov += 1;
+        }
+        if (second.len > 0) {
+            iovecs[n_iov] = .{ .base = second.ptr, .len = second.len };
+            n_iov += 1;
+        }
+
+        const total_len = first.len + second.len;
+        const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
+            if (err == error.WouldBlock) {
+                try queue.appendCopy(first);
+                try queue.appendCopy(second);
+                return false;
+            }
+            return err;
+        };
+
+        if (n == 0) return error.ConnectionReset;
+        if (n == total_len) return true;
+
+        if (n < first.len) {
+            try queue.appendCopy(first[n..]);
+            try queue.appendCopy(second);
+            return false;
+        }
+
+        const consumed_second = n - first.len;
+        if (consumed_second < second.len) {
+            try queue.appendCopy(second[consumed_second..]);
+        }
+        return false;
+    }
+
+    try queue.appendCopy(first);
+    try queue.appendCopy(second);
+    return false;
+}
+
 fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8) !bool {
     if (owned.len == 0) {
         queue.allocator.free(owned);
@@ -3561,6 +3606,11 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
 fn slotQueueClient(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
     _ = allocator;
     return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data);
+}
+
+fn slotQueueClientPair(slot: *ConnectionSlot, allocator: std.mem.Allocator, first: []const u8, second: []const u8) !bool {
+    _ = allocator;
+    return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second);
 }
 
 fn slotQueueClientOwned(slot: *ConnectionSlot, allocator: std.mem.Allocator, owned: []u8) !bool {
