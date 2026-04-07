@@ -385,10 +385,14 @@ pub const MiddleProxyContext = struct {
         @memcpy(self.s2c_buf[self.s2c_len .. self.s2c_len + dc_chunk.len], dc_chunk);
         self.s2c_len += dc_chunk.len;
 
-        // Decrypt any new full 16-byte blocks
-        while (self.s2c_decrypted_len + 16 <= self.s2c_len) {
-            try self.decryptor.decryptInPlace(self.s2c_buf[self.s2c_decrypted_len .. self.s2c_decrypted_len + 16]);
-            self.s2c_decrypted_len += 16;
+        // Decrypt any newly arrived full 16-byte blocks in one batch.
+        const undec_len = self.s2c_len - self.s2c_decrypted_len;
+        const decrypt_len = undec_len - (undec_len % 16);
+        if (decrypt_len > 0) {
+            const start = self.s2c_decrypted_len;
+            const end = start + decrypt_len;
+            try self.decryptor.decryptInPlace(self.s2c_buf[start..end]);
+            self.s2c_decrypted_len = end;
         }
 
         var out_pos: usize = 0;

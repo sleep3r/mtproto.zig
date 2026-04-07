@@ -94,13 +94,20 @@ pub const AesCtr = struct {
 /// Unlike CTR, CBC is NOT symmetric.
 pub const AesCbc = struct {
     key: [32]u8,
+    /// Cached expanded AES contexts (avoid re-computing schedule per call).
+    enc_ctx: EncCtx,
+    dec_ctx: DecCtx,
     iv: [16]u8,
 
     const block_size = 16;
+    const EncCtx = @TypeOf(Aes256.initEnc([_]u8{0} ** 32));
+    const DecCtx = @TypeOf(Aes256.initDec([_]u8{0} ** 32));
 
     pub fn init(key: *const [32]u8, iv: *const [16]u8) AesCbc {
         return .{
             .key = key.*,
+            .enc_ctx = Aes256.initEnc(key.*),
+            .dec_ctx = Aes256.initDec(key.*),
             .iv = iv.*,
         };
     }
@@ -119,7 +126,6 @@ pub const AesCbc = struct {
         if (data.len % block_size != 0) return error.UnalignedData;
         if (data.len == 0) return;
 
-        const ctx = Aes256.initEnc(self.key);
         var prev: [16]u8 = self.iv;
 
         var offset: usize = 0;
@@ -131,7 +137,7 @@ pub const AesCbc = struct {
             }
             // Encrypt
             var encrypted: [16]u8 = undefined;
-            ctx.encrypt(&encrypted, block);
+            self.enc_ctx.encrypt(&encrypted, block);
             block.* = encrypted;
             prev = encrypted;
         }
@@ -146,7 +152,6 @@ pub const AesCbc = struct {
         if (data.len % block_size != 0) return error.UnalignedData;
         if (data.len == 0) return;
 
-        const ctx = Aes256.initDec(self.key);
         var prev: [16]u8 = self.iv;
 
         var offset: usize = 0;
@@ -155,7 +160,7 @@ pub const AesCbc = struct {
             const saved = block.*;
             // Decrypt
             var decrypted: [16]u8 = undefined;
-            ctx.decrypt(&decrypted, block);
+            self.dec_ctx.decrypt(&decrypted, block);
             block.* = decrypted;
             // XOR with previous ciphertext
             for (0..16) |j| {
@@ -171,6 +176,8 @@ pub const AesCbc = struct {
     pub fn wipe(self: *AesCbc) void {
         std.crypto.secureZero(u8, &self.key);
         std.crypto.secureZero(u8, &self.iv);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.enc_ctx));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.dec_ctx));
     }
 };
 
