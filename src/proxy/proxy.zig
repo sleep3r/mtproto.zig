@@ -1890,7 +1890,7 @@ const EventLoop = struct {
         else
             null;
 
-        const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null);
+        const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, result.user);
         if (plan.count == 0) {
             self.closeSlot(slot, "no upstream candidates");
             return;
@@ -3526,12 +3526,21 @@ fn buildDcConnectPlan(
     dc_abs: usize,
     dc_idx: i16,
     snapshot: ?*const ProxyState.MiddleProxySnapshot,
+    user_name: []const u8,
 ) DcConnectPlan {
     var plan = DcConnectPlan{};
     plan.is_media_path = (dc_idx < 0) or (dc_abs == 203);
 
     if (cfg.datacenter_override) |override| {
         plan.candidates[0] = override;
+        plan.count = 1;
+        plan.use_middle_proxy = false;
+        plan.direct_fallback = null;
+        return plan;
+    }
+
+    if (cfg.userBypassesMiddleProxy(user_name)) {
+        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
         plan.count = 1;
         plan.use_middle_proxy = false;
         plan.direct_fallback = null;
@@ -3869,6 +3878,58 @@ test "parse middle proxy address for dc203" {
     const addr = parseMiddleProxyAddressForDc(cfg, 203) orelse return error.TestExpectedEqual;
     try std.testing.expect(addr.any.family == posix.AF.INET);
     try std.testing.expectEqual(@as(u16, 443), std.mem.bigToNative(u16, addr.in.sa.port));
+}
+
+test "direct users bypass middle-proxy routing" {
+    const cfg_text =
+        \\[general]
+        \\use_middle_proxy = true
+        \\[access.users]
+        \\admin = "00112233445566778899aabbccddeeff"
+        \\regular = "ffeeddccbbaa99887766554433221100"
+        \\[access.direct_users]
+        \\admin = true
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, cfg_text);
+    defer cfg.deinit(std.testing.allocator);
+
+    const mp_dc4 = net.Address.initIp4(.{ 11, 11, 11, 11 }, 443);
+    const mp_dc203 = net.Address.initIp4(.{ 12, 12, 12, 12 }, 443);
+    const snapshot = ProxyState.MiddleProxySnapshot{
+        .addrs_primary = .{
+            constants.tg_middle_proxies_v4[0],
+            constants.tg_middle_proxies_v4[1],
+            constants.tg_middle_proxies_v4[2],
+            mp_dc4,
+            constants.tg_middle_proxies_v4[4],
+        },
+        .addr_203 = mp_dc203,
+        .addrs_dc4 = [_]net.Address{mp_dc4} ++ ([_]net.Address{mp_dc4} ** 15),
+        .addrs_dc4_len = 1,
+        .addrs_203 = [_]net.Address{mp_dc203} ++ ([_]net.Address{mp_dc203} ** 7),
+        .addrs_203_len = 1,
+        .secret = [_]u8{0} ** 256,
+        .secret_len = 16,
+    };
+
+    const regular_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, "regular");
+    try std.testing.expect(regular_plan.use_middle_proxy);
+    try std.testing.expect(regular_plan.direct_fallback != null);
+    try std.testing.expect(regular_plan.candidates[0].eql(mp_dc4));
+
+    const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, "admin");
+    try std.testing.expect(!admin_plan.use_middle_proxy);
+    try std.testing.expect(admin_plan.direct_fallback == null);
+    try std.testing.expect(admin_plan.candidates[0].eql(constants.getDcAddressV4(4)));
+
+    const regular_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "regular");
+    try std.testing.expect(regular_media.use_middle_proxy);
+    try std.testing.expect(regular_media.candidates[0].eql(mp_dc203));
+
+    const admin_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "admin");
+    try std.testing.expect(!admin_media.use_middle_proxy);
+    try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
 
 test "DRS disabled fixed size" {

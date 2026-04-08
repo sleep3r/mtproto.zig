@@ -33,6 +33,9 @@ pub const Config = struct {
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
     users: std.StringHashMap([16]u8),
+    /// Users that always bypass MiddleProxy and connect to DC directly.
+    /// Section: [access.direct_users] (alias: [access.admins])
+    direct_users: std.StringHashMap(void),
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
     /// Test-only hook to override the mask port
@@ -65,6 +68,10 @@ pub const Config = struct {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
     }
 
+    pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
+        return self.direct_users.contains(user_name);
+    }
+
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
         if (self.use_middle_proxy and self.middleproxy_buffer_kb < 1024) {
@@ -86,6 +93,19 @@ pub const Config = struct {
                 .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections, shared_mb },
             );
         }
+
+        if (self.direct_users.count() > 0) {
+            const log = std.log.scoped(.config);
+            var it = @constCast(&self.direct_users).iterator();
+            while (it.next()) |entry| {
+                if (!self.users.contains(entry.key_ptr.*)) {
+                    log.warn(
+                        "access.direct_users contains unknown user '{s}' (missing in [access.users]); entry will be ignored",
+                        .{entry.key_ptr.*},
+                    );
+                }
+            }
+        }
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -99,10 +119,12 @@ pub const Config = struct {
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
         var cfg = Config{
             .users = std.StringHashMap([16]u8).init(allocator),
+            .direct_users = std.StringHashMap(void).init(allocator),
         };
 
         var lines = std.mem.splitScalar(u8, content, '\n');
         var in_users_section = false;
+        var in_direct_users_section = false;
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
@@ -117,6 +139,7 @@ pub const Config = struct {
             // Section headers
             if (line[0] == '[') {
                 in_users_section = std.mem.eql(u8, line, "[access.users]");
+                in_direct_users_section = std.mem.eql(u8, line, "[access.direct_users]") or std.mem.eql(u8, line, "[access.admins]");
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
@@ -140,6 +163,13 @@ pub const Config = struct {
                     _ = std.fmt.hexToBytes(&secret, value) catch continue;
                     const name = try allocator.dupe(u8, key);
                     try cfg.users.put(name, secret);
+                } else if (in_direct_users_section) {
+                    const enabled = std.mem.eql(u8, value, "true") or
+                        std.mem.eql(u8, value, "1") or
+                        std.mem.eql(u8, value, "yes");
+                    if (!enabled) continue;
+                    const name = try allocator.dupe(u8, key);
+                    try cfg.direct_users.put(name, {});
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
                         cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
@@ -232,6 +262,14 @@ pub const Config = struct {
             allocator.free(entry.key_ptr.*);
         }
         users.deinit();
+
+        var direct_users = @constCast(&self.direct_users);
+        var direct_it = direct_users.iterator();
+        while (direct_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+        }
+        direct_users.deinit();
+
         // Free tls_domain if it was allocated (not the default)
         if (!std.mem.eql(u8, self.tls_domain, "google.com")) {
             allocator.free(self.tls_domain);
@@ -326,6 +364,41 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+    try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
+}
+
+test "parse config - direct users allowlist" {
+    const content =
+        \\[access.users]
+        \\admin = "00112233445566778899aabbccddeeff"
+        \\regular = "aabbccddeeff00112233445566778899"
+        \\[access.direct_users]
+        \\admin = true
+        \\regular = false
+        \\ghost = true
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.direct_users.count());
+    try std.testing.expect(cfg.userBypassesMiddleProxy("admin"));
+    try std.testing.expect(!cfg.userBypassesMiddleProxy("regular"));
+    try std.testing.expect(cfg.userBypassesMiddleProxy("ghost"));
+}
+
+test "parse config - access admins alias" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\[access.admins]
+        \\alice = true
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.userBypassesMiddleProxy("alice"));
 }
 
 test "parse config - middleproxy buffer size" {
