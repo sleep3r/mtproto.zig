@@ -224,12 +224,16 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
     const red = "\x1b[31m";
 
     // Detect public IP
-    writeRaw("\n" ++ D ++ "  Detecting public IP..." ++ R);
-    const public_ip = detectPublicIp(allocator);
-    defer if (public_ip) |ip| allocator.free(ip);
-    writeRaw("\r\x1b[K");
+    var public_ip_alloc: ?[]const u8 = null;
+    if (cfg.public_ip == null) {
+        writeRaw("\n" ++ D ++ "  Detecting public IP..." ++ R);
+        public_ip_alloc = detectPublicIp(allocator);
+        writeRaw("\r\x1b[K");
+    }
+    defer if (public_ip_alloc) |ip| allocator.free(ip);
 
-    const server_ip = public_ip orelse "<SERVER_IP>";
+    const has_ip = cfg.public_ip != null or public_ip_alloc != null;
+    const server_ip = cfg.public_ip orelse (public_ip_alloc orelse "<SERVER_IP>");
 
     // Logo
     writeRaw("\n" ++ B ++ cyan);
@@ -245,7 +249,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
     writeStdout("      Listen       " ++ B ++ green ++ "0.0.0.0:{d}" ++ R ++ "\n", .{cfg.port});
     writeStdout("      Public IP    " ++ B ++ "{s}{s}" ++ R ++ "\n", .{
-        if (public_ip != null) green else yellow,
+        if (has_ip) green else yellow,
         server_ip,
     });
     writeStdout("      TLS Domain   " ++ B ++ yellow ++ "{s}" ++ R ++ "\n", .{cfg.tls_domain});
@@ -286,7 +290,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
 
     // ─── LINKS ──────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "LINKS" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
-    if (public_ip == null) {
+    if (!has_ip) {
         writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
