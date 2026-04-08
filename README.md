@@ -157,10 +157,13 @@ make update-server SERVER=<SERVER_IP> VERSION=v0.1.0
 ```
 
 What `update-server` does on the VPS:
-1. Downloads the latest (or pinned) release artifact for server architecture.
+1. Downloads the latest (or pinned) release artifact for server architecture (on x86_64 it auto-selects generic or `x86_64_v3` based on CPU features).
 2. Stops `mtproto-proxy`, replaces binary, and keeps `config.toml`/`env.sh` untouched.
-3. Refreshes helper scripts and service unit from the same release tag.
-4. Restarts service and rolls back binary automatically if restart fails.
+3. Refreshes helper scripts and updates the service unit from the same release tag (unless a tunnel-aware `mtproto-proxy.service` is detected).
+4. Checks that the downloaded binary is CPU-compatible before install and aborts on illegal-instruction mismatch.
+5. Restarts service and rolls back binary automatically if restart fails.
+
+If you intentionally want to reset a customized `mtproto-proxy.service` to the release default, run update with `FORCE_SERVICE_UPDATE=1`.
 
 If you are already on the server:
 

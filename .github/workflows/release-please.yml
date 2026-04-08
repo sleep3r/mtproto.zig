@@ -35,8 +35,13 @@ jobs:
         include:
           - target: x86_64-linux
             artifact_name: mtproto-proxy-linux-x86_64
+            cpu: ""
+          - target: x86_64-linux
+            artifact_name: mtproto-proxy-linux-x86_64_v3
+            cpu: x86_64_v3
           - target: aarch64-linux
             artifact_name: mtproto-proxy-linux-aarch64
+            cpu: ""
 
     steps:
       - name: Checkout release tag
@@ -51,11 +56,11 @@ jobs:
 
       - name: Build release binary
         run: |
-          if [ "${{ matrix.target }}" = "x86_64-linux" ]; then
-            zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dcpu=x86_64_v3
-          else
-            zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          BUILD_ARGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
+          if [ -n "${{ matrix.cpu }}" ]; then
+            BUILD_ARGS="$BUILD_ARGS -Dcpu=${{ matrix.cpu }}"
           fi
+          zig build $BUILD_ARGS
 
       - name: Package artifact
         run: |
