@@ -3,7 +3,7 @@
 # setup_nfqws.sh — Install zapret's nfqws for OS-level TCP desync.
 #
 # This complements the proxy's built-in Split-TLS desync (1-byte split in proxy.zig)
-# with OS-level packet manipulation that works on ALL outbound traffic from port 443.
+# with OS-level packet manipulation that works on ALL outbound traffic from the proxy port.
 #
 # nfqws uses NFQUEUE to intercept outbound TCP packets and applies:
 #   - Fake packets with low TTL (expires before reaching DPI but after the ISP router)
@@ -43,6 +43,45 @@ ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 
+get_server_port() {
+    local cfg="$1"
+    awk '
+        BEGIN { in_server = 0 }
+        /^[[:space:]]*\[server\][[:space:]]*$/ { in_server = 1; next }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { in_server = 0; next }
+        in_server {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ /^[[:space:]]*port[[:space:]]*=/) {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/[^0-9]/, "", value)
+                if (value != "") {
+                    print value
+                    exit
+                }
+            }
+        }
+    ' "$cfg" 2>/dev/null
+}
+
+remove_nfqws_rules() {
+    local ipt="$1"
+    command -v "$ipt" &>/dev/null || return 0
+
+    while IFS= read -r rule; do
+        rule="${rule/-A /-D }"
+        # shellcheck disable=SC2086
+        $ipt -t mangle $rule 2>/dev/null || true
+    done < <(
+        "$ipt" -t mangle -S OUTPUT 2>/dev/null | awk -v q="${NFQUEUE_NUM}" '
+            $1 == "-A" && $2 == "OUTPUT" && $0 ~ ("-j NFQUEUE --queue-num " q "($| )") {
+                print
+            }
+        '
+    )
+}
+
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_nfqws.sh"
 
 # ── Parse args ──────────────────────────────────────────────
@@ -63,6 +102,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ── Parse config port ───────────────────────────────────────
+PORT="$(get_server_port "/opt/mtproto-proxy/config.toml")"
+PORT="${PORT:-443}"
+
 # ── Uninstall ───────────────────────────────────────────────
 if $REMOVE; then
     info "Removing nfqws-mtproto..."
@@ -72,8 +115,8 @@ if $REMOVE; then
     systemctl daemon-reload
 
     # Remove iptables rules
-    iptables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
-    ip6tables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
+    remove_nfqws_rules iptables
+    remove_nfqws_rules ip6tables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
 
@@ -108,12 +151,12 @@ fi
 info "Setting up NFQUEUE rules..."
 
 # Remove old rules (idempotent)
-iptables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
-ip6tables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
+remove_nfqws_rules iptables
+remove_nfqws_rules ip6tables
 
-# Add NFQUEUE rules — intercept outbound TCP from port 443
-iptables -t mangle -A OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM"
-ip6tables -t mangle -A OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num "$NFQUEUE_NUM"
+# Add NFQUEUE rules — intercept outbound TCP from port
+iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM"
+ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM"
 
 # Persist rules
 mkdir -p /etc/iptables

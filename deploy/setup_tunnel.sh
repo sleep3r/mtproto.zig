@@ -57,6 +57,28 @@ ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 
+get_server_port() {
+    local cfg="$1"
+    awk '
+        BEGIN { in_server = 0 }
+        /^[[:space:]]*\[server\][[:space:]]*$/ { in_server = 1; next }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { in_server = 0; next }
+        in_server {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ /^[[:space:]]*port[[:space:]]*=/) {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/[^0-9]/, "", value)
+                if (value != "") {
+                    print value
+                    exit
+                }
+            }
+        }
+    ' "$cfg" 2>/dev/null
+}
+
 # ── Argument parsing ────────────────────────────────────────
 AWG_CONF="${1:-}"
 TUNNEL_MODE="${2:-direct}"
@@ -98,6 +120,9 @@ set_use_middle_proxy() {
 # ── Validate proxy is installed ─────────────────────────────
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] || fail "mtproto-proxy not found at $INSTALL_DIR. Run install.sh first."
 [[ -f "$INSTALL_DIR/config.toml" ]] || fail "config.toml not found at $INSTALL_DIR."
+
+PORT="$(get_server_port "$INSTALL_DIR/config.toml")"
+PORT="${PORT:-443}"
 
 # ── Step 1: Install AmneziaWG ───────────────────────────────
 info "Installing AmneziaWG..."
@@ -182,6 +207,8 @@ iptables -A FORWARD -i veth_main -o $MAIN_IF -j ACCEPT
 
 echo "Network namespace $NS_NAME ready, awg0 tunnel active inside namespace"
 NETNS_EOF
+sed -i "s/--dport 443/--dport $PORT/g" "$NETNS_SCRIPT"
+sed -i "s/10.200.200.2:443/10.200.200.2:$PORT/g" "$NETNS_SCRIPT"
 chmod +x "$NETNS_SCRIPT"
 ok "Created $NETNS_SCRIPT"
 
@@ -286,14 +313,6 @@ if [[ $FAIL -eq 1 ]]; then
 fi
 
 # ── Print result ────────────────────────────────────────────
-PORT=$(awk '
-    BEGIN { in_server = 0 }
-    /^\[server\]/ { in_server = 1; next }
-    /^\[/ { in_server = 0; next }
-    in_server && /^port/ { split($0, a, "="); gsub(/[^0-9]/, "", a[2]); print a[2] }
-' "$INSTALL_DIR/config.toml" | head -1)
-PORT="${PORT:-443}"
-
 # Extract first user secret
 SECRET=$(grep -oP '=\s*"\K[0-9a-f]{32}' "$INSTALL_DIR/config.toml" | head -1)
 TLS_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' "$INSTALL_DIR/config.toml" || echo "wb.ru")
