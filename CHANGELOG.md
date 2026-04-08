@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.3](https://github.com/sleep3r/mtproto.zig/compare/v0.9.2...v0.9.3) (2026-04-08)
+
+
+### Bug Fixes
+
+* public IP in AmneziaWG tunnel mode ([#97](https://github.com/sleep3r/mtproto.zig/issues/97)) ([119705b](https://github.com/sleep3r/mtproto.zig/commit/119705b5d5dd5d01585ed5798c908c61aea15ff9))
+
 ## [0.9.2](https://github.com/sleep3r/mtproto.zig/compare/v0.9.1...v0.9.2) (2026-04-08)
 
 
