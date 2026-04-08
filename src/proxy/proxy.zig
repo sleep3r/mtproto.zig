@@ -852,13 +852,45 @@ pub const ProxyState = struct {
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
-        const detected_nat_ip4 = if (cfg.datacenter_override == null)
-            detectPublicIpv4(allocator)
-        else
-            null;
-        if (detected_nat_ip4) |ip| {
-            var ip_buf: [16]u8 = undefined;
-            log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+        var detected_nat_ip4: ?[4]u8 = null;
+        if (cfg.datacenter_override == null) {
+            if (cfg.middle_proxy_nat_ip) |configured_nat_ip| {
+                if (parseIpv4Literal(configured_nat_ip)) |parsed_ip| {
+                    detected_nat_ip4 = parsed_ip;
+                    var ip_buf: [16]u8 = undefined;
+                    log.info("Using server.middle_proxy_nat_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
+                } else {
+                    log.info("server.middle_proxy_nat_ip='{s}' is not an IPv4 literal; falling back to AWG/public detection", .{configured_nat_ip});
+                }
+            }
+
+            if (detected_nat_ip4 == null) {
+                if (detectAwgEndpointIpv4(allocator)) |awg_ip| {
+                    detected_nat_ip4 = awg_ip;
+                    var awg_ip_buf: [16]u8 = undefined;
+                    log.info("Using AWG endpoint IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(awg_ip, &awg_ip_buf)});
+                }
+            }
+
+            if (detected_nat_ip4 == null) {
+                if (cfg.public_ip) |configured_public_ip| {
+                    if (parseIpv4Literal(configured_public_ip)) |parsed_ip| {
+                        detected_nat_ip4 = parsed_ip;
+                        var ip_buf: [16]u8 = undefined;
+                        log.info("Using server.public_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
+                    } else {
+                        log.info("server.public_ip='{s}' is not an IPv4 literal; auto-detecting middle-proxy NAT IP", .{configured_public_ip});
+                    }
+                }
+            }
+
+            if (detected_nat_ip4 == null) {
+                detected_nat_ip4 = detectPublicIpv4(allocator);
+                if (detected_nat_ip4) |ip| {
+                    var ip_buf: [16]u8 = undefined;
+                    log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+                }
+            }
         }
 
         return .{
@@ -2356,7 +2388,8 @@ const EventLoop = struct {
     fn middleProxyOnReadable(self: *EventLoop, slot: *ConnectionSlot) void {
         switch (slot.mp_step) {
             .waiting_rpc_nonce_response => {
-                const payload = self.mpTryReadFrame(slot, false) catch {
+                const payload = self.mpTryReadFrame(slot, false) catch |err| {
+                    log.debug("[{d}] mp nonce frame read failed: {any}", .{ slot.conn_id, err });
                     self.closeSlot(slot, "mp read nonce ans failed");
                     return;
                 } orelse return;
@@ -2506,7 +2539,8 @@ const EventLoop = struct {
             },
 
             .waiting_rpc_handshake_response => {
-                const payload = self.mpTryReadFrame(slot, true) catch {
+                const payload = self.mpTryReadFrame(slot, true) catch |err| {
+                    log.debug("[{d}] mp handshake frame read failed: {any}", .{ slot.conn_id, err });
                     if (!self.fallbackFromMiddleProxyToDirect(slot)) {
                         self.closeSlot(slot, "mp read handshake ans failed");
                     }
@@ -2673,9 +2707,26 @@ const EventLoop = struct {
             if (slot.mp_frame_have < slot.mp_frame_need) {
                 const n = posix.read(slot.upstream_fd, frame_buf[slot.mp_frame_have..slot.mp_frame_need]) catch |err| {
                     if (err == error.WouldBlock) return null;
+                    log.debug("[{d}] mp read error: step={s} encrypted={} have={d} need={d} err={any}", .{
+                        slot.conn_id,
+                        @tagName(slot.mp_step),
+                        encrypted,
+                        slot.mp_frame_have,
+                        slot.mp_frame_need,
+                        err,
+                    });
                     return err;
                 };
-                if (n == 0) return error.EndOfStream;
+                if (n == 0) {
+                    log.debug("[{d}] mp upstream eof: step={s} encrypted={} have={d} need={d}", .{
+                        slot.conn_id,
+                        @tagName(slot.mp_step),
+                        encrypted,
+                        slot.mp_frame_have,
+                        slot.mp_frame_need,
+                    });
+                    return error.EndOfStream;
+                }
                 slot.mp_frame_have += n;
                 if (slot.mp_frame_have < slot.mp_frame_need) return null;
             }
@@ -2684,6 +2735,12 @@ const EventLoop = struct {
                 if (slot.mp_frame_total_len == 0) {
                     slot.mp_frame_total_len = std.mem.readInt(u32, frame_buf[0..4], .little);
                     if (slot.mp_frame_total_len < 12 or slot.mp_frame_total_len > frame_buf.len) {
+                        log.debug("[{d}] mp plain frame size invalid: total_len={d} have={d} need={d}", .{
+                            slot.conn_id,
+                            slot.mp_frame_total_len,
+                            slot.mp_frame_have,
+                            slot.mp_frame_need,
+                        });
                         return error.BadMiddleProxyFrameSize;
                     }
                     slot.mp_frame_need = slot.mp_frame_total_len;
@@ -2691,34 +2748,81 @@ const EventLoop = struct {
                 }
             } else {
                 if (!slot.mp_frame_first_decrypted) {
-                    try slot.mp_dec.?.decryptInPlace(frame_buf[0..16]);
+                    slot.mp_dec.?.decryptInPlace(frame_buf[0..16]) catch |err| {
+                        log.debug("[{d}] mp decrypt first block failed: step={s} err={any}", .{
+                            slot.conn_id,
+                            @tagName(slot.mp_step),
+                            err,
+                        });
+                        return err;
+                    };
                     slot.mp_frame_first_decrypted = true;
                     slot.mp_frame_total_len = std.mem.readInt(u32, frame_buf[0..4], .little);
                     if (slot.mp_frame_total_len < 12 or slot.mp_frame_total_len > (1 << 24)) {
+                        const first4_le = std.mem.readInt(u32, frame_buf[0..4], .little);
+                        const first4_be = std.mem.readInt(u32, frame_buf[0..4], .big);
+                        log.debug("[{d}] mp encrypted frame size invalid: total_len={d} first4_le=0x{x} first4_be=0x{x}", .{
+                            slot.conn_id,
+                            slot.mp_frame_total_len,
+                            first4_le,
+                            first4_be,
+                        });
                         return error.BadMiddleProxyFrameSize;
                     }
                     slot.mp_frame_padded_len = if (slot.mp_frame_total_len % 16 == 0)
                         slot.mp_frame_total_len
                     else
                         slot.mp_frame_total_len + (16 - (slot.mp_frame_total_len % 16));
-                    if (slot.mp_frame_padded_len > frame_buf.len) return error.BadMiddleProxyFrameSize;
+                    if (slot.mp_frame_padded_len > frame_buf.len) {
+                        log.debug("[{d}] mp encrypted padded size invalid: total_len={d} padded_len={d} frame_buf={d}", .{
+                            slot.conn_id,
+                            slot.mp_frame_total_len,
+                            slot.mp_frame_padded_len,
+                            frame_buf.len,
+                        });
+                        return error.BadMiddleProxyFrameSize;
+                    }
                     slot.mp_frame_need = slot.mp_frame_padded_len;
                     if (slot.mp_frame_have < slot.mp_frame_need) return null;
                 }
 
                 if (slot.mp_frame_padded_len > 16) {
-                    try slot.mp_dec.?.decryptInPlace(frame_buf[16..slot.mp_frame_padded_len]);
+                    slot.mp_dec.?.decryptInPlace(frame_buf[16..slot.mp_frame_padded_len]) catch |err| {
+                        log.debug("[{d}] mp decrypt payload failed: step={s} padded_len={d} err={any}", .{
+                            slot.conn_id,
+                            @tagName(slot.mp_step),
+                            slot.mp_frame_padded_len,
+                            err,
+                        });
+                        return err;
+                    };
                 }
             }
 
             const frame = frame_buf[0..slot.mp_frame_total_len];
             const msg_seq = std.mem.readInt(i32, frame[4..8], .little);
-            if (msg_seq != slot.mp_read_seq_no) return error.BadMiddleProxySeqNo;
+            if (msg_seq != slot.mp_read_seq_no) {
+                log.debug("[{d}] mp seq mismatch: got={d} expected={d} step={s}", .{
+                    slot.conn_id,
+                    msg_seq,
+                    slot.mp_read_seq_no,
+                    @tagName(slot.mp_step),
+                });
+                return error.BadMiddleProxySeqNo;
+            }
             slot.mp_read_seq_no += 1;
 
             const expected_checksum = std.mem.readInt(u32, frame[frame.len - 4 ..][0..4], .little);
             const computed_checksum = middleproxy.crc32(frame[0 .. frame.len - 4]);
-            if (expected_checksum != computed_checksum) return error.BadMiddleProxyChecksum;
+            if (expected_checksum != computed_checksum) {
+                log.debug("[{d}] mp checksum mismatch: expected=0x{x} computed=0x{x} frame_len={d}", .{
+                    slot.conn_id,
+                    expected_checksum,
+                    computed_checksum,
+                    frame.len,
+                });
+                return error.BadMiddleProxyChecksum;
+            }
 
             // Copy payload into front of frame_buf so caller can consume before reset.
             const payload_len = frame.len - 12;
@@ -3281,6 +3385,93 @@ fn parseIpv4Literal(text: []const u8) ?[4]u8 {
     return ip;
 }
 
+fn parseEndpointHost(endpoint: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, endpoint, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) return null;
+
+    if (trimmed[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, trimmed, ']') orelse return null;
+        const host = trimmed[1..close_idx];
+        if (host.len == 0) return null;
+        return host;
+    }
+
+    if (std.mem.lastIndexOfScalar(u8, trimmed, ':')) |sep| {
+        if (sep == 0) return null;
+        return std.mem.trim(u8, trimmed[0..sep], &[_]u8{ ' ', '\t', '\r', '\n' });
+    }
+
+    return trimmed;
+}
+
+fn resolveHostnameIpv4(allocator: std.mem.Allocator, host: []const u8) ?[4]u8 {
+    var list = net.getAddressList(allocator, host, 443) catch return null;
+    defer list.deinit();
+
+    for (list.addrs) |addr| {
+        if (addr.any.family == posix.AF.INET) {
+            var ip: [4]u8 = undefined;
+            @memcpy(&ip, std.mem.asBytes(&addr.in.sa.addr));
+            std.mem.reverse(u8, &ip);
+            return ip;
+        }
+    }
+
+    return null;
+}
+
+fn parseAwgEndpointIpv4FromConfig(allocator: std.mem.Allocator, content: []const u8) ?[4]u8 {
+    var in_peer = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+
+    while (lines.next()) |raw_line| {
+        const line_no_cr = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trim(u8, line_no_cr, &[_]u8{ ' ', '\t' });
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+
+        if (line[0] == '[' and line[line.len - 1] == ']') {
+            in_peer = std.ascii.eqlIgnoreCase(line, "[Peer]");
+            continue;
+        }
+        if (!in_peer) continue;
+
+        const eq_pos = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
+        if (!std.ascii.eqlIgnoreCase(key, "Endpoint")) continue;
+
+        var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
+        if (std.mem.indexOfScalar(u8, value, '#')) |idx| value = value[0..idx];
+        if (std.mem.indexOfScalar(u8, value, ';')) |idx| value = value[0..idx];
+        value = std.mem.trim(u8, value, &[_]u8{ ' ', '\t' });
+        const host = parseEndpointHost(value) orelse continue;
+
+        if (parseIpv4Literal(host)) |ip| return ip;
+        if (resolveHostnameIpv4(allocator, host)) |resolved_ip| return resolved_ip;
+    }
+
+    return null;
+}
+
+fn detectAwgEndpointIpv4(allocator: std.mem.Allocator) ?[4]u8 {
+    const paths = [_][]const u8{
+        "/etc/amnezia/amneziawg/awg0.conf",
+        "/etc/amnezia/amneziawg/wg0.conf",
+        "/etc/wireguard/wg0.conf",
+    };
+
+    for (paths) |path| {
+        const file = std.fs.openFileAbsolute(path, .{}) catch continue;
+        defer file.close();
+
+        const content = file.readToEndAlloc(allocator, 64 * 1024) catch continue;
+        defer allocator.free(content);
+
+        if (parseAwgEndpointIpv4FromConfig(allocator, content)) |ip| return ip;
+    }
+
+    return null;
+}
+
 fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
     const services = [_][]const u8{
         "https://api.ipify.org",
@@ -3743,6 +3934,26 @@ test "parse ipv4 literal" {
     try std.testing.expectEqual([4]u8{ 179, 43, 141, 146 }, parsed);
     try std.testing.expect(parseIpv4Literal("179.43.141") == null);
     try std.testing.expect(parseIpv4Literal("179.43.141.999") == null);
+}
+
+test "parse endpoint host" {
+    try std.testing.expectEqualStrings("179.43.141.146", parseEndpointHost("179.43.141.146:41182").?);
+    try std.testing.expectEqualStrings("vpn.example.com", parseEndpointHost("vpn.example.com:51820").?);
+    try std.testing.expectEqualStrings("2001:db8::1", parseEndpointHost("[2001:db8::1]:41182").?);
+}
+
+test "parse awg endpoint ipv4 from config" {
+    const content =
+        \\[Interface]
+        \\Address = 100.83.12.60/32
+        \\
+        \\[Peer]
+        \\PublicKey = x
+        \\Endpoint = 179.43.141.146:41182
+    ;
+
+    const parsed = parseAwgEndpointIpv4FromConfig(std.testing.allocator, content) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual([4]u8{ 179, 43, 141, 146 }, parsed);
 }
 
 test "subnet rate limit - subnet key groups /24 IPv4" {

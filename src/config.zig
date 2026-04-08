@@ -17,6 +17,10 @@ pub const Config = struct {
     port: u16 = 443,
     /// Explicit public IP address. If set, bypasses detection via external services.
     public_ip: ?[]const u8 = null,
+    /// Explicit IPv4 to use in Telegram MiddleProxy AES key derivation.
+    /// Useful when `public_ip` is a domain name or when tunnel egress differs
+    /// from generic "what is my IP" services.
+    middle_proxy_nat_ip: ?[]const u8 = null,
     /// TCP listen(2) backlog for client-facing sockets
     backlog: u32 = 4096,
     /// Hard cap for concurrently handled client connections
@@ -178,6 +182,8 @@ pub const Config = struct {
                         }
                     } else if (std.mem.eql(u8, key, "public_ip")) {
                         cfg.public_ip = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "middle_proxy_nat_ip")) {
+                        cfg.middle_proxy_nat_ip = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
@@ -231,6 +237,9 @@ pub const Config = struct {
             allocator.free(self.tls_domain);
         }
         if (self.public_ip) |ip| {
+            allocator.free(ip);
+        }
+        if (self.middle_proxy_nat_ip) |ip| {
             allocator.free(ip);
         }
     }
