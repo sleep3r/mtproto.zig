@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.2](https://github.com/sleep3r/mtproto.zig/compare/v0.9.1...v0.9.2) (2026-04-08)
+
+
+### Bug Fixes
+
+* **deploy:** preserve tunnel service and avoid incompatible release binaries ([#93](https://github.com/sleep3r/mtproto.zig/issues/93)) ([7164040](https://github.com/sleep3r/mtproto.zig/commit/716404031183e1f96bcae79e6cfc08b3d1201b9b))
+
 ## [0.9.1](https://github.com/sleep3r/mtproto.zig/compare/v0.9.0...v0.9.1) (2026-04-07)
 
 
