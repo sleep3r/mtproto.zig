@@ -571,7 +571,7 @@ idle_timeout_sec = 120
 handshake_timeout_sec = 15
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 log_level = "info"                         # Runtime log level: debug, info, warn, err
-rate_limit_per_subnet = 8                  # Max new connections/sec per /24 subnet (0 = disabled)
+rate_limit_per_subnet = 30                # Max new connections/sec per /24 subnet (0 = disabled)
 # unsafe_override_limits = false           # Set true to disable auto-clamp of max_connections
 
 [censorship]
@@ -603,7 +603,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-connection buffer size in KiB (4 buffers allocated per active ME session). Values below 1024 may cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
-| `[server]` | `rate_limit_per_subnet` | `8` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
+| `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
@@ -621,7 +621,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to a RAM-safe estimate (with a warning). Set `unsafe_override_limits = true` in `[server]` to disable this. The proxy also has built-in admission control: at 90% capacity it pauses `accept()` and resumes at 80%, preventing CPU-wasteful accept→close spin loops.
 
-> **Operational note** &nbsp; The proxy limits new connections to 8/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
+> **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 

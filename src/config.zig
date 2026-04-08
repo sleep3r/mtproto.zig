@@ -50,7 +50,7 @@ pub const Config = struct {
     /// Max new connections per second per /24 subnet (0 = disabled).
     /// Limits scanner/flood/DPI-probe impact. Generous for legitimate Telegram clients
     /// which open 3-6 connections at startup and hold them.
-    rate_limit_per_subnet: u8 = 8,
+    rate_limit_per_subnet: u8 = 30,
     /// When true, disables auto-clamping of max_connections to the RAM-safe estimate.
     /// Use only if you know your host has enough memory for the configured limits.
     unsafe_override_limits: bool = false,
@@ -314,7 +314,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(!cfg.fast_mode); // Default is false
     try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
-    try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
+    try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
 }
@@ -607,7 +607,7 @@ test "parse config - full production-like config" {
         \\handshake_timeout_sec = 15
         \\backlog = 8192
         \\log_level = "info"
-        \\rate_limit_per_subnet = 8
+        \\rate_limit_per_subnet = 30
         \\
         \\[censorship]
         \\tls_domain = "wb.ru"
@@ -633,7 +633,7 @@ test "parse config - full production-like config" {
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqual(std.log.Level.info, cfg.log_level);
-    try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
+    try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqualStrings("wb.ru", cfg.tls_domain);
     try std.testing.expect(cfg.mask);
@@ -684,7 +684,7 @@ test "parse config - invalid rate_limit keeps default" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u8, 8), cfg.rate_limit_per_subnet);
+    try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
 }
 
 test "parse config - censorship section booleans" {

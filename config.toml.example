@@ -45,10 +45,10 @@ port = 443
 # log_level = "info"
 
 # Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet.
-# Limits scanner/flood/DPI-probe impact. Default of 8 is generous for
+# Limits scanner/flood/DPI-probe impact. Default of 30 is generous for
 # legitimate Telegram clients (3-6 connections at startup, then hold).
 # Set to 0 to disable rate limiting entirely.
-# rate_limit_per_subnet = 8
+# rate_limit_per_subnet = 30
 
 # By default, max_connections is auto-clamped to a RAM-safe estimate on startup.
 # Set to true to disable this safety mechanism (only if you're sure your host
