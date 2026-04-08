@@ -84,3 +84,10 @@ fast_mode = true
 # Generate with: openssl rand -hex 16
 user1 = "00112233445566778899aabbccddeeff"
 user2 = "ffeeddccbbaa99887766554433221100"
+
+[access.direct_users]
+# Optional: users that always bypass MiddleProxy (direct DC path).
+# Useful for admin/service accounts that should always use fast mode.
+# Names here must match keys from [access.users].
+# Value must be true/1/yes to enable.
+# user1 = true
