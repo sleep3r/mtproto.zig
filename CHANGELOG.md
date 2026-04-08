@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/sleep3r/mtproto.zig/compare/v0.9.4...v0.10.0) (2026-04-08)
+
+
+### Features
+
+* **config:** add per-user MiddleProxy direct bypass ([#107](https://github.com/sleep3r/mtproto.zig/issues/107)) ([877b410](https://github.com/sleep3r/mtproto.zig/commit/877b410ebf20cdf5912968ba61ea61c5c054df12))
+
+
+### Bug Fixes
+
+* **proxy:** improve middle-proxy NAT detection for AWG tunnels ([#105](https://github.com/sleep3r/mtproto.zig/issues/105)) ([7b30617](https://github.com/sleep3r/mtproto.zig/commit/7b30617bb4b22776a0a8499aed65ac1ee2966ca0))
+
 ## [0.9.4](https://github.com/sleep3r/mtproto.zig/compare/v0.9.3...v0.9.4) (2026-04-08)
 
 
