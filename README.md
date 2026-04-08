@@ -181,6 +181,12 @@ curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/upd
 
 The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs (startup banner resolves the public IP via `curl`). The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
+Prebuilt multi-arch image is published to GitHub Container Registry from this repository, so you can use `latest` directly:
+
+```bash
+docker pull ghcr.io/sleep3r/mtproto.zig:latest
+```
+
 ### Build
 
 ```bash
