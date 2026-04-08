@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.4](https://github.com/sleep3r/mtproto.zig/compare/v0.9.3...v0.9.4) (2026-04-08)
+
+
+### Bug Fixes
+
+* **deploy:** honor configured server port in helper scripts ([#101](https://github.com/sleep3r/mtproto.zig/issues/101)) ([#102](https://github.com/sleep3r/mtproto.zig/issues/102)) ([07b3b93](https://github.com/sleep3r/mtproto.zig/commit/07b3b93987f2b1906a60a9b904deff5816517317))
+
 ## [0.9.3](https://github.com/sleep3r/mtproto.zig/compare/v0.9.2...v0.9.3) (2026-04-08)
 
 
