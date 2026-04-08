@@ -10,6 +10,12 @@ use_middle_proxy = true
 [server]
 port = 443
 
+# Override the auto-detected public IP shown in startup links.
+# Useful when running inside a VPN tunnel (AmneziaWG) where ifconfig.me
+# returns the tunnel exit IP instead of the server's real address.
+# Accepts IP addresses or domain names (e.g. "proxy.example.com").
+# public_ip = "proxy.example.com"
+
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).
 # tag = "1234567890abcdef1234567890abcdef"
 

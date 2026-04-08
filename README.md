@@ -563,6 +563,7 @@ ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 
 [server]
 port = 443
+# public_ip = "proxy.example.com"           # Override auto-detected IP (useful with VPN tunnels)
 backlog = 4096                             # TCP listen queue size
 middleproxy_buffer_kb = 1024              # Per-connection ME buffers (4x this size), tune for VPS RAM
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
@@ -594,6 +595,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5 (recommended for promo-channel parity) |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
+| `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. When unset, the proxy queries `ifconfig.me`. **Required** when running inside an AmneziaWG tunnel (otherwise prints the VPN exit IP). Accepts IPs or domain names |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
