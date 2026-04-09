@@ -256,9 +256,11 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
 
     const dashboard_active = sys.isServiceActive("proxy-monitor");
     if (dashboard_active) {
-        ui.ok("monitoring dashboard is running");
+        ui.ok("monitoring dashboard is running (port 61208)");
+        ui.hint("  ssh -L 61208:localhost:61208 root@<server_ip>");
+        ui.hint("  open http://localhost:61208");
     } else {
-        ui.info("monitoring dashboard is not installed");
+        ui.info("monitoring dashboard is not installed (mtbuddy setup dashboard)");
     }
 
     const result = @import("sys.zig").exec(allocator, &.{
