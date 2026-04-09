@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/sleep3r/mtproto.zig/compare/v0.10.0...v0.11.0) (2026-04-09)
+
+
+### Features
+
+* **monitor:** make host/port configurable and fix awg idle status ([#112](https://github.com/sleep3r/mtproto.zig/issues/112)) ([93fec36](https://github.com/sleep3r/mtproto.zig/commit/93fec36085a53518549eb4d06dd190fbb4336a08))
+
 ## [0.10.0](https://github.com/sleep3r/mtproto.zig/compare/v0.9.4...v0.10.0) (2026-04-08)
 
 
