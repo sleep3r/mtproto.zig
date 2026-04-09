@@ -149,7 +149,8 @@ const Action = enum {
 
 fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
     while (true) {
-        const is_installed = @import("sys.zig").fileExists("/opt/mtproto-proxy");
+        const sys = @import("sys.zig");
+        const is_installed = sys.fileExists("/opt/mtproto-proxy");
 
         var items: std.ArrayList([]const u8) = .empty;
         defer items.deinit(allocator);
@@ -168,10 +169,18 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             try actions.append(allocator, .masking);
             try items.append(allocator, i18n.get(ui.lang, .menu_setup_tunnel));
             try actions.append(allocator, .tunnel);
-            try items.append(allocator, i18n.get(ui.lang, .menu_setup_dashboard));
-            try actions.append(allocator, .dashboard);
-            try items.append(allocator, i18n.get(ui.lang, .menu_setup_recovery));
-            try actions.append(allocator, .recovery);
+
+            const has_dashboard = sys.isServiceActive("proxy-monitor");
+            const has_recovery = sys.isServiceActive("mtproto-mask-health.timer");
+
+            if (!has_dashboard) {
+                try items.append(allocator, i18n.get(ui.lang, .menu_setup_dashboard));
+                try actions.append(allocator, .dashboard);
+            }
+            if (!has_recovery) {
+                try items.append(allocator, i18n.get(ui.lang, .menu_setup_recovery));
+                try actions.append(allocator, .recovery);
+            }
             try items.append(allocator, i18n.get(ui.lang, .menu_ipv6_hop));
             try actions.append(allocator, .ipv6hop);
             try items.append(allocator, i18n.get(ui.lang, .menu_status));
@@ -215,32 +224,41 @@ fn restartProxy(ui: *Tui, allocator: std.mem.Allocator) void {
 fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     ui.section(i18n.get(ui.lang, .menu_status));
 
-    const svc_active = @import("sys.zig").isServiceActive("mtproto-proxy");
+    const sys = @import("sys.zig");
+
+    const svc_active = sys.isServiceActive("mtproto-proxy");
     if (svc_active) {
         ui.ok("mtproto-proxy is running");
     } else {
         ui.fail("mtproto-proxy is not running");
     }
 
-    const nginx_active = @import("sys.zig").isServiceActive("nginx");
+    const nginx_active = sys.isServiceActive("nginx");
     if (nginx_active) {
         ui.ok("nginx is running");
     } else {
         ui.info("nginx is not running (masking may be disabled)");
     }
 
-    const nfqws_active = @import("sys.zig").isServiceActive("nfqws-mtproto");
+    const nfqws_active = sys.isServiceActive("nfqws-mtproto");
     if (nfqws_active) {
         ui.ok("nfqws-mtproto is running");
     } else {
         ui.info("nfqws-mtproto is not running (TCP desync disabled)");
     }
 
-    const timer_active = @import("sys.zig").isServiceActive("mtproto-mask-health.timer");
+    const timer_active = sys.isServiceActive("mtproto-mask-health.timer");
     if (timer_active) {
-        ui.ok("masking health monitor is active");
+        ui.ok("DPI auto-recovery is active");
     } else {
-        ui.info("masking health monitor is not active");
+        ui.info("DPI auto-recovery is not installed");
+    }
+
+    const dashboard_active = sys.isServiceActive("proxy-monitor");
+    if (dashboard_active) {
+        ui.ok("monitoring dashboard is running");
+    } else {
+        ui.info("monitoring dashboard is not installed");
     }
 
     const result = @import("sys.zig").exec(allocator, &.{
