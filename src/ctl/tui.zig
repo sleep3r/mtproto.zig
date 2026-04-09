@@ -528,6 +528,7 @@ pub const Tui = struct {
                             Color.dim,   s_helps[idx],
                             Color.reset,
                         });
+                        tui.clearLine();
                         tui.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
                     }
                 }
