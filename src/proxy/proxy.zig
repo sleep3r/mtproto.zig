@@ -30,6 +30,7 @@ const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
+const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
@@ -835,7 +836,19 @@ pub const ProxyState = struct {
 
         var resolved_addr: ?net.Address = null;
         if (cfg.mask) {
-            const mask_target = if (cfg.mask_port != 443) "127.0.0.1" else cfg.tls_domain;
+            const mask_target = blk: {
+                if (cfg.mask_port == 443) break :blk cfg.tls_domain;
+
+                if (isRunningInNonInitNetns()) {
+                    log.info(
+                        "mask_port={d} with non-init netns detected, using host veth IP {s} for local masking",
+                        .{ cfg.mask_port, tunnel_mask_gateway_ip },
+                    );
+                    break :blk tunnel_mask_gateway_ip;
+                }
+
+                break :blk "127.0.0.1";
+            };
             const list = net.getAddressList(allocator, mask_target, cfg.mask_port) catch |err| blk: {
                 log.err("Failed to resolve mask target '{s}': {any}", .{ mask_target, err });
                 break :blk null;
@@ -844,7 +857,7 @@ pub const ProxyState = struct {
                 defer al.deinit();
                 if (al.addrs.len > 0) {
                     resolved_addr = al.addrs[0];
-                    log.info("Mask target '{s}' resolved at startup", .{mask_target});
+                    log.info("Mask target '{s}:{d}' resolved at startup", .{ mask_target, cfg.mask_port });
                 }
             }
         }
@@ -3383,6 +3396,16 @@ fn parseIpv4Literal(text: []const u8) ?[4]u8 {
 
     if (idx != ip.len) return null;
     return ip;
+}
+
+fn isRunningInNonInitNetns() bool {
+    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var init_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    const self_ns = std.fs.readLinkAbsolute("/proc/self/ns/net", &self_buf) catch return false;
+    const init_ns = std.fs.readLinkAbsolute("/proc/1/ns/net", &init_buf) catch return false;
+
+    return !std.mem.eql(u8, self_ns, init_ns);
 }
 
 fn parseEndpointHost(endpoint: []const u8) ?[]const u8 {

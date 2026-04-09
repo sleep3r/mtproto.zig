@@ -118,6 +118,16 @@
     </div>
   </div>
 
+  <!-- Users -->
+  <div class="users-card" id="usersCard" style="display:none">
+    <div class="users-head">
+      <div class="title">👥 Users</div>
+      <div class="users-meta" id="usersMeta">—</div>
+    </div>
+    <div class="users-note" id="usersNote">—</div>
+    <div class="users-list" id="usersList"></div>
+  </div>
+
   <!-- AmneziaWG Tunnel -->
   <div class="tunnel-card" id="tunnelCard" style="display:none">
     <div class="tunnel-header">
@@ -141,6 +151,33 @@
       <div class="tunnel-stat">
         <span class="tunnel-lbl">↑ Sent</span>
         <span class="tunnel-val" id="awgTx">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Masking health -->
+  <div class="tunnel-card" id="maskingCard" style="display:none">
+    <div class="tunnel-header">
+      <div class="tunnel-icon">🧰</div>
+      <div class="tunnel-title">Masking Health</div>
+      <div class="badge" id="maskBadge"><div class="pulse-dot"></div><span id="maskStatus">—</span></div>
+    </div>
+    <div class="tunnel-details">
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">Mode</span>
+        <span class="tunnel-val" id="maskMode">—</span>
+      </div>
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">Endpoint</span>
+        <span class="tunnel-val" id="maskTarget">—</span>
+      </div>
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">Nginx</span>
+        <span class="tunnel-val" id="maskNginx">—</span>
+      </div>
+      <div class="tunnel-stat">
+        <span class="tunnel-lbl">Health Timer</span>
+        <span class="tunnel-val" id="maskTimer">—</span>
       </div>
     </div>
   </div>

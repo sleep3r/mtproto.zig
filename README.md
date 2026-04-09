@@ -48,7 +48,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing) |
 | **Split-TLS** | DPI Evasion | 1-byte Application-level record chunking to defeat passive DPI signatures |
-| **Zero-RTT** | DPI Evasion | Local Nginx server deployed on-the-fly (`127.0.0.1:8443`) to defeat active probing timing analysis |
+| **Zero-RTT** | DPI Evasion | Local Nginx server for masking (`127.0.0.1:8443`, with tunnel netns auto-routing) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
@@ -542,6 +542,10 @@ ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf middlep
 
 > **Note** &nbsp; Tunnel setup supports three modes: `direct` (default, sets `use_middle_proxy=false`), `preserve` (keeps current config), and `middleproxy` (sets `use_middle_proxy=true`). Use `middleproxy` if you need promo-tag parity and stable media behavior on non-premium clients.
 
+> **Note** &nbsp; For local masking (`mask_port = 8443`) in tunnel netns mode, masking is now auto-routed to host-side Nginx (`10.200.200.1:8443`) by deploy scripts/runtime — no extra config key is required.
+
+> **Note** &nbsp; Deploy scripts also install a self-healing masking monitor (`mtproto-mask-health.timer`) that checks local masking endpoint reachability every minute and restarts `nginx`/`mtproto-proxy` on failures.
+
 > **Note** &nbsp; To check tunnel status: `ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'`
 
 ### Managing the tunnel
@@ -552,6 +556,10 @@ ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'
 
 # Check proxy logs
 ssh root@<VPS_IP> 'journalctl -u mtproto-proxy -f'
+
+# Check masking monitor status/logs
+ssh root@<VPS_IP> 'systemctl status mtproto-mask-health.timer --no-pager'
+ssh root@<VPS_IP> 'journalctl -t mtproto-mask-health -n 50 --no-pager'
 
 # Restart (recreates namespace + tunnel)
 ssh root@<VPS_IP> 'systemctl restart mtproto-proxy'
