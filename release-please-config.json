@@ -10,7 +10,8 @@
       "draft": false,
       "prerelease": false,
       "extra-files": [
-        "src/main.zig"
+        "src/main.zig",
+        "src/ctl/main.zig"
       ]
     }
   }
