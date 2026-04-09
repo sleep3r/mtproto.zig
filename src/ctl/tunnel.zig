@@ -1,0 +1,337 @@
+//! Setup tunnel command for mtproto-ctl.
+//!
+//! Ports setup_tunnel.sh (400 lines bash) — creates an isolated network
+//! namespace with AmneziaWG tunnel so Telegram DCs become reachable
+//! while the host keeps normal connectivity.
+
+const std = @import("std");
+const tui_mod = @import("tui.zig");
+const i18n = @import("i18n.zig");
+const sys = @import("sys.zig");
+const toml = @import("toml.zig");
+
+const Tui = tui_mod.Tui;
+const Color = tui_mod.Color;
+const SummaryLine = tui_mod.SummaryLine;
+
+const INSTALL_DIR = "/opt/mtproto-proxy";
+const NS_NAME = "tg_proxy_ns";
+const AWG_CONF_DIR = "/etc/amnezia/amneziawg";
+const NETNS_SCRIPT = "/usr/local/bin/setup_netns.sh";
+const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
+
+pub const TunnelOpts = struct {
+    awg_conf: []const u8 = "",
+    mode: TunnelMode = .direct,
+};
+
+pub const TunnelMode = enum {
+    direct,
+    preserve,
+    middleproxy,
+};
+
+/// Run in CLI mode.
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+    var opts = TunnelOpts{};
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--mode") or std.mem.eql(u8, arg, "-m")) {
+            if (args.next()) |val| {
+                if (std.mem.eql(u8, val, "middleproxy")) opts.mode = .middleproxy
+                else if (std.mem.eql(u8, val, "preserve")) opts.mode = .preserve
+                else opts.mode = .direct;
+            }
+        } else if (arg.len > 0 and arg[0] != '-') {
+            opts.awg_conf = arg;
+        }
+    }
+
+    if (opts.awg_conf.len == 0) {
+        ui.fail("Usage: mtproto-ctl setup tunnel <awg-config.conf> [--mode direct|preserve|middleproxy]");
+        return;
+    }
+
+    try execute(ui, allocator, opts);
+}
+
+/// Run in interactive mode.
+pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
+    ui.section(i18n.get(ui.lang, .menu_setup_tunnel));
+
+    var conf_buf: [512]u8 = undefined;
+    const conf_path = try ui.input(
+        "AmneziaWG config file path",
+        "Path to your .conf file from AmneziaVPN app or provider.",
+        null,
+        &conf_buf,
+    );
+
+    const mode_choice = try ui.menu("Tunnel mode", &.{
+        "direct — Direct DC connections (recommended)",
+        "preserve — Keep existing use_middle_proxy setting",
+        "middleproxy — Route through Telegram middle proxy",
+    });
+    const mode: TunnelMode = switch (mode_choice) {
+        0 => .direct,
+        1 => .preserve,
+        2 => .middleproxy,
+        else => .direct,
+    };
+
+    if (!try ui.confirm(i18n.get(ui.lang, .confirm_proceed), true)) {
+        ui.info(i18n.get(ui.lang, .aborting));
+        return;
+    }
+
+    try execute(ui, allocator, .{ .awg_conf = conf_path, .mode = mode });
+}
+
+fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
+    if (!sys.isRoot()) {
+        ui.fail(i18n.get(ui.lang, .error_not_root));
+        return;
+    }
+
+    if (!sys.fileExists(opts.awg_conf)) {
+        ui.fail("Config file not found");
+        return;
+    }
+    if (!sys.fileExists(INSTALL_DIR ++ "/mtproto-proxy")) {
+        ui.fail("mtproto-proxy not installed. Run install first.");
+        return;
+    }
+
+    // Read port from config (dupe to ensure lifetime)
+    var port: []const u8 = "443";
+    var port_buf: [8]u8 = undefined;
+    {
+        var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
+        if (doc) |*d| {
+            defer d.deinit();
+            if (d.get("server", "port")) |p| {
+                const len = @min(p.len, port_buf.len);
+                @memcpy(port_buf[0..len], p[0..len]);
+                port = port_buf[0..len];
+            }
+        }
+    }
+
+    // ── Install AmneziaWG ──
+    if (sys.commandExists("awg")) {
+        ui.ok("AmneziaWG already installed");
+    } else {
+        ui.step("Installing AmneziaWG...");
+        _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
+        _ = sys.execForward(&.{ "apt-get", "install", "-y", "software-properties-common" }) catch {};
+        _ = sys.execForward(&.{ "add-apt-repository", "-y", "ppa:amnezia/ppa" }) catch {};
+        _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
+        _ = sys.execForward(&.{ "apt-get", "install", "-y", "amneziawg-tools" }) catch {};
+        ui.ok("AmneziaWG installed");
+    }
+
+    // ── Copy AWG config ──
+    ui.step("Installing AmneziaWG config...");
+    _ = sys.exec(allocator, &.{ "mkdir", "-p", AWG_CONF_DIR }) catch {};
+    _ = sys.execForward(&.{ "cp", opts.awg_conf, AWG_CONF_DIR ++ "/awg0.conf" }) catch {};
+    _ = sys.exec(allocator, &.{ "chmod", "600", AWG_CONF_DIR ++ "/awg0.conf" }) catch {};
+    ui.ok("Config installed to " ++ AWG_CONF_DIR ++ "/awg0.conf");
+
+    // ── Create netns setup script ──
+    ui.step("Creating network namespace setup script...");
+
+    var netns_script_buf: [4096]u8 = undefined;
+    const netns_script = std.fmt.bufPrint(&netns_script_buf,
+        \\#!/bin/bash
+        \\set -e
+        \\NS_NAME="tg_proxy_ns"
+        \\MAIN_IF=$(ip route get 8.8.8.8 | awk '{{printf $5}}')
+        \\
+        \\ip netns del $NS_NAME 2>/dev/null || true
+        \\ip link del veth_main 2>/dev/null || true
+        \\
+        \\sysctl -w net.ipv4.ip_forward=1 > /dev/null
+        \\
+        \\ip netns add $NS_NAME
+        \\
+        \\mkdir -p /etc/netns/$NS_NAME
+        \\echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/netns/$NS_NAME/resolv.conf
+        \\
+        \\ip link add veth_main type veth peer name veth_ns
+        \\ip link set veth_ns netns $NS_NAME
+        \\
+        \\ip addr add 10.200.200.1/24 dev veth_main
+        \\ip link set veth_main up
+        \\
+        \\ip netns exec $NS_NAME ip addr add 10.200.200.2/24 dev veth_ns
+        \\ip netns exec $NS_NAME ip link set veth_ns up
+        \\ip netns exec $NS_NAME ip link set lo up
+        \\ip netns exec $NS_NAME ip route add default via 10.200.200.1
+        \\
+        \\ip netns exec $NS_NAME awg-quick up /etc/amnezia/amneziawg/awg0.conf
+        \\
+        \\ip netns exec $NS_NAME ip rule add from 10.200.200.2 table 100 priority 100
+        \\ip netns exec $NS_NAME ip route add default via 10.200.200.1 table 100
+        \\
+        \\iptables -t nat -D PREROUTING -i $MAIN_IF -p tcp --dport {[port]s} -j DNAT --to-destination 10.200.200.2:{[port]s} 2>/dev/null || true
+        \\iptables -t nat -A PREROUTING -i $MAIN_IF -p tcp --dport {[port]s} -j DNAT --to-destination 10.200.200.2:{[port]s}
+        \\iptables -t nat -D POSTROUTING -s 10.200.200.0/24 -o $MAIN_IF -j MASQUERADE 2>/dev/null || true
+        \\iptables -t nat -A POSTROUTING -s 10.200.200.0/24 -o $MAIN_IF -j MASQUERADE
+        \\
+        \\iptables -D FORWARD -i $MAIN_IF -o veth_main -j ACCEPT 2>/dev/null || true
+        \\iptables -A FORWARD -i $MAIN_IF -o veth_main -j ACCEPT
+        \\iptables -D FORWARD -i veth_main -o $MAIN_IF -j ACCEPT 2>/dev/null || true
+        \\iptables -A FORWARD -i veth_main -o $MAIN_IF -j ACCEPT
+        \\
+        \\echo "Network namespace $NS_NAME ready, awg0 tunnel active inside namespace"
+    , .{ .port = port }) catch "";
+
+    if (netns_script.len > 0) {
+        // Write using native Zig I/O (no shell injection risk)
+        sys.writeFileMode(NETNS_SCRIPT, netns_script, 0o755) catch {
+            ui.fail("Failed to write netns script");
+            return;
+        };
+    }
+    ui.ok("Created " ++ NETNS_SCRIPT);
+
+    // ── Patch systemd service ──
+    ui.step("Patching systemd service for tunnel mode...");
+    const svc_content =
+        \\[Unit]
+        \\Description=MTProto Proxy (Zig) via AmneziaWG Tunnel
+        \\Documentation=https://github.com/sleep3r/mtproto.zig
+        \\After=network-online.target
+        \\Wants=network-online.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\ExecStartPre=/usr/local/bin/setup_netns.sh
+        \\ExecStart=/sbin/ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+        \\Restart=on-failure
+        \\RestartSec=5
+        \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+        \\LimitNOFILE=131582
+        \\TasksMax=65535
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+    ;
+    {
+        // Write using native Zig I/O
+        sys.writeFile(SERVICE_FILE, svc_content) catch {
+            ui.fail("Failed to write systemd service");
+            return;
+        };
+    }
+    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+    ui.ok("Systemd service patched for tunnel mode");
+
+    // ── Apply tunnel mode ──
+    const mode_label: []const u8 = switch (opts.mode) {
+        .direct => blk: {
+            setUseMiddleProxy(allocator, "false");
+            break :blk "Direct mode (no middle proxy)";
+        },
+        .preserve => "Preserved existing setting",
+        .middleproxy => blk: {
+            setUseMiddleProxy(allocator, "true");
+            break :blk "MiddleProxy mode enabled";
+        },
+    };
+    ui.ok(mode_label);
+
+    // ── Inject public IP ──
+    const public_ip = sys.detectPublicIp(allocator) orelse "";
+    if (public_ip.len > 0) {
+        var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
+        if (doc) |*d| {
+            defer d.deinit();
+            var quoted_buf: [64]u8 = undefined;
+            const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{public_ip}) catch "";
+            if (quoted.len > 0) {
+                d.set("server", "public_ip", quoted) catch {};
+                d.save(INSTALL_DIR ++ "/config.toml") catch {};
+            }
+        }
+        ui.stepOk("Injected public IP", public_ip);
+    }
+
+    // ── Preserve promotion tag from env.sh ──
+    if (sys.readEnvFile(allocator, INSTALL_DIR ++ "/env.sh", "TAG")) |tag| {
+        var doc2 = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
+        if (doc2) |*d| {
+            defer d.deinit();
+            var tag_buf: [128]u8 = undefined;
+            const quoted_tag = std.fmt.bufPrint(&tag_buf, "\"{s}\"", .{tag}) catch "";
+            if (quoted_tag.len > 0) {
+                d.set("server", "tag", quoted_tag) catch {};
+                d.save(INSTALL_DIR ++ "/config.toml") catch {};
+            }
+        }
+        ui.stepOk("Preserved promotion tag", tag);
+    }
+
+    // ── Patch Nginx masking for tunnel IP ──
+    if (sys.fileExists("/etc/nginx/sites-available/mtproto-masking")) {
+        const patch_cmd = "grep -q '10\\.200\\.200\\.1' /etc/nginx/sites-available/mtproto-masking 2>/dev/null || " ++
+            "sed -i '/listen.*127\\.0\\.0\\.1.*ssl/a\\    listen 10.200.200.1:8443 ssl;' /etc/nginx/sites-available/mtproto-masking && " ++
+            "nginx -t >/dev/null 2>&1 && systemctl reload nginx";
+        _ = sys.exec(allocator, &.{ "bash", "-c", patch_cmd }) catch {};
+        ui.ok("Nginx masking patched for tunnel netns");
+    }
+
+    // ── Install masking monitor ──
+    if (sys.fileExists(INSTALL_DIR ++ "/setup_mask_monitor.sh")) {
+        _ = sys.execForward(&.{ "bash", INSTALL_DIR ++ "/setup_mask_monitor.sh", "--quiet" }) catch {};
+    }
+
+    // ── Restart proxy ──
+    ui.step("Restarting proxy...");
+    _ = sys.execForward(&.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
+
+    if (sys.isServiceActive("mtproto-proxy")) {
+        ui.ok("Proxy running inside AmneziaWG tunnel");
+    } else {
+        ui.fail("Proxy failed to start. Check: journalctl -u mtproto-proxy -n 30");
+        return;
+    }
+
+    // ── Validate DC connectivity ──
+    ui.step("Validating Telegram DC connectivity...");
+    const dc_ips = [_][]const u8{
+        "149.154.175.50", "149.154.167.50", "149.154.175.100",
+        "149.154.167.91", "91.108.56.100",
+    };
+    for (dc_ips) |dc_ip| {
+        const r = sys.exec(allocator, &.{
+            "ip", "netns", "exec", NS_NAME, "nc", "-zw3", dc_ip, "443",
+        }) catch null;
+        if (r) |result| {
+            defer result.deinit();
+            if (result.exit_code == 0) {
+                ui.stepOk("DC reachable", dc_ip);
+            } else {
+                ui.print("  {s}⚠{s} DC NOT reachable: {s}\n", .{ Color.err, Color.reset, dc_ip });
+            }
+        }
+    }
+
+    // ── Summary ──
+    ui.summaryBox("AmneziaWG Tunnel Configured", &.{
+        .{ .label = "Status:", .value = "systemctl status mtproto-proxy" },
+        .{ .label = "Logs:", .value = "journalctl -u mtproto-proxy -f" },
+        .{ .label = "Tunnel:", .value = "ip netns exec " ++ NS_NAME ++ " awg show" },
+        .{ .label = "Mode:", .value = mode_label },
+        .{ .label = "", .style = .blank },
+        .{ .label = "Proxy runs inside isolated network namespace", .style = .success },
+        .{ .label = "AmneziaWG tunnel active (host network untouched)", .style = .success },
+        .{ .label = "SSH and host services unaffected", .style = .success },
+    });
+}
+
+fn setUseMiddleProxy(allocator: std.mem.Allocator, value: []const u8) void {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
+    defer doc.deinit();
+    doc.set("general", "use_middle_proxy", value) catch return;
+    doc.save(INSTALL_DIR ++ "/config.toml") catch {};
+}
