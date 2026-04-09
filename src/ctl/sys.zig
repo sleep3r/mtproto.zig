@@ -1,4 +1,4 @@
-//! System operations wrapper for mtproto-ctl.
+//! System operations wrapper for buddy.
 //!
 //! Encapsulates subprocess execution, file I/O, architecture detection,
 //! and privilege checks. All subprocess calls go through exec() which

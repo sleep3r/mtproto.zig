@@ -1,4 +1,4 @@
-//! Setup monitor command for mtproto-ctl.
+//! Setup monitor command for buddy.
 //!
 //! Ports setup_mask_monitor.sh (246 lines bash) — installs masking health
 //! self-healing via systemd timer. Monitors nginx + mtproto-proxy health

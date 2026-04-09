@@ -1,4 +1,4 @@
-//! Update command for mtproto-ctl.
+//! Update command for buddy.
 //!
 //! Ports update.sh (260 lines of bash) into structured Zig code.
 //! Downloads pre-built release artifacts from GitHub, validates

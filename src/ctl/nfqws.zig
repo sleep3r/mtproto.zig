@@ -1,4 +1,4 @@
-//! Setup nfqws command for mtproto-ctl.
+//! Setup nfqws command for buddy.
 //!
 //! Ports setup_nfqws.sh (258 lines bash) — installs zapret's nfqws
 //! for OS-level TCP desync (fake packets + split to defeat stateful DPI).

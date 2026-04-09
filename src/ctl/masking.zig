@@ -1,4 +1,4 @@
-//! Setup masking command for mtproto-ctl.
+//! Setup masking command for buddy.
 //!
 //! Ports setup_masking.sh (274 lines bash) — installs local Nginx
 //! for zero-RTT DPI masking. Eliminates the timing side-channel

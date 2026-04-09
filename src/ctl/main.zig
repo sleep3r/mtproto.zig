@@ -1,21 +1,15 @@
-//! mtproto-ctl — interactive installer & control panel for mtproto.zig
+//! buddy — interactive installer & control panel for mtproto.zig
 //!
 //! Replaces the collection of bash scripts in deploy/ with a single
 //! Zig binary. Supports both interactive TUI mode (--interactive)
 //! and non-interactive CLI with flags.
 //!
-//! Usage:
-//!   mtproto-ctl --interactive              Interactive TUI wizard
-//!   mtproto-ctl install [options]           Install from source
-//!   mtproto-ctl update [options]            Update from GitHub release
-//!   mtproto-ctl setup masking [options]     Setup local Nginx DPI masking
-//!   mtproto-ctl setup nfqws [options]       Setup nfqws TCP desync
-//!   mtproto-ctl setup tunnel <conf> [opts]  Setup AmneziaWG tunnel
-//!   mtproto-ctl setup monitor              Install masking health monitor
-//!   mtproto-ctl ipv6-hop [--auto|--check]  IPv6 rotation
-//!   mtproto-ctl update-dns <ip>            Update Cloudflare DNS
-//!   mtproto-ctl --help                     Show help
-//!   mtproto-ctl --version                  Show version
+//! One-liner install:
+//!   sudo buddy install --port 443 --domain wb.ru --yes
+//!   sudo buddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!
+//! Interactive wizard:
+//!   sudo buddy --interactive
 
 const std = @import("std");
 const i18n = @import("i18n.zig");
@@ -48,22 +42,17 @@ pub fn main() !void {
     var command: ?[]const u8 = null;
     var remaining_args = args;
 
-    // Collect global flags and find command
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "-i")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--lang")) {
             if (args.next()) |lang_val| {
-                if (std.mem.eql(u8, lang_val, "ru")) {
-                    lang = .ru;
-                } else {
-                    lang = .en;
-                }
+                lang = if (std.mem.eql(u8, lang_val, "ru")) .ru else .en;
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
-        } else if (std.mem.eql(u8, arg, "--version")) {
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             printVersion();
             return;
         } else {
@@ -73,7 +62,6 @@ pub fn main() !void {
         }
     }
 
-    // Default language from environment
     const resolved_lang = lang orelse i18n.Lang.fromEnv();
     var ui = Tui.init(resolved_lang);
 
@@ -81,7 +69,6 @@ pub fn main() !void {
     if (interactive) {
         ui.banner(version);
 
-        // If language not explicitly set, ask interactively
         if (lang == null) {
             const lang_choice = try ui.menu(
                 i18n.get(.en, .select_language),
@@ -104,7 +91,6 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, cmd, "update")) {
             return update.run(&ui, allocator, &remaining_args);
         } else if (std.mem.eql(u8, cmd, "setup")) {
-            // setup <subcommand>
             if (remaining_args.next()) |sub| {
                 if (std.mem.eql(u8, sub, "masking")) {
                     return masking.run(&ui, allocator, &remaining_args);
@@ -115,12 +101,12 @@ pub fn main() !void {
                 } else if (std.mem.eql(u8, sub, "monitor")) {
                     return monitor.run(&ui, allocator, &remaining_args);
                 } else {
-                    ui.print("  {s}Unknown setup command: {s}{s}\n", .{ Color.err, sub, Color.reset });
-                    ui.info("Available: masking, nfqws, tunnel, monitor");
+                    ui.print("\n  {s}Unknown setup subcommand:{s} {s}\n", .{ Color.err, Color.reset, sub });
+                    ui.hint("Available: masking, nfqws, tunnel, monitor");
                     return;
                 }
             } else {
-                ui.fail("Usage: mtproto-ctl setup <masking|nfqws|tunnel|monitor>");
+                ui.fail("Usage: buddy setup <masking|nfqws|tunnel|monitor>");
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
@@ -131,7 +117,7 @@ pub fn main() !void {
             showStatus(&ui, allocator);
             return;
         } else {
-            ui.print("  {s}Unknown command: {s}{s}\n\n", .{ Color.err, cmd, Color.reset });
+            ui.print("\n  {s}Unknown command:{s} {s}\n\n", .{ Color.err, Color.reset, cmd });
             printHelp();
             return;
         }
@@ -162,7 +148,7 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             4 => try monitor.runInteractive(ui, allocator),
             5 => try ipv6hop.runInteractive(ui, allocator),
             6 => showStatus(ui, allocator),
-            7 => return, // exit
+            7 => return,
             else => return,
         }
     }
@@ -171,7 +157,6 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
 fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     ui.section(i18n.get(ui.lang, .menu_status));
 
-    // Check service status
     const svc_active = @import("sys.zig").isServiceActive("mtproto-proxy");
     if (svc_active) {
         ui.ok("mtproto-proxy is running");
@@ -179,7 +164,6 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
         ui.fail("mtproto-proxy is not running");
     }
 
-    // Check nginx
     const nginx_active = @import("sys.zig").isServiceActive("nginx");
     if (nginx_active) {
         ui.ok("nginx is running");
@@ -187,15 +171,13 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
         ui.info("nginx is not running (masking may be disabled)");
     }
 
-    // Check nfqws
     const nfqws_active = @import("sys.zig").isServiceActive("nfqws-mtproto");
     if (nfqws_active) {
         ui.ok("nfqws-mtproto is running");
     } else {
-        ui.info("nfqws-mtproto is not running (TCP desync may be disabled)");
+        ui.info("nfqws-mtproto is not running (TCP desync disabled)");
     }
 
-    // Check mask health timer
     const timer_active = @import("sys.zig").isServiceActive("mtproto-mask-health.timer");
     if (timer_active) {
         ui.ok("masking health monitor is active");
@@ -203,7 +185,6 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
         ui.info("masking health monitor is not active");
     }
 
-    // Show brief service output
     const result = @import("sys.zig").exec(allocator, &.{
         "systemctl", "status", "mtproto-proxy", "--no-pager", "-l",
     }) catch return;
@@ -212,7 +193,6 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     if (result.stdout.len > 0) {
         ui.writeRaw("\n");
         ui.print("  {s}", .{Color.dim});
-        // Print first 15 lines
         var lines = std.mem.splitScalar(u8, result.stdout, '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
@@ -225,46 +205,112 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
 }
 
 fn printHelp() void {
-    const help =
-        Color.header ++ "  ⚡ mtproto-ctl" ++ Color.reset ++ " — MTProto Proxy installer & control panel\n" ++
-        "\n" ++
-        Color.accent ++ "  Usage:" ++ Color.reset ++ "\n" ++
-        "    mtproto-ctl [command] [options]\n" ++
-        "    mtproto-ctl --interactive       Start interactive TUI\n" ++
-        "\n" ++
-        Color.accent ++ "  Commands:" ++ Color.reset ++ "\n" ++
-        "    install              Install mtproto-proxy from source\n" ++
-        "    update               Update to latest release\n" ++
-        "    setup masking        Setup local Nginx DPI masking\n" ++
-        "    setup nfqws          Setup nfqws TCP desync (Zapret)\n" ++
-        "    setup tunnel <conf>  Setup AmneziaWG tunnel\n" ++
-        "    setup monitor        Install masking health monitor\n" ++
-        "    ipv6-hop             IPv6 address rotation\n" ++
-        "    update-dns <ip>      Update Cloudflare DNS A record\n" ++
-        "    status               Show service status\n" ++
-        "\n" ++
-        Color.accent ++ "  Setup options:" ++ Color.reset ++ "\n" ++
-        "    --domain <domain>    TLS masking domain (default: wb.ru)\n" ++
-        "    --ttl <N>            nfqws fake packet TTL (default: 6)\n" ++
-        "    --mode <mode>        Tunnel mode: direct|preserve|middleproxy\n" ++
-        "    --remove             Remove nfqws installation\n" ++
-        "\n" ++
-        Color.accent ++ "  IPv6 options:" ++ Color.reset ++ "\n" ++
-        "    --check              Show current IPv6 status\n" ++
-        "    --auto               Auto-rotate on ban detection\n" ++
-        "    --prefix <prefix>    IPv6 /64 prefix\n" ++
-        "    --threshold <N>      Ban detection threshold (default: 10)\n" ++
-        "\n" ++
-        Color.accent ++ "  Global options:" ++ Color.reset ++ "\n" ++
-        "    -i, --interactive    Interactive TUI mode\n" ++
-        "    --lang <en|ru>       Language (default: auto-detect)\n" ++
-        "    --help, -h           Show this help\n" ++
-        "    --version            Show version\n" ++
-        "\n";
+    var ui = Tui.init(i18n.Lang.fromEnv());
 
-    _ = std.posix.write(std.posix.STDOUT_FILENO, help) catch {};
+    ui.writeRaw("\n");
+    ui.print("  {s}⚡ buddy{s} {s}v{s}{s}  —  MTProto Proxy installer & control panel\n\n", .{
+        Color.header, Color.reset,
+        Color.dim,    version,
+        Color.reset,
+    });
+
+    // ── One-liner examples ──
+    ui.print("  {s}Quick install (one-liner):{s}\n\n", .{ Color.accent, Color.reset });
+    ui.print("    {s}# Minimal — auto-generates secret:{s}\n", .{ Color.gray, Color.reset });
+    ui.print("    {s}sudo buddy install --port 443 --domain wb.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}# Full control — bring your own secret and username:{s}\n", .{ Color.gray, Color.reset });
+    ui.print("    {s}sudo buddy install --port 443 --domain wb.ru \\\n", .{Color.bright_yellow});
+    ui.print("    {s}  --secret <32-hex> --user alice --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}# No DPI bypass (bare install):{s}\n", .{ Color.gray, Color.reset });
+    ui.print("    {s}sudo buddy install --port 443 --domain wb.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+
+    ui.print("  {s}Interactive wizard:{s}\n\n", .{ Color.accent, Color.reset });
+    ui.print("    {s}sudo buddy --interactive{s}\n\n", .{ Color.bright_yellow, Color.reset });
+
+    // ── Commands ──
+    ui.print("  {s}Commands:{s}\n\n", .{ Color.accent, Color.reset });
+    printCmd(&ui, "install", "Install mtproto-proxy from source");
+    printCmd(&ui, "update", "Update to latest GitHub release");
+    printCmd(&ui, "setup masking", "Setup local Nginx DPI masking");
+    printCmd(&ui, "setup nfqws", "Setup nfqws TCP desync (Zapret)");
+    printCmd(&ui, "setup tunnel <conf>", "Setup AmneziaWG tunnel");
+    printCmd(&ui, "setup monitor", "Install masking health monitor");
+    printCmd(&ui, "ipv6-hop", "IPv6 address rotation");
+    printCmd(&ui, "update-dns <ip>", "Update Cloudflare DNS A record");
+    printCmd(&ui, "status", "Show service status");
+    ui.writeRaw("\n");
+
+    // ── Install options ──
+    ui.print("  {s}Install options:{s}\n\n", .{ Color.accent, Color.reset });
+    printOpt(&ui, "--port,   -p <port>", "Proxy port (default: 443)");
+    printOpt(&ui, "--domain, -d <domain>", "TLS masking domain (default: wb.ru)");
+    printOpt(&ui, "--secret, -s <hex32>", "User secret (32 hex chars, auto-generated if omitted)");
+    printOpt(&ui, "--user,   -u <name>", "Username in config.toml (default: user)");
+    printOpt(&ui, "--yes,    -y", "Skip confirmation prompt (non-interactive)");
+    printOpt(&ui, "--max-connections <N>", "Max proxy connections (default: 512)");
+    printOpt(&ui, "--no-masking", "Disable Nginx DPI masking");
+    printOpt(&ui, "--no-nfqws", "Disable nfqws TCP desync");
+    printOpt(&ui, "--no-tcpmss", "Disable TCPMSS=88 clamping");
+    printOpt(&ui, "--no-dpi", "Disable all DPI bypass modules");
+    printOpt(&ui, "--ipv6-hop", "Enable IPv6 auto-hopping");
+    printOpt(&ui, "--zig-tag <ver>", "Override Zig version to install");
+    ui.writeRaw("\n");
+
+    // ── Update options ──
+    ui.print("  {s}Update options:{s}\n\n", .{ Color.accent, Color.reset });
+    printOpt(&ui, "--version, -v <tag>", "Pin to specific release tag");
+    printOpt(&ui, "--force-service", "Force systemd unit update");
+    ui.writeRaw("\n");
+
+    // ── Setup options ──
+    ui.print("  {s}Setup options:{s}\n\n", .{ Color.accent, Color.reset });
+    printOpt(&ui, "--domain <domain>", "TLS masking domain");
+    printOpt(&ui, "--ttl <N>", "nfqws fake packet TTL (default: 6)");
+    printOpt(&ui, "--mode <mode>", "Tunnel mode: direct|preserve|middleproxy");
+    printOpt(&ui, "--remove", "Remove nfqws installation");
+    ui.writeRaw("\n");
+
+    // ── IPv6 options ──
+    ui.print("  {s}IPv6 options:{s}\n\n", .{ Color.accent, Color.reset });
+    printOpt(&ui, "--check", "Show current IPv6 rotation status");
+    printOpt(&ui, "--auto", "Auto-rotate on ban detection");
+    printOpt(&ui, "--prefix <prefix>", "IPv6 /64 prefix");
+    printOpt(&ui, "--threshold <N>", "Ban detection threshold (default: 10)");
+    ui.writeRaw("\n");
+
+    // ── Global options ──
+    ui.print("  {s}Global options:{s}\n\n", .{ Color.accent, Color.reset });
+    printOpt(&ui, "-i, --interactive", "Interactive TUI wizard");
+    printOpt(&ui, "--lang <en|ru>", "Language (default: auto-detect)");
+    printOpt(&ui, "-h, --help", "Show this help");
+    printOpt(&ui, "--version", "Show version");
+    ui.writeRaw("\n");
+}
+
+fn printCmd(ui: *Tui, cmd: []const u8, desc: []const u8) void {
+    const col = 28;
+    const pad = if (cmd.len < col) col - cmd.len else 1;
+    var buf: [32]u8 = undefined;
+    @memset(buf[0..@min(pad, buf.len)], ' ');
+    ui.print("    {s}{s}{s}{s}{s}{s}\n", .{
+        Color.bright_yellow,        cmd,       Color.reset,
+        buf[0..@min(pad, buf.len)], Color.dim, desc,
+    });
+    ui.writeRaw(Color.reset);
+}
+
+fn printOpt(ui: *Tui, flag: []const u8, desc: []const u8) void {
+    const col = 30;
+    const pad = if (flag.len < col) col - flag.len else 1;
+    var buf: [32]u8 = undefined;
+    @memset(buf[0..@min(pad, buf.len)], ' ');
+    ui.print("    {s}{s}{s}{s}{s}{s}\n", .{
+        Color.info,                 flag,      Color.reset,
+        buf[0..@min(pad, buf.len)], Color.dim, desc,
+    });
+    ui.writeRaw(Color.reset);
 }
 
 fn printVersion() void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, "mtproto-ctl v" ++ version ++ "\n") catch {};
+    _ = std.posix.write(std.posix.STDOUT_FILENO, "buddy v" ++ version ++ "\n") catch {};
 }

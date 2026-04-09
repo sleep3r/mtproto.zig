@@ -1,7 +1,11 @@
-//! Install command for mtproto-ctl.
+//! Install command for buddy.
 //!
 //! Ports install.sh (296 lines of bash) into structured Zig code.
 //! Supports both interactive TUI mode and non-interactive CLI mode.
+//!
+//! One-liner usage:
+//!   sudo buddy install --port 443 --domain wb.ru --yes
+//!   sudo buddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -28,7 +32,14 @@ pub const InstallOpts = struct {
     enable_masking: bool = true,
     enable_nfqws: bool = true,
     enable_ipv6_hop: bool = false,
+    /// Pre-set user secret (32-char hex). If null, auto-generated.
     secret: ?[32]u8 = null,
+    /// User name for config.toml. If null, defaults to "user".
+    user: ?[]const u8 = null,
+    /// Skip confirmation prompt (non-interactive / one-liner mode).
+    yes: bool = false,
+    /// Zig release tag to install from (overrides default ZIG_VERSION).
+    zig_tag: ?[]const u8 = null,
 };
 
 /// Run install in CLI (non-interactive) mode.
@@ -37,22 +48,58 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
 
     // Parse CLI flags
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--port")) {
-            if (args.next()) |val| {
-                opts.port = std.fmt.parseInt(u16, val, 10) catch 443;
-            }
-        } else if (std.mem.eql(u8, arg, "--domain")) {
+        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+            if (args.next()) |val| opts.port = std.fmt.parseInt(u16, val, 10) catch 443;
+        } else if (std.mem.eql(u8, arg, "--domain") or std.mem.eql(u8, arg, "-d")) {
             if (args.next()) |val| opts.tls_domain = val;
         } else if (std.mem.eql(u8, arg, "--max-connections")) {
+            if (args.next()) |val| opts.max_connections = std.fmt.parseInt(u32, val, 10) catch 512;
+        } else if (std.mem.eql(u8, arg, "--secret") or std.mem.eql(u8, arg, "-s")) {
             if (args.next()) |val| {
-                opts.max_connections = std.fmt.parseInt(u32, val, 10) catch 512;
+                if (val.len == 32) {
+                    var sec: [32]u8 = undefined;
+                    @memcpy(&sec, val[0..32]);
+                    opts.secret = sec;
+                } else {
+                    ui.warn("--secret must be exactly 32 hex characters, ignoring");
+                }
             }
+        } else if (std.mem.eql(u8, arg, "--user") or std.mem.eql(u8, arg, "-u")) {
+            if (args.next()) |val| opts.user = val;
+        } else if (std.mem.eql(u8, arg, "--yes") or std.mem.eql(u8, arg, "-y")) {
+            opts.yes = true;
         } else if (std.mem.eql(u8, arg, "--no-masking")) {
             opts.enable_masking = false;
         } else if (std.mem.eql(u8, arg, "--no-nfqws")) {
             opts.enable_nfqws = false;
         } else if (std.mem.eql(u8, arg, "--no-tcpmss")) {
             opts.enable_tcpmss = false;
+        } else if (std.mem.eql(u8, arg, "--no-dpi")) {
+            // Disable all DPI bypass modules at once
+            opts.enable_masking = false;
+            opts.enable_nfqws = false;
+            opts.enable_tcpmss = false;
+        } else if (std.mem.eql(u8, arg, "--ipv6-hop")) {
+            opts.enable_ipv6_hop = true;
+        } else if (std.mem.eql(u8, arg, "--zig-tag")) {
+            if (args.next()) |val| opts.zig_tag = val;
+        }
+    }
+
+    // In non-interactive mode, print a compact summary of what will happen
+    if (!opts.yes) {
+        ui.writeRaw("\n");
+        ui.print("  {s}⚡ buddy install{s}\n\n", .{ Color.header, Color.reset });
+        ui.print("  {s}Port:{s}     {d}\n", .{ Color.dim, Color.reset, opts.port });
+        ui.print("  {s}Domain:{s}   {s}\n", .{ Color.dim, Color.reset, opts.tls_domain });
+        ui.print("  {s}TCPMSS:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_tcpmss) "enabled" else "disabled" });
+        ui.print("  {s}Masking:{s}  {s}\n", .{ Color.dim, Color.reset, if (opts.enable_masking) "enabled" else "disabled" });
+        ui.print("  {s}nfqws:{s}    {s}\n", .{ Color.dim, Color.reset, if (opts.enable_nfqws) "enabled" else "disabled" });
+        ui.writeRaw("\n");
+
+        if (!try ui.confirm("Proceed with installation?", true)) {
+            ui.info(ui.str(.aborting));
+            return;
         }
     }
 
@@ -88,7 +135,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     // Secret — auto-generated, just show it
     var secret_hex: [32]u8 = undefined;
     sys.generateSecret(&secret_hex);
-    ui.print("\n  {s}🔐{s} {s}: {s}{s}{s}\n", .{
+    ui.writeRaw("\n");
+    ui.print("  {s}🔐{s} {s}: {s}{s}{s}\n", .{
         Color.bright_yellow,
         Color.reset,
         ui.str(.install_secret_generated),
@@ -120,6 +168,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     opts.enable_nfqws = (dpi_result & 4) != 0;
     opts.enable_ipv6_hop = (dpi_result & 8) != 0;
     opts.secret = secret_hex;
+    opts.yes = true; // already confirmed via wizard
 
     // Confirm
     if (!try ui.confirm(ui.str(.confirm_proceed), true)) {
@@ -138,31 +187,38 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         return;
     }
 
+    ui.writeRaw("\n");
+    ui.rule();
+
     // ── Install dependencies ──
-    ui.step(ui.str(.install_checking_deps));
-    _ = sys.execForward(&.{
-        "apt-get", "update", "-qq",
-    }) catch {};
-    _ = sys.execForward(&.{
-        "apt-get", "install", "-y",
-        "iptables", "xxd", "git", "curl", "openssl", "tar", "xz-utils",
-    }) catch {};
-    ui.ok(ui.str(.install_checking_deps));
+    {
+        var sp = ui.spinner(ui.str(.install_checking_deps));
+        _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
+        _ = sys.exec(allocator, &.{
+            "apt-get",  "install", "-y",
+            "iptables", "xxd",     "git",
+            "curl",     "openssl", "tar",
+            "xz-utils",
+        }) catch {};
+        sp.stop(true, "");
+    }
 
     // ── Install Zig ──
+    const zig_ver = opts.zig_tag orelse ZIG_VERSION;
     const has_zig = blk: {
         const result = sys.exec(allocator, &.{ "zig", "version" }) catch break :blk false;
         defer result.deinit();
         const trimmed = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-        break :blk std.mem.startsWith(u8, trimmed, ZIG_VERSION);
+        break :blk std.mem.startsWith(u8, trimmed, zig_ver);
     };
 
     if (has_zig) {
-        ui.stepOk(ui.str(.install_zig_ok), ZIG_VERSION);
+        ui.stepOk(ui.str(.install_zig_ok), zig_ver);
     } else {
-        ui.step(ui.str(.install_installing_zig));
+        var sp = ui.spinner(ui.str(.install_installing_zig));
 
         const arch = sys.getArch() catch {
+            sp.stop(false, "");
             ui.fail(ui.str(.error_arch_unsupported));
             return;
         };
@@ -170,34 +226,60 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         var zig_cmd_buf: [512]u8 = undefined;
         const zig_cmd = std.fmt.bufPrint(&zig_cmd_buf,
             \\cd /tmp && curl -sSfL -o zig.tar.xz https://ziglang.org/download/{[a]s}/zig-linux-{[b]s}-{[c]s}.tar.xz && tar xf zig.tar.xz && rm -rf /usr/local/zig && mv zig-linux-{[b]s}-{[c]s} /usr/local/zig && ln -sf /usr/local/zig/zig /usr/local/bin/zig && rm -f zig.tar.xz
-        , .{ .a = ZIG_VERSION, .b = arch.toStr(), .c = ZIG_VERSION }) catch return;
+        , .{ .a = zig_ver, .b = arch.toStr(), .c = zig_ver }) catch {
+            sp.stop(false, "");
+            return;
+        };
 
-        const dl_result = sys.execForward(&.{ "bash", "-c", zig_cmd }) catch {
+        const dl_result = sys.exec(allocator, &.{ "bash", "-c", zig_cmd }) catch {
+            sp.stop(false, "");
             ui.fail(ui.str(.install_installing_zig));
             return;
         };
 
-        if (dl_result != 0) {
+        if (dl_result.exit_code != 0) {
+            sp.stop(false, "");
             ui.fail(ui.str(.install_installing_zig));
             return;
         }
-        ui.stepOk(ui.str(.install_zig_ok), ZIG_VERSION);
+        sp.stop(true, zig_ver);
     }
 
     // ── Clone & build ──
-    ui.step(ui.str(.install_building));
-    var cmd_buf: [1024]u8 = undefined;
-    const build_cmd = std.fmt.bufPrint(&cmd_buf, "TMPDIR=$(mktemp -d) && git clone --depth 1 {s} $TMPDIR && cd $TMPDIR && zig build -Doptimize=ReleaseFast && mkdir -p {s} && cp zig-out/bin/mtproto-proxy {s}/mtproto-proxy && chmod +x {s}/mtproto-proxy && cp $TMPDIR/deploy/*.sh {s}/ 2>/dev/null || true && cp $TMPDIR/deploy/mtproto-proxy.service /etc/systemd/system/ && chmod +x {s}/*.sh 2>/dev/null || true && rm -rf $TMPDIR", .{
-        REPO_URL, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR,
-    }) catch return;
+    {
+        var sp = ui.spinner(ui.str(.install_building));
+        var cmd_buf: [1024]u8 = undefined;
+        const build_cmd = std.fmt.bufPrint(
+            &cmd_buf,
+            "TMPDIR=$(mktemp -d) && git clone --depth 1 {s} $TMPDIR 2>&1 && " ++
+                "cd $TMPDIR && zig build -Doptimize=ReleaseFast 2>&1 && " ++
+                "mkdir -p {s} && cp zig-out/bin/mtproto-proxy {s}/mtproto-proxy && " ++
+                "chmod +x {s}/mtproto-proxy && " ++
+                "cp $TMPDIR/deploy/*.sh {s}/ 2>/dev/null || true && " ++
+                "cp $TMPDIR/deploy/mtproto-proxy.service /etc/systemd/system/ && " ++
+                "chmod +x {s}/*.sh 2>/dev/null || true && rm -rf $TMPDIR",
+            .{ REPO_URL, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR },
+        ) catch {
+            sp.stop(false, "");
+            return;
+        };
 
-    const build_result = sys.execForward(&.{ "bash", "-c", build_cmd }) catch {
-        ui.fail(ui.str(.install_building));
-        return;
-    };
-    if (build_result != 0) {
-        ui.fail(ui.str(.install_building));
-        return;
+        const build_result = sys.exec(allocator, &.{ "bash", "-c", build_cmd }) catch {
+            sp.stop(false, "");
+            ui.fail(ui.str(.install_building));
+            return;
+        };
+        defer build_result.deinit();
+
+        if (build_result.exit_code != 0) {
+            sp.stop(false, "");
+            ui.fail(ui.str(.install_building));
+            if (build_result.stderr.len > 0) {
+                ui.hint(build_result.stderr[0..@min(build_result.stderr.len, 200)]);
+            }
+            return;
+        }
+        sp.stop(true, "");
     }
     ui.ok(ui.str(.install_binary_ok));
 
@@ -210,6 +292,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         } else {
             sys.generateSecret(&secret_hex);
         }
+
+        const user_name = opts.user orelse "user";
 
         var doc = toml.TomlDoc.initEmpty(allocator);
         defer doc.deinit();
@@ -228,7 +312,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         try doc.addKv("fast_mode", "true");
 
         try doc.addSection("access.users");
-        try doc.addKvStr("user", &secret_hex);
+        try doc.addKvStr(user_name, &secret_hex);
 
         try doc.save(config_path_buf);
         ui.ok(ui.str(.install_config_generated));
@@ -242,26 +326,28 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         defer r.deinit();
         break :blk r.exit_code == 0;
     }) {
-        _ = sys.execForward(&.{
+        _ = sys.exec(allocator, &.{
             "useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "mtproto",
         }) catch {};
         ui.ok(ui.str(.install_user_created));
     }
 
-    // Fix ownership
-    _ = sys.execForward(&.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
+    _ = sys.exec(allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
 
     // ── Systemd service ──
-    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
-    _ = sys.execForward(&.{ "systemctl", "enable", SERVICE_NAME }) catch {};
-    _ = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch {};
-    ui.ok(ui.str(.install_service_installed));
+    {
+        var sp = ui.spinner(ui.str(.install_service_installed));
+        _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
+        _ = sys.exec(allocator, &.{ "systemctl", "enable", SERVICE_NAME }) catch {};
+        _ = sys.exec(allocator, &.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+        sp.stop(true, "");
+    }
 
     // ── Firewall ──
     if (sys.commandExists("ufw")) {
         var port_str_buf: [8]u8 = undefined;
         const port_rule = std.fmt.bufPrint(&port_str_buf, "{d}/tcp", .{opts.port}) catch "443/tcp";
-        _ = sys.execForward(&.{ "ufw", "allow", port_rule }) catch {};
+        _ = sys.exec(allocator, &.{ "ufw", "allow", port_rule }) catch {};
         ui.ok(ui.str(.install_firewall_ok));
     }
 
@@ -270,24 +356,22 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         var port_str_buf: [8]u8 = undefined;
         const port_str = std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port}) catch "443";
 
-        // IPv4
         _ = sys.exec(allocator, &.{
-            "iptables", "-t", "mangle", "-A", "OUTPUT",
-            "-p", "tcp", "--sport", port_str,
-            "--tcp-flags", "SYN,ACK", "SYN,ACK",
-            "-j", "TCPMSS", "--set-mss", "88",
+            "iptables", "-t",      "mangle",  "-A",     "OUTPUT",
+            "-p",       "tcp",     "--sport", port_str, "--tcp-flags",
+            "SYN,ACK",  "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
+            "88",
         }) catch {};
-
-        // IPv6
         _ = sys.exec(allocator, &.{
-            "ip6tables", "-t", "mangle", "-A", "OUTPUT",
-            "-p", "tcp", "--sport", port_str,
-            "--tcp-flags", "SYN,ACK", "SYN,ACK",
-            "-j", "TCPMSS", "--set-mss", "88",
+            "ip6tables", "-t",      "mangle",  "-A",     "OUTPUT",
+            "-p",        "tcp",     "--sport", port_str, "--tcp-flags",
+            "SYN,ACK",   "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
+            "88",
         }) catch {};
-
-        // Persist rules
-        _ = sys.exec(allocator, &.{ "bash", "-c", "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ip6tables-save > /etc/iptables/rules.v6" }) catch {};
+        _ = sys.exec(allocator, &.{
+            "bash",                                                                                                        "-c",
+            "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ip6tables-save > /etc/iptables/rules.v6",
+        }) catch {};
 
         ui.ok(ui.str(.install_tcpmss_ok));
     }
@@ -307,23 +391,29 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     }
 
     // ── Final restart ──
-    _ = sys.execForward(&.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
-    _ = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+    _ = sys.exec(allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
+    _ = sys.exec(allocator, &.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+
+    ui.rule();
 
     // ── Print summary ──
-    ui.step("Detecting public IP...");
+    var sp = ui.spinner("Detecting public IP");
     const public_ip = sys.detectPublicIp(allocator) orelse "<SERVER_IP>";
+    sp.stop(true, public_ip);
 
-    // Build ee-secret
+    // Read secret from generated config
     var secret_from_cfg: []const u8 = "unknown";
     {
         var cfg_doc = toml.TomlDoc.load(allocator, config_path_buf) catch {
-            secret_from_cfg = "unknown";
             printSummary(ui, public_ip, opts.port, secret_from_cfg, opts);
             return;
         };
         defer cfg_doc.deinit();
-        secret_from_cfg = cfg_doc.get("access.users", "user") orelse "unknown";
+
+        const user_name = opts.user orelse "user";
+        secret_from_cfg = cfg_doc.get("access.users", user_name) orelse
+            cfg_doc.get("access.users", "user") orelse
+            "unknown";
     }
 
     printSummary(ui, public_ip, opts.port, secret_from_cfg, opts);
@@ -334,11 +424,9 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
     var ee_buf: [512]u8 = undefined;
     var ee_pos: usize = 0;
 
-    // "ee" prefix
     @memcpy(ee_buf[0..2], "ee");
     ee_pos = 2;
 
-    // Secret hex (strip quotes if present)
     var clean_secret = secret;
     if (clean_secret.len >= 2 and clean_secret[0] == '"') {
         clean_secret = clean_secret[1 .. clean_secret.len - 1];
@@ -347,7 +435,6 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
     @memcpy(ee_buf[ee_pos..][0..sec_len], clean_secret[0..sec_len]);
     ee_pos += sec_len;
 
-    // Domain hex
     var domain_hex_buf: [512]u8 = undefined;
     const domain_hex = sys.domainToHex(opts.tls_domain, &domain_hex_buf);
     const dh_len = @min(domain_hex.len, ee_buf.len - ee_pos);
@@ -356,16 +443,20 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
 
     const ee_secret = ee_buf[0..ee_pos];
 
-    // Print link
     var link_buf: [512]u8 = undefined;
     const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
         public_ip, port, ee_secret,
     }) catch "error building link";
 
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "443";
+
     ui.summaryBox(ui.str(.install_success_header), &.{
         .{ .label = ui.str(.install_status_cmd), .value = "systemctl status mtproto-proxy" },
         .{ .label = ui.str(.install_logs_cmd), .value = "journalctl -u mtproto-proxy -f" },
         .{ .label = ui.str(.install_config_path), .value = INSTALL_DIR ++ "/config.toml" },
+        .{ .label = "Server:", .value = public_ip },
+        .{ .label = "Port:", .value = port_str },
         .{ .label = "", .style = .blank },
         .{ .label = ui.str(.install_connection_link), .style = .highlight, .value = link },
         .{ .label = "", .style = .blank },

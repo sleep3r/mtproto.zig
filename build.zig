@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     const soak_step = b.step("soak", "Run multithreaded soak stress test");
     soak_step.dependOn(&run_soak_cmd.step);
 
-    // ── mtproto-ctl (installer & control panel) ──
+    // ── buddy (installer & control panel) ──
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
         .target = target,
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const ctl_exe = b.addExecutable(.{
-        .name = "mtproto-ctl",
+        .name = "buddy",
         .root_module = ctl_mod,
     });
 
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
         run_ctl_cmd.addArgs(args);
     }
 
-    const ctl_step = b.step("ctl", "Run the installer/control panel");
+    const ctl_step = b.step("buddy", "Run buddy — the installer/control panel");
     ctl_step.dependOn(&run_ctl_cmd.step);
 
     // Tests
