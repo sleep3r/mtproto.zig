@@ -463,9 +463,9 @@ function renderUsers(users) {
   meta.textContent = total + ' users · direct ' + directTotal;
 
   if (!users?.links_ready) {
-    note.textContent = 'Set [server].public_ip in config.toml to generate copyable links.';
+    note.textContent = 'Public IP could not be detected. Set [server].public_ip in config.toml.';
   } else {
-    note.textContent = 'Links: ' + users.server + ':' + users.port + ' · tls_domain=' + (users.tls_domain || '—');
+    note.textContent = users.server + ':' + users.port + ' · tls_domain=' + (users.tls_domain || '—');
   }
 
   if (items.length === 0) {

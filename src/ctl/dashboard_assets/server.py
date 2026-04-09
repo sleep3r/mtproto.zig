@@ -548,6 +548,31 @@ def _masking_status() -> dict:
 _users_cache = {"ts": 0, "data": None}
 USERS_CACHE_TTL = 8  # seconds
 
+_public_ip_cache = {"ts": 0, "ip": ""}
+PUBLIC_IP_TTL = 300  # 5 minutes
+
+
+def _detect_public_ip() -> str:
+    """Auto-detect public IP, cached for 5 minutes."""
+    now = time.time()
+    if now - _public_ip_cache["ts"] < PUBLIC_IP_TTL and _public_ip_cache["ip"]:
+        return _public_ip_cache["ip"]
+
+    for url in ("https://ifconfig.me/ip", "https://api.ipify.org", "https://icanhazip.com"):
+        try:
+            out = subprocess.check_output(
+                ["curl", "-s", "--max-time", "3", url],
+                text=True, timeout=5, stderr=subprocess.DEVNULL,
+            ).strip()
+            if out and re.match(r"^[\d.]+$", out):
+                _public_ip_cache.update(ts=now, ip=out)
+                return out
+        except Exception:
+            continue
+
+    _public_ip_cache.update(ts=now, ip="")
+    return ""
+
 
 def _users_status() -> dict:
     now = time.time()
@@ -556,6 +581,8 @@ def _users_status() -> dict:
 
     cfg = _load_proxy_runtime_config()
     server = str(cfg.get("public_ip") or "").strip()
+    if not server:
+        server = _detect_public_ip()
     port = int(cfg.get("port", 443))
     tls_domain = str(cfg.get("tls_domain", "google.com"))
     domain_hex = tls_domain.encode("utf-8", errors="ignore").hex()
