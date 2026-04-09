@@ -498,12 +498,15 @@ pub const Tui = struct {
         }
 
         self.print("\n  {s}╭─ {s}{s}{s}\n", .{ Color.gray, Color.bold, title, Color.reset });
-        self.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
 
         var selected: usize = 0;
 
         const draw = struct {
             fn apply(tui: *Self, s_items: []const []const u8, s_helps: []const []const u8, s_state: u32, s_sel: usize) void {
+                // Separator between title and items (redrawn each cycle)
+                tui.clearLine();
+                tui.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
+
                 for (s_items, 0..) |item, idx| {
                     tui.clearLine();
                     const checked = (s_state & (@as(u32, 1) << @intCast(idx))) != 0;
@@ -567,7 +570,8 @@ pub const Tui = struct {
             }
 
             if (changed) {
-                var lines_up: usize = 1; // footer
+                // +1 for │ separator, +1 for footer, +items with optional help
+                var lines_up: usize = 2; // │ separator + footer
                 for (0..items.len) |idx| {
                     lines_up += 1; // item line
                     if (idx < helps.len) lines_up += 2; // help + spacer
