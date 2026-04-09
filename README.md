@@ -12,6 +12,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
+[![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#-quick-start)
 [![LOC](https://img.shields.io/badge/lines_of_code-5.5k-informational)](src/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
@@ -74,7 +75,8 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) **0.15.2** or later
+- **Linux** (x86_64 or aarch64) — the proxy uses `epoll` and does not support macOS, FreeBSD, or OpenBSD at runtime
+- [Zig](https://ziglang.org/download/) **0.15.2** or later (macOS is fine for cross-compilation)
 
 ### Build & Run locally
 
