@@ -117,7 +117,7 @@ if ! command -v curl >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'nginx.service'; then
+if ! systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q '^nginx\.service[[:space:]]'; then
     exit 0
 fi
 
