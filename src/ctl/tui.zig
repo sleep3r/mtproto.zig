@@ -379,7 +379,14 @@ pub const Tui = struct {
             }
         }.apply;
 
-        self.writeRaw("\x1b[s"); // save cursor position
+        // Pre-scroll to ensure save/restore works even if list causes terminal scroll
+        {
+            const total_lines = items.len + 1; // items + footer
+            for (0..total_lines) |_| self.writeRaw("\n");
+            self.cursorUp(total_lines);
+        }
+
+        self.writeRaw("\x1b[s"); // save cursor position (scrolling already done)
         draw(self, items, selected);
 
         self.enterRawMode();
@@ -544,9 +551,21 @@ pub const Tui = struct {
             }
         }.apply;
 
-        // Save cursor position before first draw, then restore before each redraw.
-        // This avoids line-counting issues when long help text wraps in narrow terminals.
-        self.writeRaw("\x1b[s"); // save cursor position
+        // Pre-scroll: emit enough blank lines to force terminal scrolling,
+        // then move back up. This ensures that when we save the cursor position,
+        // any necessary scrolling has already happened and the saved position
+        // remains valid for subsequent redraws.
+        {
+            var total_lines: usize = 2; // │ separator + footer
+            for (0..items.len) |idx| {
+                total_lines += 1; // item line
+                if (idx < helps.len) total_lines += 2; // help + spacer
+            }
+            for (0..total_lines) |_| self.writeRaw("\n");
+            self.cursorUp(total_lines);
+        }
+
+        self.writeRaw("\x1b[s"); // save cursor position (scrolling already done)
         draw(self, items, helps, state, selected);
 
         self.enterRawMode();
