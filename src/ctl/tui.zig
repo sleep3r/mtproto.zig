@@ -379,6 +379,7 @@ pub const Tui = struct {
             }
         }.apply;
 
+        self.writeRaw("\x1b[s"); // save cursor position
         draw(self, items, selected);
 
         self.enterRawMode();
@@ -404,7 +405,8 @@ pub const Tui = struct {
             }
 
             if (changed) {
-                self.cursorUp(items.len + 1);
+                self.writeRaw("\x1b[u"); // restore cursor position
+                self.writeRaw("\x1b[J"); // clear to end of screen
                 draw(self, items, selected);
             }
         }
@@ -503,7 +505,7 @@ pub const Tui = struct {
 
         const draw = struct {
             fn apply(tui: *Self, s_items: []const []const u8, s_helps: []const []const u8, s_state: u32, s_sel: usize) void {
-                // Separator between title and items (redrawn each cycle)
+                // Separator between title and items
                 tui.clearLine();
                 tui.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
 
@@ -542,6 +544,9 @@ pub const Tui = struct {
             }
         }.apply;
 
+        // Save cursor position before first draw, then restore before each redraw.
+        // This avoids line-counting issues when long help text wraps in narrow terminals.
+        self.writeRaw("\x1b[s"); // save cursor position
         draw(self, items, helps, state, selected);
 
         self.enterRawMode();
@@ -570,13 +575,9 @@ pub const Tui = struct {
             }
 
             if (changed) {
-                // +1 for │ separator, +1 for footer, +items with optional help
-                var lines_up: usize = 2; // │ separator + footer
-                for (0..items.len) |idx| {
-                    lines_up += 1; // item line
-                    if (idx < helps.len) lines_up += 2; // help + spacer
-                }
-                self.cursorUp(lines_up);
+                self.writeRaw("\x1b[u"); // restore cursor position
+                // Clear from cursor to end of screen to handle line wrapping differences
+                self.writeRaw("\x1b[J");
                 draw(self, items, helps, state, selected);
             }
         }
