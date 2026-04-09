@@ -102,7 +102,8 @@ deploy-tunnel:
 	@echo "--- Setting up AmneziaWG tunnel ---"
 	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
 	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
-	ssh root@$(SERVER) "bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh"
+	scp deploy/setup_mask_monitor.sh root@$(SERVER):/tmp/setup_mask_monitor.sh
+	ssh root@$(SERVER) "install -m 0755 /tmp/setup_mask_monitor.sh /opt/mtproto-proxy/setup_mask_monitor.sh 2>/dev/null || true; bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh /tmp/setup_mask_monitor.sh"
 
 # Add tunnel to existing installation
 deploy-tunnel-only:
@@ -111,7 +112,8 @@ deploy-tunnel-only:
 	@case "$(TUNNEL_MODE)" in direct|preserve|middleproxy) ;; *) echo "Invalid TUNNEL_MODE: $(TUNNEL_MODE). Allowed: direct, preserve, middleproxy"; exit 1 ;; esac
 	scp $(AWG_CONF) root@$(SERVER):/tmp/awg_client.conf
 	scp deploy/setup_tunnel.sh root@$(SERVER):/tmp/setup_tunnel.sh
-	ssh root@$(SERVER) "bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh"
+	scp deploy/setup_mask_monitor.sh root@$(SERVER):/tmp/setup_mask_monitor.sh
+	ssh root@$(SERVER) "install -m 0755 /tmp/setup_mask_monitor.sh /opt/mtproto-proxy/setup_mask_monitor.sh 2>/dev/null || true; bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh /tmp/setup_mask_monitor.sh"
 
 update-dns:
 	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi

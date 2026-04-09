@@ -8,7 +8,8 @@
 # a ServerHello from "wb.ru" when real wb.ru responds in 20ms is suspicious.
 #
 # Solution: Run Nginx locally with a self-signed cert. Update config.toml to use
-# mask_port=8443 (or keep 443 with upstream). The proxy connects to 127.0.0.1
+# mask_port=8443 (or keep 443 with upstream). The proxy connects to local Nginx
+# (`127.0.0.1` by default, or `10.200.200.1` in tunnel netns mode)
 # instead of the remote domain, eliminating the RTT fingerprint.
 #
 # Usage:
@@ -20,9 +21,10 @@
 #   1. Installs Nginx (if not present)
 #   2. Obtains a real Let's Encrypt certificate for tls_domain (via certbot)
 #      OR generates a self-signed cert if certbot fails
-#   3. Configures Nginx to listen on 127.0.0.1:8443
+#   3. Configures Nginx to listen on 127.0.0.1:8443 (and 10.200.200.1 when tunnel veth exists)
 #   4. Serves a minimal page that mimics the real domain
 #   5. Updates mtproto config to use local masking
+#   6. Installs self-healing masking monitor (systemd timer)
 #
 
 set -euo pipefail
@@ -31,6 +33,11 @@ TLS_DOMAIN="${1:-wb.ru}"
 NGINX_PORT=8443
 INSTALL_DIR="/opt/mtproto-proxy"
 CERT_DIR="/etc/nginx/ssl"
+TUNNEL_HOST_IP=""
+
+if ip -4 addr show 2>/dev/null | grep -q '10\.200\.200\.1/'; then
+    TUNNEL_HOST_IP="10.200.200.1"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -95,6 +102,11 @@ fi
 # ── Configure Nginx ─────────────────────────────────────────
 info "Configuring Nginx on 127.0.0.1:${NGINX_PORT}..."
 
+EXTRA_LISTEN_LINE=""
+if [[ -n "$TUNNEL_HOST_IP" ]]; then
+    EXTRA_LISTEN_LINE="    listen ${TUNNEL_HOST_IP}:${NGINX_PORT} ssl;"
+fi
+
 # Create a minimal web root
 mkdir -p /var/www/masking
 cat > /var/www/masking/index.html << 'HTMLEOF'
@@ -109,6 +121,7 @@ cat > /etc/nginx/sites-available/mtproto-masking << NGINXEOF
 # Serves TLS responses that mimic ${TLS_DOMAIN} for DPI evasion
 server {
     listen 127.0.0.1:${NGINX_PORT} ssl;
+${EXTRA_LISTEN_LINE}
 
     server_name ${TLS_DOMAIN};
 
@@ -145,7 +158,11 @@ fi
 # Test config and reload/restart
 nginx -t 2>/dev/null || fail "Nginx config test failed"
 systemctl restart nginx || true
+systemctl enable nginx >/dev/null 2>&1 || true
 ok "Nginx configured on 127.0.0.1:${NGINX_PORT}"
+if [[ -n "$TUNNEL_HOST_IP" ]]; then
+    ok "Nginx configured on ${TUNNEL_HOST_IP}:${NGINX_PORT} for tunnel netns"
+fi
 
 # ── Verify Nginx is responding ──────────────────────────────
 sleep 1
@@ -220,6 +237,19 @@ else
     info "Add 'mask_port = ${NGINX_PORT}' to your [censorship] section manually"
 fi
 
+# ── Install masking self-healing monitor ────────────────────
+MASK_MONITOR_SCRIPT="${INSTALL_DIR}/setup_mask_monitor.sh"
+if [[ ! -x "$MASK_MONITOR_SCRIPT" ]]; then
+    MASK_MONITOR_SCRIPT="$(dirname "$0")/setup_mask_monitor.sh"
+fi
+
+if [[ -x "$MASK_MONITOR_SCRIPT" ]]; then
+    info "Installing masking health monitor..."
+    bash "$MASK_MONITOR_SCRIPT" --quiet || warn "Masking monitor install failed"
+else
+    warn "setup_mask_monitor.sh not found; masking self-healing monitor not installed"
+fi
+
 # ── Summary ─────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
@@ -227,8 +257,13 @@ echo -e "${BOLD}  Local Nginx Masking Configured${RESET}"
 echo -e "${CYAN}══════════════════════════════════════════════════${RESET}"
 echo ""
 echo -e "  ${DIM}Nginx:${RESET}     127.0.0.1:${NGINX_PORT} (TLS)"
+if [[ -n "$TUNNEL_HOST_IP" ]]; then
+echo -e "  ${DIM}Tunnel host:${RESET} ${TUNNEL_HOST_IP}:${NGINX_PORT} (TLS)"
+fi
 echo -e "  ${DIM}Domain:${RESET}    ${TLS_DOMAIN}"
 echo -e "  ${DIM}Cert:${RESET}      ${CERT_DIR}/cert.pem"
+echo -e "  ${DIM}Monitor:${RESET}   systemctl status mtproto-mask-health.timer"
+echo -e "  ${DIM}Mon logs:${RESET}  journalctl -t mtproto-mask-health -n 50"
 echo ""
 echo -e "  ${BOLD}Effect:${RESET}"
 echo -e "  Bad clients are now forwarded to local Nginx (<1ms RTT)"

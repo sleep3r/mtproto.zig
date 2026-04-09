@@ -161,6 +161,12 @@ for file in install.sh update.sh update_dns.sh ipv6-hop.sh setup_masking.sh setu
     curl -fsSL "${RAW_BASE}/${file}" -o "${TMP_DIR}/${file}" || fail "Failed to download ${file}"
 done
 
+if curl -fsSL "${RAW_BASE}/setup_mask_monitor.sh" -o "${TMP_DIR}/setup_mask_monitor.sh"; then
+    ok "Downloaded setup_mask_monitor.sh"
+else
+    warn "setup_mask_monitor.sh is missing in ${TAG}, keeping existing local copy if present"
+fi
+
 if curl -fsSL "${RAW_BASE}/setup_tunnel.sh" -o "${TMP_DIR}/setup_tunnel.sh"; then
     ok "Downloaded setup_tunnel.sh"
 else
@@ -187,6 +193,9 @@ install -m 0755 "${TMP_DIR}/update.sh" "${INSTALL_DIR}/update.sh"
 install -m 0755 "${TMP_DIR}/update_dns.sh" "${INSTALL_DIR}/update_dns.sh"
 install -m 0755 "${TMP_DIR}/ipv6-hop.sh" "${INSTALL_DIR}/ipv6-hop.sh"
 install -m 0755 "${TMP_DIR}/setup_masking.sh" "${INSTALL_DIR}/setup_masking.sh"
+if [[ -f "${TMP_DIR}/setup_mask_monitor.sh" ]]; then
+    install -m 0755 "${TMP_DIR}/setup_mask_monitor.sh" "${INSTALL_DIR}/setup_mask_monitor.sh"
+fi
 install -m 0755 "${TMP_DIR}/setup_nfqws.sh" "${INSTALL_DIR}/setup_nfqws.sh"
 if [[ -f "${TMP_DIR}/setup_tunnel.sh" ]]; then
     install -m 0755 "${TMP_DIR}/setup_tunnel.sh" "${INSTALL_DIR}/setup_tunnel.sh"
@@ -223,6 +232,15 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     ok "Update complete: ${SERVICE_NAME} is active"
 else
     fail "Service is not active after restart"
+fi
+
+if [[ -x "${INSTALL_DIR}/setup_mask_monitor.sh" ]]; then
+    info "Applying masking monitor setup..."
+    if bash "${INSTALL_DIR}/setup_mask_monitor.sh" --quiet; then
+        ok "Masking monitor setup applied"
+    else
+        warn "Masking monitor setup failed"
+    fi
 fi
 
 echo ""

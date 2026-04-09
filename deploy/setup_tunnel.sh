@@ -23,7 +23,8 @@
 #   5. Adds policy routing so response packets go back to clients (not into tunnel)
 #   6. Patches the systemd service to run the proxy inside the namespace
 #   7. Applies selected tunnel mode for use_middle_proxy (direct/preserve/middleproxy)
-#   8. Restarts the proxy
+#   8. Adjusts local masking for netns mode + enables masking monitor
+#   9. Restarts the proxy
 #
 # Architecture:
 #
@@ -67,6 +68,28 @@ get_server_port() {
             line = $0
             sub(/#.*/, "", line)
             if (line ~ /^[[:space:]]*port[[:space:]]*=/) {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/[^0-9]/, "", value)
+                if (value != "") {
+                    print value
+                    exit
+                }
+            }
+        }
+    ' "$cfg" 2>/dev/null
+}
+
+get_mask_port() {
+    local cfg="$1"
+    awk '
+        BEGIN { in_censorship = 0 }
+        /^[[:space:]]*\[censorship\][[:space:]]*$/ { in_censorship = 1; next }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { in_censorship = 0; next }
+        in_censorship {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ /^[[:space:]]*mask_port[[:space:]]*=/) {
                 split(line, parts, "=")
                 value = parts[2]
                 gsub(/[^0-9]/, "", value)
@@ -285,6 +308,39 @@ if [[ -n "$PUBLIC_IP" ]]; then
     ok "Injected public IP ($PUBLIC_IP) into config"
 fi
 
+MASK_PORT="$(get_mask_port "$INSTALL_DIR/config.toml")"
+MASK_PORT="${MASK_PORT:-443}"
+if [[ "$MASK_PORT" != "443" ]]; then
+    MASKING_SITE="/etc/nginx/sites-available/mtproto-masking"
+    if [[ -f "$MASKING_SITE" ]]; then
+        if ! grep -Eq "^[[:space:]]*listen[[:space:]]+10\\.200\\.200\\.1:${MASK_PORT}[[:space:]]+ssl;" "$MASKING_SITE"; then
+            if grep -Eq "^[[:space:]]*listen[[:space:]]+127\\.0\\.0\\.1:${MASK_PORT}[[:space:]]+ssl;" "$MASKING_SITE"; then
+                sed -i "/^[[:space:]]*listen[[:space:]]*127\\.0\\.0\\.1:${MASK_PORT}[[:space:]]*ssl;/a\    listen 10.200.200.1:${MASK_PORT} ssl;" "$MASKING_SITE"
+                if nginx -t >/dev/null 2>&1; then
+                    systemctl reload nginx || true
+                    ok "Patched Nginx masking listener on 10.200.200.1:${MASK_PORT}"
+                else
+                    warn "Nginx config test failed after masking listener patch"
+                fi
+            else
+                warn "Could not find 127.0.0.1:${MASK_PORT} listener in ${MASKING_SITE}"
+            fi
+        fi
+    fi
+fi
+
+MASK_MONITOR_SCRIPT="${INSTALL_DIR}/setup_mask_monitor.sh"
+if [[ ! -x "$MASK_MONITOR_SCRIPT" ]]; then
+    MASK_MONITOR_SCRIPT="$(dirname "$0")/setup_mask_monitor.sh"
+fi
+
+if [[ -x "$MASK_MONITOR_SCRIPT" ]]; then
+    info "Ensuring masking health monitor is installed..."
+    bash "$MASK_MONITOR_SCRIPT" --quiet || warn "Masking monitor install failed"
+else
+    warn "setup_mask_monitor.sh not found; masking self-healing monitor not installed"
+fi
+
 # ── Step 6: Restart proxy ───────────────────────────────────
 info "Restarting proxy..."
 systemctl restart mtproto-proxy
@@ -327,6 +383,8 @@ echo ""
 echo -e "  ${DIM}Status:${RESET}  systemctl status mtproto-proxy"
 echo -e "  ${DIM}Logs:${RESET}    journalctl -u mtproto-proxy -f"
 echo -e "  ${DIM}Tunnel:${RESET}  ip netns exec $NS_NAME awg show"
+echo -e "  ${DIM}Monitor:${RESET} systemctl status mtproto-mask-health.timer"
+echo -e "  ${DIM}Mon logs:${RESET} journalctl -t mtproto-mask-health -n 50"
 echo ""
 echo -e "  ${BOLD}Connection link:${RESET}"
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"

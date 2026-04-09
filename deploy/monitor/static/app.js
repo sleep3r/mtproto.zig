@@ -267,6 +267,105 @@ function fmtT(b) {
   return (b / 1073741824).toFixed(1) + ' GB';
 }
 
+function shortProxyLink(link) {
+  if (!link) return 'link unavailable';
+  if (link.length <= 88) return link;
+  return link.slice(0, 52) + '…' + link.slice(-32);
+}
+
+async function copyText(text) {
+  if (!text) return false;
+
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) {}
+
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'absolute';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch (_) {
+    ok = false;
+  }
+
+  document.body.removeChild(ta);
+  return ok;
+}
+
+function renderUsers(users) {
+  const card = $('usersCard');
+  if (!card) return;
+
+  const meta = $('usersMeta');
+  const note = $('usersNote');
+  const list = $('usersList');
+  card.style.display = '';
+
+  const items = (users && Array.isArray(users.items)) ? users.items : [];
+  const total = Number(users?.total || 0);
+  const directTotal = Number(users?.direct_total || 0);
+
+  meta.textContent = total + ' users · direct ' + directTotal;
+
+  if (!users?.links_ready) {
+    note.textContent = 'Set [server].public_ip in config.toml to generate copyable links.';
+  } else {
+    note.textContent = 'Links: ' + users.server + ':' + users.port + ' · tls_domain=' + (users.tls_domain || '—');
+  }
+
+  if (items.length === 0) {
+    list.innerHTML = '<div class="user-empty">No users configured in [access.users].</div>';
+    return;
+  }
+
+  list.innerHTML = items.map((u) => {
+    const tg = u.tg_link || '';
+    const tme = u.tme_link || '';
+    const preview = shortProxyLink(tg || tme);
+    const routeClass = u.direct ? 'direct' : 'default';
+    const routeLabel = u.direct ? 'direct' : 'default';
+    const tgData = encodeURIComponent(tg);
+    const tmeData = encodeURIComponent(tme);
+    return '<div class="user-row">' +
+      '<div class="user-name">' + esc(u.name || 'user') + '</div>' +
+      '<div class="route-badge ' + routeClass + '">' + routeLabel + '</div>' +
+      '<div class="user-link" title="' + esc(tg || tme || 'link unavailable') + '">' + esc(preview) + '</div>' +
+      '<div class="user-actions">' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg ? '' : ' disabled') + '>Copy tg://</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme ? '' : ' disabled') + '>Copy t.me</button>' +
+      '</div>' +
+      '</div>';
+  }).join('');
+
+  list.querySelectorAll('.user-copy').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const encoded = btn.dataset.link || '';
+      if (!encoded) return;
+
+      const link = decodeURIComponent(encoded);
+      const original = btn.textContent;
+      const ok = await copyText(link);
+      btn.textContent = ok ? 'Copied' : 'Failed';
+      btn.classList.toggle('active', ok);
+      setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('active');
+      }, 1100);
+    });
+  });
+}
+
 // ── Polling ──
 async function poll() {
   const r = await fetch('/api/stats', { cache: 'no-store' });
@@ -333,6 +432,60 @@ async function poll() {
     $('awgRx').textContent = awg.rx || '—';
     $('awgTx').textContent = awg.tx || '—';
   }
+
+  // Masking health
+  const masking = d.masking;
+  const mc = $('maskingCard');
+  if (!masking) {
+    mc.style.display = 'none';
+  } else {
+    mc.style.display = '';
+
+    const maskBadge = $('maskBadge');
+    if (!masking.enabled) {
+      maskBadge.className = 'badge off';
+      $('maskStatus').textContent = 'Disabled';
+    } else if (masking.mode === 'remote') {
+      maskBadge.className = 'badge';
+      $('maskStatus').textContent = 'Remote mode';
+    } else if (masking.healthy) {
+      maskBadge.className = 'badge';
+      $('maskStatus').textContent = 'Healthy';
+    } else {
+      maskBadge.className = 'badge off';
+      $('maskStatus').textContent = 'Degraded';
+    }
+
+    let modeText = masking.mode || '—';
+    if (masking.mode === 'remote') {
+      modeText = 'remote (' + (masking.tls_domain || '—') + ':443)';
+    } else if (masking.mode === 'local' && masking.using_netns) {
+      modeText = 'local (netns)';
+    } else if (masking.mode === 'local') {
+      modeText = 'local';
+    }
+    $('maskMode').textContent = modeText;
+
+    let endpointText = masking.target || '—';
+    if (masking.mode === 'local') {
+      if (masking.endpoint_ok === true) {
+        endpointText += ' (OK)';
+      } else if (masking.endpoint_ok === false) {
+        endpointText += ' (DOWN)';
+      }
+    }
+    $('maskTarget').textContent = endpointText;
+
+    const nginxState = (masking.nginx_active ? 'active' : 'down') + ' / ' +
+      (masking.nginx_enabled ? 'enabled' : 'disabled');
+    $('maskNginx').textContent = nginxState;
+
+    const timerState = (masking.health_timer_active ? 'active' : 'down') + ' / ' +
+      (masking.health_timer_enabled ? 'enabled' : 'disabled');
+    $('maskTimer').textContent = timerState;
+  }
+
+  renderUsers(d.users || null);
 }
 
 function setDataBadge(state, text) {

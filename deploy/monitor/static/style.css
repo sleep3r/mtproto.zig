@@ -283,6 +283,114 @@ body::after {
   color: var(--text-dim); margin-top: 6px;
 }
 
+/* ── Users card ── */
+.users-card {
+  background: var(--card);
+  backdrop-filter: blur(24px);
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  margin-bottom: 14px;
+  overflow: hidden;
+  transition: border-color 0.3s;
+}
+.users-card:hover { border-color: var(--card-hover); }
+.users-head {
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(247,164,29,0.05);
+}
+.users-head .title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.6px;
+  color: var(--text-dim);
+}
+.users-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.users-note {
+  padding: 8px 24px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border-bottom: 1px solid rgba(247,164,29,0.05);
+}
+.users-list {
+  display: flex;
+  flex-direction: column;
+}
+.user-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 180px) 90px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 24px;
+  border-bottom: 1px solid rgba(247,164,29,0.04);
+}
+.user-row:last-child {
+  border-bottom: 0;
+}
+.user-name {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.route-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  padding: 4px 8px;
+}
+.route-badge.direct {
+  color: var(--green);
+  border: 1px solid rgba(52,211,153,0.25);
+  background: rgba(52,211,153,0.08);
+}
+.route-badge.default {
+  color: var(--text-dim);
+  border: 1px solid rgba(247,164,29,0.15);
+  background: rgba(247,164,29,0.05);
+}
+.user-link {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.user-actions .ui-btn {
+  height: 26px;
+  font-size: 10px;
+  padding: 0 9px;
+}
+.user-actions .ui-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.user-empty {
+  padding: 16px 24px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* ── Tunnel card ── */
 .tunnel-card {
   background: var(--card);
@@ -453,4 +561,12 @@ body::after {
   .poll-controls { width: 100%; }
   .logs-controls { padding: 10px 14px; }
   .log-search { width: 100%; }
+  .users-head { padding: 12px 14px; }
+  .users-note { padding: 8px 14px; }
+  .user-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 10px 14px;
+  }
+  .user-link { white-space: normal; word-break: break-all; }
 }

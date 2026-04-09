@@ -13,7 +13,8 @@
 #   5. Opens configured proxy port in ufw (if active)
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
 #   7. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE)
-#   8. Prints the ready-to-use tg:// link
+#   8. Installs masking self-healing monitor (nginx + timer watchdog)
+#   9. Prints the ready-to-use tg:// link
 
 set -euo pipefail
 
@@ -246,6 +247,12 @@ else
     warn "Masking validation failed: https://127.0.0.1:${MASK_PORT}/ is not responding"
 fi
 
+if systemctl is-active --quiet mtproto-mask-health.timer; then
+    ok "Masking health monitor timer is active"
+else
+    warn "Masking health monitor timer is not active"
+fi
+
 # ── Cleanup ─────────────────────────────────────────────────
 rm -rf "$TMPBUILD"
 
@@ -266,6 +273,8 @@ echo ""
 echo -e "  ${DIM}Status:${RESET}  systemctl status $SERVICE_NAME"
 echo -e "  ${DIM}Logs:${RESET}    journalctl -u $SERVICE_NAME -f"
 echo -e "  ${DIM}Config:${RESET}  $INSTALL_DIR/config.toml"
+echo -e "  ${DIM}Monitor:${RESET} systemctl status mtproto-mask-health.timer"
+echo -e "  ${DIM}Mon logs:${RESET} journalctl -t mtproto-mask-health -n 50"
 echo ""
 echo -e "  ${BOLD}Connection link:${RESET}"
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
