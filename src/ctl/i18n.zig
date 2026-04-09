@@ -87,6 +87,10 @@ pub const S = enum(u16) {
     install_dpi_nfqws_help,
     install_dpi_ipv6,
     install_dpi_ipv6_help,
+    install_dpi_desync,
+    install_dpi_desync_help,
+    install_dpi_drs,
+    install_dpi_drs_help,
     install_checking_deps,
     install_installing_zig,
     install_zig_ok,
@@ -265,6 +269,14 @@ const en_strings = [_][]const u8{
     "IPv6 auto-hopping",
     // install_dpi_ipv6_help
     "Rotate IPv6 address when ban is detected. Requires Cloudflare API.",
+    // install_dpi_desync
+    "ServerHello desync",
+    // install_dpi_desync_help
+    "Split ServerHello into 1-byte + 3ms delay + rest (defeats passive DPI signatures).",
+    // install_dpi_drs
+    "Dynamic Record Sizing (DRS)",
+    // install_dpi_drs_help
+    "Ramp TLS records 1369→16384 bytes to mimic browser behavior, evade traffic analysis.",
     // install_checking_deps
     "Installing system dependencies...",
     // install_installing_zig
@@ -482,6 +494,14 @@ const ru_strings = [_][]const u8{
     "Автоматическая ротация IPv6",
     // install_dpi_ipv6_help
     "Ротация IPv6 адреса при обнаружении блокировки. Нужен Cloudflare API.",
+    // install_dpi_desync
+    "Desync ServerHello",
+    // install_dpi_desync_help
+    "Фрагментирует ServerHello: 1 байт + 3мс задержка + остаток (обход пассивного DPI).",
+    // install_dpi_drs
+    "Dynamic Record Sizing (DRS)",
+    // install_dpi_drs_help
+    "Наращивание TLS записей 1369→16384 байт, имитируя браузер, обход анализа трафика.",
     // install_checking_deps
     "Установка системных зависимостей...",
     // install_installing_zig

@@ -32,6 +32,8 @@ pub const InstallOpts = struct {
     enable_masking: bool = true,
     enable_nfqws: bool = true,
     enable_ipv6_hop: bool = false,
+    enable_desync: bool = true,
+    enable_drs: bool = false,
     /// Pre-set user secret (32-char hex). If null, auto-generated.
     secret: ?[32]u8 = null,
     /// User name for config.toml. If null, defaults to "user".
@@ -170,21 +172,27 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
             ui.str(.install_dpi_tcpmss),
             ui.str(.install_dpi_masking),
             ui.str(.install_dpi_nfqws),
+            ui.str(.install_dpi_desync),
+            ui.str(.install_dpi_drs),
             ui.str(.install_dpi_ipv6),
         },
         &.{
             ui.str(.install_dpi_tcpmss_help),
             ui.str(.install_dpi_masking_help),
             ui.str(.install_dpi_nfqws_help),
+            ui.str(.install_dpi_desync_help),
+            ui.str(.install_dpi_drs_help),
             ui.str(.install_dpi_ipv6_help),
         },
-        &.{ true, true, true, false },
+        &.{ true, true, true, true, false, false },
     );
 
     opts.enable_tcpmss = (dpi_result & 1) != 0;
     opts.enable_masking = (dpi_result & 2) != 0;
     opts.enable_nfqws = (dpi_result & 4) != 0;
-    opts.enable_ipv6_hop = (dpi_result & 8) != 0;
+    opts.enable_desync = (dpi_result & 8) != 0;
+    opts.enable_drs = (dpi_result & 16) != 0;
+    opts.enable_ipv6_hop = (dpi_result & 32) != 0;
     opts.secret = secret_hex;
     opts.yes = true; // already confirmed via wizard
 
@@ -329,6 +337,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         try doc.addSection("censorship");
         try doc.addKvStr("tls_domain", opts.tls_domain);
         try doc.addKv("mask", "true");
+        try doc.addKv("desync", if (opts.enable_desync) "true" else "false");
+        try doc.addKv("drs", if (opts.enable_drs) "true" else "false");
         try doc.addKv("fast_mode", "true");
 
         try doc.addSection("access.users");
@@ -492,6 +502,14 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
         .{
             .label = if (opts.enable_nfqws) "nfqws TCP Desync (Zapret)" else "",
             .style = if (opts.enable_nfqws) .success else .blank,
+        },
+        .{
+            .label = if (opts.enable_desync) "ServerHello desync (built-in)" else "",
+            .style = if (opts.enable_desync) .success else .blank,
+        },
+        .{
+            .label = if (opts.enable_drs) "Dynamic Record Sizing (built-in)" else "",
+            .style = if (opts.enable_drs) .success else .blank,
         },
     });
 
