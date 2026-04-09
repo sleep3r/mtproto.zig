@@ -256,9 +256,16 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
 
     const dashboard_active = sys.isServiceActive("proxy-monitor");
     if (dashboard_active) {
-        ui.ok("monitoring dashboard is running (port 61208)");
-        ui.hint("  ssh -L 61208:localhost:61208 root@<server_ip>");
-        ui.hint("  open http://localhost:61208");
+        ui.ok("monitoring dashboard is running");
+        ui.summaryBox("Dashboard", &.{
+            .{ .label = "Status:", .value = "active", .style = .label_value },
+            .{ .label = "Port:", .value = "61208", .style = .label_value },
+            .{ .label = "Service:", .value = "systemctl status proxy-monitor", .style = .label_value },
+            .{ .label = "", .value = "", .style = .blank },
+            .{ .label = "Access via SSH tunnel:", .value = "", .style = .highlight },
+            .{ .label = "Command:", .value = "ssh -L 61208:localhost:61208 root@<ip>", .style = .label_value },
+            .{ .label = "Open:", .value = "http://localhost:61208", .style = .label_value },
+        });
     } else {
         ui.info("monitoring dashboard is not installed (mtbuddy setup dashboard)");
     }
