@@ -416,7 +416,7 @@ sudo systemctl stop mtproto-proxy
 
 ## &nbsp; Monitoring
 
-The project includes a lightweight, Zig-themed web dashboard for real-time server monitoring. It runs as a separate systemd service (~30 MB RAM) and is accessible via SSH tunnel — no ports are exposed to the internet.
+The project includes a lightweight, Zig-themed web dashboard for real-time server monitoring. It runs as a separate systemd service (~30 MB RAM). By default, it is accessible only via SSH tunnel — no ports are exposed to the internet, though this is configurable.
 
 **Features:**
 - **Interactive Charts** — glassmorphism hover tooltips with exact values and time
@@ -433,11 +433,11 @@ The project includes a lightweight, Zig-themed web dashboard for real-time serve
 make deploy-monitor SERVER=<SERVER_IP>
 ```
 
-This uploads `deploy/monitor/` (Python FastAPI backend + static frontend), installs Python dependencies (`fastapi`, `uvicorn`, `psutil`, `websockets`), creates a `proxy-monitor` systemd service, and starts it on `127.0.0.1:61208`.
+This uploads `deploy/monitor/` (Python FastAPI backend + static frontend), installs Python dependencies (`fastapi`, `uvicorn`, `psutil`, `websockets`), creates a `proxy-monitor` systemd service, and starts it. By default, it binds to `127.0.0.1:61208` (configurable via `[monitor]` section in `config.toml`).
 
 ### Access
 
-The dashboard binds to `127.0.0.1` only — access it via SSH tunnel:
+By default, the dashboard binds to `127.0.0.1` only — access it via SSH tunnel:
 
 ```bash
 make monitor SERVER=<SERVER_IP>
@@ -582,6 +582,10 @@ log_level = "info"                         # Runtime log level: debug, info, war
 rate_limit_per_subnet = 30                # Max new connections/sec per /24 subnet (0 = disabled)
 # unsafe_override_limits = false           # Set true to disable auto-clamp of max_connections
 
+[monitor]
+# host = "127.0.0.1"                       # Bind address for dashboard. Use "0.0.0.0" to expose externally
+# port = 61208                             # TCP port for the dashboard
+
 [censorship]
 tls_domain = "wb.ru"
 mask = true
@@ -617,6 +621,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
+| `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the monitoring dashboard HTTP server. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
+| `[monitor]` | `port` | `61208` | TCP port for the monitoring dashboard HTTP server |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
 | `[censorship]` | `mask_port` | `443` | Non-standard port override for masking locally (e.g. `8443` for zero-RTT local Nginx) |

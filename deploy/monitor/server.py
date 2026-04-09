@@ -8,13 +8,50 @@ import time
 import threading
 import queue
 import subprocess
+import sys
 from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 
 import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+
+
+def _load_monitor_config() -> dict:
+    """Load [monitor] section from config.toml (host, port)."""
+    defaults = {"host": "127.0.0.1", "port": 61208}
+    if tomllib is None:
+        return defaults
+    # Look for config.toml relative to the install directory
+    candidates = [
+        Path(__file__).parent.parent / "config.toml",  # /opt/mtproto-proxy/config.toml
+        Path("/opt/mtproto-proxy/config.toml"),
+    ]
+    for p in candidates:
+        if p.is_file():
+            try:
+                with open(p, "rb") as f:
+                    cfg = tomllib.load(f)
+                mon = cfg.get("monitor", {})
+                return {
+                    "host": str(mon.get("host", defaults["host"])),
+                    "port": int(mon.get("port", defaults["port"])),
+                }
+            except Exception as exc:
+                print(f"[monitor] warning: failed to parse {p}: {exc}", file=sys.stderr)
+    return defaults
+
+
+MONITOR_CFG = _load_monitor_config()
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -181,21 +218,19 @@ def _awg_status() -> dict:
 
         m = re.search(r"latest handshake:\s*(.+)", out)
         if m:
-            hs = m[1].strip()
-            result["handshake"] = hs
-            # Consider active if handshake was within last 3 minutes
-            if "second" in hs or "minute" in hs:
-                try:
-                    val = int(re.search(r"(\d+)", hs)[1])
-                    if "second" in hs or ("minute" in hs and val <= 3):
-                        result["active"] = True
-                except (TypeError, ValueError):
-                    pass
+            result["handshake"] = m[1].strip()
 
         m = re.search(r"transfer:\s*([\d.]+\s*\S+)\s+received,\s*([\d.]+\s*\S+)\s+sent", out)
         if m:
             result["rx"] = m[1]
             result["tx"] = m[2]
+
+        if result.get("endpoint"):
+            result["active"] = True
+            if not result.get("handshake"):
+                result["handshake"] = "none (idle)"
+        else:
+            result["reason"] = "no endpoint configured"
 
         _awg_cache.update(ts=now, data=result)
         return result
@@ -273,4 +308,4 @@ async def ws_logs(ws: WebSocket):
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=61208, log_level="warning")
+    uvicorn.run(app, host=MONITOR_CFG["host"], port=MONITOR_CFG["port"], log_level="warning")

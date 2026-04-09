@@ -56,11 +56,11 @@ sleep 2
 
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo ""
-  echo "✅ Monitor running on 127.0.0.1:${PORT}"
+  echo "✅ Monitor started (default: 127.0.0.1:61208, configurable in config.toml under [monitor])"
   echo ""
-  echo "Access via SSH tunnel:"
-  echo "  ssh -L ${PORT}:localhost:${PORT} root@\$(hostname -I | awk '{print \$1}')"
-  echo "  open http://localhost:${PORT}"
+  echo "If using the default config, access via SSH tunnel:"
+  echo "  ssh -L 61208:localhost:61208 root@\$(hostname -I | awk '{print \$1}')"
+  echo "  open http://localhost:61208"
 else
   echo "❌ Failed to start. Check: journalctl -u ${SERVICE_NAME} --no-pager -n 20"
   exit 1

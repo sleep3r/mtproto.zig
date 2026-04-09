@@ -55,6 +55,17 @@ port = 443
 # has enough memory for the configured limits).
 # unsafe_override_limits = false
 
+[monitor]
+# Bind address for the monitoring dashboard HTTP server.
+# Default: 127.0.0.1 (localhost only).
+# Set to "0.0.0.0" to expose the dashboard on all interfaces.
+# WARNING: the dashboard has no authentication — use a firewall or
+# reverse proxy with auth if binding to a public interface.
+# host = "127.0.0.1"
+
+# TCP port for the monitoring dashboard.
+# port = 61208
+
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
 # Choose a popular, high-traffic domain in the target region.
