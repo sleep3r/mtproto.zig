@@ -60,8 +60,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     var conf_buf: [512]u8 = undefined;
     const conf_path = try ui.input(
-        "AmneziaWG config file path",
-        "Path to your .conf file from AmneziaVPN app or provider.",
+        i18n.get(ui.lang, .tunnel_conf_prompt),
+        i18n.get(ui.lang, .tunnel_conf_help),
         null,
         &conf_buf,
     );

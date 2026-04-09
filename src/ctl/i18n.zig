@@ -37,10 +37,12 @@ pub const S = enum(u16) {
     menu_update,
     menu_setup_masking,
     menu_setup_tunnel,
-    menu_setup_monitor,
+    menu_setup_recovery,
+    menu_setup_dashboard,
     menu_ipv6_hop,
     menu_edit_config,
     menu_status,
+    menu_restart,
     menu_uninstall,
     menu_exit,
 
@@ -56,6 +58,16 @@ pub const S = enum(u16) {
     version_label,
     confirm_proceed,
     aborting,
+    restart_success,
+
+    // ── Monitor ──
+    monitor_header,
+    monitor_port_prompt,
+    monitor_port_help,
+
+    // ── Tunnel ──
+    tunnel_conf_prompt,
+    tunnel_conf_help,
 
     // ── Install ──
     install_header,
@@ -161,14 +173,18 @@ const en_strings = [_][]const u8{
     "\xF0\x9F\x9B\xA1\xEF\xB8\x8F  Setup DPI evasion",
     // menu_setup_tunnel
     "\xF0\x9F\x94\x97  Setup AmneziaWG tunnel",
-    // menu_setup_monitor
-    "\xF0\x9F\x93\x8A  Setup monitoring",
+    // menu_setup_recovery
+    "🚑  Setup auto-recovery",
+    // menu_setup_dashboard
+    "📊  Install Monitoring Dashboard",
     // menu_ipv6_hop
     "\xF0\x9F\x94\x84  IPv6 hopping",
     // menu_edit_config
     "\xE2\x9A\x99\xEF\xB8\x8F  Edit configuration",
     // menu_status
     "\xF0\x9F\x93\x8B  Show status",
+    // menu_restart
+    "\xE2\x86\xA9\xEF\xB8\x8F  Restart proxy",
     // menu_uninstall
     "\xF0\x9F\x97\x91\xEF\xB8\x8F  Uninstall (Remove completely)",
     // menu_exit
@@ -197,6 +213,22 @@ const en_strings = [_][]const u8{
     "Proceed?",
     // aborting
     "Aborted.",
+    // restart_success
+    "Proxy restarted successfully.",
+
+    // ── Monitor ──
+    // monitor_header
+    "Configure Monitor API",
+    // monitor_port_prompt
+    "API port",
+    // monitor_port_help
+    "Port for Prometheus metrics / API.",
+
+    // ── Tunnel ──
+    // tunnel_conf_prompt
+    "AmneziaWG config file path",
+    // tunnel_conf_help
+    "Path to your .conf file from AmneziaVPN app or provider.",
 
     // ── Install ──
     // install_header
@@ -358,14 +390,18 @@ const ru_strings = [_][]const u8{
     "\xF0\x9F\x9B\xA1\xEF\xB8\x8F  Настроить обход DPI",
     // menu_setup_tunnel
     "\xF0\x9F\x94\x97  Настроить AmneziaWG туннель",
-    // menu_setup_monitor
-    "\xF0\x9F\x93\x8A  Настроить мониторинг",
+    // menu_setup_recovery
+    "🚑  Настроить авто-восстановление",
+    // menu_setup_dashboard
+    "📊  Установить дашборд мониторинга",
     // menu_ipv6_hop
     "\xF0\x9F\x94\x84  Ротация IPv6",
     // menu_edit_config
     "\xE2\x9A\x99\xEF\xB8\x8F  Настроить конфигурацию",
     // menu_status
     "\xF0\x9F\x93\x8B  Показать статус",
+    // menu_restart
+    "\xE2\x86\xA9\xEF\xB8\x8F  Перезапустить прокси",
     // menu_uninstall
     "\xF0\x9F\x97\x91\xEF\xB8\x8F  Полностью удалить прокси",
     // menu_exit
@@ -394,6 +430,22 @@ const ru_strings = [_][]const u8{
     "Продолжить?",
     // aborting
     "Отменено.",
+    // restart_success
+    "Прокси успешно перезапущен.",
+
+    // ── Monitor ──
+    // monitor_header
+    "Настройка API мониторинга",
+    // monitor_port_prompt
+    "Порт API",
+    // monitor_port_help
+    "Порт для отдачи метрик Prometheus / API.",
+
+    // ── Tunnel ──
+    // tunnel_conf_prompt
+    "Путь к конфигурации AmneziaWG",
+    // tunnel_conf_help
+    "Путь к .conf файлу от VPN-приложения или провайдера.",
 
     // ── Install ──
     // install_header

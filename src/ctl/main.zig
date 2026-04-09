@@ -19,7 +19,8 @@ const update = @import("update.zig");
 const masking = @import("masking.zig");
 const nfqws = @import("nfqws.zig");
 const tunnel = @import("tunnel.zig");
-const monitor = @import("monitor.zig");
+const recovery = @import("recovery.zig");
+const dashboard = @import("dashboard.zig");
 const ipv6hop = @import("ipv6hop.zig");
 const uninstall = @import("uninstall.zig");
 
@@ -101,15 +102,17 @@ pub fn main() !void {
                     return nfqws.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "tunnel")) {
                     return tunnel.run(&ui, allocator, &remaining_args);
-                } else if (std.mem.eql(u8, sub, "monitor")) {
-                    return monitor.run(&ui, allocator, &remaining_args);
+                } else if (std.mem.eql(u8, sub, "recovery")) {
+                    return recovery.run(&ui, allocator, &remaining_args);
+                } else if (std.mem.eql(u8, sub, "dashboard")) {
+                    return dashboard.run(&ui, allocator, &remaining_args);
                 } else {
                     ui.print("\n  {s}Unknown setup subcommand:{s} {s}\n", .{ Color.err, Color.reset, sub });
-                    ui.hint("Available: masking, nfqws, tunnel, monitor");
+                    ui.hint("Available: masking, nfqws, tunnel, recovery, dashboard");
                     return;
                 }
             } else {
-                ui.fail("Usage: mtbuddy setup <masking|nfqws|tunnel|monitor>");
+                ui.fail("Usage: mtbuddy setup <masking|nfqws|tunnel|recovery|dashboard>");
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
@@ -135,9 +138,11 @@ const Action = enum {
     update,
     masking,
     tunnel,
-    monitor,
+    recovery,
+    dashboard,
     ipv6hop,
     status,
+    restart,
     uninstall,
     exit,
 };
@@ -151,8 +156,10 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
         var actions: std.ArrayList(Action) = .empty;
         defer actions.deinit(allocator);
 
-        try items.append(allocator, i18n.get(ui.lang, .menu_install));
-        try actions.append(allocator, .install);
+        if (!is_installed) {
+            try items.append(allocator, i18n.get(ui.lang, .menu_install));
+            try actions.append(allocator, .install);
+        }
 
         if (is_installed) {
             try items.append(allocator, i18n.get(ui.lang, .menu_update));
@@ -161,12 +168,16 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             try actions.append(allocator, .masking);
             try items.append(allocator, i18n.get(ui.lang, .menu_setup_tunnel));
             try actions.append(allocator, .tunnel);
-            try items.append(allocator, i18n.get(ui.lang, .menu_setup_monitor));
-            try actions.append(allocator, .monitor);
+            try items.append(allocator, i18n.get(ui.lang, .menu_setup_dashboard));
+            try actions.append(allocator, .dashboard);
+            try items.append(allocator, i18n.get(ui.lang, .menu_setup_recovery));
+            try actions.append(allocator, .recovery);
             try items.append(allocator, i18n.get(ui.lang, .menu_ipv6_hop));
             try actions.append(allocator, .ipv6hop);
             try items.append(allocator, i18n.get(ui.lang, .menu_status));
             try actions.append(allocator, .status);
+            try items.append(allocator, i18n.get(ui.lang, .menu_restart));
+            try actions.append(allocator, .restart);
             try items.append(allocator, i18n.get(ui.lang, .menu_uninstall));
             try actions.append(allocator, .uninstall);
         }
@@ -182,13 +193,23 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             .update => try update.runInteractive(ui, allocator),
             .masking => try masking.runInteractive(ui, allocator),
             .tunnel => try tunnel.runInteractive(ui, allocator),
-            .monitor => try monitor.runInteractive(ui, allocator),
+            .dashboard => try dashboard.runInteractive(ui, allocator),
+            .recovery => try recovery.runInteractive(ui, allocator),
             .ipv6hop => try ipv6hop.runInteractive(ui, allocator),
             .status => showStatus(ui, allocator),
+            .restart => restartProxy(ui, allocator),
             .uninstall => try uninstall.runInteractive(ui, allocator),
             .exit => return,
         }
     }
+}
+
+fn restartProxy(ui: *Tui, allocator: std.mem.Allocator) void {
+    var sp = ui.spinner("Restarting...");
+    sp.start();
+    _ = @import("sys.zig").exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
+    _ = @import("sys.zig").exec(allocator, &.{ "systemctl", "restart", "nfqws-mtproto" }) catch {};
+    sp.stop(true, i18n.get(ui.lang, .restart_success));
 }
 
 fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
@@ -272,7 +293,8 @@ fn printHelp() void {
     printCmd(&ui, "setup masking", "Setup local Nginx DPI masking");
     printCmd(&ui, "setup nfqws", "Setup nfqws TCP desync (Zapret)");
     printCmd(&ui, "setup tunnel <conf>", "Setup AmneziaWG tunnel");
-    printCmd(&ui, "setup monitor", "Install masking health monitor");
+    printCmd(&ui, "setup dashboard",     "Install web monitoring dashboard");
+    printCmd(&ui, "setup recovery",      "Install DPI auto-recovery");
     printCmd(&ui, "ipv6-hop", "IPv6 address rotation");
     printCmd(&ui, "update-dns <ip>", "Update Cloudflare DNS A record");
     printCmd(&ui, "status", "Show service status");

@@ -1,4 +1,4 @@
-//! Setup monitor command for mtbuddy.
+//! Setup auto-recovery command for mtbuddy.
 //!
 //! Ports setup_mask_monitor.sh (246 lines bash) — installs masking health
 //! self-healing via systemd timer. Monitors nginx + mtproto-proxy health
@@ -20,13 +20,13 @@ const MASK_HEALTH_TIMER = "/etc/systemd/system/mtproto-mask-health.timer";
 const NGINX_DROPIN_DIR = "/etc/systemd/system/nginx.service.d";
 const PROXY_DROPIN_DIR = "/etc/systemd/system/mtproto-proxy.service.d";
 
-pub const MonitorOpts = struct {
+pub const RecoveryOpts = struct {
     quiet: bool = false,
 };
 
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
-    var opts = MonitorOpts{};
+    var opts = RecoveryOpts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--quiet")) {
             opts.quiet = true;
@@ -37,7 +37,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
 
 /// Run in interactive mode.
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
-    ui.section(i18n.get(ui.lang, .menu_setup_monitor));
+    ui.section(i18n.get(ui.lang, .menu_setup_recovery));
 
     if (!try ui.confirm(i18n.get(ui.lang, .confirm_proceed), true)) {
         ui.info(i18n.get(ui.lang, .aborting));
@@ -47,7 +47,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     try execute(ui, allocator, .{});
 }
 
-fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MonitorOpts) !void {
+fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void {
     _ = opts;
 
     if (!sys.isRoot()) {
@@ -187,7 +187,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MonitorOpts) !void {
         ui.warn("Nginx service is not active");
     }
 
-    ui.summaryBox("Masking Monitor Installed", &.{
+    ui.summaryBox("DPI Auto-Recovery (Health Check) Activated", &.{
         .{ .label = "Health script:", .value = MASK_HEALTH_SCRIPT },
         .{ .label = "Timer:", .value = "systemctl status mtproto-mask-health.timer" },
         .{ .label = "Logs:", .value = "journalctl -t mtproto-mask-health -n 50" },

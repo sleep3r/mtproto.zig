@@ -305,7 +305,7 @@ pub const Tui = struct {
     pub fn banner(self: *Self, version: []const u8) void {
         self.writeRaw("\n");
         // Top border
-        self.print("{s}  ╭──────────────────────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
+        self.print("{s}  ╭──────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
         self.print("{s}  │{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
 
         // Logo line — "⚡ mtproto.zig" centered in 50 chars interior
@@ -344,7 +344,7 @@ pub const Tui = struct {
         });
 
         self.print("{s}  │{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
-        self.print("{s}  ╰──────────────────────────────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });
+        self.print("{s}  ╰──────────────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });
         self.writeRaw("\n");
     }
 
@@ -398,7 +398,9 @@ pub const Tui = struct {
                 self.print("\n", .{});
                 return selected;
             } else if (ev.key == .ctrl_c) {
-                return error.InputError;
+                self.print("\n\n  {s}Exited{s}\n", .{ Color.dim, Color.reset });
+                self.exitRawMode();
+                std.process.exit(0);
             }
 
             if (changed) {
@@ -558,7 +560,9 @@ pub const Tui = struct {
                 self.print("\n", .{});
                 return state;
             } else if (ev.key == .ctrl_c) {
-                return state;
+                self.print("\n\n  {s}Exited{s}\n", .{ Color.dim, Color.reset });
+                self.exitRawMode();
+                std.process.exit(0);
             }
 
             if (changed) {
@@ -594,7 +598,7 @@ pub const Tui = struct {
             Color.gray,   Color.reset,
         });
         self.print("  {s}├──────────────────────────────────────────────────────────────────┤{s}\n", .{ Color.gray, Color.reset });
-        self.print("  {s}│{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
+        self.print("  {s}│{s}                                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
 
         for (lines) |line| {
             switch (line.style) {
@@ -647,7 +651,7 @@ pub const Tui = struct {
                     });
                 },
                 .blank => {
-                    self.print("  {s}│{s}                                                  {s}│{s}\n", .{
+                    self.print("  {s}│{s}                                                                  {s}│{s}\n", .{
                         Color.gray, Color.reset, Color.gray, Color.reset,
                     });
                 },
@@ -667,7 +671,7 @@ pub const Tui = struct {
             }
         }
 
-        self.print("  {s}│{s}                                                  {s}│{s}\n", .{
+        self.print("  {s}│{s}                                                                  {s}│{s}\n", .{
             Color.gray, Color.reset, Color.gray, Color.reset,
         });
         self.print("  {s}╰──────────────────────────────────────────────────────────────────╯{s}\n\n", .{
@@ -679,18 +683,24 @@ pub const Tui = struct {
 
     pub fn section(self: *Self, title: []const u8) void {
         self.writeRaw("\n");
-        const title_len = std.unicode.utf8CountCodepoints(title) catch title.len;
-        const inner = 50;
+
+        var clean_title = title;
+        if (std.mem.indexOf(u8, title, "  ")) |idx| {
+            clean_title = title[idx + 2 ..];
+        }
+
+        const title_len = std.unicode.utf8CountCodepoints(clean_title) catch clean_title.len;
+        const inner = 66;
         const pad = if (title_len + 4 < inner) inner - title_len - 4 else 0;
         var pad_buf: [64]u8 = undefined;
-        @memset(pad_buf[0..pad], ' ');
+        @memset(pad_buf[0..@min(pad, pad_buf.len)], ' ');
 
         self.print("  {s}╭──────────────────────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
         self.print("  {s}│{s} {s}⚙  {s}{s}{s}{s}{s}│{s}\n", .{
-            Color.gray,      Color.reset,
-            Color.bold,      Color.bright_yellow,
-            title,           Color.reset,
-            pad_buf[0..pad], Color.gray,
+            Color.gray,          Color.reset,
+            Color.bold,          Color.bright_yellow,
+            clean_title,         Color.reset,
+            pad_buf[0..@min(pad, pad_buf.len)], Color.gray,
             Color.reset,
         });
         self.print("  {s}╰──────────────────────────────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });

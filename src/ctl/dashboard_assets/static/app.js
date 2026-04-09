@@ -1,4 +1,4 @@
-/* MTProto Proxy Monitor — frontend logic */
+/* MTProto Proxy Dashboard — frontend logic */
 
 const $ = id => document.getElementById(id);
 const MH = 90;       // max history points
@@ -303,6 +303,150 @@ async function copyText(text) {
   return ok;
 }
 
+// ── User Management ──
+
+let pendingDeleteUser = null;
+
+function showToast(msg, type) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || 'info');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }, 3000);
+}
+
+async function apiCall(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok || !data.ok) {
+    throw new Error(data.error || 'request failed');
+  }
+  return data;
+}
+
+function setupAddUserForm() {
+  const btn = $('addUserBtn');
+  const form = $('addUserForm');
+  const nameInput = $('newUserName');
+  const secretInput = $('newUserSecret');
+  const submitBtn = $('addUserSubmit');
+  const cancelBtn = $('addUserCancel');
+  const status = $('addUserStatus');
+
+  btn.addEventListener('click', () => {
+    form.style.display = form.style.display === 'none' ? '' : 'none';
+    if (form.style.display !== 'none') {
+      nameInput.value = '';
+      secretInput.value = '';
+      status.textContent = '';
+      nameInput.focus();
+    }
+  });
+
+  cancelBtn.addEventListener('click', () => {
+    form.style.display = 'none';
+    status.textContent = '';
+  });
+
+  async function doAdd() {
+    const name = nameInput.value.trim();
+    const secret = secretInput.value.trim();
+    if (!name) {
+      status.textContent = 'Username is required';
+      status.className = 'form-status error';
+      return;
+    }
+
+    submitBtn.disabled = true;
+    status.textContent = 'Creating user & restarting proxy...';
+    status.className = 'form-status info';
+
+    try {
+      const data = await apiCall('/api/users/add', { name, secret: secret || undefined });
+      showToast(`User "${data.name}" created. Proxy restarted.`, 'success');
+      form.style.display = 'none';
+      _users_cache_bust();
+      await runPoll();
+    } catch (e) {
+      status.textContent = e.message;
+      status.className = 'form-status error';
+    } finally {
+      submitBtn.disabled = false;
+    }
+  }
+
+  submitBtn.addEventListener('click', doAdd);
+  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
+  secretInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doAdd(); });
+}
+
+function setupDeleteModal() {
+  const modal = $('deleteModal');
+  const confirmBtn = $('deleteConfirm');
+  const cancelBtn = $('deleteCancel');
+
+  cancelBtn.addEventListener('click', () => {
+    modal.style.display = 'none';
+    pendingDeleteUser = null;
+  });
+
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) {
+      modal.style.display = 'none';
+      pendingDeleteUser = null;
+    }
+  });
+
+  confirmBtn.addEventListener('click', async () => {
+    if (!pendingDeleteUser) return;
+    confirmBtn.disabled = true;
+    try {
+      await apiCall('/api/users/remove', { name: pendingDeleteUser });
+      showToast(`User "${pendingDeleteUser}" deleted. Proxy restarted.`, 'success');
+      _users_cache_bust();
+      await runPoll();
+    } catch (e) {
+      showToast('Delete failed: ' + e.message, 'error');
+    } finally {
+      confirmBtn.disabled = false;
+      modal.style.display = 'none';
+      pendingDeleteUser = null;
+    }
+  });
+}
+
+function showDeleteModal(name) {
+  pendingDeleteUser = name;
+  $('deleteUserName').textContent = name;
+  $('deleteModal').style.display = '';
+}
+
+async function toggleDirect(name, newDirect) {
+  try {
+    await apiCall('/api/users/direct', { name, direct: newDirect });
+    showToast(`User "${name}" is now ${newDirect ? 'direct' : 'default'}. Proxy restarted.`, 'success');
+    _users_cache_bust();
+    await runPoll();
+  } catch (e) {
+    showToast('Failed: ' + e.message, 'error');
+  }
+}
+
+function _users_cache_bust() {
+  // Force next poll to show fresh data
+  if (lastData && lastData.users) {
+    lastData.users = null;
+  }
+}
+
 function renderUsers(users) {
   const card = $('usersCard');
   if (!card) return;
@@ -337,17 +481,24 @@ function renderUsers(users) {
     const routeLabel = u.direct ? 'direct' : 'default';
     const tgData = encodeURIComponent(tg);
     const tmeData = encodeURIComponent(tme);
+    const userName = esc(u.name || 'user');
+    const directToggle = u.direct
+      ? `<button class="ui-btn user-direct-toggle on" type="button" data-user="${userName}" data-direct="false" title="Switch to default route">direct</button>`
+      : `<button class="ui-btn user-direct-toggle" type="button" data-user="${userName}" data-direct="true" title="Switch to direct route">default</button>`;
+
     return '<div class="user-row">' +
-      '<div class="user-name">' + esc(u.name || 'user') + '</div>' +
-      '<div class="route-badge ' + routeClass + '">' + routeLabel + '</div>' +
+      '<div class="user-name">' + userName + '</div>' +
+      '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || 'link unavailable') + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg ? '' : ' disabled') + '>Copy tg://</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme ? '' : ' disabled') + '>Copy t.me</button>' +
+      '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
       '</div>' +
       '</div>';
   }).join('');
 
+  // Copy buttons
   list.querySelectorAll('.user-copy').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const encoded = btn.dataset.link || '';
@@ -362,6 +513,22 @@ function renderUsers(users) {
         btn.textContent = original;
         btn.classList.remove('active');
       }, 1100);
+    });
+  });
+
+  // Direct toggle buttons
+  list.querySelectorAll('.user-direct-toggle').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.user;
+      const newDirect = btn.dataset.direct === 'true';
+      toggleDirect(name, newDirect);
+    });
+  });
+
+  // Delete buttons
+  list.querySelectorAll('.user-delete').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      showDeleteModal(btn.dataset.user);
     });
   });
 }
@@ -582,6 +749,8 @@ $('pollToggle').addEventListener('click', () => {
 
 updatePollControls();
 updateFreshness();
+setupAddUserForm();
+setupDeleteModal();
 runPoll();
 restartPollingLoop();
 setInterval(updateFreshness, 1000);

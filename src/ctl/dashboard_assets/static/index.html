@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>⚡ MTProto Proxy — Zig Monitor</title>
+  <title>⚡ MTProto Proxy — Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
 </head>
@@ -14,15 +14,15 @@
   <div class="header">
     <div class="header-left">
       <div class="zig-logo">
-        <svg viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
-          <path d="M46 320L126 80h104L150 320H46z" fill="#f7a41d"/>
-          <path d="M250 320L330 80h18L268 320h-18z" fill="#f7a41d" opacity="0.7"/>
-          <path d="M160 80l80 0-80 240h-80l80-240z" fill="#f7a41d" opacity="0.4"/>
+        <svg viewBox="0 0 580 400" xmlns="http://www.w3.org/2000/svg">
+          <polygon points="154,0 0,224 42,224 28,280 368,280 410,224 252,224 406,0" fill="#f7a41d"/>
+          <polygon points="196,280 154,336 512,336 580,224 538,224 552,280" fill="#f7a41d"/>
+          <polygon points="538,224 580,224 406,0 368,0" fill="#f7a41d" opacity="0.6"/>
         </svg>
       </div>
       <h1>
         <span class="accent">MTProto</span>Proxy
-        <span class="dim">monitor</span>
+        <span class="dim">dashboard</span>
       </h1>
     </div>
     <div class="header-right">
@@ -122,9 +122,32 @@
   <div class="users-card" id="usersCard" style="display:none">
     <div class="users-head">
       <div class="title">👥 Users</div>
-      <div class="users-meta" id="usersMeta">—</div>
+      <div class="users-head-right">
+        <div class="users-meta" id="usersMeta">—</div>
+        <button class="ui-btn add-user-btn" id="addUserBtn" type="button">+ Add User</button>
+      </div>
     </div>
     <div class="users-note" id="usersNote">—</div>
+
+    <!-- Add user form (hidden by default) -->
+    <div class="add-user-form" id="addUserForm" style="display:none">
+      <div class="form-row">
+        <div class="form-field">
+          <label>Username</label>
+          <input id="newUserName" class="ui-input" type="text" placeholder="e.g. alice" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label>Secret <span class="form-hint">(leave empty to auto-generate)</span></label>
+          <input id="newUserSecret" class="ui-input" type="text" placeholder="32 hex chars (optional)" autocomplete="off">
+        </div>
+        <div class="form-actions">
+          <button class="ui-btn active" id="addUserSubmit" type="button">Create</button>
+          <button class="ui-btn" id="addUserCancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <div class="form-status" id="addUserStatus"></div>
+    </div>
+
     <div class="users-list" id="usersList"></div>
   </div>
 
@@ -205,6 +228,21 @@
 
   <!-- Shared tooltip for all charts -->
   <div id="chartTooltip" class="chart-tooltip"></div>
+
+  <!-- Delete confirmation modal -->
+  <div class="modal-overlay" id="deleteModal" style="display:none">
+    <div class="modal">
+      <div class="modal-title">⚠ Delete User</div>
+      <div class="modal-body">
+        Are you sure you want to delete <b id="deleteUserName"></b>?
+        <br><span class="form-hint">The proxy will be restarted to apply changes.</span>
+      </div>
+      <div class="modal-actions">
+        <button class="ui-btn danger" id="deleteConfirm" type="button">Delete</button>
+        <button class="ui-btn" id="deleteCancel" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script src="/app.js"></script>

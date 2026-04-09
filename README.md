@@ -136,7 +136,10 @@ sudo mtbuddy status
 # Setup DPI modules after the fact
 sudo mtbuddy setup masking --domain wb.ru
 sudo mtbuddy setup nfqws
-sudo mtbuddy setup monitor
+sudo mtbuddy setup recovery
+
+# Install web monitoring dashboard
+sudo mtbuddy setup dashboard
 
 # AmneziaWG tunnel (for servers where Telegram DCs are blocked)
 sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
@@ -263,16 +266,20 @@ alice = true   # bypass MiddleProxy for this user
 
 ## Monitoring dashboard
 
-A lightweight web dashboard (FastAPI + WebSocket, ~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, AmneziaWG tunnel metrics, and streaming logs.
+A lightweight web dashboard (FastAPI + WebSocket, ~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, AmneziaWG tunnel metrics, user management, and streaming logs.
+
+The dashboard is **embedded directly into the `mtbuddy` binary** — no extra files needed.
 
 ```bash
-# Deploy to server
-make deploy-monitor SERVER=<ip>
+# Install the dashboard on the server
+sudo mtbuddy setup dashboard
 
-# Open via SSH tunnel (binds to 127.0.0.1 by default)
-make monitor SERVER=<ip>
+# Open via SSH tunnel (binds to 127.0.0.1:61208 by default)
+ssh -L 61208:localhost:61208 root@<server_ip>
 # → http://localhost:61208
 ```
+
+Alternatively, expose the dashboard port via `[monitor]` config section and access directly.
 
 ---
 

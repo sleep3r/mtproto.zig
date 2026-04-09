@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""MTProto Proxy Monitor — API server."""
+"""MTProto Proxy Dashboard — API server."""
 
 import asyncio
 import json
+import os
 import re
+import secrets
 import time
 import threading
 import queue
@@ -21,7 +23,7 @@ except ModuleNotFoundError:
         tomllib = None
 
 import psutil
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -34,7 +36,7 @@ def _proxy_config_candidates():
     ]
 
 
-def _load_monitor_config() -> dict:
+def _load_dashboard_config() -> dict:
     """Load [monitor] section from config.toml (host, port)."""
     defaults = {"host": "127.0.0.1", "port": 61208}
     if tomllib is None:
@@ -51,11 +53,11 @@ def _load_monitor_config() -> dict:
                     "port": int(mon.get("port", defaults["port"])),
                 }
             except Exception as exc:
-                print(f"[monitor] warning: failed to parse {p}: {exc}", file=sys.stderr)
+                print(f"[dashboard] warning: failed to parse {p}: {exc}", file=sys.stderr)
     return defaults
 
 
-MONITOR_CFG = _load_monitor_config()
+DASHBOARD_CFG = _load_dashboard_config()
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -579,6 +581,7 @@ def _users_status() -> dict:
         items.append(
             {
                 "name": name,
+                "secret": secret_raw,
                 "direct": name in direct_users,
                 "tg_link": tg_link,
                 "tme_link": tme_link,
@@ -597,6 +600,173 @@ def _users_status() -> dict:
 
     _users_cache.update(ts=now, data=result)
     return result
+
+
+# ── Config file manipulation helpers ──
+
+def _find_config_path() -> Path | None:
+    for p in _proxy_config_candidates():
+        if p.is_file():
+            return p
+    return None
+
+
+def _restart_proxy():
+    """Restart mtproto-proxy systemd service."""
+    try:
+        subprocess.run(
+            ["systemctl", "restart", "mtproto-proxy"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except Exception:
+        pass
+    # Invalidate caches
+    _users_cache["ts"] = 0
+    _mask_cache["ts"] = 0
+
+
+def _add_user_to_config(name: str, secret: str) -> bool:
+    """Add a user to [access.users] section. Returns True on success."""
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+    # Find [access.users] section
+    insert_idx = None
+    in_users = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.lower() == "[access.users]":
+            in_users = True
+            continue
+        if in_users:
+            if stripped.startswith("[") and stripped.endswith("]"):
+                # Insert before next section
+                insert_idx = i
+                break
+            if not stripped or stripped.startswith("#"):
+                continue
+        if in_users and i == len(lines) - 1:
+            insert_idx = len(lines)
+
+    if insert_idx is None:
+        if in_users:
+            insert_idx = len(lines)
+        else:
+            # No [access.users] section, append one
+            lines.append("\n[access.users]\n")
+            insert_idx = len(lines)
+
+    new_line = f'{name} = "{secret}"\n'
+    lines.insert(insert_idx, new_line)
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _remove_user_from_config(name: str) -> bool:
+    """Remove a user from [access.users] and [access.direct_users]. Returns True on success."""
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    new_lines = []
+    in_users = False
+    in_direct = False
+    removed = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "[access.users]":
+            in_users = True
+            in_direct = False
+            new_lines.append(line)
+            continue
+        elif stripped.lower() in ("[access.direct_users]", "[access.admins]"):
+            in_users = False
+            in_direct = True
+            new_lines.append(line)
+            continue
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            in_users = False
+            in_direct = False
+            new_lines.append(line)
+            continue
+
+        if (in_users or in_direct) and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key == name:
+                removed = True
+                continue  # skip this line
+
+        new_lines.append(line)
+
+    if removed:
+        cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    return removed
+
+
+def _set_user_direct(name: str, direct: bool) -> bool:
+    """Set or unset direct status for a user. Returns True on success."""
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    new_lines = []
+    found_direct_section = False
+    in_direct = False
+    user_line_found = False
+    direct_section_end = None
+
+    # First pass: find and optionally remove existing entry
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.lower() in ("[access.direct_users]", "[access.admins]"):
+            found_direct_section = True
+            in_direct = True
+            new_lines.append(line)
+            continue
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            if in_direct:
+                direct_section_end = len(new_lines)
+            in_direct = False
+            new_lines.append(line)
+            continue
+
+        if in_direct and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key == name:
+                user_line_found = True
+                if direct:
+                    # Keep it but ensure it says true
+                    new_lines.append(f"{name} = true\n")
+                # If not direct, skip the line (remove)
+                continue
+
+        new_lines.append(line)
+
+    # If in_direct was still true at EOF, mark end
+    if in_direct:
+        direct_section_end = len(new_lines)
+
+    # If we need to add and didn't find the line
+    if direct and not user_line_found:
+        if found_direct_section and direct_section_end is not None:
+            new_lines.insert(direct_section_end, f"{name} = true\n")
+        elif found_direct_section:
+            new_lines.append(f"{name} = true\n")
+        else:
+            # Create section
+            new_lines.append("\n[access.direct_users]\n")
+            new_lines.append(f"{name} = true\n")
+
+    cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    return True
 
 
 @app.get("/api/stats")
@@ -647,6 +817,86 @@ def api_stats():
     )
 
 
+# ── User Management API ──
+
+@app.post("/api/users/add")
+async def api_user_add(request: Request):
+    """Add a new user. Body: { name: str, secret?: str }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    name = str(body.get("name", "")).strip()
+    if not name or not re.match(r"^[a-zA-Z0-9_-]+$", name):
+        return JSONResponse({"ok": False, "error": "invalid name (use a-z, 0-9, _, -)"}, status_code=400)
+
+    # Check if user already exists
+    cfg = _load_proxy_runtime_config()
+    if name in cfg.get("users", {}):
+        return JSONResponse({"ok": False, "error": "user already exists"}, status_code=409)
+
+    secret = str(body.get("secret", "")).strip().lower()
+    if not secret:
+        secret = secrets.token_hex(16)
+    if not USER_SECRET_RE.fullmatch(secret):
+        return JSONResponse({"ok": False, "error": "invalid secret (must be 32 hex chars)"}, status_code=400)
+
+    if not _add_user_to_config(name, secret):
+        return JSONResponse({"ok": False, "error": "failed to write config"}, status_code=500)
+
+    _users_cache["ts"] = 0
+    _restart_proxy()
+    return JSONResponse({"ok": True, "name": name, "secret": secret, "restarted": True})
+
+
+@app.post("/api/users/remove")
+async def api_user_remove(request: Request):
+    """Remove a user. Body: { name: str }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "name is required"}, status_code=400)
+
+    if not _remove_user_from_config(name):
+        return JSONResponse({"ok": False, "error": "user not found"}, status_code=404)
+
+    _users_cache["ts"] = 0
+    _restart_proxy()
+    return JSONResponse({"ok": True, "name": name, "restarted": True})
+
+
+@app.post("/api/users/direct")
+async def api_user_direct(request: Request):
+    """Toggle direct status. Body: { name: str, direct: bool }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    name = str(body.get("name", "")).strip()
+    direct = bool(body.get("direct", False))
+
+    if not name:
+        return JSONResponse({"ok": False, "error": "name is required"}, status_code=400)
+
+    # Verify user exists
+    cfg = _load_proxy_runtime_config()
+    if name not in cfg.get("users", {}):
+        return JSONResponse({"ok": False, "error": "user not found"}, status_code=404)
+
+    if not _set_user_direct(name, direct):
+        return JSONResponse({"ok": False, "error": "failed to write config"}, status_code=500)
+
+    _users_cache["ts"] = 0
+    _restart_proxy()
+    return JSONResponse({"ok": True, "name": name, "direct": direct, "restarted": True})
+
+
 @app.get("/api/logs")
 def api_logs():
     _drain_to_recent()
@@ -678,5 +928,5 @@ app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 if __name__ == "__main__":
     uvicorn.run(
-        app, host=MONITOR_CFG["host"], port=MONITOR_CFG["port"], log_level="warning"
+        app, host=DASHBOARD_CFG["host"], port=DASHBOARD_CFG["port"], log_level="warning"
     )

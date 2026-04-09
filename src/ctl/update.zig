@@ -173,6 +173,31 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     }
     ui.stepOk(ui.str(.update_download_ok), selected_asset.?);
 
+    // ── Attempt to download mtbuddy ──
+    var buddy_candidate_buf: [256]u8 = undefined;
+    var buddy_candidate: []const u8 = "";
+    var has_mtbuddy = false;
+
+    if (std.mem.indexOf(u8, selected_asset.?, "mtproto-proxy")) |idx| {
+        const after = selected_asset.?[idx + "mtproto-proxy".len ..];
+        buddy_candidate = std.fmt.bufPrint(&buddy_candidate_buf, "mtbuddy{s}", .{after}) catch "";
+
+        if (buddy_candidate.len > 0) {
+            var url_buf: [512]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://github.com/{s}/{s}/releases/download/{s}/{s}.tar.gz", .{
+                REPO_OWNER, REPO_NAME, tag, buddy_candidate,
+            }) catch "";
+
+            if (url.len > 0) {
+                const dl_buddy = sys.exec(allocator, &.{ "curl", "-fsSL", url, "-o", "/tmp/mtbuddy.tar.gz" }) catch null;
+                if (dl_buddy) |b| {
+                    if (b.exit_code == 0) has_mtbuddy = true;
+                    b.deinit();
+                }
+            }
+        }
+    }
+
     // ── Extract ──
     var extract_dir_buf: [128]u8 = undefined;
     const extract_dir = std.fmt.bufPrint(&extract_dir_buf, "/tmp/mtproto-update-{s}", .{tag}) catch return;
@@ -183,6 +208,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         ui.fail(ui.str(.error_download_failed));
         return;
     };
+
+    if (has_mtbuddy) {
+        _ = sys.execForward(&.{ "tar", "-xzf", "/tmp/mtbuddy.tar.gz", "-C", extract_dir }) catch {};
+    }
 
     var new_binary_buf: [256]u8 = undefined;
     const new_binary = std.fmt.bufPrint(&new_binary_buf, "{s}/{s}", .{ extract_dir, selected_asset.? }) catch return;
@@ -239,22 +268,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     ui.step(ui.str(.update_installing));
     _ = sys.execForward(&.{ "install", "-m", "0755", new_binary, INSTALL_DIR ++ "/mtproto-proxy" }) catch {};
 
-    // Download & install deploy scripts from this tag
-    const raw_base_buf = "https://raw.githubusercontent.com/" ++ REPO_OWNER ++ "/" ++ REPO_NAME ++ "/";
-    const deploy_scripts = [_][]const u8{
-        "install.sh",  "update.sh",  "update_dns.sh", "ipv6-hop.sh",
-        "setup_masking.sh", "setup_nfqws.sh",
-    };
-
-    for (deploy_scripts) |script| {
-        var script_url_buf: [512]u8 = undefined;
-        const script_url = std.fmt.bufPrint(&script_url_buf, "{s}{s}/deploy/{s}", .{ raw_base_buf, tag, script }) catch continue;
-
-        var script_dest_buf: [256]u8 = undefined;
-        const script_dest = std.fmt.bufPrint(&script_dest_buf, "{s}/{s}", .{ INSTALL_DIR, script }) catch continue;
-
-        _ = sys.exec(allocator, &.{ "curl", "-fsSL", script_url, "-o", script_dest }) catch continue;
-        _ = sys.exec(allocator, &.{ "chmod", "+x", script_dest }) catch continue;
+    if (has_mtbuddy and buddy_candidate.len > 0) {
+        var buddy_bin_buf: [256]u8 = undefined;
+        const buddy_bin = std.fmt.bufPrint(&buddy_bin_buf, "{s}/{s}", .{ extract_dir, buddy_candidate }) catch "";
+        if (sys.fileExists(buddy_bin)) {
+            _ = sys.execForward(&.{ "install", "-m", "0755", buddy_bin, "/usr/local/bin/mtbuddy" }) catch {};
+        }
     }
 
     // Fix ownership
@@ -262,6 +281,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Update service file (unless tunnel-aware) ──
     if (opts.force_service_update or !isTunnelServiceUnit()) {
+        const raw_base_buf = "https://raw.githubusercontent.com/" ++ REPO_OWNER ++ "/" ++ REPO_NAME ++ "/";
         var svc_url_buf: [512]u8 = undefined;
         const svc_url = std.fmt.bufPrint(&svc_url_buf, "{s}{s}/deploy/mtproto-proxy.service", .{ raw_base_buf, tag }) catch "";
         if (svc_url.len > 0) {
