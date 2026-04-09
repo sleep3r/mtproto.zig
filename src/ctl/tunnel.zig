@@ -1,4 +1,4 @@
-//! Setup tunnel command for buddy.
+//! Setup tunnel command for mtbuddy.
 //!
 //! Ports setup_tunnel.sh (400 lines bash) — creates an isolated network
 //! namespace with AmneziaWG tunnel so Telegram DCs become reachable
@@ -47,7 +47,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
     }
 
     if (opts.awg_conf.len == 0) {
-        ui.fail("Usage: buddy setup tunnel <awg-config.conf> [--mode direct|preserve|middleproxy]");
+        ui.fail("Usage: mtbuddy setup tunnel <awg-config.conf> [--mode direct|preserve|middleproxy]");
         return;
     }
 

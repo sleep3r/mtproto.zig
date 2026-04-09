@@ -1,15 +1,15 @@
-//! buddy — interactive installer & control panel for mtproto.zig
+//! mtbuddy — interactive installer & control panel for mtproto.zig
 //!
 //! Replaces the collection of bash scripts in deploy/ with a single
 //! Zig binary. Supports both interactive TUI mode (--interactive)
 //! and non-interactive CLI with flags.
 //!
 //! One-liner install:
-//!   sudo buddy install --port 443 --domain wb.ru --yes
-//!   sudo buddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!   sudo mtbuddy install --port 443 --domain wb.ru --yes
+//!   sudo mtbuddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
 //!
 //! Interactive wizard:
-//!   sudo buddy --interactive
+//!   sudo mtbuddy --interactive
 
 const std = @import("std");
 const i18n = @import("i18n.zig");
@@ -106,7 +106,7 @@ pub fn main() !void {
                     return;
                 }
             } else {
-                ui.fail("Usage: buddy setup <masking|nfqws|tunnel|monitor>");
+                ui.fail("Usage: mtbuddy setup <masking|nfqws|tunnel|monitor>");
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
@@ -208,7 +208,7 @@ fn printHelp() void {
     var ui = Tui.init(i18n.Lang.fromEnv());
 
     ui.writeRaw("\n");
-    ui.print("  {s}⚡ buddy{s} {s}v{s}{s}  —  MTProto Proxy installer & control panel\n\n", .{
+    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  MTProto Proxy installer & control panel\n\n", .{
         Color.header, Color.reset,
         Color.dim,    version,
         Color.reset,
@@ -217,15 +217,15 @@ fn printHelp() void {
     // ── One-liner examples ──
     ui.print("  {s}Quick install (one-liner):{s}\n\n", .{ Color.accent, Color.reset });
     ui.print("    {s}# Minimal — auto-generates secret:{s}\n", .{ Color.gray, Color.reset });
-    ui.print("    {s}sudo buddy install --port 443 --domain wb.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
     ui.print("    {s}# Full control — bring your own secret and username:{s}\n", .{ Color.gray, Color.reset });
-    ui.print("    {s}sudo buddy install --port 443 --domain wb.ru \\\n", .{Color.bright_yellow});
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru \\\n", .{Color.bright_yellow});
     ui.print("    {s}  --secret <32-hex> --user alice --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
     ui.print("    {s}# No DPI bypass (bare install):{s}\n", .{ Color.gray, Color.reset });
-    ui.print("    {s}sudo buddy install --port 443 --domain wb.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
 
     ui.print("  {s}Interactive wizard:{s}\n\n", .{ Color.accent, Color.reset });
-    ui.print("    {s}sudo buddy --interactive{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy --interactive{s}\n\n", .{ Color.bright_yellow, Color.reset });
 
     // ── Commands ──
     ui.print("  {s}Commands:{s}\n\n", .{ Color.accent, Color.reset });
@@ -312,5 +312,5 @@ fn printOpt(ui: *Tui, flag: []const u8, desc: []const u8) void {
 }
 
 fn printVersion() void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, "buddy v" ++ version ++ "\n") catch {};
+    _ = std.posix.write(std.posix.STDOUT_FILENO, "mtbuddy v" ++ version ++ "\n") catch {};
 }

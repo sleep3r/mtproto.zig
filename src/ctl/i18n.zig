@@ -1,4 +1,4 @@
-//! Comptime bilingual string table for buddy.
+//! Comptime bilingual string table for mtbuddy.
 //!
 //! All user-facing strings are defined here in English and Russian.
 //! Language selection happens once at startup; lookups are a simple
@@ -165,7 +165,7 @@ const en_strings = [_][]const u8{
     // checking_root
     "Checking root privileges...",
     // error_not_root
-    "This command requires root. Run: sudo buddy",
+    "This command requires root. Run: sudo mtbuddy",
     // press_enter
     "Press Enter to continue...",
     // yes
@@ -342,7 +342,7 @@ const ru_strings = [_][]const u8{
     // checking_root
     "Проверка прав root...",
     // error_not_root
-    "Требуются права root. Запустите: sudo buddy",
+    "Требуются права root. Запустите: sudo mtbuddy",
     // press_enter
     "Нажмите Enter для продолжения...",
     // yes

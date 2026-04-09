@@ -1,4 +1,4 @@
-//! TOML reader/writer with format preservation for buddy.
+//! TOML reader/writer with format preservation for mtbuddy.
 //!
 //! Unlike src/config.zig (read-only parser for the proxy runtime),
 //! this module preserves original formatting, comments, and whitespace

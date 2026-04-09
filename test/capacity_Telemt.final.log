@@ -1,0 +1,35 @@
+[2m2026-04-05T10:58:45.960149Z[0m [32m INFO[0m [2mtelemt::maestro[0m[2m:[0m Telemt MTProxy v3.3.35
+[2m2026-04-05T10:58:45.960258Z[0m [32m INFO[0m [2mtelemt::maestro[0m[2m:[0m Log level: normal
+[2m2026-04-05T10:58:45.960264Z[0m [32m INFO[0m [2mtelemt::maestro[0m[2m:[0m Modes: classic=false secure=false tls=true
+[2m2026-04-05T10:58:45.960268Z[0m [32m INFO[0m [2mtelemt::maestro[0m[2m:[0m TLS domain: google.com
+[2m2026-04-05T10:58:45.960272Z[0m [32m INFO[0m [2mtelemt::maestro[0m[2m:[0m Mask: false -> google.com:443
+[2m2026-04-05T10:58:45.960458Z[0m [32m INFO[0m [2mtelemt::api[0m[2m:[0m API endpoint: http://0.0.0.0:9091/v1/*
+[2m2026-04-05T10:58:45.961778Z[0m [32m INFO[0m [2mtelemt::tls_front::cache[0m[2m:[0m Loaded TLS cache entries from disk [3mcount[0m[2m=[0m1
+[2m2026-04-05T10:58:50.963632Z[0m [32m INFO[0m [2mtelemt::network::probe[0m[2m:[0m STUN-Quorum reached, IP: 38.180.236.207
+[2m2026-04-05T10:58:50.963692Z[0m [32m INFO[0m [2mtelemt::network::probe[0m[2m:[0m Network capabilities resolved [3mipv4[0m[2m=[0m"38.180.236.207" [3mipv6[0m[2m=[0m"-" [3mreflected_v4[0m[2m=[0m"38.180.236.207" [3mreflected_v6[0m[2m=[0m"-" [3mipv4_bogon[0m[2m=[0mfalse [3mipv6_bogon[0m[2m=[0mfalse [3mipv4_me[0m[2m=[0mtrue [3mipv6_me[0m[2m=[0mfalse [3mipv4_dc[0m[2m=[0mtrue [3mipv6_dc[0m[2m=[0mfalse [3mprefer[0m[2m=[0m4 [3mmultipath[0m[2m=[0mfalse
+[2m2026-04-05T10:58:50.963757Z[0m [32m INFO[0m [2mtelemt::maestro[0m[2m:[0m Transport: Direct DC - TCP - standard DC-over-TCP
+[2m2026-04-05T10:58:50.965056Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m ================= Telegram DC Connectivity =================
+[2m2026-04-05T10:58:51.534257Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m   IPv4 only / IPv6 unavailable
+[2m2026-04-05T10:58:51.534288Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m   via direct
+[2m2026-04-05T10:58:51.534294Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m ============================================================
+[2m2026-04-05T10:58:51.534302Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m     DC1 [IPv4] 149.154.175.50:443				142 ms
+[2m2026-04-05T10:58:51.534321Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m     DC2 [IPv4] 149.154.167.51:443				31 ms
+[2m2026-04-05T10:58:51.534327Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m     DC3 [IPv4] 149.154.175.100:443				135 ms
+[2m2026-04-05T10:58:51.534333Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m     DC4 [IPv4] 149.154.167.91:443				33 ms
+[2m2026-04-05T10:58:51.534339Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m     DC5 [IPv4] 149.154.171.5:443				169 ms
+[2m2026-04-05T10:58:51.534344Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m     DC203 [IPv4] 91.105.192.100:443				59 ms
+[2m2026-04-05T10:58:51.534349Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m ============================================================
+[2m2026-04-05T10:58:51.534357Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m ===================== Telegram Startup =====================
+[2m2026-04-05T10:58:51.534363Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m   DC/ME Initialized in 5 seconds
+[2m2026-04-05T10:58:51.534367Z[0m [32m INFO[0m [2mtelemt::maestro::connectivity[0m[2m:[0m ============================================================
+[2m2026-04-05T10:58:51.534664Z[0m [32m INFO[0m [2mtelemt::maestro::listeners[0m[2m:[0m Listening on 0.0.0.0:16546
+[2m2026-04-05T10:58:51.534683Z[0m [32m INFO[0m [2mtelemt::links[0m[2m:[0m --- Proxy Links (38.180.236.207) ---
+[2m2026-04-05T10:58:51.534689Z[0m [32m INFO[0m [2mtelemt::links[0m[2m:[0m User: bench
+[2m2026-04-05T10:58:51.534696Z[0m [32m INFO[0m [2mtelemt::links[0m[2m:[0m   EE-TLS:  tg://proxy?server=38.180.236.207&port=16546&secret=ee00112233445566778899aabbccddeeff676f6f676c652e636f6d
+[2m2026-04-05T10:58:51.534714Z[0m [32m INFO[0m [2mtelemt::links[0m[2m:[0m ------------------------
+[2m2026-04-05T10:58:51.535048Z[0m [32m INFO[0m [2mtelemt::config::hot_reload[0m[2m:[0m config watcher: inotify active on "/root/benchmarks/configs/capacity-telemt.toml"
+[2m2026-04-05T10:58:51.535103Z[0m [32m INFO[0m [2mtelemt::config::hot_reload[0m[2m:[0m config watcher: poll watcher active (Docker/NFS safe)
+[2m2026-04-05T10:59:23.483341Z[0m [32m INFO[0m [2mtelemt::maestro::shutdown[0m[2m:[0m Received shutdown signal [3msignal[0m[2m=[0mSIGTERM
+[2m2026-04-05T10:59:23.483424Z[0m [32m INFO[0m [2mtelemt::maestro::shutdown[0m[2m:[0m Shutting down...
+[2m2026-04-05T10:59:23.483450Z[0m [32m INFO[0m [2mtelemt::maestro::shutdown[0m[2m:[0m Uptime: 37 seconds / 37 seconds
+[2m2026-04-05T10:59:23.483461Z[0m [32m INFO[0m [2mtelemt::maestro::shutdown[0m[2m:[0m Shutdown completed successfully in 0 seconds.

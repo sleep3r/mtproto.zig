@@ -1,4 +1,4 @@
-//! IPv6 hopping command for buddy.
+//! IPv6 hopping command for mtbuddy.
 //!
 //! Ports ipv6-hop.sh (159 lines bash) — rotates IPv6 address when ban
 //! detected. TSPU can't ban /64 subnets without breaking legitimate traffic.
@@ -249,7 +249,7 @@ fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_nam
 /// Update DNS A record (from update_dns.sh).
 pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const new_ip = args.next() orelse {
-        ui.fail("Usage: buddy update-dns <new_ip>");
+        ui.fail("Usage: mtbuddy update-dns <new_ip>");
         return;
     };
 

@@ -1,4 +1,4 @@
-//! TUI rendering engine for buddy.
+//! TUI rendering engine for mtbuddy.
 //!
 //! Provides styled terminal output components:
 //! banner, menus, confirmations, text input, spinners, status lines,
@@ -311,7 +311,7 @@ pub const Tui = struct {
         self.print("{s}  │{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
 
         // Logo line — "⚡ mtproto.zig" centered in 50 chars interior
-        self.print("{s}  │{s}         {s}⚡  m t p r o t o . z i g{s}           {s}│{s}\n", .{
+        self.print("{s}  │{s}            {s}⚡  m t p r o t o . z i g{s}             {s}│{s}\n", .{
             Color.gray,   Color.reset,
             Color.header, Color.reset,
             Color.gray,   Color.reset,
@@ -320,7 +320,7 @@ pub const Tui = struct {
         self.print("{s}  │{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
 
         // Subtitle
-        self.print("{s}  │{s}       {s}installer & control panel{s}               {s}│{s}\n", .{
+        self.print("{s}  │{s}            {s}installer & control panel{s}             {s}│{s}\n", .{
             Color.gray,               Color.reset,
             Color.dim ++ Color.white, Color.reset,
             Color.gray,               Color.reset,

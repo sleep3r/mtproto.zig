@@ -1,11 +1,11 @@
-//! Install command for buddy.
+//! Install command for mtbuddy.
 //!
 //! Ports install.sh (296 lines of bash) into structured Zig code.
 //! Supports both interactive TUI mode and non-interactive CLI mode.
 //!
 //! One-liner usage:
-//!   sudo buddy install --port 443 --domain wb.ru --yes
-//!   sudo buddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!   sudo mtbuddy install --port 443 --domain wb.ru --yes
+//!   sudo mtbuddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -89,7 +89,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
     // In non-interactive mode, print a compact summary of what will happen
     if (!opts.yes) {
         ui.writeRaw("\n");
-        ui.print("  {s}⚡ buddy install{s}\n\n", .{ Color.header, Color.reset });
+        ui.print("  {s}⚡ mtbuddy install{s}\n\n", .{ Color.header, Color.reset });
         ui.print("  {s}Port:{s}     {d}\n", .{ Color.dim, Color.reset, opts.port });
         ui.print("  {s}Domain:{s}   {s}\n", .{ Color.dim, Color.reset, opts.tls_domain });
         ui.print("  {s}TCPMSS:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_tcpmss) "enabled" else "disabled" });

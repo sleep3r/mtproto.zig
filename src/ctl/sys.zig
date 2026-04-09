@@ -1,4 +1,4 @@
-//! System operations wrapper for buddy.
+//! System operations wrapper for mtbuddy.
 //!
 //! Encapsulates subprocess execution, file I/O, architecture detection,
 //! and privilege checks. All subprocess calls go through exec() which

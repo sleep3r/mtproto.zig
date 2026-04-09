@@ -48,7 +48,7 @@ It also ships more evasion techniques than any of the above:
 
 ## Install
 
-All installation, updates, and management are done through **buddy** — a native Zig CLI that ships alongside the proxy.
+All installation, updates, and management are done through **mtbuddy** — a native Zig CLI that ships alongside the proxy.
 
 ### One command
 
@@ -56,27 +56,27 @@ All installation, updates, and management are done through **buddy** — a nativ
 curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash
 ```
 
-This downloads the latest `buddy` binary and runs `buddy --help`. Then install the proxy:
+This downloads the latest `mtbuddy` binary and runs `mtbuddy --help`. Then install the proxy:
 
 ```bash
 # Minimal — auto-generates a secret, enables all DPI bypass modules
-sudo buddy install --port 443 --domain wb.ru --yes
+sudo mtbuddy install --port 443 --domain wb.ru --yes
 
 # Bring your own secret and username
-sudo buddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --yes
+sudo mtbuddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --yes
 
 # Disable all DPI modules (bare proxy only)
-sudo buddy install --port 443 --domain wb.ru --no-dpi --yes
+sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
 ```
 
-At the end, buddy prints a ready-to-use `tg://` connection link.
+At the end, mtbuddy prints a ready-to-use `tg://` connection link.
 
 ### Interactive wizard
 
 If you prefer to be walked through the setup:
 
 ```bash
-sudo buddy --interactive
+sudo mtbuddy --interactive
 ```
 
 ### What the install does
@@ -110,37 +110,37 @@ sudo buddy --interactive
 
 ```bash
 # Update to latest release (checks CPU compat, auto-rollback on failure)
-sudo buddy update
+sudo mtbuddy update
 
 # Pin to a specific version
-sudo buddy update --version v0.11.1
+sudo mtbuddy update --version v0.11.1
 ```
 
 ---
 
-## Other buddy commands
+## Other mtbuddy commands
 
 ```bash
 # Show proxy and module status
-sudo buddy status
+sudo mtbuddy status
 
 # Setup DPI modules after the fact
-sudo buddy setup masking --domain wb.ru
-sudo buddy setup nfqws
-sudo buddy setup monitor
+sudo mtbuddy setup masking --domain wb.ru
+sudo mtbuddy setup nfqws
+sudo mtbuddy setup monitor
 
 # AmneziaWG tunnel (for servers where Telegram DCs are blocked)
-sudo buddy setup tunnel /path/to/awg0.conf --mode direct
+sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
 
 # IPv6 hopping
-sudo buddy ipv6-hop --check
-sudo buddy ipv6-hop --auto --prefix 2a01:abcd:ef00:: --threshold 5
+sudo mtbuddy ipv6-hop --check
+sudo mtbuddy ipv6-hop --auto --prefix 2a01:abcd:ef00:: --threshold 5
 
 # Update Cloudflare DNS A record
-sudo buddy update-dns 1.2.3.4
+sudo mtbuddy update-dns 1.2.3.4
 
 # Full help
-buddy --help
+mtbuddy --help
 ```
 
 ---
@@ -170,7 +170,7 @@ Client → VPS:443 → [DNAT] → tg_proxy_ns:443
 ```
 
 ```bash
-sudo buddy setup tunnel /path/to/awg0.conf --mode direct
+sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
 ```
 
 **Modes:**
@@ -178,13 +178,13 @@ sudo buddy setup tunnel /path/to/awg0.conf --mode direct
 - `middleproxy` — sets `use_middle_proxy=true` (required for promo tags)
 - `preserve` — keeps current config unchanged
 
-After setup, `buddy` validates connectivity to all 5 Telegram DCs through the tunnel and prints the link.
+After setup, `mtbuddy` validates connectivity to all 5 Telegram DCs through the tunnel and prints the link.
 
 ---
 
 ## Configuration
 
-Config lives at `/opt/mtproto-proxy/config.toml`. Buddy generates it on install; you can edit it manually and restart:
+Config lives at `/opt/mtproto-proxy/config.toml`. MTBuddy generates it on install; you can edit it manually and restart:
 
 ```toml
 [general]
