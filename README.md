@@ -23,14 +23,12 @@ Most MTProto proxies are large, dependency-heavy, and use lots of memory. This o
 
 | Proxy | Language | Binary | Baseline RSS | Startup | Dependencies |
 |---|---|---:|---:|---|---|
-| **mtproto.zig** | Zig | **177 KB*** | **0.75 MB** | **< 10 ms** | **0** |
+| **mtproto.zig** | Zig | **177 KB** | **0.75 MB** | **< 10 ms** | **0** |
 | Official MTProxy | C | 524 KB | 8.0 MB | < 10 ms | openssl, zlib |
 | Telemt | Rust | 15 MB | 12.1 MB | ~ 5-6 s | 423 crates |
 | mtg | Go | 13 MB | 11.6 MB | ~ 30 ms | 78 modules |
 | MTProtoProxy | Python | N/A | ~ 30 MB | ~ 300 ms | python3, cryptography |
 | JSMTProxy | Node.js | N/A | ~ 45 MB | ~ 400 ms | nodejs, openssl |
-
-*\* 177 KB is achieved using `ReleaseSmall` and `-fstrip`. Default `ReleaseFast` includes safe panic traces and debug info, so it will be larger on disk. Operational memory usage remains strictly <1MB idle.*
 
 ## Why Zig?
 

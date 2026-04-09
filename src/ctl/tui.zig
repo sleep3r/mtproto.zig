@@ -258,11 +258,9 @@ pub const Tui = struct {
 
     // ── Spinner factory ────────────────────────────────────────────────────
 
-    /// Create and immediately start a spinner for a task label.
+    /// Create a spinner for a task label. MUST call .start() on the returned instance.
     pub fn spinner(self: *Self, label: []const u8) Spinner {
-        var s = Spinner{ .tui = self, .label = label };
-        s.start();
-        return s;
+        return Spinner{ .tui = self, .label = label };
     }
 
     // ── Status lines ───────────────────────────────────────────────────────
@@ -307,7 +305,7 @@ pub const Tui = struct {
     pub fn banner(self: *Self, version: []const u8) void {
         self.writeRaw("\n");
         // Top border
-        self.print("{s}  ╭──────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
+        self.print("{s}  ╭──────────────────────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
         self.print("{s}  │{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
 
         // Logo line — "⚡ mtproto.zig" centered in 50 chars interior
@@ -346,7 +344,7 @@ pub const Tui = struct {
         });
 
         self.print("{s}  │{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
-        self.print("{s}  ╰──────────────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });
+        self.print("{s}  ╰──────────────────────────────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });
         self.writeRaw("\n");
     }
 
@@ -580,12 +578,12 @@ pub const Tui = struct {
     /// Print a bordered summary box (for final output).
     pub fn summaryBox(self: *Self, title: []const u8, lines: []const SummaryLine) void {
         self.writeRaw("\n");
-        self.print("  {s}╭──────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
+        self.print("  {s}╭──────────────────────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
 
         // Title line
         const title_len = std.unicode.utf8CountCodepoints(title) catch title.len;
-        const box_interior = 48;
-        const title_pad = if (title_len + 2 < box_interior) box_interior - title_len - 2 else 0;
+        const box_interior = 66;
+        const title_pad = if (title_len + 1 < box_interior) box_interior - title_len - 1 else 0;
         var title_pad_buf: [64]u8 = undefined;
         @memset(title_pad_buf[0..title_pad], ' ');
 
@@ -595,7 +593,7 @@ pub const Tui = struct {
             Color.reset,  title_pad_buf[0..title_pad],
             Color.gray,   Color.reset,
         });
-        self.print("  {s}├──────────────────────────────────────────────────┤{s}\n", .{ Color.gray, Color.reset });
+        self.print("  {s}├──────────────────────────────────────────────────────────────────┤{s}\n", .{ Color.gray, Color.reset });
         self.print("  {s}│{s}                                                  {s}│{s}\n", .{ Color.gray, Color.reset, Color.gray, Color.reset });
 
         for (lines) |line| {
@@ -607,7 +605,7 @@ pub const Tui = struct {
                     @memset(l_pad[0..lp], ' ');
 
                     const v_len = std.unicode.utf8CountCodepoints(line.value) catch line.value.len;
-                    const used = 4 + l_len + lp + v_len; // "  " prefix + label + pad + value
+                    const used = 2 + l_len + lp + v_len; // "  " prefix + label + pad + value
                     const r_pad_len = if (used < box_interior) box_interior - used else 0;
                     const rp = @min(r_pad_len, 64);
                     var r_pad: [64]u8 = undefined;
@@ -672,7 +670,7 @@ pub const Tui = struct {
         self.print("  {s}│{s}                                                  {s}│{s}\n", .{
             Color.gray, Color.reset, Color.gray, Color.reset,
         });
-        self.print("  {s}╰──────────────────────────────────────────────────╯{s}\n\n", .{
+        self.print("  {s}╰──────────────────────────────────────────────────────────────────╯{s}\n\n", .{
             Color.gray, Color.reset,
         });
     }
@@ -682,12 +680,12 @@ pub const Tui = struct {
     pub fn section(self: *Self, title: []const u8) void {
         self.writeRaw("\n");
         const title_len = std.unicode.utf8CountCodepoints(title) catch title.len;
-        const inner = 36;
-        const pad = if (title_len + 1 < inner) inner - title_len - 1 else 0;
+        const inner = 50;
+        const pad = if (title_len + 4 < inner) inner - title_len - 4 else 0;
         var pad_buf: [64]u8 = undefined;
         @memset(pad_buf[0..pad], ' ');
 
-        self.print("  {s}╭────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
+        self.print("  {s}╭──────────────────────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
         self.print("  {s}│{s} {s}⚙  {s}{s}{s}{s}{s}│{s}\n", .{
             Color.gray,      Color.reset,
             Color.bold,      Color.bright_yellow,
@@ -695,7 +693,7 @@ pub const Tui = struct {
             pad_buf[0..pad], Color.gray,
             Color.reset,
         });
-        self.print("  {s}╰────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });
+        self.print("  {s}╰──────────────────────────────────────────────────────────────────╯{s}\n", .{ Color.gray, Color.reset });
     }
 
     // ── Progress block ─────────────────────────────────────────────────────

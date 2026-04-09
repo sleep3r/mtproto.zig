@@ -45,8 +45,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     var version_buf: [32]u8 = undefined;
     const version_input = try ui.input(
-        "Version",
-        "Leave empty for latest, or specify e.g. v0.11.0",
+        ui.str(.update_version_prompt),
+        ui.str(.update_version_help),
         "latest",
         &version_buf,
     );

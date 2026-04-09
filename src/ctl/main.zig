@@ -21,6 +21,7 @@ const nfqws = @import("nfqws.zig");
 const tunnel = @import("tunnel.zig");
 const monitor = @import("monitor.zig");
 const ipv6hop = @import("ipv6hop.zig");
+const uninstall = @import("uninstall.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -88,6 +89,8 @@ pub fn main() !void {
     if (command) |cmd| {
         if (std.mem.eql(u8, cmd, "install")) {
             return install.run(&ui, allocator, &remaining_args);
+        } else if (std.mem.eql(u8, cmd, "uninstall")) {
+            return uninstall.run(&ui, allocator, &remaining_args);
         } else if (std.mem.eql(u8, cmd, "update")) {
             return update.run(&ui, allocator, &remaining_args);
         } else if (std.mem.eql(u8, cmd, "setup")) {
@@ -127,29 +130,63 @@ pub fn main() !void {
     printHelp();
 }
 
+const Action = enum {
+    install,
+    update,
+    masking,
+    tunnel,
+    monitor,
+    ipv6hop,
+    status,
+    uninstall,
+    exit,
+};
+
 fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
     while (true) {
-        const choice = try ui.menu(i18n.get(ui.lang, .menu_title), &.{
-            i18n.get(ui.lang, .menu_install),
-            i18n.get(ui.lang, .menu_update),
-            i18n.get(ui.lang, .menu_setup_masking),
-            i18n.get(ui.lang, .menu_setup_tunnel),
-            i18n.get(ui.lang, .menu_setup_monitor),
-            i18n.get(ui.lang, .menu_ipv6_hop),
-            i18n.get(ui.lang, .menu_status),
-            i18n.get(ui.lang, .menu_exit),
-        });
+        const is_installed = @import("sys.zig").fileExists("/opt/mtproto-proxy");
 
-        switch (choice) {
-            0 => try install.runInteractive(ui, allocator),
-            1 => try update.runInteractive(ui, allocator),
-            2 => try masking.runInteractive(ui, allocator),
-            3 => try tunnel.runInteractive(ui, allocator),
-            4 => try monitor.runInteractive(ui, allocator),
-            5 => try ipv6hop.runInteractive(ui, allocator),
-            6 => showStatus(ui, allocator),
-            7 => return,
-            else => return,
+        var items: std.ArrayList([]const u8) = .empty;
+        defer items.deinit(allocator);
+        var actions: std.ArrayList(Action) = .empty;
+        defer actions.deinit(allocator);
+
+        try items.append(allocator, i18n.get(ui.lang, .menu_install));
+        try actions.append(allocator, .install);
+
+        if (is_installed) {
+            try items.append(allocator, i18n.get(ui.lang, .menu_update));
+            try actions.append(allocator, .update);
+            try items.append(allocator, i18n.get(ui.lang, .menu_setup_masking));
+            try actions.append(allocator, .masking);
+            try items.append(allocator, i18n.get(ui.lang, .menu_setup_tunnel));
+            try actions.append(allocator, .tunnel);
+            try items.append(allocator, i18n.get(ui.lang, .menu_setup_monitor));
+            try actions.append(allocator, .monitor);
+            try items.append(allocator, i18n.get(ui.lang, .menu_ipv6_hop));
+            try actions.append(allocator, .ipv6hop);
+            try items.append(allocator, i18n.get(ui.lang, .menu_status));
+            try actions.append(allocator, .status);
+            try items.append(allocator, i18n.get(ui.lang, .menu_uninstall));
+            try actions.append(allocator, .uninstall);
+        }
+
+        try items.append(allocator, i18n.get(ui.lang, .menu_exit));
+        try actions.append(allocator, .exit);
+
+        const choice_idx = try ui.menu(i18n.get(ui.lang, .menu_title), items.items);
+        const action = actions.items[choice_idx];
+
+        switch (action) {
+            .install => try install.runInteractive(ui, allocator),
+            .update => try update.runInteractive(ui, allocator),
+            .masking => try masking.runInteractive(ui, allocator),
+            .tunnel => try tunnel.runInteractive(ui, allocator),
+            .monitor => try monitor.runInteractive(ui, allocator),
+            .ipv6hop => try ipv6hop.runInteractive(ui, allocator),
+            .status => showStatus(ui, allocator),
+            .uninstall => try uninstall.runInteractive(ui, allocator),
+            .exit => return,
         }
     }
 }
@@ -230,6 +267,7 @@ fn printHelp() void {
     // ── Commands ──
     ui.print("  {s}Commands:{s}\n\n", .{ Color.accent, Color.reset });
     printCmd(&ui, "install", "Install mtproto-proxy from source");
+    printCmd(&ui, "uninstall", "Uninstall mtproto-proxy completely");
     printCmd(&ui, "update", "Update to latest GitHub release");
     printCmd(&ui, "setup masking", "Setup local Nginx DPI masking");
     printCmd(&ui, "setup nfqws", "Setup nfqws TCP desync (Zapret)");

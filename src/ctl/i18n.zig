@@ -41,6 +41,7 @@ pub const S = enum(u16) {
     menu_ipv6_hop,
     menu_edit_config,
     menu_status,
+    menu_uninstall,
     menu_exit,
 
     // ── Common ──
@@ -62,6 +63,8 @@ pub const S = enum(u16) {
     install_port_help,
     install_domain_prompt,
     install_domain_help,
+    install_secret_prompt,
+    install_secret_help,
     install_secret_generated,
     install_dpi_header,
     install_dpi_tcpmss,
@@ -93,6 +96,8 @@ pub const S = enum(u16) {
 
     // ── Update ──
     update_header,
+    update_version_prompt,
+    update_version_help,
     update_resolving_tag,
     update_tag_resolved,
     update_downloading,
@@ -110,6 +115,12 @@ pub const S = enum(u16) {
     update_arch_label,
     update_artifact_label,
     update_backup_label,
+
+    // ── Uninstall ──
+    uninstall_header,
+    uninstall_warning,
+    uninstall_in_progress,
+    uninstall_success,
 
     // ── Errors ──
     error_arch_unsupported,
@@ -158,6 +169,8 @@ const en_strings = [_][]const u8{
     "\xE2\x9A\x99\xEF\xB8\x8F  Edit configuration",
     // menu_status
     "\xF0\x9F\x93\x8B  Show status",
+    // menu_uninstall
+    "\xF0\x9F\x97\x91\xEF\xB8\x8F  Uninstall (Remove completely)",
     // menu_exit
     "\xF0\x9F\x9A\xAA  Exit",
 
@@ -196,6 +209,10 @@ const en_strings = [_][]const u8{
     "TLS masking domain",
     // install_domain_help
     "The domain your proxy pretends to be.\nDPI sees a connection to this site instead of Telegram.\nShort domains like wb.ru look like legitimate traffic.",
+    // install_secret_prompt
+    "Proxy secret (32 hex chars)",
+    // install_secret_help
+    "Leave as 'auto' to generate a random secure secret automatically.",
     // install_secret_generated
     "User secret auto-generated",
     // install_dpi_header
@@ -255,7 +272,11 @@ const en_strings = [_][]const u8{
 
     // ── Update ──
     // update_header
-    "Update MTProto Proxy",
+    "Update mtproto-proxy",
+    // update_version_prompt
+    "Version",
+    // update_version_help
+    "Leave empty for latest, or specify e.g. v0.11.0",
     // update_resolving_tag
     "Resolving latest release...",
     // update_tag_resolved
@@ -290,6 +311,16 @@ const en_strings = [_][]const u8{
     "Artifact:",
     // update_backup_label
     "Backup:",
+
+    // ── Uninstall ──
+    // uninstall_header
+    "Uninstall mtproto-proxy",
+    // uninstall_warning
+    "This will completely remove mtbuddy, mtproto-proxy, nfqws, and all related configurations. Are you sure?",
+    // uninstall_in_progress
+    "Removing components",
+    // uninstall_success
+    "mtproto-proxy and all its components have been removed.",
 
     // ── Errors ──
     // error_arch_unsupported
@@ -335,6 +366,8 @@ const ru_strings = [_][]const u8{
     "\xE2\x9A\x99\xEF\xB8\x8F  Настроить конфигурацию",
     // menu_status
     "\xF0\x9F\x93\x8B  Показать статус",
+    // menu_uninstall
+    "\xF0\x9F\x97\x91\xEF\xB8\x8F  Полностью удалить прокси",
     // menu_exit
     "\xF0\x9F\x9A\xAA  Выход",
 
@@ -373,6 +406,10 @@ const ru_strings = [_][]const u8{
     "TLS домен для маскировки",
     // install_domain_help
     "Домен, под который прокси маскирует трафик.\nDPI видит подключение к этому сайту вместо Telegram.\nКороткие домены вроде wb.ru похожи на легитимный трафик.",
+    // install_secret_prompt
+    "Секрет прокси (32 hex символа)",
+    // install_secret_help
+    "Оставьте 'auto', чтобы сгенерировать надежный секрет автоматически.",
     // install_secret_generated
     "Секрет сгенерирован автоматически",
     // install_dpi_header
@@ -433,6 +470,10 @@ const ru_strings = [_][]const u8{
     // ── Update ──
     // update_header
     "Обновление MTProto Proxy",
+    // update_version_prompt
+    "Версия",
+    // update_version_help
+    "Оставьте пустым для latest, или укажите (напр. v0.11.0)",
     // update_resolving_tag
     "Определение последней версии...",
     // update_tag_resolved
@@ -467,6 +508,16 @@ const ru_strings = [_][]const u8{
     "Артефакт:",
     // update_backup_label
     "Резервная копия:",
+
+    // ── Uninstall ──
+    // uninstall_header
+    "Удаление mtproto-proxy",
+    // uninstall_warning
+    "Это действие полностью удалит mtbuddy, прокси, nfqws и все связанные настройки. Вы уверены?",
+    // uninstall_in_progress
+    "Удаление компонентов",
+    // uninstall_success
+    "mtproto-proxy и все связанные компоненты успешно удалены.",
 
     // ── Errors ──
     // error_arch_unsupported

@@ -132,18 +132,36 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     );
     opts.tls_domain = domain;
 
-    // Secret — auto-generated, just show it
+    // Secret
     var secret_hex: [32]u8 = undefined;
-    sys.generateSecret(&secret_hex);
-    ui.writeRaw("\n");
-    ui.print("  {s}🔐{s} {s}: {s}{s}{s}\n", .{
-        Color.bright_yellow,
-        Color.reset,
-        ui.str(.install_secret_generated),
-        Color.ok,
-        &secret_hex,
-        Color.reset,
-    });
+    var secret_buf: [256]u8 = undefined;
+    while (true) {
+        const sec_str = try ui.input(
+            ui.str(.install_secret_prompt),
+            ui.str(.install_secret_help),
+            "auto",
+            &secret_buf,
+        );
+
+        if (std.mem.eql(u8, sec_str, "auto") or sec_str.len == 0) {
+            sys.generateSecret(&secret_hex);
+            ui.writeRaw("\n");
+            ui.print("  {s}🔐{s} {s}: {s}{s}{s}\n", .{
+                Color.bright_yellow,
+                Color.reset,
+                ui.str(.install_secret_generated),
+                Color.ok,
+                &secret_hex,
+                Color.reset,
+            });
+            break;
+        } else if (sec_str.len == 32) {
+            @memcpy(&secret_hex, sec_str[0..32]);
+            break;
+        } else {
+            ui.print("  {s}✗ Secret must be exactly 32 hex characters, or 'auto'{s}\n", .{ Color.err, Color.reset });
+        }
+    }
 
     // DPI modules — checkbox selection
     const dpi_result = try ui.checkboxes(
@@ -193,6 +211,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     // ── Install dependencies ──
     {
         var sp = ui.spinner(ui.str(.install_checking_deps));
+        sp.start();
         _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
         _ = sys.exec(allocator, &.{
             "apt-get",  "install", "-y",
@@ -216,6 +235,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.stepOk(ui.str(.install_zig_ok), zig_ver);
     } else {
         var sp = ui.spinner(ui.str(.install_installing_zig));
+        sp.start();
 
         const arch = sys.getArch() catch {
             sp.stop(false, "");
@@ -225,7 +245,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
         var zig_cmd_buf: [512]u8 = undefined;
         const zig_cmd = std.fmt.bufPrint(&zig_cmd_buf,
-            \\cd /tmp && curl -sSfL -o zig.tar.xz https://ziglang.org/download/{[a]s}/zig-linux-{[b]s}-{[c]s}.tar.xz && tar xf zig.tar.xz && rm -rf /usr/local/zig && mv zig-linux-{[b]s}-{[c]s} /usr/local/zig && ln -sf /usr/local/zig/zig /usr/local/bin/zig && rm -f zig.tar.xz
+            \\cd /tmp && curl -sSfL -o zig.tar.xz https://ziglang.org/download/{[a]s}/zig-{[b]s}-linux-{[c]s}.tar.xz && tar xf zig.tar.xz && rm -rf /usr/local/zig && mv zig-{[b]s}-linux-{[c]s} /usr/local/zig && ln -sf /usr/local/zig/zig /usr/local/bin/zig && rm -f zig.tar.xz
         , .{ .a = zig_ver, .b = arch.toStr(), .c = zig_ver }) catch {
             sp.stop(false, "");
             return;
@@ -233,13 +253,14 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
         const dl_result = sys.exec(allocator, &.{ "bash", "-c", zig_cmd }) catch {
             sp.stop(false, "");
-            ui.fail(ui.str(.install_installing_zig));
             return;
         };
 
         if (dl_result.exit_code != 0) {
             sp.stop(false, "");
-            ui.fail(ui.str(.install_installing_zig));
+            if (dl_result.stderr.len > 0) {
+                ui.hint(dl_result.stderr[0..@min(dl_result.stderr.len, 200)]);
+            }
             return;
         }
         sp.stop(true, zig_ver);
@@ -248,6 +269,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     // ── Clone & build ──
     {
         var sp = ui.spinner(ui.str(.install_building));
+        sp.start();
         var cmd_buf: [1024]u8 = undefined;
         const build_cmd = std.fmt.bufPrint(
             &cmd_buf,
@@ -266,14 +288,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
         const build_result = sys.exec(allocator, &.{ "bash", "-c", build_cmd }) catch {
             sp.stop(false, "");
-            ui.fail(ui.str(.install_building));
             return;
         };
         defer build_result.deinit();
 
         if (build_result.exit_code != 0) {
             sp.stop(false, "");
-            ui.fail(ui.str(.install_building));
             if (build_result.stderr.len > 0) {
                 ui.hint(build_result.stderr[0..@min(build_result.stderr.len, 200)]);
             }
@@ -337,6 +357,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     // ── Systemd service ──
     {
         var sp = ui.spinner(ui.str(.install_service_installed));
+        sp.start();
         _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
         _ = sys.exec(allocator, &.{ "systemctl", "enable", SERVICE_NAME }) catch {};
         _ = sys.exec(allocator, &.{ "systemctl", "restart", SERVICE_NAME }) catch {};
@@ -398,6 +419,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     // ── Print summary ──
     var sp = ui.spinner("Detecting public IP");
+    sp.start();
     const public_ip = sys.detectPublicIp(allocator) orelse "<SERVER_IP>";
     sp.stop(true, public_ip);
 
@@ -458,8 +480,6 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
         .{ .label = "Server:", .value = public_ip },
         .{ .label = "Port:", .value = port_str },
         .{ .label = "", .style = .blank },
-        .{ .label = ui.str(.install_connection_link), .style = .highlight, .value = link },
-        .{ .label = "", .style = .blank },
         .{ .label = ui.str(.install_dpi_active), .style = .highlight },
         .{
             .label = if (opts.enable_tcpmss) "TCPMSS=88 (ClientHello fragmentation)" else "",
@@ -474,4 +494,9 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
             .style = if (opts.enable_nfqws) .success else .blank,
         },
     });
+
+    ui.writeRaw("\n");
+    ui.print("  {s}╭─ {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.bold, ui.str(.install_connection_link) });
+    ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, link, tui_mod.Color.reset });
+    ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
 }

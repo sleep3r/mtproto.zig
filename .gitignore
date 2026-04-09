@@ -13,3 +13,5 @@ config.toml
 __pycache__
 *.json
 *.logtest_poll.zig
+fix_tui.py
+test_list.zig
