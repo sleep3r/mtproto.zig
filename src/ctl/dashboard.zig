@@ -22,6 +22,7 @@ const server_py = @embedFile("dashboard_assets/server.py");
 const index_html = @embedFile("dashboard_assets/static/index.html");
 const style_css = @embedFile("dashboard_assets/static/style.css");
 const app_js = @embedFile("dashboard_assets/static/app.js");
+const logo_svg = @embedFile("dashboard_assets/static/logo.svg");
 
 pub const DashboardOpts = struct {
     quiet: bool = false,
@@ -98,6 +99,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !void {
     sys.writeFile(INSTALL_DIR ++ "/static/index.html", index_html) catch {};
     sys.writeFile(INSTALL_DIR ++ "/static/style.css", style_css) catch {};
     sys.writeFile(INSTALL_DIR ++ "/static/app.js", app_js) catch {};
+    sys.writeFile(INSTALL_DIR ++ "/static/logo.svg", logo_svg) catch {};
 
     ui.ok("Dashboard files extracted to " ++ INSTALL_DIR);
 
