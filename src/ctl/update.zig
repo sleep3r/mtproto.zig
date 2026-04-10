@@ -173,7 +173,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Apply masking monitor (if recovery is already installed) ──
     if (sys.isServiceActive("mtproto-mask-health.timer") or sys.fileExists("/usr/local/bin/mtproto-mask-health.sh")) {
-        recovery.execute(ui, allocator, .{}) catch {};
+        recovery.execute(ui, allocator, .{ .quiet = true }) catch {};
     }
 
     // ── Summary ──

@@ -345,12 +345,15 @@ pub const Config = struct {
                     }
                 } else if (in_upstream_socks5_section or in_upstream_http_section) {
                     if (std.mem.eql(u8, key, "host")) {
+                        if (cfg.upstream_proxy_host) |h| allocator.free(h);
                         cfg.upstream_proxy_host = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "port")) {
                         cfg.upstream_proxy_port = std.fmt.parseInt(u16, value, 10) catch 0;
                     } else if (std.mem.eql(u8, key, "username")) {
+                        if (cfg.upstream_proxy_username) |u| allocator.free(u);
                         cfg.upstream_proxy_username = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "password")) {
+                        if (cfg.upstream_proxy_password) |p| allocator.free(p);
                         cfg.upstream_proxy_password = try allocator.dupe(u8, value);
                     }
                 } else if (in_upstream_tunnel_section) {
@@ -1155,4 +1158,28 @@ test "parse config - upstream socks alias" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(UpstreamMode.socks5, cfg.upstream_mode);
+}
+
+test "parse config - duplicate upstream proxy fields" {
+    const content =
+        \\[upstream]
+        \\type = "socks5"
+        \\[upstream.socks5]
+        \\host = "10.0.0.1"
+        \\host = "10.0.0.2"
+        \\port = 1080
+        \\username = "first"
+        \\username = "second"
+        \\password = "one"
+        \\password = "two"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("10.0.0.2", cfg.upstream_proxy_host.?);
+    try std.testing.expectEqualStrings("second", cfg.upstream_proxy_username.?);
+    try std.testing.expectEqualStrings("two", cfg.upstream_proxy_password.?);
 }

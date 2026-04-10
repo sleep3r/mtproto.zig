@@ -327,7 +327,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     // ── Apply masking monitor (if recovery is already installed) ──
     if (sys.isServiceActive("mtproto-mask-health.timer") or sys.fileExists("/usr/local/bin/mtproto-mask-health.sh")) {
         const recovery = @import("recovery.zig");
-        recovery.execute(ui, allocator, .{}) catch {};
+        recovery.execute(ui, allocator, .{ .quiet = true }) catch {};
     }
 
     // ── Restart proxy ──
@@ -388,10 +388,10 @@ fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
     var quoted_buf: [64]u8 = undefined;
     const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{value}) catch return;
     doc.set("upstream", "type", quoted) catch return;
-    
+
     // Default to AmneziaWG interface when setting up tunnel via this script
     doc.set("upstream.tunnel", "interface", "\"awg0\"") catch return;
-    
+
     doc.save(INSTALL_DIR ++ "/config.toml") catch {};
 }
 

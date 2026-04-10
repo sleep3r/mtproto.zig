@@ -626,7 +626,7 @@ const ConnectionSlot = struct {
     mp_frame_first_decrypted: bool = false,
 
     // Non-blocking proxy handshake state (SOCKS5 / HTTP CONNECT)
-    proxy_handshake_buf: [512]u8 = undefined,
+    proxy_handshake_buf: [1024]u8 = undefined,
     proxy_handshake_pos: u16 = 0,
     proxy_handshake_len: u16 = 0,
     proxy_target_addr: ?net.Address = null,
@@ -1780,38 +1780,25 @@ const EventLoop = struct {
             .proxy_http_connect,
             => {
                 // Proxy handshake phases: flush pending writes.
-                const had_pending = slot.hasUpstreamPending();
-                if (flushUpstreamPending(slot, self.state.allocator)) |_| {} else |err| {
-                    log.debug("[{d}] proxy handshake flush error: {any}", .{ slot.conn_id, err });
-                    self.closeSlot(slot, "proxy handshake flush error");
-                    return;
+                if (slot.hasUpstreamPending()) {
+                    if (flushUpstreamPending(slot, self.state.allocator)) |_| {} else |err| {
+                        log.debug("[{d}] proxy handshake flush error: {any}", .{ slot.conn_id, err });
+                        self.closeSlot(slot, "proxy handshake flush error");
+                        return;
+                    }
                 }
-                if (had_pending and !slot.hasUpstreamPending()) {
+
+                if (!slot.hasUpstreamPending()) {
                     slot.last_activity_ms = std.time.milliTimestamp();
                     // Write complete, switch to reading response
                     switch (slot.phase) {
-                        .proxy_socks5_greeting => {
-                            slot.phase = .proxy_socks5_greeting_resp;
-                            slot.proxy_handshake_pos = 0;
-                            self.modFd(slot.upstream_fd, true, false) catch {};
-                        },
-                        .proxy_socks5_auth => {
-                            slot.phase = .proxy_socks5_auth_resp;
-                            slot.proxy_handshake_pos = 0;
-                            self.modFd(slot.upstream_fd, true, false) catch {};
-                        },
-                        .proxy_socks5_connect => {
-                            slot.phase = .proxy_socks5_connect_resp;
-                            slot.proxy_handshake_pos = 0;
-                            self.modFd(slot.upstream_fd, true, false) catch {};
-                        },
-                        .proxy_http_connect => {
-                            slot.phase = .proxy_http_connect_resp;
-                            slot.proxy_handshake_pos = 0;
-                            self.modFd(slot.upstream_fd, true, false) catch {};
-                        },
+                        .proxy_socks5_greeting => slot.phase = .proxy_socks5_greeting_resp,
+                        .proxy_socks5_auth => slot.phase = .proxy_socks5_auth_resp,
+                        .proxy_socks5_connect => slot.phase = .proxy_socks5_connect_resp,
+                        .proxy_http_connect => slot.phase = .proxy_http_connect_resp,
                         else => {},
                     }
+                    slot.proxy_handshake_pos = 0;
                 }
             },
             .writing_dc_nonce, .relaying, .mask_relaying, .middle_proxy_handshake => {
@@ -2238,7 +2225,10 @@ const EventLoop = struct {
     }
 
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: net.Address, kind: UpstreamKind) !void {
-        const connect_result = try self.state.upstream.connect(addr);
+        const connect_result = if (kind == .mask) blk: {
+            const direct = upstream_mod.Upstream.initDirect();
+            break :blk try direct.connect(addr);
+        } else try self.state.upstream.connect(addr);
         const fd = connect_result.fd;
         errdefer posix.close(fd);
 
@@ -2347,11 +2337,11 @@ const EventLoop = struct {
             return;
         }
 
-        slot.phase = .proxy_socks5_greeting;
+        slot.phase = if (slot.hasUpstreamPending())
+            .proxy_socks5_greeting
+        else
+            .proxy_socks5_greeting_resp;
         slot.proxy_handshake_pos = 0;
-        self.modFd(slot.upstream_fd, false, true) catch {
-            self.closeSlot(slot, "socks5 modfd failed");
-        };
     }
 
     fn onProxySocks5Readable(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2450,11 +2440,11 @@ const EventLoop = struct {
             return;
         }
 
-        slot.phase = .proxy_socks5_auth;
+        slot.phase = if (slot.hasUpstreamPending())
+            .proxy_socks5_auth
+        else
+            .proxy_socks5_auth_resp;
         slot.proxy_handshake_pos = 0;
-        self.modFd(slot.upstream_fd, false, true) catch {
-            self.closeSlot(slot, "socks5 auth modfd failed");
-        };
     }
 
     fn socks5SendConnect(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2475,11 +2465,11 @@ const EventLoop = struct {
             return;
         }
 
-        slot.phase = .proxy_socks5_connect;
+        slot.phase = if (slot.hasUpstreamPending())
+            .proxy_socks5_connect
+        else
+            .proxy_socks5_connect_resp;
         slot.proxy_handshake_pos = 0;
-        self.modFd(slot.upstream_fd, false, true) catch {
-            self.closeSlot(slot, "socks5 connect modfd failed");
-        };
     }
 
     // ─── HTTP CONNECT Proxy Handshake ───────────────────────────
@@ -2510,11 +2500,11 @@ const EventLoop = struct {
             return;
         }
 
-        slot.phase = .proxy_http_connect;
+        slot.phase = if (slot.hasUpstreamPending())
+            .proxy_http_connect
+        else
+            .proxy_http_connect_resp;
         slot.proxy_handshake_pos = 0;
-        self.modFd(slot.upstream_fd, false, true) catch {
-            self.closeSlot(slot, "http connect modfd failed");
-        };
     }
 
     fn onProxyHttpConnectReadable(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2558,12 +2548,6 @@ const EventLoop = struct {
         slot.proxy_target_addr = null;
 
         log.debug("[{d}] proxy handshake complete, proceeding to DC path", .{slot.conn_id});
-
-        // Switch upstream fd to write interest for DC nonce / middle-proxy
-        self.modFd(slot.upstream_fd, true, true) catch {
-            self.closeSlot(slot, "proxy->dc modfd failed");
-            return;
-        };
 
         if (slot.use_middle_proxy) {
             self.middleProxyBegin(slot);
@@ -3450,6 +3434,24 @@ const EventLoop = struct {
             .connecting_upstream => {
                 want_client_in = false;
                 want_upstream_out = true;
+            },
+
+            .proxy_socks5_greeting,
+            .proxy_socks5_auth,
+            .proxy_socks5_connect,
+            .proxy_http_connect,
+            => {
+                want_client_in = false;
+                want_upstream_out = true;
+            },
+
+            .proxy_socks5_greeting_resp,
+            .proxy_socks5_auth_resp,
+            .proxy_socks5_connect_resp,
+            .proxy_http_connect_resp,
+            => {
+                want_client_in = false;
+                want_upstream_in = true;
             },
 
             .writing_dc_nonce => {

@@ -50,7 +50,7 @@ It also ships more evasion techniques than any of the above:
 | **IPv6 hopping** | Auto-rotates IPv6 address from /64 on ban detection via Cloudflare API |
 | **Anti-replay** | Rejects replayed handshakes + detects ТСПУ Revisor active probes |
 | **Multi-user** | Independent per-user secrets |
-| **MiddleProxy** | Telemt-compatible ME transport with auto-refreshed Telegram metadata |
+| **MiddleProxy** | ME transport with auto-refreshed Telegram metadata |
 
 ---
 
@@ -307,8 +307,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[upstream.http] port` | — | HTTP CONNECT proxy port |
 | `[upstream.http] username` | — | HTTP proxy username (empty = no auth) |
 | `[upstream.http] password` | — | HTTP proxy password |
-| `[general] use_middle_proxy` | `false` | Telemt-compatible ME mode for DC1..5 (recommended for promo parity) |
-| `[general] ad_tag` | — | Alias for `[server].tag` (telemt compat) |
+| `[general] use_middle_proxy` | `false` | ME mode for DC1..5 (recommended for promo parity) |
+| `[general] ad_tag` | — | Alias for `[server].tag` |
 | `[server] port` | `443` | TCP listen port |
 | `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel |
 | `[server] backlog` | `4096` | TCP listen queue depth |
@@ -334,8 +334,6 @@ alice = true   # bypass MiddleProxy for this user
 </details>
 
 > Generate a secret: `openssl rand -hex 16`
->
-> Config format is compatible with [telemt](https://github.com/telemt/telemt).
 
 ---
 

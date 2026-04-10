@@ -239,7 +239,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     // ── Install masking monitor ──
     if (!opts.skip_monitor) {
         const recovery = @import("recovery.zig");
-        recovery.execute(ui, allocator, .{}) catch |err| {
+        recovery.execute(ui, allocator, .{ .quiet = true }) catch |err| {
             ui.warn("Failed to install auto-recovery module");
             std.log.debug("Recovery install error: {any}", .{err});
         };

@@ -48,8 +48,6 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 }
 
 pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void {
-    _ = opts;
-
     if (!sys.isRoot()) {
         ui.fail(i18n.get(ui.lang, .error_not_root));
         return;
@@ -58,13 +56,9 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void
     // ── Create drop-in for nginx auto-restart ──
     _ = sys.exec(allocator, &.{ "mkdir", "-p", NGINX_DROPIN_DIR, PROXY_DROPIN_DIR }) catch {};
 
-    sys.writeFile(NGINX_DROPIN_DIR ++ "/restart.conf",
-        "[Service]\nRestart=on-failure\nRestartSec=2s\n"
-    ) catch {};
+    sys.writeFile(NGINX_DROPIN_DIR ++ "/restart.conf", "[Service]\nRestart=on-failure\nRestartSec=2s\n") catch {};
 
-    sys.writeFile(PROXY_DROPIN_DIR ++ "/10-nginx.conf",
-        "[Unit]\nWants=nginx.service\nAfter=nginx.service\n"
-    ) catch {};
+    sys.writeFile(PROXY_DROPIN_DIR ++ "/10-nginx.conf", "[Unit]\nWants=nginx.service\nAfter=nginx.service\n") catch {};
 
     // ── Create health check script ──
     const health_script =
@@ -152,17 +146,13 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void
         };
     }
 
-    sys.writeFile(MASK_HEALTH_SERVICE,
-        "[Unit]\nDescription=MTProto masking endpoint health check\n\n" ++
-        "[Service]\nType=oneshot\nExecStart=" ++ MASK_HEALTH_SCRIPT ++ "\n"
-    ) catch {};
+    sys.writeFile(MASK_HEALTH_SERVICE, "[Unit]\nDescription=MTProto masking endpoint health check\n\n" ++
+        "[Service]\nType=oneshot\nExecStart=" ++ MASK_HEALTH_SCRIPT ++ "\n") catch {};
 
     // ── Create timer unit ──
-    sys.writeFile(MASK_HEALTH_TIMER,
-        "[Unit]\nDescription=Run MTProto masking health check every minute\n\n" ++
+    sys.writeFile(MASK_HEALTH_TIMER, "[Unit]\nDescription=Run MTProto masking health check every minute\n\n" ++
         "[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nRandomizedDelaySec=10s\nPersistent=true\n\n" ++
-        "[Install]\nWantedBy=timers.target\n"
-    ) catch {};
+        "[Install]\nWantedBy=timers.target\n") catch {};
 
     // ── Enable and start ──
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
@@ -174,26 +164,28 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void
     }
     _ = sys.exec(allocator, &.{ "systemctl", "start", "mtproto-mask-health.service" }) catch {};
 
-    // ── Report status ──
-    if (sys.isServiceActive("mtproto-mask-health.timer")) {
-        ui.ok("Masking health timer is active");
-    } else {
-        ui.warn("Masking health timer is not active");
-    }
+    if (!opts.quiet) {
+        // ── Report status ──
+        if (sys.isServiceActive("mtproto-mask-health.timer")) {
+            ui.ok("Masking health timer is active");
+        } else {
+            ui.warn("Masking health timer is not active");
+        }
 
-    if (sys.isServiceActive("nginx")) {
-        ui.ok("Nginx service is active");
-    } else {
-        ui.warn("Nginx service is not active");
-    }
+        if (sys.isServiceActive("nginx")) {
+            ui.ok("Nginx service is active");
+        } else {
+            ui.warn("Nginx service is not active");
+        }
 
-    ui.summaryBox("DPI Auto-Recovery (Health Check) Activated", &.{
-        .{ .label = "Health script:", .value = MASK_HEALTH_SCRIPT },
-        .{ .label = "Timer:", .value = "systemctl status mtproto-mask-health.timer" },
-        .{ .label = "Logs:", .value = "journalctl -t mtproto-mask-health -n 50" },
-        .{ .label = "", .style = .blank },
-        .{ .label = "Auto-restart nginx on failure", .style = .success },
-        .{ .label = "Auto-restart mtproto-proxy if nginx recovery insufficient", .style = .success },
-        .{ .label = "Checks every 60 seconds", .style = .success },
-    });
+        ui.summaryBox("DPI Auto-Recovery (Health Check) Activated", &.{
+            .{ .label = "Health script:", .value = MASK_HEALTH_SCRIPT },
+            .{ .label = "Timer:", .value = "systemctl status mtproto-mask-health.timer" },
+            .{ .label = "Logs:", .value = "journalctl -t mtproto-mask-health -n 50" },
+            .{ .label = "", .style = .blank },
+            .{ .label = "Auto-restart nginx on failure", .style = .success },
+            .{ .label = "Auto-restart mtproto-proxy if nginx recovery insufficient", .style = .success },
+            .{ .label = "Checks every 60 seconds", .style = .success },
+        });
+    }
 }
