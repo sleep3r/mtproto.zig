@@ -91,8 +91,10 @@ sudo mtbuddy --interactive
 <details>
 <summary>Demo: interactive installer</summary>
 <br>
-
-<video src="https://github.com/sleep3r/mtproto.zig/raw/main/assets/buddy.mp4" autoplay loop muted playsinline width="100%"></video>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/assets/buddy.gif" alt="Demo: interactive installer" width="80%">
+</p>
+<br>
 
 </details>
 
@@ -292,8 +294,10 @@ Alternatively, expose the dashboard port via `[monitor]` config section and acce
 <details>
 <summary>Demo: monitoring dashboard</summary>
 <br>
-
-<video src="https://github.com/sleep3r/mtproto.zig/raw/main/assets/dashboard.mp4" autoplay loop muted playsinline width="100%"></video>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/assets/dashboard.gif" alt="Demo: monitoring dashboard" width="80%">
+</p>
+<br>
 
 </details>
 
