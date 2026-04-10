@@ -250,6 +250,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     };
     ui.ok(mode_label);
 
+    setUpstreamType(allocator, "amnezia_wg");
+    ui.stepOk("Set [upstream].type", "amnezia_wg");
+
     // ── Inject public IP (preserve existing custom value) ──
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
     if (doc) |*d| {
@@ -372,6 +375,16 @@ fn setUseMiddleProxy(allocator: std.mem.Allocator, value: []const u8) void {
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
     defer doc.deinit();
     doc.set("general", "use_middle_proxy", value) catch return;
+    doc.save(INSTALL_DIR ++ "/config.toml") catch {};
+}
+
+fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
+    defer doc.deinit();
+
+    var quoted_buf: [64]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{value}) catch return;
+    doc.set("upstream", "type", quoted) catch return;
     doc.save(INSTALL_DIR ++ "/config.toml") catch {};
 }
 

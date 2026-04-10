@@ -375,6 +375,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         try doc.addKv("idle_timeout_sec", "120");
         try doc.addKv("handshake_timeout_sec", "15");
 
+        try doc.addSection("upstream");
+        try doc.addKvStr("type", "direct");
+
         try doc.addSection("censorship");
         try doc.addKvStr("tls_domain", opts.tls_domain);
         try doc.addKv("mask", "true");

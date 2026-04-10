@@ -895,19 +895,34 @@ pub const ProxyState = struct {
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .upstream = upstream_mod.Upstream.initDirect(),
             .tunnel_info = blk: {
-                // Explicit config takes priority
-                if (cfg.tunnel_type != .none) {
-                    const t = tunnel_mod.Tunnel{ .tag = cfg.tunnel_type };
-                    log.info("Tunnel: {s} (from config)", .{t.name()});
-                    break :blk t;
+                const in_non_init_netns = isRunningInNonInitNetns();
+                switch (cfg.upstream_mode) {
+                    .direct => {
+                        if (in_non_init_netns) {
+                            log.warn("upstream.type=direct but proxy runs in non-init netns; egress still follows namespace routing", .{});
+                        }
+                        log.info("Upstream mode: direct (configured)", .{});
+                        break :blk tunnel_mod.Tunnel{ .tag = .none };
+                    },
+                    .amnezia_wg => {
+                        const t = tunnel_mod.Tunnel{ .tag = .amnezia_wg };
+                        if (in_non_init_netns) {
+                            log.info("Upstream mode: {s} (configured)", .{t.name()});
+                        } else {
+                            log.warn("upstream.type=amnezia_wg configured, but proxy is not running in tunnel netns", .{});
+                        }
+                        break :blk t;
+                    },
+                    .auto => {
+                        if (in_non_init_netns) {
+                            const t = tunnel_mod.Tunnel{ .tag = .amnezia_wg };
+                            log.info("Upstream mode: {s} (auto-detected from network namespace)", .{t.name()});
+                            break :blk t;
+                        }
+                        log.info("Upstream mode: direct (auto)", .{});
+                        break :blk tunnel_mod.Tunnel{ .tag = .none };
+                    },
                 }
-                // Auto-detect: if we're in a non-init netns, assume AmneziaWG
-                if (isRunningInNonInitNetns()) {
-                    const t = tunnel_mod.Tunnel{ .tag = .amnezia_wg };
-                    log.info("Tunnel: {s} (auto-detected from network namespace)", .{t.name()});
-                    break :blk t;
-                }
-                break :blk tunnel_mod.Tunnel{ .tag = .none };
             },
         };
     }
@@ -918,6 +933,14 @@ pub const ProxyState = struct {
 
     pub fn run(self: *ProxyState) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+        if (self.config.upstream_mode == .amnezia_wg and !isRunningInNonInitNetns()) {
+            log.err(
+                "upstream.type=amnezia_wg requires running proxy inside tunnel netns (expected via `mtbuddy setup tunnel`)",
+                .{},
+            );
+            return error.UpstreamTunnelNotActive;
+        }
 
         const address = net.Address.initIp6(
             .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
