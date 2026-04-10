@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.5](https://github.com/sleep3r/mtproto.zig/compare/v0.14.4...v0.14.5) (2026-04-10)
+
+
+### Bug Fixes
+
+* **uninstall:** stop and disable proxy-monitor service ([#144](https://github.com/sleep3r/mtproto.zig/issues/144)) ([a84babf](https://github.com/sleep3r/mtproto.zig/commit/a84babf2c5b00331a8d4c8f10b1c02189cd882ac))
+
 ## [0.14.4](https://github.com/sleep3r/mtproto.zig/compare/v0.14.3...v0.14.4) (2026-04-10)
 
 
