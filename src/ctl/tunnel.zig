@@ -302,13 +302,20 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         ui.ok("Nginx masking patched for tunnel netns");
     }
 
-    // ── Firewall: allow namespace → host veth traffic ──
+    // ── Firewall rules for namespace ──
     if (sys.commandExists("ufw")) {
         var ufw_buf: [128]u8 = undefined;
         const ufw_rule = std.fmt.bufPrint(&ufw_buf, "ufw allow from 10.200.200.0/24 to 10.200.200.1 port {s}", .{port}) catch "";
         if (ufw_rule.len > 0) {
             _ = sys.exec(allocator, &.{ "bash", "-c", ufw_rule }) catch {};
             ui.ok("Firewall: allowed namespace traffic to host veth");
+        }
+
+        var route_buf: [128]u8 = undefined;
+        const route_rule = std.fmt.bufPrint(&route_buf, "ufw route allow proto tcp to 10.200.200.2 port {s}", .{port}) catch "";
+        if (route_rule.len > 0) {
+            _ = sys.exec(allocator, &.{ "bash", "-c", route_rule }) catch {};
+            ui.ok("Firewall: allowed external client traffic forwarding");
         }
     }
 
