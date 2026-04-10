@@ -88,6 +88,14 @@ If you prefer to be walked through the setup:
 sudo mtbuddy --interactive
 ```
 
+<details>
+<summary>Demo: interactive installer</summary>
+<br>
+
+https://github.com/sleep3r/mtproto.zig/raw/main/assets/buddy.mp4
+
+</details>
+
 ### What the install does
 
 1. Installs **Zig 0.15.2** (downloads from `ziglang.org` if not present)
@@ -280,6 +288,14 @@ ssh -L 61208:localhost:61208 root@<server_ip>
 ```
 
 Alternatively, expose the dashboard port via `[monitor]` config section and access directly.
+
+<details>
+<summary>Demo: monitoring dashboard</summary>
+<br>
+
+https://github.com/sleep3r/mtproto.zig/raw/main/assets/dashboard.mp4
+
+</details>
 
 ---
 
