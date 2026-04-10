@@ -96,7 +96,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     if (sys.commandExists("certbot")) {
         ui.step("Attempting Let's Encrypt certificate...");
         const r = sys.exec(allocator, &.{
-            "certbot", "certonly", "--nginx", "-d", opts.tls_domain,
+            "certbot",           "certonly",    "--nginx",                           "-d", opts.tls_domain,
             "--non-interactive", "--agree-tos", "--register-unsafely-without-email",
         }) catch null;
         if (r) |result| {
@@ -123,9 +123,9 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         var subj_buf: [128]u8 = undefined;
         const subj = std.fmt.bufPrint(&subj_buf, "/CN={s}", .{opts.tls_domain}) catch "/CN=wb.ru";
         _ = sys.execForward(&.{
-            "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-            "-keyout", CERT_DIR ++ "/key.pem", "-out", CERT_DIR ++ "/cert.pem",
-            "-days", "3650", "-nodes", "-subj", subj,
+            "openssl", "req",                  "-x509", "-newkey",               "ec",    "-pkeyopt", "ec_paramgen_curve:prime256v1",
+            "-keyout", CERT_DIR ++ "/key.pem", "-out",  CERT_DIR ++ "/cert.pem", "-days", "3650",     "-nodes",
+            "-subj",   subj,
         }) catch {};
         ui.ok("Self-signed certificate generated");
     }
@@ -133,9 +133,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     // ── Configure Nginx ──
     ui.step("Configuring Nginx...");
     sys.execSilent(allocator, &.{ "mkdir", "-p", "/var/www/masking" });
-    sys.writeFile("/var/www/masking/index.html",
-        "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n"
-    ) catch {};
+    sys.writeFile("/var/www/masking/index.html", "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n") catch {};
 
     // Build nginx config
     var extra_listen: []const u8 = "";
@@ -224,10 +222,18 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         };
         defer doc.deinit();
 
+        var tls_domain_val_buf: [320]u8 = undefined;
+        const tls_domain_val = std.fmt.bufPrint(&tls_domain_val_buf, "\"{s}\"", .{opts.tls_domain}) catch {
+            ui.warn("Could not update tls_domain in config.toml");
+            return;
+        };
+
+        try doc.set("censorship", "tls_domain", tls_domain_val);
         try doc.set("censorship", "mask_port", NGINX_PORT);
+        try doc.set("censorship", "mask", "true");
         doc.save(config_path) catch {};
         _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path }) catch {};
-        ui.ok("Updated config.toml with mask_port = " ++ NGINX_PORT);
+        ui.ok("Updated config.toml with tls_domain, mask=true, mask_port = " ++ NGINX_PORT);
     }
 
     // ── Install masking monitor ──
