@@ -30,6 +30,9 @@ jobs:
       - name: Cross-compile for Linux x86_64
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 
+      - name: Cross-compile for Linux x86_64_v3+aes
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
+
       - name: Verify binary exists
         run: |
           ls -lh zig-out/bin/mtproto-proxy
