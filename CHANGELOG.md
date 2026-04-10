@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.8](https://github.com/sleep3r/mtproto.zig/compare/v0.14.7...v0.14.8) (2026-04-10)
+
+
+### Bug Fixes
+
+* **ctl:** unify install to use release artifacts instead of building from source ([#156](https://github.com/sleep3r/mtproto.zig/issues/156)) ([f15844b](https://github.com/sleep3r/mtproto.zig/commit/f15844b26f0c6230a84d3d1e75b6e7362f1b4002))
+
 ## [0.14.7](https://github.com/sleep3r/mtproto.zig/compare/v0.14.6...v0.14.7) (2026-04-10)
 
 
