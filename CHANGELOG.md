@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.0](https://github.com/sleep3r/mtproto.zig/compare/v0.13.0...v0.14.0) (2026-04-10)
+
+
+### Features
+
+* **proxy:** add --help and --version flags to mtproto-proxy ([#127](https://github.com/sleep3r/mtproto.zig/issues/127)) ([3026c42](https://github.com/sleep3r/mtproto.zig/commit/3026c428b340f5c15fc849b60eeb4e2dea31aff4))
+
+
+### Bug Fixes
+
+* **bootstrap:** align artifact names with CI output ([#124](https://github.com/sleep3r/mtproto.zig/issues/124)) ([d8ccf51](https://github.com/sleep3r/mtproto.zig/commit/d8ccf5144b6a311519665ef2a1debcc3e9b37f28))
+* **bootstrap:** look up binary by artifact name inside archive ([#126](https://github.com/sleep3r/mtproto.zig/issues/126)) ([b271a5b](https://github.com/sleep3r/mtproto.zig/commit/b271a5b047e879186147ca672d15af9511b5cac9))
+
 ## [0.13.0](https://github.com/sleep3r/mtproto.zig/compare/v0.12.0...v0.13.0) (2026-04-10)
 
 
