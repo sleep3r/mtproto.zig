@@ -253,6 +253,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
 
     setUpstreamType(allocator, "tunnel");
     ui.stepOk("Set [upstream].type", "tunnel");
+    ui.stepOk("Set [upstream.tunnel].interface", "awg0");
 
     // ── Inject public IP (preserve existing custom value) ──
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
