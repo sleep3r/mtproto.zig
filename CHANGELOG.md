@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/sleep3r/mtproto.zig/compare/v0.14.8...v0.15.0) (2026-04-10)
+
+
+### Features
+
+* SOCKS5 & HTTP CONNECT upstream proxies, generic tunnel type ([#158](https://github.com/sleep3r/mtproto.zig/issues/158)) ([ef5bc9f](https://github.com/sleep3r/mtproto.zig/commit/ef5bc9f83bc3ac8db3b09f3919b24fdf0591458f))
+
 ## [0.14.8](https://github.com/sleep3r/mtproto.zig/compare/v0.14.7...v0.14.8) (2026-04-10)
 
 
