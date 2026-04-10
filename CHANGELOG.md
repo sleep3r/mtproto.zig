@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.3](https://github.com/sleep3r/mtproto.zig/compare/v0.14.2...v0.14.3) (2026-04-10)
+
+
+### Bug Fixes
+
+* **mtbuddy:** print all user links and persist masking domain ([#134](https://github.com/sleep3r/mtproto.zig/issues/134)) ([c457e33](https://github.com/sleep3r/mtproto.zig/commit/c457e33a9bbb2d7ef1436288d0d46fa904040f57))
+
 ## [0.14.2](https://github.com/sleep3r/mtproto.zig/compare/v0.14.1...v0.14.2) (2026-04-10)
 
 
