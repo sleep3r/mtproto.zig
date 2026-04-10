@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/sleep3r/mtproto.zig/compare/v0.12.0...v0.13.0) (2026-04-10)
+
+
+### Features
+
+* **ctl:** add --config flag to install command ([#121](https://github.com/sleep3r/mtproto.zig/issues/121)) ([8300412](https://github.com/sleep3r/mtproto.zig/commit/830041273eeb6146f6d69bd97ccd17df66602efa))
+
 ## [0.12.0](https://github.com/sleep3r/mtproto.zig/compare/v0.11.0...v0.12.0) (2026-04-10)
 
 

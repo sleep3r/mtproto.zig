@@ -27,7 +27,7 @@ const uninstall = @import("uninstall.zig");
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
 
-const version = "0.12.0"; // x-release-please-version
+const version = "0.13.0"; // x-release-please-version
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
