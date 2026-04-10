@@ -9,6 +9,7 @@ const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
 const toml = @import("toml.zig");
+const Tunnel = @import("tunnel").Tunnel;
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -411,4 +412,18 @@ fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
 
     try sys.writeFileMode(path, sanitized, 0o600);
     return true;
+}
+
+/// Detect the currently active tunnel by inspecting runtime state.
+/// Returns the `Tunnel.Tag` corresponding to the detected tunnel,
+/// or `.none` if no known tunnel is active.
+pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
+    // Check if AmneziaWG interface is up inside the network namespace
+    const result = sys.exec(allocator, &.{
+        "ip", "netns", "exec", NS_NAME, "awg", "show", "awg0",
+    }) catch return .none;
+    defer result.deinit();
+
+    if (result.exit_code == 0) return .amnezia_wg;
+    return .none;
 }

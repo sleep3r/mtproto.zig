@@ -4,6 +4,7 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
+const Tunnel = @import("tunnel.zig").Tunnel;
 
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
@@ -63,6 +64,9 @@ pub const Config = struct {
     unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
+    /// Active tunnel type: "none" (default, auto-detect), "amnezia_wg".
+    /// Parsed from the [tunnel] section.
+    tunnel_type: Tunnel.Tag = .none,
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -128,6 +132,7 @@ pub const Config = struct {
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
+        var in_tunnel_section = false;
         var server_tag_set = false;
 
         while (lines.next()) |raw_line| {
@@ -143,6 +148,7 @@ pub const Config = struct {
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
+                in_tunnel_section = std.mem.eql(u8, line, "[tunnel]");
                 continue;
             }
 
@@ -247,6 +253,10 @@ pub const Config = struct {
                         cfg.drs = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
+                    }
+                } else if (in_tunnel_section) {
+                    if (std.mem.eql(u8, key, "type")) {
+                        cfg.tunnel_type = Tunnel.fromString(value);
                     }
                 }
             }
@@ -809,4 +819,58 @@ test "parse config - multiple users" {
     const alice_secret = cfg.users.get("alice").?;
     try std.testing.expectEqual(@as(u8, 0x00), alice_secret[0]);
     try std.testing.expectEqual(@as(u8, 0xff), alice_secret[15]);
+}
+
+test "parse config - tunnel type amnezia_wg" {
+    const content =
+        \\[tunnel]
+        \\type = "amnezia_wg"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Tunnel.Tag.amnezia_wg, cfg.tunnel_type);
+}
+
+test "parse config - tunnel type default none" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Tunnel.Tag.none, cfg.tunnel_type);
+}
+
+test "parse config - tunnel type none explicit" {
+    const content =
+        \\[tunnel]
+        \\type = "none"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Tunnel.Tag.none, cfg.tunnel_type);
+}
+
+test "parse config - tunnel type invalid falls back to none" {
+    const content =
+        \\[tunnel]
+        \\type = "banana"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Tunnel.Tag.none, cfg.tunnel_type);
 }

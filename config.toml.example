@@ -66,6 +66,16 @@ port = 443
 # TCP port for the monitoring dashboard.
 # port = 61208
 
+[tunnel]
+# Active tunnel type for outgoing connections.
+# "none"       — direct TCP (default, auto-detected at runtime)
+# "amnezia_wg" — AmneziaWG via Linux network namespace
+#
+# When set to "none", the proxy auto-detects if it's running inside
+# the tg_proxy_ns network namespace and activates AmneziaWG mode
+# automatically. Set explicitly to override auto-detection.
+# type = "none"
+
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
 # Choose a popular, high-traffic domain in the target region.

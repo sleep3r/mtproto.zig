@@ -4,10 +4,19 @@
 //! when creating upstream sockets. Today it only provides a direct TCP
 //! connector, but new variants (SOCKS5, HTTP CONNECT, custom tunnels)
 //! can be added without changing the event loop call sites.
+//!
+//! The `tunnel_info` field carries metadata about the active tunnel
+//! (see `tunnel.zig`). For namespace-based tunnels like AmneziaWG,
+//! the connect variant stays `direct` because the proxy process itself
+//! runs inside the namespace — so all TCP connects implicitly traverse
+//! the tunnel without socket-level wrapping.
 
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const tunnel_mod = @import("../tunnel.zig");
+
+pub const Tunnel = tunnel_mod.Tunnel;
 
 pub const ConnectResult = struct {
     fd: posix.fd_t,

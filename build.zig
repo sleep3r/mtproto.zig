@@ -57,10 +57,19 @@ pub fn build(b: *std.Build) void {
     soak_step.dependOn(&run_soak_cmd.step);
 
     // ── mtbuddy (installer & control panel) ──
+    const tunnel_mod = b.createModule(.{
+        .root_source_file = b.path("src/tunnel.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tunnel", .module = tunnel_mod },
+        },
     });
 
     const ctl_exe = b.addExecutable(.{

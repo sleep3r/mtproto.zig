@@ -16,6 +16,7 @@ const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
 const upstream_mod = @import("upstream.zig");
+const tunnel_mod = @import("../tunnel.zig");
 
 const log = std.log.scoped(.proxy);
 
@@ -825,6 +826,7 @@ pub const ProxyState = struct {
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
     upstream: upstream_mod.Upstream,
+    tunnel_info: tunnel_mod.Tunnel,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -934,6 +936,21 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .upstream = upstream_mod.Upstream.initDirect(),
+            .tunnel_info = blk: {
+                // Explicit config takes priority
+                if (cfg.tunnel_type != .none) {
+                    const t = tunnel_mod.Tunnel{ .tag = cfg.tunnel_type };
+                    log.info("Tunnel: {s} (from config)", .{t.name()});
+                    break :blk t;
+                }
+                // Auto-detect: if we're in a non-init netns, assume AmneziaWG
+                if (isRunningInNonInitNetns()) {
+                    const t = tunnel_mod.Tunnel{ .tag = .amnezia_wg };
+                    log.info("Tunnel: {s} (auto-detected from network namespace)", .{t.name()});
+                    break :blk t;
+                }
+                break :blk tunnel_mod.Tunnel{ .tag = .none };
+            },
         };
     }
 

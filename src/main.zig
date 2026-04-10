@@ -423,4 +423,5 @@ test {
     _ = tls;
     _ = config;
     _ = proxy;
+    _ = @import("tunnel.zig");
 }
