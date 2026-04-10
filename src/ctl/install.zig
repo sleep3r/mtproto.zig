@@ -478,7 +478,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     var secret_from_cfg: []const u8 = "unknown";
     {
         var cfg_doc = toml.TomlDoc.load(allocator, config_path_buf) catch {
-            printSummary(ui, public_ip, opts.port, secret_from_cfg, opts);
+            printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts, config_path_buf);
             return;
         };
         defer cfg_doc.deinit();
@@ -489,38 +489,130 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
             "unknown";
     }
 
-    printSummary(ui, public_ip, opts.port, secret_from_cfg, opts);
+    printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts, config_path_buf);
 }
 
-fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, opts: InstallOpts) void {
-    // Build ee-secret string
-    var ee_buf: [512]u8 = undefined;
+fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) []const u8 {
     var ee_pos: usize = 0;
 
     @memcpy(ee_buf[0..2], "ee");
     ee_pos = 2;
 
     var clean_secret = secret;
-    if (clean_secret.len >= 2 and clean_secret[0] == '"') {
+    if (clean_secret.len >= 2 and clean_secret[0] == '"' and clean_secret[clean_secret.len - 1] == '"') {
         clean_secret = clean_secret[1 .. clean_secret.len - 1];
     }
+
     const sec_len = @min(clean_secret.len, ee_buf.len - ee_pos);
     @memcpy(ee_buf[ee_pos..][0..sec_len], clean_secret[0..sec_len]);
     ee_pos += sec_len;
 
     var domain_hex_buf: [512]u8 = undefined;
-    const domain_hex = sys.domainToHex(opts.tls_domain, &domain_hex_buf);
+    const domain_hex = sys.domainToHex(tls_domain, &domain_hex_buf);
     const dh_len = @min(domain_hex.len, ee_buf.len - ee_pos);
     @memcpy(ee_buf[ee_pos..][0..dh_len], domain_hex[0..dh_len]);
     ee_pos += dh_len;
 
-    const ee_secret = ee_buf[0..ee_pos];
+    return ee_buf[0..ee_pos];
+}
 
-    var link_buf: [512]u8 = undefined;
-    const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
-        public_ip, port, ee_secret,
-    }) catch "error building link";
+fn stripInlineComment(value: []const u8) []const u8 {
+    var in_quotes = false;
+    var comment_pos: ?usize = null;
 
+    for (value, 0..) |c, ci| {
+        if (c == '"') {
+            in_quotes = !in_quotes;
+        } else if (c == '#' and !in_quotes) {
+            comment_pos = ci;
+            break;
+        }
+    }
+
+    if (comment_pos) |cp| {
+        return std.mem.trim(u8, value[0..cp], &[_]u8{ ' ', '\t' });
+    }
+    return std.mem.trim(u8, value, &[_]u8{ ' ', '\t' });
+}
+
+fn isValidSecretHex(secret: []const u8) bool {
+    if (secret.len != 32) return false;
+    for (secret) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
+fn printLinksFromConfig(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    public_ip: []const u8,
+    port: u16,
+    tls_domain: []const u8,
+    config_path: []const u8,
+) bool {
+    var cfg_doc = toml.TomlDoc.load(allocator, config_path) catch return false;
+    defer cfg_doc.deinit();
+
+    var printed_any = false;
+    var in_users_section = false;
+
+    for (cfg_doc.lines.items) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        if (trimmed[0] == '[') {
+            in_users_section = std.mem.eql(u8, trimmed, "[access.users]");
+            continue;
+        }
+        if (!in_users_section) continue;
+
+        const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const user_name = std.mem.trim(u8, trimmed[0..eq_pos], &[_]u8{ ' ', '\t' });
+        if (user_name.len == 0) continue;
+
+        var secret_hex = std.mem.trim(u8, trimmed[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
+        secret_hex = stripInlineComment(secret_hex);
+        if (secret_hex.len >= 2 and secret_hex[0] == '"' and secret_hex[secret_hex.len - 1] == '"') {
+            secret_hex = secret_hex[1 .. secret_hex.len - 1];
+        }
+        if (!isValidSecretHex(secret_hex)) continue;
+
+        var ee_buf: [512]u8 = undefined;
+        const ee_secret = buildEeSecret(secret_hex, tls_domain, &ee_buf);
+
+        var link_buf: [512]u8 = undefined;
+        const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+            public_ip,
+            port,
+            ee_secret,
+        }) catch continue;
+
+        ui.print("  {s}│{s}  {s}{s}:{s} {s}{s}{s}\n", .{
+            tui_mod.Color.gray,
+            tui_mod.Color.reset,
+            tui_mod.Color.dim,
+            user_name,
+            tui_mod.Color.reset,
+            tui_mod.Color.white,
+            link,
+            tui_mod.Color.reset,
+        });
+        printed_any = true;
+    }
+
+    return printed_any;
+}
+
+fn printSummary(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    public_ip: []const u8,
+    port: u16,
+    secret: []const u8,
+    opts: InstallOpts,
+    config_path: []const u8,
+) void {
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "443";
 
@@ -556,6 +648,20 @@ fn printSummary(ui: *Tui, public_ip: []const u8, port: u16, secret: []const u8, 
 
     ui.writeRaw("\n");
     ui.print("  {s}╭─ {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.bold, ui.str(.install_connection_link) });
-    ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, link, tui_mod.Color.reset });
+
+    if (!printLinksFromConfig(ui, allocator, public_ip, port, opts.tls_domain, config_path)) {
+        var ee_buf: [512]u8 = undefined;
+        const ee_secret = buildEeSecret(secret, opts.tls_domain, &ee_buf);
+
+        var link_buf: [512]u8 = undefined;
+        const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+            public_ip,
+            port,
+            ee_secret,
+        }) catch "error building link";
+
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, link, tui_mod.Color.reset });
+    }
+
     ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
 }
