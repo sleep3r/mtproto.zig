@@ -209,10 +209,59 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     };
 }
 
+fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstimate) !void {
+    const est = capacity_estimate orelse {
+        if (builtin.os.tag == .linux and !cfg.unsafe_override_limits) {
+            const log_main = std.log.scoped(.config);
+            log_main.warn(
+                "could not read /proc/meminfo; skipping max_connections safety clamp. " ++
+                    "set a conservative [server].max_connections to avoid OOM.",
+                .{},
+            );
+        }
+        return;
+    };
+
+    if (cfg.max_connections <= est.safe_connections) return;
+
+    const log_main = std.log.scoped(.config);
+    if (cfg.unsafe_override_limits) {
+        log_main.warn(
+            "max_connections={d} is above RAM-safe estimate ({d}); " ++
+                "unsafe_override_limits=true, keeping configured limit.",
+            .{ cfg.max_connections, est.safe_connections },
+        );
+        return;
+    }
+
+    const configured_limit = cfg.max_connections;
+    cfg.max_connections = est.safe_connections;
+
+    if (cfg.max_connections > est.safe_connections) {
+        log_main.err(
+            "failed to enforce RAM safety limit: max_connections={d}, safe={d}; refusing startup",
+            .{ cfg.max_connections, est.safe_connections },
+        );
+        return error.CapacitySafetyEnforcementFailed;
+    }
+
+    log_main.warn(
+        "auto-clamping max_connections from {d} to {d} " ++
+            "(host has {d} MiB RAM, ~{d} KiB/connection). " ++
+            "To disable this safety clamp, set unsafe_override_limits = true in [server].",
+        .{
+            configured_limit,
+            est.safe_connections,
+            est.total_ram_bytes / (1024 * 1024),
+            est.per_conn_bytes / 1024,
+        },
+    );
+}
+
 // ============= Startup Banner =============
 
 /// Print a stylish startup banner with config summary and connection links.
-fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
+fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estimate: ?CapacityEstimate) void {
     const R = "\x1b[0m";
     const B = "\x1b[1m";
     const D = "\x1b[2m";
@@ -261,8 +310,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
     }
     writeRaw(R ++ "\n\n");
 
-    if (detectTotalRamBytes(allocator)) |total_ram| {
-        const est = estimateCapacity(&cfg, total_ram);
+    if (capacity_estimate) |est| {
         writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CAPACITY" ++ R ++ " " ++ D ++ "────────────────────────────────────" ++ R ++ "\n");
         writeStdout("      Host RAM     " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.total_ram_bytes / (1024 * 1024)});
         writeStdout("      Per conn     ~{d} KiB ({s})\n", .{
@@ -381,28 +429,15 @@ pub fn main() !void {
         );
     }
 
-    // Auto-clamp max_connections to RAM-safe estimate (unless explicitly opted out)
-    if (detectTotalRamBytes(allocator)) |total_ram| {
-        const est = estimateCapacity(&cfg, total_ram);
-        if (cfg.max_connections > est.safe_connections and !cfg.unsafe_override_limits) {
-            const log_main = std.log.scoped(.config);
-            log_main.warn(
-                "auto-clamping max_connections from {d} to {d} " ++
-                    "(host has {d} MiB RAM, ~{d} KiB/connection). " ++
-                    "To disable this safety clamp, set unsafe_override_limits = true in [server].",
-                .{
-                    cfg.max_connections,
-                    est.safe_connections,
-                    est.total_ram_bytes / (1024 * 1024),
-                    est.per_conn_bytes / 1024,
-                },
-            );
-            cfg.max_connections = est.safe_connections;
-        }
-    }
+    const capacity_estimate = if (detectTotalRamBytes(allocator)) |total_ram|
+        estimateCapacity(&cfg, total_ram)
+    else
+        null;
+
+    try enforceCapacitySafety(&cfg, capacity_estimate);
 
     // Print the startup banner (includes IP detection)
-    printBanner(allocator, cfg);
+    printBanner(allocator, cfg, capacity_estimate);
 
     // Emit config warnings (e.g. buffer too small, memory concerns)
     cfg.emitWarnings();
@@ -423,4 +458,42 @@ test {
     _ = config;
     _ = proxy;
     _ = @import("tunnel.zig");
+}
+
+test "capacity safety clamp enforces safe cap when override disabled" {
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .max_connections = 4096,
+        .unsafe_override_limits = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    const est = CapacityEstimate{
+        .total_ram_bytes = 2 * 1024 * 1024 * 1024,
+        .per_conn_bytes = 2 * 1024 * 1024,
+        .safe_connections = 585,
+    };
+
+    try enforceCapacitySafety(&cfg, est);
+    try std.testing.expectEqual(@as(u32, 585), cfg.max_connections);
+}
+
+test "capacity safety clamp keeps configured limit when override enabled" {
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .max_connections = 4096,
+        .unsafe_override_limits = true,
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    const est = CapacityEstimate{
+        .total_ram_bytes = 2 * 1024 * 1024 * 1024,
+        .per_conn_bytes = 2 * 1024 * 1024,
+        .safe_connections = 585,
+    };
+
+    try enforceCapacitySafety(&cfg, est);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.max_connections);
 }
