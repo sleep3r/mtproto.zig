@@ -14,6 +14,7 @@ const Tui = tui_mod.Tui;
 
 const INSTALL_DIR = "/opt/mtproto-proxy";
 const AWG_CONF_DIR = "/etc/amnezia/amneziawg";
+const AWG_IFACE_CONF_PATH = "/etc/amnezia/awg0.conf";
 const TUNNEL_SCRIPT = "/usr/local/bin/setup_tunnel.sh";
 const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
 const AWG_CONFIG_PATH = AWG_CONF_DIR ++ "/awg0.conf";
@@ -98,9 +99,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
 
     // ── Copy AWG config ──
     ui.step("Installing AmneziaWG config...");
+    _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/amnezia" }) catch {};
     _ = sys.exec(allocator, &.{ "mkdir", "-p", AWG_CONF_DIR }) catch {};
     _ = sys.execForward(&.{ "cp", opts.awg_conf, AWG_CONFIG_PATH }) catch {};
     _ = sys.exec(allocator, &.{ "chmod", "600", AWG_CONFIG_PATH }) catch {};
+    _ = sys.execForward(&.{ "ln", "-sfn", AWG_CONFIG_PATH, AWG_IFACE_CONF_PATH }) catch {};
 
     const dns_removed = stripAwgDnsLines(allocator, AWG_CONFIG_PATH) catch false;
     if (dns_removed) {
@@ -121,13 +124,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     const tunnel_script = std.fmt.bufPrint(&tunnel_script_buf,
         \\#!/bin/bash
         \\set -euo pipefail
-        \\CONF="{[awg_conf]s}"
         \\IFACE="awg0"
         \\MARK={[mark]d}
         \\TABLE={[table]d}
         \\
-        \\awg-quick down "$CONF" 2>/dev/null || true
-        \\awg-quick up "$CONF"
+        \\awg-quick down "$IFACE" 2>/dev/null || true
+        \\awg-quick up "$IFACE"
         \\
         \\ip -4 route flush table "$TABLE" 2>/dev/null || true
         \\ip -4 route add default dev "$IFACE" table "$TABLE"
@@ -135,7 +137,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\ip -4 rule add fwmark "$MARK" table "$TABLE" priority 1200
         \\
         \\echo "Tunnel routing ready: fwmark=$MARK -> table $TABLE via $IFACE"
-    , .{ .awg_conf = AWG_CONFIG_PATH, .mark = TUNNEL_MARK, .table = TUNNEL_TABLE }) catch "";
+    , .{ .mark = TUNNEL_MARK, .table = TUNNEL_TABLE }) catch "";
 
     if (tunnel_script.len == 0) {
         ui.fail("Failed to render tunnel setup script");
