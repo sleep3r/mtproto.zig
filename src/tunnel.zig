@@ -3,9 +3,9 @@
 //! Defines the `Tunnel` metadata type that describes which tunnel
 //! (if any) is active for outgoing proxy connections. This is a
 //! capability/metadata struct — not a socket connector — because
-//! network-level tunnels (AmneziaWG, WireGuard, ...) work by running
-//! the proxy inside a network namespace rather than wrapping individual
-//! connect() calls. The specific VPN type is an mtbuddy concern.
+//! network-level tunnels (AmneziaWG, WireGuard, ...) are configured
+//! by mtbuddy and selected at runtime via socket policy routing marks.
+//! The specific VPN type is an mtbuddy concern.
 //!
 //! Socket-level proxy types (SOCKS5, HTTP CONNECT) are also tracked
 //! here for logging and status display, even though their actual I/O
@@ -17,9 +17,7 @@ pub const Tunnel = struct {
     pub const Tag = enum {
         /// Direct connection — no tunnel active.
         none,
-        /// VPN tunnel via Linux network namespace. The proxy process
-        /// runs inside `tg_proxy_ns` and all outgoing TCP connects
-        /// traverse the VPN interface (AmneziaWG, WireGuard, etc.).
+        /// VPN tunnel selected via socket policy routing (SO_MARK).
         tunnel,
         /// SOCKS5 proxy — socket-level upstream wrapping.
         socks5,
@@ -43,7 +41,7 @@ pub const Tunnel = struct {
     pub fn requiresNetns(self: *const Tunnel) bool {
         return switch (self.tag) {
             .none => false,
-            .tunnel => true,
+            .tunnel => false,
             .socks5 => false,
             .http_connect => false,
         };
@@ -53,7 +51,7 @@ pub const Tunnel = struct {
     pub fn netnsName(self: *const Tunnel) ?[]const u8 {
         return switch (self.tag) {
             .none => null,
-            .tunnel => "tg_proxy_ns",
+            .tunnel => null,
             .socks5 => null,
             .http_connect => null,
         };
@@ -106,7 +104,7 @@ test "tunnel - requiresNetns" {
     try std.testing.expect(!direct.requiresNetns());
 
     const vpn = Tunnel{ .tag = .tunnel };
-    try std.testing.expect(vpn.requiresNetns());
+    try std.testing.expect(!vpn.requiresNetns());
 
     const socks = Tunnel{ .tag = .socks5 };
     try std.testing.expect(!socks.requiresNetns());
@@ -120,7 +118,7 @@ test "tunnel - netnsName" {
     try std.testing.expect(direct.netnsName() == null);
 
     const vpn = Tunnel{ .tag = .tunnel };
-    try std.testing.expectEqualStrings("tg_proxy_ns", vpn.netnsName().?);
+    try std.testing.expect(vpn.netnsName() == null);
 
     const socks = Tunnel{ .tag = .socks5 };
     try std.testing.expect(socks.netnsName() == null);

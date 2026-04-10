@@ -240,6 +240,14 @@ test "http_connect - parse response no terminator yet" {
     try std.testing.expect(result == null);
 }
 
+test "http_connect - parse response with pipelined payload" {
+    const data = "HTTP/1.1 200 Connection Established\r\nX-Test: 1\r\n\r\n\x01\x02";
+    const result = parseResponse(data);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(u16, 200), result.?.status);
+    try std.testing.expectEqualSlices(u8, "\x01\x02", data[result.?.header_end..]);
+}
+
 test "http_connect - address formatting ipv4" {
     var buf: [64]u8 = undefined;
     const addr = net.Address.initIp4(.{ 10, 0, 0, 1 }, 8080);

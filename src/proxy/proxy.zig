@@ -35,7 +35,7 @@ const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
-const tunnel_mask_gateway_ip = "10.200.200.1";
+const tunnel_socket_mark: u32 = 200;
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
@@ -912,19 +912,10 @@ pub const ProxyState = struct {
 
         var resolved_addr: ?net.Address = null;
         if (cfg.mask) {
-            const mask_target = blk: {
-                if (cfg.mask_port == 443) break :blk cfg.tls_domain;
-
-                if (isRunningInNonInitNetns()) {
-                    log.info(
-                        "mask_port={d} with non-init netns detected, using host veth IP {s} for local masking",
-                        .{ cfg.mask_port, tunnel_mask_gateway_ip },
-                    );
-                    break :blk tunnel_mask_gateway_ip;
-                }
-
-                break :blk "127.0.0.1";
-            };
+            const mask_target = if (cfg.mask_port == 443) cfg.tls_domain else "127.0.0.1";
+            if (cfg.mask_port != 443) {
+                log.info("mask_port={d} configured, using local mask target 127.0.0.1", .{cfg.mask_port});
+            }
             const list = net.getAddressList(allocator, mask_target, cfg.mask_port) catch |err| blk: {
                 log.err("Failed to resolve mask target '{s}': {any}", .{ mask_target, err });
                 break :blk null;
@@ -1009,6 +1000,7 @@ pub const ProxyState = struct {
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .upstream = upblk: {
                 switch (cfg.upstream_mode) {
+                    .tunnel => break :upblk upstream_mod.Upstream.initDirectWithMark(tunnel_socket_mark),
                     .socks5 => {
                         if (cfg.upstream_proxy_host) |host| {
                             if (cfg.upstream_proxy_port > 0) {
@@ -1051,27 +1043,18 @@ pub const ProxyState = struct {
                         log.warn("upstream.type=http but proxy host/port not configured; falling back to direct", .{});
                         break :upblk upstream_mod.Upstream.initDirect();
                     },
-                    else => break :upblk upstream_mod.Upstream.initDirect(),
+                    .direct, .auto => break :upblk upstream_mod.Upstream.initDirect(),
                 }
             },
             .tunnel_info = blk: {
-                const in_non_init_netns = isRunningInNonInitNetns();
                 switch (cfg.upstream_mode) {
                     .direct => {
-                        if (in_non_init_netns) {
-                            log.warn("upstream.type=direct but proxy runs in non-init netns; egress still follows namespace routing", .{});
-                        }
                         log.info("Upstream mode: direct (configured)", .{});
                         break :blk tunnel_mod.Tunnel{ .tag = .none };
                     },
                     .tunnel => {
-                        const t = tunnel_mod.Tunnel{ .tag = .tunnel };
-                        if (in_non_init_netns) {
-                            log.info("Upstream mode: {s} (configured)", .{t.name()});
-                        } else {
-                            log.warn("upstream.type=tunnel configured, but proxy is not running in tunnel netns", .{});
-                        }
-                        break :blk t;
+                        log.info("Upstream mode: tunnel (socket policy routing via SO_MARK={d})", .{tunnel_socket_mark});
+                        break :blk tunnel_mod.Tunnel{ .tag = .tunnel };
                     },
                     .socks5 => {
                         break :blk tunnel_mod.Tunnel{ .tag = .socks5 };
@@ -1080,10 +1063,8 @@ pub const ProxyState = struct {
                         break :blk tunnel_mod.Tunnel{ .tag = .http_connect };
                     },
                     .auto => {
-                        if (in_non_init_netns) {
-                            const t = tunnel_mod.Tunnel{ .tag = .tunnel };
-                            log.info("Upstream mode: {s} (auto-detected from network namespace)", .{t.name()});
-                            break :blk t;
+                        if (isRunningInNonInitNetns()) {
+                            log.warn("auto mode does not infer tunnel from netns; using direct egress", .{});
                         }
                         log.info("Upstream mode: direct (auto)", .{});
                         break :blk tunnel_mod.Tunnel{ .tag = .none };
@@ -1099,14 +1080,6 @@ pub const ProxyState = struct {
 
     pub fn run(self: *ProxyState) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
-
-        if (self.config.upstream_mode == .tunnel and !isRunningInNonInitNetns()) {
-            log.err(
-                "upstream.type=tunnel requires running proxy inside tunnel netns (expected via `mtbuddy setup tunnel`)",
-                .{},
-            );
-            return error.UpstreamTunnelNotActive;
-        }
 
         const address = net.Address.initIp6(
             .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -2417,6 +2390,13 @@ const EventLoop = struct {
                     return;
                 }
 
+                if (have.len > result.consumed) {
+                    self.appendPipelined(slot, have[result.consumed..]) catch {
+                        self.closeSlot(slot, "socks5 pipelined append failed");
+                        return;
+                    };
+                }
+
                 // SOCKS5 handshake complete — proceed to DC path
                 self.proxyHandshakeComplete(slot);
             },
@@ -2536,6 +2516,13 @@ const EventLoop = struct {
             log.debug("[{d}] HTTP CONNECT failed: status={d}", .{ slot.conn_id, result.status });
             self.closeSlot(slot, "http connect rejected");
             return;
+        }
+
+        if (have.len > result.header_end) {
+            self.appendPipelined(slot, have[result.header_end..]) catch {
+                self.closeSlot(slot, "http connect pipelined append failed");
+                return;
+            };
         }
 
         // HTTP CONNECT handshake complete — proceed to DC path
@@ -2947,11 +2934,9 @@ const EventLoop = struct {
                 var ts_arr: [4]u8 = undefined;
                 std.mem.writeInt(u32, &ts_arr, slot.mp_timestamp, .little);
 
-                var peer_addr: net.Address = undefined;
-                var peer_len: posix.socklen_t = @sizeOf(net.Address);
-                posix.getpeername(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
+                const tg_addr = slot.current_upstream_addr orelse {
                     self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp getpeername failed");
+                    self.closeSlot(slot, "mp missing logical upstream addr");
                     return;
                 };
 
@@ -2971,39 +2956,45 @@ const EventLoop = struct {
                 var tg_ip_v6_opt: ?[16]u8 = null;
                 var my_ip_v6_opt: ?[16]u8 = null;
 
-                if (peer_addr.any.family == posix.AF.INET and local_addr.any.family == posix.AF.INET) {
+                const local_port = switch (local_addr.any.family) {
+                    posix.AF.INET => std.mem.bigToNative(u16, local_addr.in.sa.port),
+                    posix.AF.INET6 => std.mem.bigToNative(u16, local_addr.in6.sa.port),
+                    else => {
+                        self.state.middle_proxy_lock.unlockShared();
+                        self.closeSlot(slot, "mp unsupported local addr family");
+                        return;
+                    },
+                };
+                std.mem.writeInt(u16, &my_port, local_port, .little);
+
+                if (tg_addr.any.family == posix.AF.INET) {
                     var tg_ip_v4: [4]u8 = undefined;
-                    @memcpy(&tg_ip_v4, std.mem.asBytes(&peer_addr.in.sa.addr));
+                    @memcpy(&tg_ip_v4, std.mem.asBytes(&tg_addr.in.sa.addr));
                     std.mem.reverse(u8, &tg_ip_v4);
                     tg_ip_v4_opt = tg_ip_v4;
 
-                    var my_ip_v4: [4]u8 = undefined;
-                    @memcpy(&my_ip_v4, std.mem.asBytes(&local_addr.in.sa.addr));
-                    std.mem.reverse(u8, &my_ip_v4);
-
                     if (self.state.middle_proxy_nat_ip4) |nat_ip| {
-                        my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
-                        middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
+                        const my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
+                        my_ip_v4_opt = my_ip_v4;
+                        middle_local_addr = net.Address.initIp4(nat_ip, local_port);
                     }
 
-                    my_ip_v4_opt = my_ip_v4;
-
-                    std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in.sa.port), .little);
-                    std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in.sa.port), .little);
-                } else if (peer_addr.any.family == posix.AF.INET6 and local_addr.any.family == posix.AF.INET6) {
+                    std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, tg_addr.in.sa.port), .little);
+                } else if (tg_addr.any.family == posix.AF.INET6) {
                     var tg_ip_v6: [16]u8 = undefined;
-                    @memcpy(&tg_ip_v6, &peer_addr.in6.sa.addr);
+                    @memcpy(&tg_ip_v6, &tg_addr.in6.sa.addr);
                     tg_ip_v6_opt = tg_ip_v6;
 
-                    var my_ip_v6: [16]u8 = undefined;
-                    @memcpy(&my_ip_v6, &local_addr.in6.sa.addr);
-                    my_ip_v6_opt = my_ip_v6;
+                    if (local_addr.any.family == posix.AF.INET6) {
+                        var my_ip_v6: [16]u8 = undefined;
+                        @memcpy(&my_ip_v6, &local_addr.in6.sa.addr);
+                        my_ip_v6_opt = my_ip_v6;
+                    }
 
-                    std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in6.sa.port), .little);
-                    std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in6.sa.port), .little);
+                    std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, tg_addr.in6.sa.port), .little);
                 } else {
                     self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp unsupported addr family");
+                    self.closeSlot(slot, "mp unsupported upstream addr family");
                     return;
                 }
 

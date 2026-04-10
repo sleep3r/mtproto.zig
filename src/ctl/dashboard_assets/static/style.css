@@ -626,6 +626,146 @@ body::after {
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
+
+.routing-list {
+  border-top: 1px solid rgba(247,164,29,0.05);
+}
+
+.routing-controls {
+  padding: 10px 24px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid rgba(247,164,29,0.05);
+}
+
+.routing-upstream-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.routing-extra-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.routing-upstream-ctl label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+}
+
+.routing-extra-ctl label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+}
+
+.routing-host {
+  width: 160px;
+}
+
+.routing-port {
+  width: 92px;
+}
+
+.routing-user,
+.routing-pass {
+  width: 140px;
+}
+
+.routing-action-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  min-height: 16px;
+  margin-left: auto;
+}
+
+.routing-action-note.error {
+  color: var(--red);
+}
+
+.routing-action-note.ok {
+  color: var(--green);
+}
+
+.routing-row {
+  display: grid;
+  grid-template-columns: minmax(80px, 110px) 80px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 24px;
+  border-bottom: 1px solid rgba(247,164,29,0.04);
+}
+
+.routing-row:last-child {
+  border-bottom: 0;
+}
+
+.routing-iface {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.routing-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--zig);
+  border: 1px solid rgba(247,164,29,0.25);
+  border-radius: 999px;
+  padding: 2px 6px;
+}
+
+.routing-state {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.9px;
+  font-weight: 700;
+}
+
+.routing-state.on {
+  color: var(--green);
+}
+
+.routing-state.mid {
+  color: var(--amber);
+}
+
+.routing-state.off {
+  color: var(--red);
+}
+
+.routing-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.routing-xfer {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+  white-space: nowrap;
+}
+
+.routing-empty {
+  padding: 12px 24px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .app.stale .tunnel-card { opacity: 0.62; }
 
 /* ── Tooltips ── */
@@ -764,4 +904,32 @@ body::after {
   .user-delete { opacity: 1; }
   .form-row { flex-direction: column; }
   .tunnel-details { grid-template-columns: repeat(2, 1fr); }
+  .routing-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+    padding: 10px 14px;
+  }
+  .routing-meta { white-space: normal; }
+  .routing-controls {
+    padding: 10px 14px;
+    align-items: stretch;
+  }
+  .routing-upstream-ctl {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .routing-extra-ctl {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .routing-host,
+  .routing-port,
+  .routing-user,
+  .routing-pass {
+    width: 100%;
+  }
+  .routing-action-note {
+    margin-left: 0;
+    width: 100%;
+  }
 }

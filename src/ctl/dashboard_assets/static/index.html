@@ -147,31 +147,63 @@
     <div class="users-list" id="usersList"></div>
   </div>
 
-  <!-- AmneziaWG Tunnel -->
-  <div class="tunnel-card" id="tunnelCard" style="display:none">
+  <!-- Routing & upstream -->
+  <div class="tunnel-card" id="routingCard" style="display:none">
     <div class="tunnel-header">
-      <div class="tunnel-icon">🛡</div>
-      <div class="tunnel-title">AmneziaWG Tunnel</div>
-      <div class="badge" id="awgBadge"><div class="pulse-dot"></div><span id="awgStatus">—</span></div>
+      <div class="tunnel-icon">🧭</div>
+      <div class="tunnel-title">Routing &amp; Upstream</div>
+      <div class="badge" id="routingBadge"><div class="pulse-dot"></div><span id="routingStatus">—</span></div>
+    </div>
+    <div class="routing-controls">
+      <button class="ui-btn" id="routingMiddleBtn" type="button">MiddleProxy: —</button>
+      <div class="routing-upstream-ctl">
+        <label for="routingUpstreamSelect">Upstream</label>
+        <select id="routingUpstreamSelect" class="ui-select">
+          <option value="auto">auto</option>
+          <option value="direct">direct</option>
+          <option value="tunnel">tunnel</option>
+          <option value="socks5">socks5</option>
+          <option value="http">http</option>
+        </select>
+        <button class="ui-btn active" id="routingUpstreamApply" type="button">Apply</button>
+      </div>
+      <div class="routing-extra-ctl" id="routingTunnelCtl" style="display:none">
+        <label for="routingTunnelIfaceSelect">Tunnel iface</label>
+        <select id="routingTunnelIfaceSelect" class="ui-select"></select>
+        <button class="ui-btn" id="routingTunnelIfaceApply" type="button">Set iface</button>
+      </div>
+      <div class="routing-extra-ctl" id="routingProxyCtl" style="display:none">
+        <label id="routingProxyHostLabel" for="routingProxyHost">Proxy host</label>
+        <input id="routingProxyHost" class="ui-input routing-host" type="text" placeholder="127.0.0.1" autocomplete="off">
+        <label for="routingProxyPort">Port</label>
+        <input id="routingProxyPort" class="ui-input routing-port" type="number" min="1" max="65535" placeholder="1080" autocomplete="off">
+        <label for="routingProxyUser">User</label>
+        <input id="routingProxyUser" class="ui-input routing-user" type="text" placeholder="optional" autocomplete="off">
+        <label for="routingProxyPass">Pass</label>
+        <input id="routingProxyPass" class="ui-input routing-pass" type="password" placeholder="optional" autocomplete="off">
+        <button class="ui-btn" id="routingProxyApply" type="button">Set target</button>
+      </div>
+      <div class="routing-action-note" id="routingActionNote"></div>
     </div>
     <div class="tunnel-details">
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Endpoint</span>
-        <span class="tunnel-val" id="awgEndpoint">—</span>
+        <span class="tunnel-lbl">MiddleProxy</span>
+        <span class="tunnel-val" id="routingMiddle">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Handshake</span>
-        <span class="tunnel-val" id="awgHandshake">—</span>
+        <span class="tunnel-lbl">Upstream</span>
+        <span class="tunnel-val" id="routingUpstream">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">↓ Received</span>
-        <span class="tunnel-val" id="awgRx">—</span>
+        <span class="tunnel-lbl">Target</span>
+        <span class="tunnel-val" id="routingTarget">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">↑ Sent</span>
-        <span class="tunnel-val" id="awgTx">—</span>
+        <span class="tunnel-lbl">Policy</span>
+        <span class="tunnel-val" id="routingPolicy">—</span>
       </div>
     </div>
+    <div class="routing-list" id="routingTunnelsList"></div>
   </div>
 
   <!-- Masking health -->

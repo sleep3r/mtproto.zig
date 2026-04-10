@@ -46,7 +46,7 @@ It also ships more evasion techniques than any of the above:
 | **TCPMSS=88** | Fragments ClientHello across 6 TCP packets, breaking DPI reassembly |
 | **nfqws TCP desync** | Sends fake packets + TTL-limited splits to confuse stateful DPI |
 | **Split-TLS** | 1-byte Application records to defeat passive signatures |
-| **VPN tunnel** | Routes through WireGuard/AmneziaWG in an isolated network namespace when DCs are blocked |
+| **VPN tunnel** | Routes through WireGuard/AmneziaWG using explicit socket policy routing (SO_MARK) when DCs are blocked |
 | **IPv6 hopping** | Auto-rotates IPv6 address from /64 on ban detection via Cloudflare API |
 | **Anti-replay** | Rejects replayed handshakes + detects ТСПУ Revisor active probes |
 | **Multi-user** | Independent per-user secrets |
@@ -155,7 +155,7 @@ sudo mtbuddy setup recovery
 sudo mtbuddy setup dashboard
 
 # VPN tunnel (for servers where Telegram DCs are blocked)
-sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
+sudo mtbuddy setup tunnel /path/to/awg0.conf
 
 # IPv6 hopping
 sudo mtbuddy ipv6-hop --check
@@ -188,40 +188,38 @@ The proxy supports multiple ways to route outgoing connections to Telegram DC se
 
 | `[upstream].type` | How it works | When to use |
 |---|---|---|
-| `auto` (default) | Auto-detect: if running in a network namespace → tunnel, otherwise → direct | Most deployments |
+| `auto` (default) | Direct egress without tunnel policy marks | Most deployments |
 | `direct` | Connect to Telegram DCs directly from the host | DCs reachable from the server |
-| `tunnel` | Direct connect inside an isolated network namespace with a VPN tunnel | DCs blocked by the ISP |
+| `tunnel` | Direct connect with `SO_MARK=200` policy-routed via VPN interface | DCs blocked by the ISP |
 | `socks5` | Route through an external SOCKS5 proxy with optional auth | Existing proxy infrastructure |
 | `http` | Route through an HTTP CONNECT proxy with optional auth | Corporate proxy environments |
 
 ### VPN tunnel
 
-If your VPS is in a region where Telegram DCs are blocked at the network level, you can route proxy traffic through a VPN tunnel in an isolated network namespace. The host is completely unaffected — only the proxy process runs inside the namespace.
+If your VPS is in a region where Telegram DCs are blocked at the network level, you can route proxy traffic through a VPN tunnel with explicit socket policy routing. The proxy runs in the host namespace; only sockets marked by the proxy (`SO_MARK=200`) are routed through the tunnel table.
 
 Currently supported VPN types:
 - **AmneziaWG** — DPI-resistant WireGuard fork (recommended for Russia/Iran)
 - **WireGuard** — standard WireGuard (planned)
 
 ```
-Client → VPS:443 → [DNAT] → tg_proxy_ns:443
-                                  │
-                             mtproto-proxy
-                                  │
-                             awg0 (tunnel)
-                                  │
-                          Telegram DC servers
+Client → mtproto-proxy (host namespace)
+                     │
+                SO_MARK=200
+                     │
+        Linux policy routing table 200
+                     │
+                 awg0 (tunnel)
+                     │
+             Telegram DC servers
 ```
 
 ```bash
-sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
+sudo mtbuddy setup tunnel /path/to/awg0.conf
 ```
 
-**Modes:**
-- `direct` — sets `use_middle_proxy=false` (default, lower latency)
-- `middleproxy` — sets `use_middle_proxy=true` (required for promo tags)
-- `preserve` — keeps current config unchanged
-
-After setup, `mtbuddy` validates connectivity to all 5 Telegram DCs through the tunnel and prints the link.
+`mtbuddy` keeps `[general].use_middle_proxy` unchanged and only configures transport (`[upstream].type = "tunnel"`).
+After setup, it validates policy routes (`mark 200`) to Telegram DC ranges and prints operational commands.
 
 ### SOCKS5 proxy
 
@@ -298,7 +296,7 @@ alice = true   # bypass MiddleProxy for this user
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `[upstream].type` | `auto` | Egress mode: `auto` (detect netns), `direct`, `tunnel` (VPN via netns), `socks5`, or `http` |
+| `[upstream].type` | `auto` | Egress mode: `auto` (direct), `direct`, `tunnel` (VPN via socket policy routing), `socks5`, or `http` |
 | `[upstream.socks5] host` | — | SOCKS5 proxy address |
 | `[upstream.socks5] port` | — | SOCKS5 proxy port |
 | `[upstream.socks5] username` | — | SOCKS5 username (empty = no auth) |
