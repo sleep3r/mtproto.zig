@@ -11,7 +11,6 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
-[![LOC](https://img.shields.io/badge/lines_of_code-5.5k-informational)](src/)
 
 </div>
 
