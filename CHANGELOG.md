@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/sleep3r/mtproto.zig/compare/v0.14.0...v0.14.1) (2026-04-10)
+
+
+### Bug Fixes
+
+* **bootstrap:** download mtbuddy binary instead of mtproto-proxy ([#128](https://github.com/sleep3r/mtproto.zig/issues/128)) ([f0d0658](https://github.com/sleep3r/mtproto.zig/commit/f0d065821cbcac6d28851a58da378949ba979e20))
+
 ## [0.14.0](https://github.com/sleep3r/mtproto.zig/compare/v0.13.0...v0.14.0) (2026-04-10)
 
 
