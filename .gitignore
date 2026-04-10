@@ -15,3 +15,5 @@ __pycache__
 *.logtest_poll.zig
 fix_tui.py
 test_list.zig
+bundle.sh
+codebase.txt

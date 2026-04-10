@@ -4,62 +4,69 @@ description: Build, deploy, update, and validate workflow for mtproto.zig.
 
 # Deployment Workflow
 
-## Build and Verify Locally
+## Available Makefile Targets
 
-```bash
-make release
-make test
+```
+make help     — show all targets
+make build    — cross-compile proxy + mtbuddy for Linux x86_64
+make fmt      — format all Zig source files
+make test     — run unit tests
+make deploy   — build and push proxy + mtbuddy to server
 ```
 
-Or explicit Linux build:
+Default server: `mtproto.sleep3r.ru` (override with `SERVER=<host>`).
+
+## Local Dev Iteration
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+make build          # cross-compile both binaries
+make fmt            # format source
+make test           # run unit tests
 ```
 
 ## Deploy to Server
 
 ```bash
-make deploy SERVER=<SERVER_IP>
+make deploy                            # uses default SERVER
+make deploy SERVER=mtproto.sleep3r.ru  # explicit
 ```
 
-Typical flow:
+`deploy` depends on `build`, so it always cross-compiles first. Flow:
 
-1. Cross-compile Linux binary.
-2. Upload binary and deploy assets.
-3. Restart `mtproto-proxy` service.
-4. Verify service status.
+1. `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3`
+2. `systemctl stop mtproto-proxy`
+3. Upload `mtproto-proxy` → `/opt/mtproto-proxy/`
+4. Upload `mtbuddy` → `/usr/local/bin/mtbuddy`
+5. Upload `config.toml` (if present locally)
+6. Upload `.env` → `env.sh` (if present locally)
+7. `chown` + `systemctl start mtproto-proxy`
 
-## Update Existing Server (Release Artifact Path)
-
-Recommended for operators:
-
-```bash
-make update-server SERVER=<SERVER_IP>
-make update-server SERVER=<SERVER_IP> VERSION=vX.Y.Z
-```
+## Update via mtbuddy (Release Artifact Path)
 
 Directly on host:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash
+```
+
+Or if mtbuddy is already installed:
+
+```bash
+mtbuddy update
+mtbuddy update --version vX.Y.Z
 ```
 
 ## Post-Deploy Validation
 
 ```bash
-ssh root@<SERVER_IP> 'systemctl status mtproto-proxy --no-pager'
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "10 minutes ago" --no-pager'
-```
-
-Quick capacity sanity:
-
-```bash
-ssh root@<SERVER_IP> 'python3 /root/benchmarks/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 500,1000 --open-budget-sec 10 --hold-seconds 0.6 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+ssh root@<SERVER> 'systemctl status mtproto-proxy --no-pager'
+ssh root@<SERVER> 'journalctl -u mtproto-proxy --since "10 minutes ago" --no-pager'
 ```
 
 ## Operational Notes
 
-- Runtime target is Linux.
+- Runtime target is Linux x86_64.
+- Both `mtproto-proxy` and `mtbuddy` are cross-compiled and deployed together.
 - Keep config secrets in deployed config file, not in repository defaults.
-- If benchmark modes change, keep `test/README.md` and main `README.md` synchronized.
+- The `mtbuddy` binary lives at `/usr/local/bin/mtbuddy` on the server.
+- The proxy binary and config live at `/opt/mtproto-proxy/`.

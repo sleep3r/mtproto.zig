@@ -7,6 +7,17 @@ description: Current architecture and design rules for the Linux epoll-based Zig
 
 This project is a production MTProto proxy in Zig with FakeTLS fronting, active anti-replay protection, and Linux-first deployment.
 
+## Build Artifacts
+
+The project produces two binaries via `build.zig`:
+
+| Binary | Source | Install Path | Purpose |
+|--------|--------|-------------|---------|
+| `mtproto-proxy` | `src/main.zig` | `/opt/mtproto-proxy/mtproto-proxy` | The proxy server |
+| `mtbuddy` | `src/ctl/main.zig` | `/usr/local/bin/mtbuddy` | Installer & control panel (TUI) |
+
+Cross-compile for production: `make build` (or `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3`).
+
 ## Runtime Model
 
 - **Single-threaded network core**: one Linux `epoll` event loop handles socket I/O.
@@ -58,6 +69,37 @@ Primary file: `src/proxy/proxy.zig`.
 
 - Write path uses chained blocks + `writev` flush.
 - Queue head uses index progression (not repeated `orderedRemove(0)` hot-path shifts).
+
+## mtbuddy (Installer & Control Panel)
+
+Source tree: `src/ctl/`. Interactive TUI with raw terminal mode, arrow-key navigation, and Unicode box-drawing.
+
+Key modules:
+
+| Module | Purpose |
+|--------|---------|
+| `main.zig` | CLI arg dispatch + interactive menu |
+| `tui.zig` | Terminal UI engine (raw mode, rendering) |
+| `install.zig` | Fresh proxy installation |
+| `update.zig` | Self-update from GitHub releases |
+| `tunnel.zig` | AmneziaWG tunnel + network namespace setup |
+| `dashboard.zig` | Monitoring dashboard installer |
+| `recovery.zig` | Service recovery & masking health |
+| `uninstall.zig` | Clean uninstall |
+| `i18n.zig` | English / Russian localization |
+
+## Deployment Layout (Server)
+
+```
+/opt/mtproto-proxy/
+├── mtproto-proxy          # proxy binary
+├── config.toml            # runtime configuration
+├── env.sh                 # optional env vars (TAG, etc.)
+└── monitor/               # dashboard assets (optional)
+
+/usr/local/bin/mtbuddy     # installer/control binary
+/etc/systemd/system/mtproto-proxy.service
+```
 
 ## Platform Scope
 

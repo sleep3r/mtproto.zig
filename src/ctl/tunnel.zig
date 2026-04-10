@@ -301,6 +301,16 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         ui.ok("Nginx masking patched for tunnel netns");
     }
 
+    // ── Firewall: allow namespace → host veth traffic ──
+    if (sys.commandExists("ufw")) {
+        var ufw_buf: [128]u8 = undefined;
+        const ufw_rule = std.fmt.bufPrint(&ufw_buf, "ufw allow from 10.200.200.0/24 to 10.200.200.1 port {s}", .{port}) catch "";
+        if (ufw_rule.len > 0) {
+            _ = sys.exec(allocator, &.{ "bash", "-c", ufw_rule }) catch {};
+            ui.ok("Firewall: allowed namespace traffic to host veth");
+        }
+    }
+
     // ── Install masking monitor ──
     if (sys.fileExists(INSTALL_DIR ++ "/setup_mask_monitor.sh")) {
         _ = sys.execForward(&.{ "bash", INSTALL_DIR ++ "/setup_mask_monitor.sh", "--quiet" }) catch {};
