@@ -1113,9 +1113,13 @@ pub const ProxyState = struct {
 
         setNonBlocking(server.stream.handle);
 
-        if (self.config.datacenter_override == null) {
+        if (self.config.use_middle_proxy and self.config.datacenter_override == null) {
             self.refreshMiddleProxyInfo() catch |err| {
-                log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
+                if (isMiddleProxyRefreshNetworkError(err)) {
+                    log.info("Initial middle-proxy refresh unavailable ({s}), using bundled defaults", .{@errorName(err)});
+                } else {
+                    log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
+                }
             };
 
             if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
@@ -1188,9 +1192,25 @@ pub const ProxyState = struct {
         while (true) {
             std.Thread.sleep(middle_proxy_update_period_ns);
             self.refreshMiddleProxyInfo() catch |err| {
-                log.warn("Middle-proxy refresh failed: {any}", .{err});
+                if (isMiddleProxyRefreshNetworkError(err)) {
+                    log.info("Middle-proxy refresh unavailable ({s}), keeping current cache", .{@errorName(err)});
+                } else {
+                    log.warn("Middle-proxy refresh failed: {any}", .{err});
+                }
             };
         }
+    }
+
+    fn isMiddleProxyRefreshNetworkError(err: anyerror) bool {
+        const name = @errorName(err);
+        return std.mem.eql(u8, name, "UnexpectedConnectFailure") or
+            std.mem.eql(u8, name, "ConnectionRefused") or
+            std.mem.eql(u8, name, "ConnectionResetByPeer") or
+            std.mem.eql(u8, name, "NetworkUnreachable") or
+            std.mem.eql(u8, name, "HostUnreachable") or
+            std.mem.eql(u8, name, "ConnectionTimedOut") or
+            std.mem.eql(u8, name, "TemporaryNameServerFailure") or
+            std.mem.eql(u8, name, "NameServerFailure");
     }
 
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
