@@ -47,7 +47,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     try execute(ui, allocator, .{});
 }
 
-fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void {
+pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void {
     _ = opts;
 
     if (!sys.isRoot()) {

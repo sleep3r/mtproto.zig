@@ -279,6 +279,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     // ── Download + validate proxy binary ──
     var artifact = release.Artifact{};
+    defer release.cleanup(allocator, &artifact);
     {
         var sp = ui.spinner(ui.str(.install_downloading));
         sp.start();
@@ -298,8 +299,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
             artifact.binaryPath(),
             INSTALL_DIR ++ "/mtproto-proxy",
         }) catch {};
-        release.downloadServiceFile(allocator, tag.slice());
-        release.cleanup(allocator, &artifact);
+        release.writeServiceFile();
     }
     ui.ok(ui.str(.install_binary_ok));
 

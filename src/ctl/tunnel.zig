@@ -322,9 +322,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         }
     }
 
-    // ── Install masking monitor ──
-    if (sys.fileExists(INSTALL_DIR ++ "/setup_mask_monitor.sh")) {
-        _ = sys.execForward(&.{ "bash", INSTALL_DIR ++ "/setup_mask_monitor.sh", "--quiet" }) catch {};
+    // ── Apply masking monitor (if recovery is already installed) ──
+    if (sys.isServiceActive("mtproto-mask-health.timer") or sys.fileExists("/usr/local/bin/mtproto-mask-health.sh")) {
+        const recovery = @import("recovery.zig");
+        recovery.execute(ui, allocator, .{}) catch {};
     }
 
     // ── Restart proxy ──

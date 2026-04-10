@@ -16,7 +16,6 @@ pub const SERVICE_NAME = "mtproto-proxy";
 pub const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
 
 const RELEASES_API = "https://api.github.com/repos/" ++ REPO_OWNER ++ "/" ++ REPO_NAME ++ "/releases/latest";
-const RAW_BASE = "https://raw.githubusercontent.com/" ++ REPO_OWNER ++ "/" ++ REPO_NAME ++ "/";
 
 // ── Result types ────────────────────────────────────────────────
 
@@ -67,7 +66,7 @@ pub fn resolveTag(
     tag: *Tag,
 ) bool {
     if (version) |v| {
-        if (v.len == 0) return resolveLatest(allocator, tag);
+        if (v.len == 0 or std.mem.eql(u8, v, "latest")) return resolveLatest(allocator, tag);
         if (v[0] != 'v') {
             tag.buf[0] = 'v';
             const n = @min(v.len, tag.buf.len - 1);
@@ -155,6 +154,9 @@ pub fn downloadProxyArtifact(
 
         if (!sys.fileExists(bin_path)) continue;
 
+        // Guarantee executable bit (paranoid umask can strip +x from tar)
+        _ = sys.exec(allocator, &.{ "chmod", "+x", bin_path }) catch {};
+
         // Validate — run with a nonexistent config to check for SIGILL (exit 132)
         const check = sys.exec(allocator, &.{
             bin_path,
@@ -209,15 +211,46 @@ pub fn downloadBuddyArtifact(
     return bin_path;
 }
 
-/// Download the systemd service file from the repository at the given tag.
-pub fn downloadServiceFile(allocator: std.mem.Allocator, tag: []const u8) void {
-    var url_buf: [512]u8 = undefined;
-    const url = std.fmt.bufPrint(
-        &url_buf,
-        "{s}{s}/deploy/mtproto-proxy.service",
-        .{ RAW_BASE, tag },
-    ) catch return;
-    _ = sys.exec(allocator, &.{ "curl", "-fsSL", url, "-o", SERVICE_FILE }) catch {};
+/// Write the systemd service file from embedded content.
+/// Avoids network dependency on raw.githubusercontent.com which may be
+/// throttled or blocked on some hosting providers.
+pub fn writeServiceFile() void {
+    const content =
+        \\[Unit]
+        \\Description=MTProto Proxy (Zig)
+        \\Documentation=https://github.com/sleep3r/mtproto.zig
+        \\After=network-online.target
+        \\Wants=network-online.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\User=mtproto
+        \\Group=mtproto
+        \\WorkingDirectory=/opt/mtproto-proxy
+        \\ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+        \\Restart=always
+        \\RestartSec=3
+        \\
+        \\# Security hardening
+        \\NoNewPrivileges=yes
+        \\ProtectSystem=strict
+        \\ProtectHome=yes
+        \\PrivateTmp=yes
+        \\ReadOnlyPaths=/opt/mtproto-proxy
+        \\
+        \\# Allow binding to privileged ports (443)
+        \\AmbientCapabilities=CAP_NET_BIND_SERVICE
+        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+        \\
+        \\# Limits
+        \\LimitNOFILE=131582
+        \\TasksMax=65535
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+    ;
+    sys.writeFile(SERVICE_FILE, content) catch {};
 }
 
 /// Remove temporary files created during download.

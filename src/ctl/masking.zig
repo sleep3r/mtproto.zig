@@ -238,9 +238,11 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
 
     // ── Install masking monitor ──
     if (!opts.skip_monitor) {
-        if (sys.fileExists(INSTALL_DIR ++ "/setup_mask_monitor.sh")) {
-            _ = sys.execForward(&.{ "bash", INSTALL_DIR ++ "/setup_mask_monitor.sh", "--quiet" }) catch {};
-        }
+        const recovery = @import("recovery.zig");
+        recovery.execute(ui, allocator, .{}) catch |err| {
+            ui.warn("Failed to install auto-recovery module");
+            std.log.debug("Recovery install error: {any}", .{err});
+        };
     }
 
     // ── Summary ──

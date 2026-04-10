@@ -314,7 +314,7 @@ fn printHelp() void {
 
     // ── Commands ──
     ui.print("  {s}Commands:{s}\n\n", .{ Color.accent, Color.reset });
-    printCmd(&ui, "install", "Install mtproto-proxy from source");
+    printCmd(&ui, "install", "Install mtproto-proxy from release");
     printCmd(&ui, "uninstall", "Uninstall mtproto-proxy completely");
     printCmd(&ui, "update", "Update to latest GitHub release");
     printCmd(&ui, "setup masking", "Setup local Nginx DPI masking");
@@ -341,7 +341,7 @@ fn printHelp() void {
     printOpt(&ui, "--no-tcpmss", "Disable TCPMSS=88 clamping");
     printOpt(&ui, "--no-dpi", "Disable all DPI bypass modules");
     printOpt(&ui, "--ipv6-hop", "Enable IPv6 auto-hopping");
-    printOpt(&ui, "--zig-tag <ver>", "Override Zig version to install");
+    printOpt(&ui, "--version, -v <tag>", "Release version to install (default: latest)");
     ui.writeRaw("\n");
 
     // ── Update options ──

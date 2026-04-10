@@ -8,6 +8,7 @@ const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
 const release = @import("release.zig");
+const recovery = @import("recovery.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -89,6 +90,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Download + validate proxy binary ──
     var artifact = release.Artifact{};
+    defer release.cleanup(allocator, &artifact);
     {
         ui.step(ui.str(.update_downloading));
         if (!release.downloadProxyArtifact(allocator, tag.slice(), "update", &artifact)) {
@@ -148,7 +150,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Update service file (unless tunnel-aware) ──
     if (opts.force_service_update or !isTunnelServiceUnit()) {
-        release.downloadServiceFile(allocator, tag.slice());
+        release.writeServiceFile();
     }
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
 
@@ -169,13 +171,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     ui.ok(ui.str(.update_starting));
 
-    // ── Apply masking monitor ──
-    if (sys.fileExists(INSTALL_DIR ++ "/setup_mask_monitor.sh")) {
-        _ = sys.execForward(&.{ "bash", INSTALL_DIR ++ "/setup_mask_monitor.sh", "--quiet" }) catch {};
+    // ── Apply masking monitor (if recovery is already installed) ──
+    if (sys.isServiceActive("mtproto-mask-health.timer") or sys.fileExists("/usr/local/bin/mtproto-mask-health.sh")) {
+        recovery.execute(ui, allocator, .{}) catch {};
     }
-
-    // ── Cleanup ──
-    release.cleanup(allocator, &artifact);
 
     // ── Summary ──
     const arch_str = blk: {
