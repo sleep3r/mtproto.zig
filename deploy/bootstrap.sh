@@ -12,6 +12,7 @@ set -euo pipefail
 
 REPO="sleep3r/mtproto.zig"
 INSTALL_TO="/usr/local/bin/mtbuddy"
+BINARY_NAME="mtproto-proxy"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -29,12 +30,12 @@ case "$ARCH" in
   x86_64)
     # prefer v3 if CPU supports it
     if grep -qE 'avx2|bmi1|bmi2' /proc/cpuinfo 2>/dev/null; then
-      ARTIFACT="mtbuddy-linux-x86_64_v3"
+      ARTIFACT="mtproto-proxy-linux-x86_64_v3"
     else
-      ARTIFACT="mtbuddy-linux-x86_64"
+      ARTIFACT="mtproto-proxy-linux-x86_64"
     fi
     ;;
-  aarch64) ARTIFACT="mtbuddy-linux-aarch64" ;;
+  aarch64) ARTIFACT="mtproto-proxy-linux-aarch64" ;;
   *) fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -52,8 +53,8 @@ curl -fsSL "$DOWNLOAD_URL" -o "$TMP/mtbuddy.tar.gz" \
   || fail "Download failed: $DOWNLOAD_URL"
 
 tar xzf "$TMP/mtbuddy.tar.gz" -C "$TMP"
-BUDDY_BIN="$(find "$TMP" -type f -name 'mtbuddy' | head -1)"
-[ -n "$BUDDY_BIN" ] || fail "mtbuddy binary not found in archive"
+BUDDY_BIN="$(find "$TMP" -type f -name "$BINARY_NAME" | head -1)"
+[ -n "$BUDDY_BIN" ] || fail "$BINARY_NAME binary not found in archive"
 
 # ── validate ──────────────────────────────────────────────────────
 "$BUDDY_BIN" --version > /dev/null 2>&1 || fail "Binary validation failed (illegal instruction?)"
