@@ -19,6 +19,7 @@ const NS_NAME = "tg_proxy_ns";
 const AWG_CONF_DIR = "/etc/amnezia/amneziawg";
 const NETNS_SCRIPT = "/usr/local/bin/setup_netns.sh";
 const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
+const AWG_CONFIG_PATH = AWG_CONF_DIR ++ "/awg0.conf";
 
 pub const TunnelOpts = struct {
     awg_conf: []const u8 = "",
@@ -37,9 +38,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--mode") or std.mem.eql(u8, arg, "-m")) {
             if (args.next()) |val| {
-                if (std.mem.eql(u8, val, "middleproxy")) opts.mode = .middleproxy
-                else if (std.mem.eql(u8, val, "preserve")) opts.mode = .preserve
-                else opts.mode = .direct;
+                if (std.mem.eql(u8, val, "middleproxy")) opts.mode = .middleproxy else if (std.mem.eql(u8, val, "preserve")) opts.mode = .preserve else opts.mode = .direct;
             }
         } else if (arg.len > 0 and arg[0] != '-') {
             opts.awg_conf = arg;
@@ -132,9 +131,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     // ── Copy AWG config ──
     ui.step("Installing AmneziaWG config...");
     _ = sys.exec(allocator, &.{ "mkdir", "-p", AWG_CONF_DIR }) catch {};
-    _ = sys.execForward(&.{ "cp", opts.awg_conf, AWG_CONF_DIR ++ "/awg0.conf" }) catch {};
-    _ = sys.exec(allocator, &.{ "chmod", "600", AWG_CONF_DIR ++ "/awg0.conf" }) catch {};
-    ui.ok("Config installed to " ++ AWG_CONF_DIR ++ "/awg0.conf");
+    _ = sys.execForward(&.{ "cp", opts.awg_conf, AWG_CONFIG_PATH }) catch {};
+    _ = sys.exec(allocator, &.{ "chmod", "600", AWG_CONFIG_PATH }) catch {};
+
+    const dns_removed = stripAwgDnsLines(allocator, AWG_CONFIG_PATH) catch false;
+    if (dns_removed) {
+        ui.warn("Removed DNS from awg0.conf (netns resolver is managed separately)");
+    }
+
+    ui.ok("Config installed to " ++ AWG_CONFIG_PATH);
 
     // ── Create netns setup script ──
     ui.step("Creating network namespace setup script...");
@@ -144,7 +149,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\#!/bin/bash
         \\set -e
         \\NS_NAME="tg_proxy_ns"
-        \\MAIN_IF=$(ip route get 8.8.8.8 | awk '{{printf $5}}')
+        \\MAIN_IF=$(ip -o -4 route show default | awk '{{print $5; exit}}')
+        \\if [[ -z "$MAIN_IF" ]]; then
+        \\    echo "Failed to detect main network interface" >&2
+        \\    exit 1
+        \\fi
         \\
         \\ip netns del $NS_NAME 2>/dev/null || true
         \\ip link del veth_main 2>/dev/null || true
@@ -167,7 +176,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\ip netns exec $NS_NAME ip link set lo up
         \\ip netns exec $NS_NAME ip route add default via 10.200.200.1
         \\
-        \\ip netns exec $NS_NAME awg-quick up /etc/amnezia/amneziawg/awg0.conf
+        \\ip netns exec $NS_NAME awg-quick up {[awg_conf]s}
         \\
         \\ip netns exec $NS_NAME ip rule add from 10.200.200.2 table 100 priority 100
         \\ip netns exec $NS_NAME ip route add default via 10.200.200.1 table 100
@@ -183,7 +192,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\iptables -A FORWARD -i veth_main -o $MAIN_IF -j ACCEPT
         \\
         \\echo "Network namespace $NS_NAME ready, awg0 tunnel active inside namespace"
-    , .{ .port = port }) catch "";
+    , .{ .port = port, .awg_conf = AWG_CONFIG_PATH }) catch "";
 
     if (netns_script.len > 0) {
         // Write using native Zig I/O (no shell injection risk)
@@ -334,4 +343,50 @@ fn setUseMiddleProxy(allocator: std.mem.Allocator, value: []const u8) void {
     defer doc.deinit();
     doc.set("general", "use_middle_proxy", value) catch return;
     doc.save(INSTALL_DIR ++ "/config.toml") catch {};
+}
+
+fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var removed_any = false;
+    var wrote_any = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+
+        var skip = false;
+        if (trimmed.len > 0 and trimmed[0] != '#') {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+                const key = std.mem.trim(u8, trimmed[0..eq_pos], &[_]u8{ ' ', '\t' });
+                if (std.ascii.eqlIgnoreCase(key, "DNS")) {
+                    skip = true;
+                }
+            }
+        }
+
+        if (skip) {
+            removed_any = true;
+            continue;
+        }
+
+        if (wrote_any) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, line);
+        wrote_any = true;
+    }
+
+    if (!removed_any) return false;
+
+    const sanitized = try output.toOwnedSlice(allocator);
+    defer allocator.free(sanitized);
+
+    try sys.writeFileMode(path, sanitized, 0o600);
+    return true;
 }
