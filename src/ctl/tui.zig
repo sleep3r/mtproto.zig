@@ -9,6 +9,19 @@
 const std = @import("std");
 const i18n = @import("i18n.zig");
 
+// ── Terminal geometry helpers (used by draw closures) ──────────────────────
+
+/// Calculate physical terminal rows for a line of `visible_len` characters.
+fn physicalRows(visible_len: usize, width: u16) usize {
+    if (visible_len == 0 or width == 0) return 1;
+    return (visible_len + width - 1) / width;
+}
+
+/// Count visible columns (UTF-8 codepoints, ignoring byte count).
+fn visibleLen(s: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(s) catch s.len;
+}
+
 pub const Key = enum {
     up,
     down,
@@ -227,9 +240,19 @@ pub const Tui = struct {
 
     // ── Low-level output ───────────────────────────────────────────────────
 
-    /// Move cursor up N lines
+    /// Move cursor up N physical rows
     pub fn cursorUp(self: *Self, n: usize) void {
+        if (n == 0) return;
         self.print("\x1b[{d}A", .{n});
+    }
+
+    /// Query terminal width via ioctl. Falls back to 80.
+    pub fn getTermWidth(self: *Self) u16 {
+        if (!self.is_tty) return 80;
+        var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        const rc = std.posix.system.ioctl(self.out.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        if (std.posix.errno(rc) == .SUCCESS and ws.col > 0) return ws.col;
+        return 80;
     }
 
     /// Clear current line and move to beginning
@@ -358,7 +381,8 @@ pub const Tui = struct {
         var selected: usize = 0;
 
         const draw = struct {
-            fn apply(tui: *Self, s_items: []const []const u8, s_sel: usize) void {
+            fn apply(tui: *Self, s_items: []const []const u8, s_sel: usize, width: u16) usize {
+                var lines: usize = 0;
                 for (s_items, 0..) |item, idx| {
                     tui.clearLine();
                     if (idx == s_sel) {
@@ -371,23 +395,19 @@ pub const Tui = struct {
                     } else {
                         tui.print("  {s}│{s}    {s}\n", .{ Color.gray, Color.reset, item });
                     }
+                    const vis = 7 + visibleLen(item); // "  │  ❯ " = 7 visible chars
+                    lines += physicalRows(vis, width);
                 }
                 tui.clearLine();
                 tui.print("  {s}╰─❯{s} {s}↑↓ navigate  Enter select{s}\n", .{
                     Color.gray, Color.reset, Color.dim, Color.reset,
                 });
+                lines += physicalRows(35, width);
+                return lines;
             }
         }.apply;
 
-        // Pre-scroll to ensure save/restore works even if list causes terminal scroll
-        {
-            const total_lines = items.len + 1; // items + footer
-            for (0..total_lines) |_| self.writeRaw("\n");
-            self.cursorUp(total_lines);
-        }
-
-        self.writeRaw("\x1b[s"); // save cursor position (scrolling already done)
-        draw(self, items, selected);
+        var drawn_lines = draw(self, items, selected, self.getTermWidth());
 
         self.enterRawMode();
         defer self.exitRawMode();
@@ -412,9 +432,9 @@ pub const Tui = struct {
             }
 
             if (changed) {
-                self.writeRaw("\x1b[u"); // restore cursor position
-                self.writeRaw("\x1b[J"); // clear to end of screen
-                draw(self, items, selected);
+                self.cursorUp(drawn_lines);
+                self.writeRaw("\x1b[J");
+                drawn_lines = draw(self, items, selected, self.getTermWidth());
             }
         }
     }
@@ -511,10 +531,14 @@ pub const Tui = struct {
         var selected: usize = 0;
 
         const draw = struct {
-            fn apply(tui: *Self, s_items: []const []const u8, s_helps: []const []const u8, s_state: u32, s_sel: usize) void {
-                // Separator between title and items
+            /// Draw checklist and return the exact number of physical terminal rows emitted.
+            fn apply(tui: *Self, s_items: []const []const u8, s_helps: []const []const u8, s_state: u32, s_sel: usize, width: u16) usize {
+                var lines: usize = 0;
+
+                // Separator
                 tui.clearLine();
                 tui.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
+                lines += 1;
 
                 for (s_items, 0..) |item, idx| {
                     tui.clearLine();
@@ -533,40 +557,39 @@ pub const Tui = struct {
                             Color.gray, Color.reset, mark, item,
                         });
                     }
+                    // "  │  ❯ [▣] " = 11 visible columns + item text
+                    lines += physicalRows(11 + visibleLen(item), width);
+
                     if (idx < s_helps.len) {
-                        tui.clearLine();
-                        tui.print("  {s}│{s}       {s}{s}{s}\n", .{
-                            Color.gray,  Color.reset,
-                            Color.dim,   s_helps[idx],
-                            Color.reset,
-                        });
+                        // Split on explicit \n to maintain left border on each line
+                        var it = std.mem.splitScalar(u8, s_helps[idx], '\n');
+                        while (it.next()) |line| {
+                            tui.clearLine();
+                            tui.print("  {s}│{s}       {s}{s}{s}\n", .{
+                                Color.gray,  Color.reset,
+                                Color.dim,   line,
+                                Color.reset,
+                            });
+                            // "  │       " = 10 visible columns + help text
+                            lines += physicalRows(10 + visibleLen(line), width);
+                        }
                         tui.clearLine();
                         tui.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
+                        lines += 1;
                     }
                 }
                 tui.clearLine();
                 tui.print("  {s}╰─❯{s} {s}↑↓ navigate  Space toggle  Enter confirm{s}\n", .{
                     Color.gray, Color.reset, Color.dim, Color.reset,
                 });
+                lines += physicalRows(49, width); // footer visible length
+
+                return lines;
             }
         }.apply;
 
-        // Pre-scroll: emit enough blank lines to force terminal scrolling,
-        // then move back up. This ensures that when we save the cursor position,
-        // any necessary scrolling has already happened and the saved position
-        // remains valid for subsequent redraws.
-        {
-            var total_lines: usize = 2; // │ separator + footer
-            for (0..items.len) |idx| {
-                total_lines += 1; // item line
-                if (idx < helps.len) total_lines += 2; // help + spacer
-            }
-            for (0..total_lines) |_| self.writeRaw("\n");
-            self.cursorUp(total_lines);
-        }
-
-        self.writeRaw("\x1b[s"); // save cursor position (scrolling already done)
-        draw(self, items, helps, state, selected);
+        // Initial draw, capturing the exact physical line count
+        var drawn_lines = draw(self, items, helps, state, selected, self.getTermWidth());
 
         self.enterRawMode();
         defer self.exitRawMode();
@@ -594,10 +617,12 @@ pub const Tui = struct {
             }
 
             if (changed) {
-                self.writeRaw("\x1b[u"); // restore cursor position
-                // Clear from cursor to end of screen to handle line wrapping differences
+                // Move up exactly the physical rows we emitted previously
+                self.cursorUp(drawn_lines);
+                // Clear stale text (handles terminal resize wider)
                 self.writeRaw("\x1b[J");
-                draw(self, items, helps, state, selected);
+                // Re-evaluate width and redraw
+                drawn_lines = draw(self, items, helps, state, selected, self.getTermWidth());
             }
         }
     }
