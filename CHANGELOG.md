@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/sleep3r/mtproto.zig/compare/v0.14.1...v0.14.2) (2026-04-10)
+
+
+### Bug Fixes
+
+* **bootstrap:** redirect ok/step output to stderr to avoid subshell capture pollution ([#131](https://github.com/sleep3r/mtproto.zig/issues/131)) ([da886d4](https://github.com/sleep3r/mtproto.zig/commit/da886d4fd3523de9da11531cfddb0b7b382a2091))
+
 ## [0.14.1](https://github.com/sleep3r/mtproto.zig/compare/v0.14.0...v0.14.1) (2026-04-10)
 
 
