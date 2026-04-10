@@ -42,6 +42,11 @@ pub const InstallOpts = struct {
     yes: bool = false,
     /// Zig release tag to install from (overrides default ZIG_VERSION).
     zig_tag: ?[]const u8 = null,
+    /// Path to an existing config.toml to use.
+    config_path: ?[]const u8 = null,
+    /// Internal flags to track if user explicitly provided a value.
+    port_provided: bool = false,
+    domain_provided: bool = false,
 };
 
 /// Run install in CLI (non-interactive) mode.
@@ -51,9 +56,17 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
     // Parse CLI flags
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
-            if (args.next()) |val| opts.port = std.fmt.parseInt(u16, val, 10) catch 443;
+            if (args.next()) |val| {
+                opts.port = std.fmt.parseInt(u16, val, 10) catch 443;
+                opts.port_provided = true;
+            }
         } else if (std.mem.eql(u8, arg, "--domain") or std.mem.eql(u8, arg, "-d")) {
-            if (args.next()) |val| opts.tls_domain = val;
+            if (args.next()) |val| {
+                opts.tls_domain = val;
+                opts.domain_provided = true;
+            }
+        } else if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            if (args.next()) |val| opts.config_path = val;
         } else if (std.mem.eql(u8, arg, "--max-connections")) {
             if (args.next()) |val| opts.max_connections = std.fmt.parseInt(u32, val, 10) catch 512;
         } else if (std.mem.eql(u8, arg, "--secret") or std.mem.eql(u8, arg, "-s")) {
@@ -85,6 +98,29 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
             opts.enable_ipv6_hop = true;
         } else if (std.mem.eql(u8, arg, "--zig-tag")) {
             if (args.next()) |val| opts.zig_tag = val;
+        }
+    }
+
+    if (opts.config_path) |cfg_path| {
+        if (!sys.fileExists(cfg_path)) {
+            ui.fail("Specified config file does not exist");
+            return;
+        }
+        var doc = toml.TomlDoc.load(allocator, cfg_path) catch {
+            ui.fail("Failed to parse specified config file");
+            return;
+        };
+        defer doc.deinit();
+
+        if (!opts.port_provided) {
+            if (doc.get("server", "port")) |p_str| {
+                opts.port = std.fmt.parseInt(u16, p_str, 10) catch 443;
+            }
+        }
+        if (!opts.domain_provided) {
+            if (doc.get("censorship", "tls_domain")) |d_str| {
+                opts.tls_domain = d_str;
+            }
         }
     }
 
@@ -310,6 +346,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.stop(true, "");
     }
     ui.ok(ui.str(.install_binary_ok));
+
+    // ── Copy user config (if provided) ──
+    if (opts.config_path) |cfg_path| {
+        _ = sys.exec(allocator, &.{ "cp", cfg_path, INSTALL_DIR ++ "/config.toml" }) catch {};
+    }
 
     // ── Generate config ──
     const config_path_buf = INSTALL_DIR ++ "/config.toml";

@@ -333,6 +333,7 @@ fn printHelp() void {
     printOpt(&ui, "--domain, -d <domain>", "TLS masking domain (default: wb.ru)");
     printOpt(&ui, "--secret, -s <hex32>", "User secret (32 hex chars, auto-generated if omitted)");
     printOpt(&ui, "--user,   -u <name>", "Username in config.toml (default: user)");
+    printOpt(&ui, "--config, -c <path>", "Use existing config.toml file");
     printOpt(&ui, "--yes,    -y", "Skip confirmation prompt (non-interactive)");
     printOpt(&ui, "--max-connections <N>", "Max proxy connections (default: 512)");
     printOpt(&ui, "--no-masking", "Disable Nginx DPI masking");
