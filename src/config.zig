@@ -4,7 +4,6 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
-const Tunnel = @import("tunnel.zig").Tunnel;
 
 pub const UpstreamMode = enum {
     /// Infer egress mode from runtime environment (default).
@@ -21,13 +20,6 @@ fn parseUpstreamMode(value: []const u8) ?UpstreamMode {
     if (std.mem.eql(u8, value, "direct") or std.mem.eql(u8, value, "none")) return .direct;
     if (std.mem.eql(u8, value, "amnezia_wg") or std.mem.eql(u8, value, "amneziawg")) return .amnezia_wg;
     return null;
-}
-
-fn parseLegacyTunnelMode(value: []const u8) UpstreamMode {
-    return switch (Tunnel.fromString(value)) {
-        .none => .direct,
-        .amnezia_wg => .amnezia_wg,
-    };
 }
 
 fn stripInlineComment(value: []const u8) []const u8 {
@@ -122,8 +114,6 @@ pub const Config = struct {
     /// Upstream egress mode. Parsed from [upstream].type.
     /// Supported values: auto | direct | amnezia_wg.
     upstream_mode: UpstreamMode = .auto,
-    /// Backward-compatibility marker: config used deprecated [tunnel] section.
-    uses_legacy_tunnel_section: bool = false,
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -167,11 +157,6 @@ pub const Config = struct {
                 }
             }
         }
-
-        if (self.uses_legacy_tunnel_section) {
-            const log = std.log.scoped(.config);
-            log.warn("[tunnel] section is deprecated; use [upstream] type = \"direct|amnezia_wg|auto\"", .{});
-        }
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -195,9 +180,7 @@ pub const Config = struct {
         var in_server_section = false;
         var in_general_section = false;
         var in_upstream_section = false;
-        var in_tunnel_section = false;
         var server_tag_set = false;
-        var upstream_set = false;
 
         while (lines.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
@@ -213,7 +196,6 @@ pub const Config = struct {
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
                 in_upstream_section = std.mem.eql(u8, line, "[upstream]");
-                in_tunnel_section = std.mem.eql(u8, line, "[tunnel]");
                 continue;
             }
 
@@ -325,14 +307,6 @@ pub const Config = struct {
                     if (std.mem.eql(u8, key, "type")) {
                         if (parseUpstreamMode(value)) |mode| {
                             cfg.upstream_mode = mode;
-                            upstream_set = true;
-                        }
-                    }
-                } else if (in_tunnel_section) {
-                    if (std.mem.eql(u8, key, "type")) {
-                        cfg.uses_legacy_tunnel_section = true;
-                        if (!upstream_set) {
-                            cfg.upstream_mode = parseLegacyTunnelMode(value);
                         }
                     }
                 }
@@ -982,7 +956,7 @@ test "parse config - upstream type invalid keeps default auto" {
     try std.testing.expectEqual(UpstreamMode.auto, cfg.upstream_mode);
 }
 
-test "parse config - legacy tunnel maps to upstream" {
+test "parse config - legacy tunnel section ignored" {
     const content =
         \\[tunnel]
         \\type = "amnezia_wg"
@@ -993,23 +967,5 @@ test "parse config - legacy tunnel maps to upstream" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expect(cfg.uses_legacy_tunnel_section);
-    try std.testing.expectEqual(UpstreamMode.amnezia_wg, cfg.upstream_mode);
-}
-
-test "parse config - upstream overrides legacy tunnel" {
-    const content =
-        \\[tunnel]
-        \\type = "amnezia_wg"
-        \\[upstream]
-        \\type = "direct"
-        \\[access.users]
-        \\alice = "00112233445566778899aabbccddeeff"
-    ;
-
-    var cfg = try Config.parse(std.testing.allocator, content);
-    defer cfg.deinit(std.testing.allocator);
-
-    try std.testing.expect(cfg.uses_legacy_tunnel_section);
-    try std.testing.expectEqual(UpstreamMode.direct, cfg.upstream_mode);
+    try std.testing.expectEqual(UpstreamMode.auto, cfg.upstream_mode);
 }
