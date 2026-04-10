@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.7](https://github.com/sleep3r/mtproto.zig/compare/v0.14.6...v0.14.7) (2026-04-10)
+
+
+### Bug Fixes
+
+* **main:** enforce fail-closed max_connections safety clamp ([#152](https://github.com/sleep3r/mtproto.zig/issues/152)) ([24ea08c](https://github.com/sleep3r/mtproto.zig/commit/24ea08cdd2ecd328056db82a7d973cdc4a0bce3f))
+
 ## [0.14.6](https://github.com/sleep3r/mtproto.zig/compare/v0.14.5...v0.14.6) (2026-04-10)
 
 
