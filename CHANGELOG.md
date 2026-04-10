@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.0](https://github.com/sleep3r/mtproto.zig/compare/v0.11.0...v0.12.0) (2026-04-10)
+
+
+### Features
+
+* introduce buddy — native installer & control panel ([#116](https://github.com/sleep3r/mtproto.zig/issues/116)) ([519baa7](https://github.com/sleep3r/mtproto.zig/commit/519baa7aa9177530f8a2295a7d530b14862e9337))
+
+
+### Bug Fixes
+
+* **docs:** replace mp4 videos with gif for README compatibility ([#119](https://github.com/sleep3r/mtproto.zig/issues/119)) ([078ab9d](https://github.com/sleep3r/mtproto.zig/commit/078ab9d855f681efbf03330dfd075ee040be3948))
+* **docs:** use absolute URLs for README video embeds ([#118](https://github.com/sleep3r/mtproto.zig/issues/118)) ([8a920f5](https://github.com/sleep3r/mtproto.zig/commit/8a920f584b7a9d02b730687f7b114db4224f545b))
+
 ## [0.11.0](https://github.com/sleep3r/mtproto.zig/compare/v0.10.0...v0.11.0) (2026-04-09)
 
 
