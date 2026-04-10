@@ -33,6 +33,7 @@ deploy: build ## Build and push proxy + mtbuddy to server
 		rm .env.tmp; \
 	fi
 	ssh root@$(SERVER) 'chown -R mtproto:mtproto /opt/mtproto-proxy/ && systemctl start mtproto-proxy'
+	ssh root@$(SERVER) 'if [ -f /etc/systemd/system/proxy-monitor.service ]; then mtbuddy setup dashboard --quiet; fi'
 
 # ── dashboard ─────────────────────────────────────────────────────────────────
 
