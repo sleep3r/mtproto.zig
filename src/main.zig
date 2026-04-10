@@ -326,10 +326,9 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config) void {
 }
 
 pub fn main() !void {
-    // Use page_allocator instead of GeneralPurposeAllocator for production.
-    // GPA has an internal mutex that causes deadlocks under heavy thread contention
-    // (1000+ simultaneous connections all doing TLS validation allocations).
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
     // Parse config path from args
     var args = try std.process.argsWithAllocator(allocator);

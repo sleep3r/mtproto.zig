@@ -38,6 +38,8 @@ pub fn validateTlsHandshake(
     secrets: []const UserSecret,
     ignore_time_skew: bool,
 ) !?TlsValidation {
+    _ = allocator;
+
     const min_len = constants.tls_digest_pos + constants.tls_digest_len + 1;
     if (handshake.len < min_len) return null;
 
@@ -48,16 +50,13 @@ pub fn validateTlsHandshake(
     const session_id_len_pos = constants.tls_digest_pos + constants.tls_digest_len;
     if (session_id_len_pos >= handshake.len) return null;
     const session_id_len: usize = handshake[session_id_len_pos];
-    if (session_id_len > 32) return null;
+    if (session_id_len != 32) return null;
 
     const session_id_start = session_id_len_pos + 1;
     if (handshake.len < session_id_start + session_id_len) return null;
 
-    // Build message with zeroed digest for HMAC
-    const msg = try allocator.alloc(u8, handshake.len);
-    defer allocator.free(msg);
-    @memcpy(msg, handshake);
-    @memset(msg[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
     const now: i64 = if (!ignore_time_skew)
         @intCast(std.time.timestamp())
@@ -65,7 +64,12 @@ pub fn validateTlsHandshake(
         0;
 
     for (secrets) |entry| {
-        const computed = crypto.sha256Hmac(&entry.secret, msg);
+        var hmac = HmacSha256.init(&entry.secret);
+        hmac.update(handshake[0..constants.tls_digest_pos]);
+        hmac.update(&zero_digest);
+        hmac.update(handshake[constants.tls_digest_pos + constants.tls_digest_len ..]);
+        var computed: [constants.tls_digest_len]u8 = undefined;
+        hmac.final(&computed);
 
         // Constant-time comparison of first 28 bytes using stdlib
         if (!std.crypto.timing_safe.eql([28]u8, digest[0..28].*, computed[0..28].*)) continue;
@@ -148,14 +152,9 @@ pub fn buildServerHelloWithTemplate(
     errdefer allocator.free(response);
     @memcpy(response, template);
 
-    // 2. Patch Session ID (echo from client). Template assumes 32-byte session ID.
-    if (session_id.len == 32) {
-        @memcpy(response[tmpl_session_id_offset..][0..32], session_id);
-    } else if (session_id.len <= 32) {
-        // Non-standard length: patch the length byte and copy what we have
-        response[tmpl_session_id_offset - 1] = @intCast(session_id.len);
-        @memcpy(response[tmpl_session_id_offset..][0..session_id.len], session_id);
-    }
+    // 2. Patch Session ID (echo from client). Template is fixed for 32-byte session IDs.
+    if (session_id.len != 32) return error.BadSessionIdLength;
+    @memcpy(response[tmpl_session_id_offset..][0..32], session_id);
 
     // 3. Patch X25519 public key with fresh random bytes
     var x25519_key: [32]u8 = undefined;
@@ -519,6 +518,17 @@ test "buildServerHello deterministic AppData (no random size fingerprint)" {
     try std.testing.expectEqualSlices(u8, r1[app_offset..], r2[app_offset..]);
 }
 
+test "buildServerHello rejects non-32-byte session id" {
+    const allocator = std.testing.allocator;
+    var digest = [_]u8{0xAA} ** 32;
+    const session_id = [_]u8{0xBB} ** 16;
+
+    try std.testing.expectError(
+        error.BadSessionIdLength,
+        buildServerHello(allocator, &digest, &digest, &session_id),
+    );
+}
+
 test "buildServerHelloTemplate depends on seed" {
     const t1 = buildServerHelloTemplate(0x1111_2222_3333_4444);
     const t2 = buildServerHelloTemplate(0x5555_6666_7777_8888);
@@ -538,16 +548,16 @@ test "validateTlsHandshake - valid handshake" {
 
     // Client hello mock
     // min_len = 11 + 32 + 1 = 44 bytes minimum
-    var handshake = [_]u8{0x00} ** 64;
+    var handshake = [_]u8{0x00} ** 96;
     // Set timestamp (say 123456789 = 0x075BCD15)
     // Wait, the client sends digest WITH timestamp XOR'd in the last 4 bytes.
     // If ignore_time_skew = true, the proxy doesn't care what timestamp is.
     // Proxy calculates HMAC on handshake with zeroed digest, then expects it to match (up to 28 bytes) the given digest.
 
-    var hmac_input = std.mem.zeroes([64]u8);
+    var hmac_input = std.mem.zeroes([96]u8);
     // Add session id len
-    hmac_input[43] = 4; // session_id len
-    hmac_input[44] = 0xaa; // session ID
+    hmac_input[43] = 32; // session_id len
+    @memset(hmac_input[44..76], 0xaa);
 
     // Compute HMAC
     const computed_mac = crypto.sha256Hmac(&secrets[1].secret, &hmac_input);
@@ -579,6 +589,30 @@ test "validateTlsHandshake - invalid user" {
     try std.testing.expect(result == null);
 }
 
+test "validateTlsHandshake - rejects non-32 session id" {
+    const allocator = std.testing.allocator;
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var handshake = [_]u8{0x00} ** 80;
+
+    var hmac_input = std.mem.zeroes([80]u8);
+    hmac_input[43] = 16;
+    @memset(hmac_input[44..60], 0xaa);
+
+    const computed_mac = crypto.sha256Hmac(&secrets[0].secret, &hmac_input);
+    @memcpy(&handshake, &hmac_input);
+    @memcpy(handshake[constants.tls_digest_pos..][0..28], computed_mac[0..28]);
+
+    const timestamp: u32 = 0x01020304;
+    const ts_bytes = std.mem.toBytes(timestamp);
+    handshake[constants.tls_digest_pos + 28] = computed_mac[28] ^ ts_bytes[0];
+    handshake[constants.tls_digest_pos + 29] = computed_mac[29] ^ ts_bytes[1];
+    handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
+    handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
+
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    try std.testing.expect(result == null);
+}
+
 test "extractSni - malformed returns null" {
     // Too short
     try std.testing.expect(extractSni(&[_]u8{ 0x16, 0x03, 0x01, 0x00 }) == null);
@@ -590,11 +624,11 @@ test "validateTlsHandshake returns canonical_hmac" {
     const allocator = std.testing.allocator;
 
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
-    var handshake = [_]u8{0x00} ** 64;
+    var handshake = [_]u8{0x00} ** 96;
 
-    var hmac_input = std.mem.zeroes([64]u8);
-    hmac_input[43] = 4;
-    hmac_input[44] = 0xaa;
+    var hmac_input = std.mem.zeroes([96]u8);
+    hmac_input[43] = 32;
+    @memset(hmac_input[44..76], 0xaa);
 
     const computed_mac = crypto.sha256Hmac(&secrets[0].secret, &hmac_input);
     @memcpy(&handshake, &hmac_input);

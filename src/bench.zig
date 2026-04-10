@@ -3,9 +3,11 @@ const net = std.net;
 const crypto = @import("crypto/crypto.zig");
 const middleproxy = @import("protocol/middleproxy.zig");
 const constants = @import("protocol/constants.zig");
+const tls = @import("protocol/tls.zig");
 
 const Mode = enum {
     bench,
+    handshake,
     soak,
 };
 
@@ -44,6 +46,7 @@ pub fn main() !void {
 
     switch (opts.mode) {
         .bench => try runBench(allocator),
+        .handshake => try runHandshakeBench(allocator),
         .soak => try runSoak(allocator, opts),
     }
 }
@@ -99,6 +102,53 @@ fn runBench(allocator: std.mem.Allocator) !void {
             bytesPerSecToMiB(produced_out_bytes, elapsed_ns),
         });
     }
+}
+
+fn runHandshakeBench(allocator: std.mem.Allocator) !void {
+    const bench_secret = [_]u8{0x42} ** 16;
+    const user_secrets = [_]tls.UserSecret{.{ .name = "bench", .secret = bench_secret }};
+    const iterations: usize = 1_000_000;
+
+    var handshake = [_]u8{0} ** 96;
+    handshake[constants.tls_digest_pos + constants.tls_digest_len] = 32;
+    @memset(handshake[44..76], 0xaa);
+
+    var canonical_input = handshake;
+    @memset(canonical_input[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
+    const canonical = crypto.sha256Hmac(&bench_secret, &canonical_input);
+
+    @memcpy(handshake[constants.tls_digest_pos..][0..28], canonical[0..28]);
+    const ts: u32 = 0x11223344;
+    const ts_bytes = std.mem.toBytes(ts);
+    handshake[constants.tls_digest_pos + 28] = canonical[28] ^ ts_bytes[0];
+    handshake[constants.tls_digest_pos + 29] = canonical[29] ^ ts_bytes[1];
+    handshake[constants.tls_digest_pos + 30] = canonical[30] ^ ts_bytes[2];
+    handshake[constants.tls_digest_pos + 31] = canonical[31] ^ ts_bytes[3];
+
+    var warmup: usize = 0;
+    while (warmup < 1000) : (warmup += 1) {
+        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true);
+        if (ok == null) return error.BenchmarkValidationFailed;
+    }
+
+    var timer = try std.time.Timer.start();
+    var matched: usize = 0;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true);
+        if (ok != null) matched += 1;
+    }
+
+    const elapsed_ns = timer.read();
+    const ns_per_op = elapsedNsPerOp(elapsed_ns, iterations);
+    const ops_per_sec = if (elapsed_ns == 0)
+        0
+    else
+        @as(u64, @intCast((@as(u128, iterations) * std.time.ns_per_s) / elapsed_ns));
+
+    std.debug.print("benchmark: validateTlsHandshake\n", .{});
+    std.debug.print("iterations matched ns_per_op ops_per_sec\n", .{});
+    std.debug.print("{d} {d} {d} {d}\n", .{ iterations, matched, ns_per_op, ops_per_sec });
 }
 
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
@@ -229,6 +279,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Options {
             opts.mode = .bench;
             continue;
         }
+        if (std.mem.eql(u8, arg, "handshake")) {
+            opts.mode = .handshake;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "soak")) {
             opts.mode = .soak;
             continue;
@@ -283,6 +337,7 @@ fn printUsage() void {
         \\
         \\Modes:
         \\  bench (default): microbenchmark for C2S encapsulation
+        \\  handshake: microbenchmark for TLS handshake validation
         \\  soak: multithreaded crash/stability stress test
         \\
     , .{});
@@ -335,10 +390,15 @@ fn nextPayloadLen(state: *u64, max_payload: usize) usize {
     const pick_hot = (nextRand(state) % 10) < 7;
     if (pick_hot) {
         const idx: usize = @intCast(nextRand(state) % hot_sizes.len);
-        const capped = @min(hot_sizes[idx], max_payload);
-        return if (capped == 0) 1 else capped;
+        return normalizePayloadLen(hot_sizes[idx], max_payload);
     }
 
     const max_u64 = @as(u64, @intCast(@max(@as(usize, 1), max_payload)));
-    return 1 + @as(usize, @intCast(nextRand(state) % max_u64));
+    const random_len = 1 + @as(usize, @intCast(nextRand(state) % max_u64));
+    return normalizePayloadLen(random_len, max_payload);
+}
+
+fn normalizePayloadLen(payload_len: usize, max_payload: usize) usize {
+    const capped = @max(@as(usize, 4), @min(payload_len, max_payload));
+    return capped - @mod(capped, 4);
 }

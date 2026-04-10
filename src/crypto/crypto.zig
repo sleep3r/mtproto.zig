@@ -112,12 +112,12 @@ pub const AesCbc = struct {
         };
     }
 
-    fn xorBlocks(a: *const [16]u8, b: *const [16]u8) [16]u8 {
-        var result: [16]u8 = undefined;
-        for (0..16) |i| {
-            result[i] = a[i] ^ b[i];
-        }
-        return result;
+    fn xorBlockInPlace(dst: *[16]u8, mask: *const [16]u8) void {
+        const BlockVec = @Vector(16, u8);
+        const a: BlockVec = @bitCast(dst.*);
+        const b: BlockVec = @bitCast(mask.*);
+        const mixed: BlockVec = a ^ b;
+        dst.* = @bitCast(mixed);
     }
 
     /// Encrypt data in-place. Data length must be a multiple of 16.
@@ -132,9 +132,7 @@ pub const AesCbc = struct {
         while (offset < data.len) : (offset += block_size) {
             const block: *[16]u8 = data[offset..][0..16];
             // XOR plaintext with previous ciphertext
-            for (0..16) |j| {
-                block[j] ^= prev[j];
-            }
+            xorBlockInPlace(block, &prev);
             // Encrypt
             var encrypted: [16]u8 = undefined;
             self.enc_ctx.encrypt(&encrypted, block);
@@ -163,9 +161,7 @@ pub const AesCbc = struct {
             self.dec_ctx.decrypt(&decrypted, block);
             block.* = decrypted;
             // XOR with previous ciphertext
-            for (0..16) |j| {
-                block[j] ^= prev[j];
-            }
+            xorBlockInPlace(block, &prev);
             prev = saved;
         }
 

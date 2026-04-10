@@ -6,6 +6,37 @@
 const std = @import("std");
 const Tunnel = @import("tunnel.zig").Tunnel;
 
+fn stripInlineComment(value: []const u8) []const u8 {
+    var in_quotes = false;
+    var escaped = false;
+    var i: usize = 0;
+
+    while (i < value.len) : (i += 1) {
+        const ch = value[i];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (in_quotes and ch == '\\') {
+            escaped = true;
+            continue;
+        }
+
+        if (ch == '"') {
+            in_quotes = !in_quotes;
+            continue;
+        }
+
+        if (!in_quotes and (ch == '#' or ch == ';')) {
+            return std.mem.trimRight(u8, value[0..i], &[_]u8{ ' ', '\t' });
+        }
+    }
+
+    return std.mem.trimRight(u8, value, &[_]u8{ ' ', '\t' });
+}
+
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
 
@@ -156,6 +187,8 @@ pub const Config = struct {
             if (std.mem.indexOfScalar(u8, line, '=')) |eq_pos| {
                 const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
                 var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
+                value = stripInlineComment(value);
+                if (value.len == 0) continue;
 
                 // Strip quotes from value
                 if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
@@ -562,6 +595,36 @@ test "parse config - tag parsing" {
     try std.testing.expect(cfg.tag != null);
     const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
     try std.testing.expectEqual(expected_tag, cfg.tag.?);
+}
+
+test "parse config - inline comment after tag" {
+    const content =
+        \\[server]
+        \\tag = "1234567890abcdef1234567890abcdef" # production tag
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.tag != null);
+    const expected_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
+    try std.testing.expectEqual(expected_tag, cfg.tag.?);
+}
+
+test "parse config - quoted hash preserved" {
+    const content =
+        \\[censorship]
+        \\tls_domain = "exa#mple.com" # inline comment
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("exa#mple.com", cfg.tls_domain);
 }
 
 test "parse config - tag default null" {

@@ -36,7 +36,7 @@ const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
-const read_buf_size: usize = 4096;
+const read_buf_size: usize = 32 * 1024;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed-size open-addressed hash table — zero heap allocation.
@@ -151,46 +151,22 @@ const SubnetRateLimit = struct {
     }
 };
 
-const MsgBlockClass = enum(u2) {
-    tiny = 0,
-    small = 1,
-    standard = 2,
-};
-
 const MsgBlock = struct {
-    class: MsgBlockClass,
     len: usize,
-    data: [standard_block_size]u8,
+    data: [msg_block_size]u8,
 };
 
-const tiny_block_size: usize = 64;
-const small_block_size: usize = 512;
-const standard_block_size: usize = 2048;
+const msg_block_size: usize = 2048;
+const msg_free_cap_per_queue: usize = 4;
 const max_scatter_parts: usize = 64;
 
 fn hasFatalEpollHangup(events: u32) bool {
     return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0;
 }
 
-fn classCapacity(class: MsgBlockClass) usize {
-    return switch (class) {
-        .tiny => tiny_block_size,
-        .small => small_block_size,
-        .standard => standard_block_size,
-    };
-}
-
-fn chooseClass(size: usize) MsgBlockClass {
-    if (size <= tiny_block_size) return .tiny;
-    if (size <= small_block_size) return .small;
-    return .standard;
-}
-
 const MessageQueue = struct {
     allocator: std.mem.Allocator,
-    tiny_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    small_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    std_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
+    free: std.ArrayListUnmanaged(*MsgBlock) = .{},
     blocks: std.ArrayListUnmanaged(*MsgBlock) = .{},
     head_idx: usize = 0,
     offset: usize = 0,
@@ -199,21 +175,15 @@ const MessageQueue = struct {
     fn deinit(self: *MessageQueue) void {
         self.clear();
 
-        for (self.tiny_free.items) |blk| self.allocator.destroy(blk);
-        for (self.small_free.items) |blk| self.allocator.destroy(blk);
-        for (self.std_free.items) |blk| self.allocator.destroy(blk);
+        for (self.free.items) |blk| self.allocator.destroy(blk);
 
-        self.tiny_free.deinit(self.allocator);
-        self.small_free.deinit(self.allocator);
-        self.std_free.deinit(self.allocator);
+        self.free.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
     }
 
     fn clear(self: *MessageQueue) void {
         for (self.blocks.items[self.head_idx..]) |blk| {
-            self.recycleBlock(blk) catch {
-                self.allocator.destroy(blk);
-            };
+            self.recycleBlock(blk);
         }
         self.blocks.clearRetainingCapacity();
         self.head_idx = 0;
@@ -231,11 +201,10 @@ const MessageQueue = struct {
         var off: usize = 0;
         while (off < data.len) {
             const rem = data.len - off;
-            const class = chooseClass(rem);
-            const cap = classCapacity(class);
+            const cap = msg_block_size;
             const take = @min(rem, cap);
 
-            var blk = try self.acquireBlock(class);
+            const blk = try self.acquireBlock();
             blk.len = take;
             @memcpy(blk.data[0..take], data[off .. off + take]);
             try self.blocks.append(self.allocator, blk);
@@ -288,9 +257,7 @@ const MessageQueue = struct {
             remaining -= blk_left;
             self.offset = 0;
             self.head_idx += 1;
-            self.recycleBlock(blk) catch {
-                self.allocator.destroy(blk);
-            };
+            self.recycleBlock(blk);
         }
 
         if (self.head_idx > 0 and (self.head_idx >= self.blocks.items.len or self.head_idx >= 64)) {
@@ -308,34 +275,29 @@ const MessageQueue = struct {
         }
     }
 
-    fn acquireBlock(self: *MessageQueue, class: MsgBlockClass) !*MsgBlock {
-        const list = switch (class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
-        };
-
-        if (list.items.len > 0) {
-            return list.pop().?;
+    fn acquireBlock(self: *MessageQueue) !*MsgBlock {
+        if (self.free.items.len > 0) {
+            return self.free.pop().?;
         }
 
         const blk = try self.allocator.create(MsgBlock);
         blk.* = .{
-            .class = class,
             .len = 0,
             .data = undefined,
         };
         return blk;
     }
 
-    fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) !void {
+    fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) void {
         blk.len = 0;
-        const list = switch (blk.class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
+        if (self.free.items.len >= msg_free_cap_per_queue) {
+            self.allocator.destroy(blk);
+            return;
+        }
+
+        self.free.append(self.allocator, blk) catch {
+            self.allocator.destroy(blk);
         };
-        try list.append(self.allocator, blk);
     }
 };
 
@@ -586,8 +548,6 @@ const ConnectionSlot = struct {
     c2s_bytes: u64 = 0,
     s2c_bytes: u64 = 0,
 
-    read_buf: ?[]u8 = null,
-
     // Non-blocking write queues (slab-like chain buffers)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
     upstream_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
@@ -617,6 +577,7 @@ const ConnectionSlot = struct {
     client_interest_out: bool = false,
     upstream_interest_in: bool = false,
     upstream_interest_out: bool = false,
+    desync_wait_enqueued: bool = false,
 
     fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
@@ -673,9 +634,6 @@ const ConnectionSlot = struct {
         self.current_upstream_addr = null;
         self.dc_abs = 0;
         self.is_media_path = false;
-
-        if (self.read_buf) |buf| allocator.free(buf);
-        self.read_buf = null;
 
         if (self.mp_frame_buf) |buf| allocator.free(buf);
         self.mp_frame_buf = null;
@@ -1198,6 +1156,8 @@ const EventLoop = struct {
     prev_dropped_hs_budget: u64,
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
+    shared_read_buf: [read_buf_size]u8,
+    desync_wait_slots: std.ArrayListUnmanaged(u32),
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
 
@@ -1224,6 +1184,8 @@ const EventLoop = struct {
             .prev_dropped_hs_budget = 0,
             .prev_hs_timeout = 0,
             .prev_mp_fallback = 0,
+            .shared_read_buf = undefined,
+            .desync_wait_slots = .{},
             .mp_c2s_scratch = null,
             .mp_s2c_scratch = null,
         };
@@ -1244,6 +1206,7 @@ const EventLoop = struct {
 
         if (self.mp_c2s_scratch) |buf| self.state.allocator.free(buf);
         if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
+        self.desync_wait_slots.deinit(self.state.allocator);
 
         self.pool.deinit();
         posix.close(self.epoll_fd);
@@ -1276,6 +1239,8 @@ const EventLoop = struct {
                 const slot = self.pool.getByFd(fd) orelse continue;
                 self.processSlotEvent(slot, fd, ev_flags);
             }
+
+            self.processDesyncWaits();
 
             const now_ns = std.time.nanoTimestamp();
             if (self.accept_paused and now_ns >= self.accept_resume_ns) {
@@ -1363,6 +1328,9 @@ const EventLoop = struct {
                 }
             };
             accepted_this_round += 1;
+
+            // Ensure desync byte-splitting is not coalesced by Nagle during early handshake.
+            setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
             if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
@@ -1569,6 +1537,10 @@ const EventLoop = struct {
                 if (!slot.hasClientPending()) {
                     slot.phase = .desync_wait;
                     slot.desync_deadline_ns = std.time.nanoTimestamp() + (3 * std.time.ns_per_ms);
+                    self.enqueueDesyncWait(slot) catch {
+                        self.closeSlot(slot, "desync wait queue failed");
+                        return;
+                    };
                 }
             },
             .writing_server_hello_rest => {
@@ -1646,6 +1618,57 @@ const EventLoop = struct {
         if (!slot.hasUpstreamPending() and slot.dc_initial_tail == null) {
             self.startRelay(slot);
         }
+    }
+
+    fn enqueueDesyncWait(self: *EventLoop, slot: *ConnectionSlot) !void {
+        if (slot.desync_wait_enqueued) return;
+        try self.desync_wait_slots.append(self.state.allocator, slot.index);
+        slot.desync_wait_enqueued = true;
+    }
+
+    fn processDesyncWaits(self: *EventLoop) void {
+        if (self.desync_wait_slots.items.len == 0) return;
+
+        const now_ns = std.time.nanoTimestamp();
+        var write_idx: usize = 0;
+        var read_idx: usize = 0;
+
+        while (read_idx < self.desync_wait_slots.items.len) : (read_idx += 1) {
+            const slot_idx = self.desync_wait_slots.items[read_idx];
+            const slot = self.pool.slots[slot_idx] orelse continue;
+
+            if (slot.phase != .desync_wait) {
+                slot.desync_wait_enqueued = false;
+                continue;
+            }
+
+            if (now_ns < slot.desync_deadline_ns) {
+                self.desync_wait_slots.items[write_idx] = slot_idx;
+                write_idx += 1;
+                continue;
+            }
+
+            slot.desync_wait_enqueued = false;
+            slot.phase = .writing_server_hello_rest;
+
+            if (slot.server_hello) |sh| {
+                if (slot.server_hello_off < sh.len) {
+                    if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {
+                        slot.server_hello_off = sh.len;
+                    } else |_| {
+                        self.closeSlot(slot, "desync rest write failed");
+                        continue;
+                    }
+                }
+            }
+
+            self.syncInterests(slot) catch |err| {
+                log.debug("[{d}] desync syncInterests error: {any}", .{ slot.conn_id, err });
+                self.closeSlot(slot, "desync sync interests failed");
+            };
+        }
+
+        self.desync_wait_slots.shrinkRetainingCapacity(write_idx);
     }
 
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -1846,10 +1869,7 @@ const EventLoop = struct {
                 continue;
             }
 
-            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-                self.closeSlot(slot, "alloc read buffer failed");
-                return;
-            };
+            const read_buf = self.shared_read_buf[0..];
             const want = @min(remaining, read_buf.len);
             const n = posix.read(slot.client_fd, read_buf[0..want]) catch |err| {
                 if (err == error.WouldBlock) return;
@@ -2274,7 +2294,7 @@ const EventLoop = struct {
         else
             null;
 
-        const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch) catch |err| {
+        const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch, self.shared_read_buf[0..]) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2299,7 +2319,7 @@ const EventLoop = struct {
         else
             null;
 
-        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
+        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch, self.shared_read_buf[0..]) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -2316,49 +2336,45 @@ const EventLoop = struct {
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
-            return;
-        };
+        const read_buf = self.shared_read_buf[0..];
 
         const n = posix.read(slot.client_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay c2s read error");
             return;
         };
         if (n == 0) {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay c2s eof");
             return;
         }
 
         _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay c2s queue error");
             return;
         };
+        slot.last_activity_ms = std.time.milliTimestamp();
     }
 
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
-            return;
-        };
+        const read_buf = self.shared_read_buf[0..];
 
         const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay s2c read error");
             return;
         };
         if (n == 0) {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay s2c eof");
             return;
         }
 
         _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask relay s2c queue error");
             return;
         };
+        slot.last_activity_ms = std.time.milliTimestamp();
     }
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2867,7 +2883,6 @@ const EventLoop = struct {
 
     fn runTimers(self: *EventLoop) void {
         const now_ms = std.time.milliTimestamp();
-        const now_ns = std.time.nanoTimestamp();
 
         const hi: usize = @intCast(self.pool.allocated_hi);
         if (hi == 0) return;
@@ -2884,19 +2899,6 @@ const EventLoop = struct {
 
             const slot = slot_opt orelse continue;
             if (slot.phase == .idle) continue;
-
-            if (slot.phase == .desync_wait and now_ns >= slot.desync_deadline_ns) {
-                slot.phase = .writing_server_hello_rest;
-                if (slot.server_hello) |sh| {
-                    if (slot.server_hello_off < sh.len) {
-                        if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {} else |_| {
-                            self.closeSlot(slot, "desync rest write failed");
-                            continue;
-                        }
-                        slot.server_hello_off = sh.len;
-                    }
-                }
-            }
 
             if (slot.phase == .closing) {
                 self.closeSlot(slot, "closing phase");
@@ -3056,6 +3058,7 @@ const EventLoop = struct {
             self.closed_since_log += 1;
         }
 
+        slot.desync_wait_enqueued = false;
         slot.phase = .idle;
         self.pool.release(slot);
     }
@@ -3112,8 +3115,7 @@ const EventLoop = struct {
     }
 };
 
-fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_c2s_scratch: ?[]u8) !RelayProgress {
-    const read_buf = try ensureReadBuf(slot, allocator);
+fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_c2s_scratch: ?[]u8, read_buf: []u8) !RelayProgress {
     var consumed_any = false;
 
     while (true) {
@@ -3198,8 +3200,7 @@ fn relayClientToUpstreamStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
     }
 }
 
-fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_s2c_scratch: ?[]u8) !RelayProgress {
-    const read_buf = try ensureReadBuf(slot, allocator);
+fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_s2c_scratch: ?[]u8, read_buf: []u8) !RelayProgress {
     const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
         if (err == error.WouldBlock) return .none;
         return err;
@@ -3357,13 +3358,6 @@ fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
         },
         else => return "?",
     }
-}
-
-fn ensureReadBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
-    if (slot.read_buf) |buf| return buf;
-    const buf = try allocator.alloc(u8, read_buf_size);
-    slot.read_buf = buf;
-    return buf;
 }
 
 fn ensureMpFrameBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
