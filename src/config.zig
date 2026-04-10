@@ -7,18 +7,29 @@ const std = @import("std");
 
 pub const UpstreamMode = enum {
     /// Infer egress mode from runtime environment (default).
-    /// If proxy runs in non-init netns, treat as AmneziaWG; otherwise direct.
+    /// If proxy runs in non-init netns, treat as tunnel; otherwise direct.
     auto,
     /// Explicit direct egress.
     direct,
-    /// Explicit AmneziaWG egress (requires running inside tunnel netns).
-    amnezia_wg,
+    /// VPN tunnel egress (AmneziaWG, WireGuard, etc.) — requires running
+    /// inside tunnel network namespace. The specific VPN type is an
+    /// mtbuddy/installer concern; for runtime proxy they are identical.
+    tunnel,
+    /// SOCKS5 proxy upstream.
+    socks5,
+    /// HTTP CONNECT proxy upstream.
+    http,
 };
 
 fn parseUpstreamMode(value: []const u8) ?UpstreamMode {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "direct") or std.mem.eql(u8, value, "none")) return .direct;
-    if (std.mem.eql(u8, value, "amnezia_wg") or std.mem.eql(u8, value, "amneziawg")) return .amnezia_wg;
+    if (std.mem.eql(u8, value, "tunnel")) return .tunnel;
+    // Backward compatibility: old config values map to .tunnel
+    if (std.mem.eql(u8, value, "amnezia_wg") or std.mem.eql(u8, value, "amneziawg")) return .tunnel;
+    if (std.mem.eql(u8, value, "wireguard") or std.mem.eql(u8, value, "wg")) return .tunnel;
+    if (std.mem.eql(u8, value, "socks5") or std.mem.eql(u8, value, "socks")) return .socks5;
+    if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "http_connect")) return .http;
     return null;
 }
 
@@ -112,8 +123,20 @@ pub const Config = struct {
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
     /// Upstream egress mode. Parsed from [upstream].type.
-    /// Supported values: auto | direct | amnezia_wg.
+    /// Supported values: auto | direct | tunnel | socks5 | http.
     upstream_mode: UpstreamMode = .auto,
+    /// Proxy server host for socks5/http upstream modes.
+    /// Parsed from [upstream.socks5].host or [upstream.http].host.
+    upstream_proxy_host: ?[]const u8 = null,
+    /// Proxy server port for socks5/http upstream modes.
+    upstream_proxy_port: u16 = 0,
+    /// Proxy authentication username (empty string = no auth).
+    upstream_proxy_username: ?[]const u8 = null,
+    /// Proxy authentication password.
+    upstream_proxy_password: ?[]const u8 = null,
+    /// VPN tunnel interface name (e.g. "awg0", "wg0").
+    /// Parsed from [upstream.tunnel].interface.
+    upstream_tunnel_interface: ?[]const u8 = null,
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -180,6 +203,9 @@ pub const Config = struct {
         var in_server_section = false;
         var in_general_section = false;
         var in_upstream_section = false;
+        var in_upstream_socks5_section = false;
+        var in_upstream_http_section = false;
+        var in_upstream_tunnel_section = false;
         var server_tag_set = false;
 
         while (lines.next()) |raw_line| {
@@ -196,6 +222,14 @@ pub const Config = struct {
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
                 in_upstream_section = std.mem.eql(u8, line, "[upstream]");
+                in_upstream_socks5_section = std.mem.eql(u8, line, "[upstream.socks5]");
+                in_upstream_http_section = std.mem.eql(u8, line, "[upstream.http]");
+                in_upstream_tunnel_section = std.mem.eql(u8, line, "[upstream.tunnel]");
+                // Sub-sections are also part of the upstream family;
+                // entering a sub-section should not reset the parent.
+                if (in_upstream_socks5_section or in_upstream_http_section or in_upstream_tunnel_section) {
+                    in_upstream_section = false;
+                }
                 continue;
             }
 
@@ -309,6 +343,20 @@ pub const Config = struct {
                             cfg.upstream_mode = mode;
                         }
                     }
+                } else if (in_upstream_socks5_section or in_upstream_http_section) {
+                    if (std.mem.eql(u8, key, "host")) {
+                        cfg.upstream_proxy_host = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "port")) {
+                        cfg.upstream_proxy_port = std.fmt.parseInt(u16, value, 10) catch 0;
+                    } else if (std.mem.eql(u8, key, "username")) {
+                        cfg.upstream_proxy_username = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "password")) {
+                        cfg.upstream_proxy_password = try allocator.dupe(u8, value);
+                    }
+                } else if (in_upstream_tunnel_section) {
+                    if (std.mem.eql(u8, key, "interface")) {
+                        cfg.upstream_tunnel_interface = try allocator.dupe(u8, value);
+                    }
                 }
             }
         }
@@ -340,6 +388,18 @@ pub const Config = struct {
         }
         if (self.middle_proxy_nat_ip) |ip| {
             allocator.free(ip);
+        }
+        if (self.upstream_proxy_host) |h| {
+            allocator.free(h);
+        }
+        if (self.upstream_proxy_username) |u| {
+            allocator.free(u);
+        }
+        if (self.upstream_proxy_password) |p| {
+            allocator.free(p);
+        }
+        if (self.upstream_tunnel_interface) |iface| {
+            allocator.free(iface);
         }
     }
 
@@ -902,7 +962,7 @@ test "parse config - multiple users" {
     try std.testing.expectEqual(@as(u8, 0xff), alice_secret[15]);
 }
 
-test "parse config - upstream type amnezia_wg" {
+test "parse config - upstream type amnezia_wg backward compat" {
     const content =
         \\[upstream]
         \\type = "amnezia_wg"
@@ -913,7 +973,22 @@ test "parse config - upstream type amnezia_wg" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(UpstreamMode.amnezia_wg, cfg.upstream_mode);
+    // amnezia_wg maps to .tunnel for backward compatibility
+    try std.testing.expectEqual(UpstreamMode.tunnel, cfg.upstream_mode);
+}
+
+test "parse config - upstream type tunnel explicit" {
+    const content =
+        \\[upstream]
+        \\type = "tunnel"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.tunnel, cfg.upstream_mode);
 }
 
 test "parse config - upstream type default auto" {
@@ -968,4 +1043,116 @@ test "parse config - legacy tunnel section ignored" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(UpstreamMode.auto, cfg.upstream_mode);
+}
+
+test "parse config - upstream type wireguard backward compat" {
+    const content =
+        \\[upstream]
+        \\type = "wireguard"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.tunnel, cfg.upstream_mode);
+}
+
+test "parse config - upstream socks5 with credentials" {
+    const content =
+        \\[upstream]
+        \\type = "socks5"
+        \\[upstream.socks5]
+        \\host = "38.180.236.207"
+        \\port = 1080
+        \\username = "admin"
+        \\password = "fr6CgjUvxFEAn5vs"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.socks5, cfg.upstream_mode);
+    try std.testing.expectEqualStrings("38.180.236.207", cfg.upstream_proxy_host.?);
+    try std.testing.expectEqual(@as(u16, 1080), cfg.upstream_proxy_port);
+    try std.testing.expectEqualStrings("admin", cfg.upstream_proxy_username.?);
+    try std.testing.expectEqualStrings("fr6CgjUvxFEAn5vs", cfg.upstream_proxy_password.?);
+}
+
+test "parse config - upstream http with credentials" {
+    const content =
+        \\[upstream]
+        \\type = "http"
+        \\[upstream.http]
+        \\host = "38.180.236.207"
+        \\port = 8080
+        \\username = "admin"
+        \\password = "secret123"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.http, cfg.upstream_mode);
+    try std.testing.expectEqualStrings("38.180.236.207", cfg.upstream_proxy_host.?);
+    try std.testing.expectEqual(@as(u16, 8080), cfg.upstream_proxy_port);
+    try std.testing.expectEqualStrings("admin", cfg.upstream_proxy_username.?);
+    try std.testing.expectEqualStrings("secret123", cfg.upstream_proxy_password.?);
+}
+
+test "parse config - upstream socks5 no credentials" {
+    const content =
+        \\[upstream]
+        \\type = "socks5"
+        \\[upstream.socks5]
+        \\host = "127.0.0.1"
+        \\port = 1080
+        \\username = ""
+        \\password = ""
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.socks5, cfg.upstream_mode);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.upstream_proxy_host.?);
+    try std.testing.expectEqual(@as(u16, 1080), cfg.upstream_proxy_port);
+    // Empty string credentials are preserved
+    try std.testing.expectEqualStrings("", cfg.upstream_proxy_username.?);
+    try std.testing.expectEqualStrings("", cfg.upstream_proxy_password.?);
+}
+
+test "parse config - upstream http_connect alias" {
+    const content =
+        \\[upstream]
+        \\type = "http_connect"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.http, cfg.upstream_mode);
+}
+
+test "parse config - upstream socks alias" {
+    const content =
+        \\[upstream]
+        \\type = "socks"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(UpstreamMode.socks5, cfg.upstream_mode);
 }

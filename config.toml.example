@@ -70,8 +70,34 @@ port = 443
 # Upstream egress mode for outgoing DC connections.
 # "auto"       — detect by runtime namespace (default)
 # "direct"     — direct TCP from current namespace
-# "amnezia_wg" — require running proxy inside tunnel namespace
+# "tunnel"     — VPN tunnel via network namespace (AmneziaWG, WireGuard, ...)
+# "socks5"     — route via SOCKS5 proxy
+# "http"       — route via HTTP CONNECT proxy
 # type = "auto"
+
+# ── VPN tunnel configuration ──
+# Activate with: type = "tunnel"
+# The interface name determines which VPN type is used:
+#   awg0 — AmneziaWG (default, via mtbuddy setup tunnel)
+#   wg0  — WireGuard
+# [upstream.tunnel]
+# interface = "awg0"
+
+# ── SOCKS5 upstream proxy configuration ──
+# Activate with: type = "socks5"
+# [upstream.socks5]
+# host = "127.0.0.1"
+# port = 1080
+# username = ""
+# password = ""
+
+# ── HTTP CONNECT upstream proxy configuration ──
+# Activate with: type = "http"
+# [upstream.http]
+# host = "127.0.0.1"
+# port = 8080
+# username = ""
+# password = ""
 
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.

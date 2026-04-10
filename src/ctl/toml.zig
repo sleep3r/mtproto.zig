@@ -182,6 +182,8 @@ fn sectionHeader(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "server")) return "[server]";
     if (std.mem.eql(u8, name, "censorship")) return "[censorship]";
     if (std.mem.eql(u8, name, "general")) return "[general]";
+    if (std.mem.eql(u8, name, "upstream")) return "[upstream]";
+    if (std.mem.eql(u8, name, "upstream.tunnel")) return "[upstream.tunnel]";
     if (std.mem.eql(u8, name, "access.users")) return "[access.users]";
     if (std.mem.eql(u8, name, "access.direct_users")) return "[access.direct_users]";
     // Fallback: just return the name (caller is responsible for brackets)

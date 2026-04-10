@@ -1,8 +1,9 @@
 //! Setup tunnel command for mtbuddy.
 //!
 //! Ports setup_tunnel.sh (400 lines bash) — creates an isolated network
-//! namespace with AmneziaWG tunnel so Telegram DCs become reachable
+//! namespace with a VPN tunnel so Telegram DCs become reachable
 //! while the host keeps normal connectivity.
+//! Currently supports AmneziaWG; other VPN types will be added.
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -47,7 +48,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
     }
 
     if (opts.awg_conf.len == 0) {
-        ui.fail("Usage: mtbuddy setup tunnel <awg-config.conf> [--mode direct|preserve|middleproxy]");
+        ui.fail("Usage: mtbuddy setup tunnel <vpn-config.conf> [--mode direct|preserve|middleproxy]");
         return;
     }
 
@@ -250,8 +251,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     };
     ui.ok(mode_label);
 
-    setUpstreamType(allocator, "amnezia_wg");
-    ui.stepOk("Set [upstream].type", "amnezia_wg");
+    setUpstreamType(allocator, "tunnel");
+    ui.stepOk("Set [upstream].type", "tunnel");
 
     // ── Inject public IP (preserve existing custom value) ──
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
@@ -333,7 +334,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     _ = sys.execForward(&.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
 
     if (sys.isServiceActive("mtproto-proxy")) {
-        ui.ok("Proxy running inside AmneziaWG tunnel");
+        ui.ok("Proxy running inside VPN tunnel");
     } else {
         ui.fail("Proxy failed to start. Check: journalctl -u mtproto-proxy -n 30");
         return;
@@ -360,14 +361,14 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     }
 
     // ── Summary ──
-    ui.summaryBox("AmneziaWG Tunnel Configured", &.{
+    ui.summaryBox("VPN Tunnel Configured", &.{
         .{ .label = "Status:", .value = "systemctl status mtproto-proxy" },
         .{ .label = "Logs:", .value = "journalctl -u mtproto-proxy -f" },
         .{ .label = "Tunnel:", .value = "ip netns exec " ++ NS_NAME ++ " awg show" },
         .{ .label = "Mode:", .value = mode_label },
         .{ .label = "", .style = .blank },
         .{ .label = "Proxy runs inside isolated network namespace", .style = .success },
-        .{ .label = "AmneziaWG tunnel active (host network untouched)", .style = .success },
+        .{ .label = "VPN tunnel active (host network untouched)", .style = .success },
         .{ .label = "SSH and host services unaffected", .style = .success },
     });
 }
@@ -386,6 +387,10 @@ fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
     var quoted_buf: [64]u8 = undefined;
     const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{value}) catch return;
     doc.set("upstream", "type", quoted) catch return;
+    
+    // Default to AmneziaWG interface when setting up tunnel via this script
+    doc.set("upstream.tunnel", "interface", "\"awg0\"") catch return;
+    
     doc.save(INSTALL_DIR ++ "/config.toml") catch {};
 }
 
@@ -440,11 +445,22 @@ fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
 /// or `.none` if no known tunnel is active.
 pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
     // Check if AmneziaWG interface is up inside the network namespace
-    const result = sys.exec(allocator, &.{
+    const awg_result = sys.exec(allocator, &.{
         "ip", "netns", "exec", NS_NAME, "awg", "show", "awg0",
-    }) catch return .none;
-    defer result.deinit();
+    }) catch null;
+    if (awg_result) |r| {
+        defer r.deinit();
+        if (r.exit_code == 0) return .tunnel;
+    }
 
-    if (result.exit_code == 0) return .amnezia_wg;
+    // Check if WireGuard interface is up inside the network namespace
+    const wg_result = sys.exec(allocator, &.{
+        "ip", "netns", "exec", NS_NAME, "wg", "show", "wg0",
+    }) catch null;
+    if (wg_result) |r| {
+        defer r.deinit();
+        if (r.exit_code == 0) return .tunnel;
+    }
+
     return .none;
 }

@@ -176,7 +176,7 @@ const en_strings = [_][]const u8{
     // menu_setup_masking
     "\xF0\x9F\x9B\xA1\xEF\xB8\x8F  Setup DPI evasion",
     // menu_setup_tunnel
-    "\xF0\x9F\x94\x97  Setup AmneziaWG tunnel",
+    "\xF0\x9F\x94\x97  Setup tunnel",
     // menu_setup_recovery
     "🚑  Setup auto-recovery",
     // menu_setup_dashboard
@@ -230,9 +230,9 @@ const en_strings = [_][]const u8{
 
     // ── Tunnel ──
     // tunnel_conf_prompt
-    "AmneziaWG config file path",
+    "VPN config file path",
     // tunnel_conf_help
-    "Path to your .conf file from AmneziaVPN app or provider.",
+    "Path to your .conf file from VPN app or provider.",
 
     // ── Install ──
     // install_header
@@ -401,7 +401,7 @@ const ru_strings = [_][]const u8{
     // menu_setup_masking
     "\xF0\x9F\x9B\xA1\xEF\xB8\x8F  Настроить обход DPI",
     // menu_setup_tunnel
-    "\xF0\x9F\x94\x97  Настроить AmneziaWG туннель",
+    "\xF0\x9F\x94\x97  Настроить туннель",
     // menu_setup_recovery
     "🚑  Настроить авто-восстановление",
     // menu_setup_dashboard
@@ -455,7 +455,7 @@ const ru_strings = [_][]const u8{
 
     // ── Tunnel ──
     // tunnel_conf_prompt
-    "Путь к конфигурации AmneziaWG",
+    "Путь к конфигурации VPN",
     // tunnel_conf_help
     "Путь к .conf файлу от VPN-приложения или провайдера.",
 

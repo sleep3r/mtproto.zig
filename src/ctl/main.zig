@@ -319,7 +319,7 @@ fn printHelp() void {
     printCmd(&ui, "update", "Update to latest GitHub release");
     printCmd(&ui, "setup masking", "Setup local Nginx DPI masking");
     printCmd(&ui, "setup nfqws", "Setup nfqws TCP desync (Zapret)");
-    printCmd(&ui, "setup tunnel <conf>", "Setup AmneziaWG tunnel");
+    printCmd(&ui, "setup tunnel <conf>", "Setup VPN tunnel (AmneziaWG, WireGuard, ...)");
     printCmd(&ui, "setup dashboard",     "Install web monitoring dashboard");
     printCmd(&ui, "setup recovery",      "Install DPI auto-recovery");
     printCmd(&ui, "ipv6-hop", "IPv6 address rotation");

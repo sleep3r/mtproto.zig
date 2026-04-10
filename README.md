@@ -46,7 +46,7 @@ It also ships more evasion techniques than any of the above:
 | **TCPMSS=88** | Fragments ClientHello across 6 TCP packets, breaking DPI reassembly |
 | **nfqws TCP desync** | Sends fake packets + TTL-limited splits to confuse stateful DPI |
 | **Split-TLS** | 1-byte Application records to defeat passive signatures |
-| **AmneziaWG tunnel** | Routes through WG in an isolated network namespace when Telegram DCs are blocked |
+| **VPN tunnel** | Routes through WireGuard/AmneziaWG in an isolated network namespace when DCs are blocked |
 | **IPv6 hopping** | Auto-rotates IPv6 address from /64 on ban detection via Cloudflare API |
 | **Anti-replay** | Rejects replayed handshakes + detects ТСПУ Revisor active probes |
 | **Multi-user** | Independent per-user secrets |
@@ -154,7 +154,7 @@ sudo mtbuddy setup recovery
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 
-# AmneziaWG tunnel (for servers where Telegram DCs are blocked)
+# VPN tunnel (for servers where Telegram DCs are blocked)
 sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
 
 # IPv6 hopping
@@ -180,9 +180,27 @@ sudo systemctl restart mtproto-proxy
 
 ---
 
-## AmneziaWG tunnel
+## Upstream Routing
 
-If your VPS is in a region where Telegram DCs are blocked at the network level (e.g. Russia), you can route proxy traffic through an AmneziaWG tunnel in an isolated network namespace. The host is completely unaffected — only the proxy process runs inside the namespace.
+The proxy supports multiple ways to route outgoing connections to Telegram DC servers.
+
+### Routing modes
+
+| `[upstream].type` | How it works | When to use |
+|---|---|---|
+| `auto` (default) | Auto-detect: if running in a network namespace → tunnel, otherwise → direct | Most deployments |
+| `direct` | Connect to Telegram DCs directly from the host | DCs reachable from the server |
+| `tunnel` | Direct connect inside an isolated network namespace with a VPN tunnel | DCs blocked by the ISP |
+| `socks5` | Route through an external SOCKS5 proxy with optional auth | Existing proxy infrastructure |
+| `http` | Route through an HTTP CONNECT proxy with optional auth | Corporate proxy environments |
+
+### VPN tunnel
+
+If your VPS is in a region where Telegram DCs are blocked at the network level, you can route proxy traffic through a VPN tunnel in an isolated network namespace. The host is completely unaffected — only the proxy process runs inside the namespace.
+
+Currently supported VPN types:
+- **AmneziaWG** — DPI-resistant WireGuard fork (recommended for Russia/Iran)
+- **WireGuard** — standard WireGuard (planned)
 
 ```
 Client → VPS:443 → [DNAT] → tg_proxy_ns:443
@@ -205,7 +223,37 @@ sudo mtbuddy setup tunnel /path/to/awg0.conf --mode direct
 
 After setup, `mtbuddy` validates connectivity to all 5 Telegram DCs through the tunnel and prints the link.
 
-It also sets `[upstream].type = "amnezia_wg"` in `config.toml`, so tunnel intent is explicit in config (not only in systemd/netns wiring).
+### SOCKS5 proxy
+
+Route DC connections through an external SOCKS5 proxy. Supports RFC 1928 auth.
+
+```toml
+[upstream]
+type = "socks5"
+
+[upstream.socks5]
+host = "127.0.0.1"
+port = 1080
+username = "admin"    # optional, omit for no-auth
+password = "secret"
+```
+
+### HTTP CONNECT proxy
+
+Route DC connections through an HTTP CONNECT proxy. Supports Basic auth.
+
+```toml
+[upstream]
+type = "http"
+
+[upstream.http]
+host = "127.0.0.1"
+port = 8080
+username = "admin"    # optional, omit for no-auth
+password = "secret"
+```
+
+> **Note:** Only DC-bound traffic is routed through the configured upstream. Mask (camouflage) connections always go direct.
 
 ---
 
@@ -218,11 +266,11 @@ Config lives at `/opt/mtproto-proxy/config.toml`. MTBuddy generates it on instal
 use_middle_proxy = true   # ME mode for promo-channel parity
 
 [upstream]
-type = "auto"            # auto | direct | amnezia_wg
+type = "auto"            # auto | direct | tunnel | socks5 | http
 
 [server]
 port = 443
-# public_ip = "proxy.example.com"   # Override auto-detected IP (recommended with amnezia_wg)
+# public_ip = "proxy.example.com"   # Override auto-detected IP (recommended with tunnel)
 max_connections = 512
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -250,11 +298,19 @@ alice = true   # bypass MiddleProxy for this user
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `[upstream].type` | `auto` | Egress mode: `auto` (detect netns), `direct`, or `amnezia_wg` (requires proxy in tunnel netns) |
+| `[upstream].type` | `auto` | Egress mode: `auto` (detect netns), `direct`, `tunnel` (VPN via netns), `socks5`, or `http` |
+| `[upstream.socks5] host` | — | SOCKS5 proxy address |
+| `[upstream.socks5] port` | — | SOCKS5 proxy port |
+| `[upstream.socks5] username` | — | SOCKS5 username (empty = no auth) |
+| `[upstream.socks5] password` | — | SOCKS5 password |
+| `[upstream.http] host` | — | HTTP CONNECT proxy address |
+| `[upstream.http] port` | — | HTTP CONNECT proxy port |
+| `[upstream.http] username` | — | HTTP proxy username (empty = no auth) |
+| `[upstream.http] password` | — | HTTP proxy password |
 | `[general] use_middle_proxy` | `false` | Telemt-compatible ME mode for DC1..5 (recommended for promo parity) |
 | `[general] ad_tag` | — | Alias for `[server].tag` (telemt compat) |
 | `[server] port` | `443` | TCP listen port |
-| `[server] public_ip` | auto | Override auto-detected IP/domain. Required with AmneziaWG tunnel |
+| `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |
@@ -285,7 +341,7 @@ alice = true   # bypass MiddleProxy for this user
 
 ## Monitoring dashboard
 
-A lightweight web dashboard (FastAPI + WebSocket, ~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, AmneziaWG tunnel metrics, user management, and streaming logs.
+A lightweight web dashboard (FastAPI + WebSocket, ~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, tunnel metrics, user management, and streaming logs.
 
 The dashboard is **embedded directly into the `mtbuddy` binary** — no extra files needed.
 
