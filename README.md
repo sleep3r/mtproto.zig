@@ -76,6 +76,9 @@ sudo mtbuddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --
 
 # Disable all DPI modules (bare proxy only)
 sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
+
+# Install using an existing config file (auto-maps port and domain)
+sudo mtbuddy install --config /path/to/config.toml --yes
 ```
 
 At the end, mtbuddy prints a ready-to-use `tg://` connection link.
@@ -117,6 +120,7 @@ sudo mtbuddy --interactive
 | `--domain, -d` | `wb.ru` | TLS masking domain |
 | `--secret, -s` | auto | User secret (32 hex chars) |
 | `--user, -u` | `user` | Username in `config.toml` |
+| `--config, -c` | — | Use existing `config.toml` file |
 | `--yes, -y` | — | Skip confirmation prompt |
 | `--no-masking` | — | Disable Nginx masking |
 | `--no-nfqws` | — | Disable nfqws TCP desync |
