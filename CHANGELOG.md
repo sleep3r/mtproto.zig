@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/sleep3r/mtproto.zig/compare/v0.14.5...v0.14.6) (2026-04-10)
+
+
+### Bug Fixes
+
+* **ctl:** honor configured public IP in generated links ([#146](https://github.com/sleep3r/mtproto.zig/issues/146)) ([ce6463d](https://github.com/sleep3r/mtproto.zig/commit/ce6463d96752a415d3be6ca6df8bb408c0bfd26c))
+
 ## [0.14.5](https://github.com/sleep3r/mtproto.zig/compare/v0.14.4...v0.14.5) (2026-04-10)
 
 

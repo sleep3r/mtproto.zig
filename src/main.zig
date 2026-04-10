@@ -47,7 +47,7 @@ fn lockFreeLog(
 
 const log = std.log.scoped(.mtproto);
 
-const version = "0.14.5"; // x-release-please-version
+const version = "0.14.6"; // x-release-please-version
 
 // ============= Output Helpers (Zig 0.15 compatible) =============
 
