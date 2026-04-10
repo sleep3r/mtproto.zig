@@ -383,7 +383,7 @@ make soak      # 30s multithreaded stability test
 Cross-compile for Linux from macOS:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 scp zig-out/bin/mtproto-proxy root@<SERVER>:/opt/mtproto-proxy/
 ```
 

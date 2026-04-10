@@ -10,8 +10,8 @@ help: ## Show this help message
 
 # ── local dev ─────────────────────────────────────────────────────────────────
 
-build: ## Cross-compile proxy + mtbuddy for Linux x86_64
-	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
+build: ## Cross-compile proxy + mtbuddy for Linux x86_64 (AES-enabled)
+	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 
 fmt: ## Format all Zig source files
 	zig fmt src/
