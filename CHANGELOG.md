@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/sleep3r/mtproto.zig/compare/v0.14.3...v0.14.4) (2026-04-10)
+
+
+### Bug Fixes
+
+* **tunnel:** tolerate AWG DNS lines in netns setup ([#136](https://github.com/sleep3r/mtproto.zig/issues/136)) ([c5748c4](https://github.com/sleep3r/mtproto.zig/commit/c5748c495ce5e13a5d3502056b3a237bfcc8cbea))
+
 ## [0.14.3](https://github.com/sleep3r/mtproto.zig/compare/v0.14.2...v0.14.3) (2026-04-10)
 
 
