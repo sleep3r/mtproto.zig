@@ -35,12 +35,27 @@ jobs:
         include:
           - target: x86_64-linux
             artifact_name: mtproto-proxy-linux-x86_64
+            binary: mtproto-proxy
             cpu: ""
           - target: x86_64-linux
             artifact_name: mtproto-proxy-linux-x86_64_v3
+            binary: mtproto-proxy
             cpu: x86_64_v3
           - target: aarch64-linux
             artifact_name: mtproto-proxy-linux-aarch64
+            binary: mtproto-proxy
+            cpu: ""
+          - target: x86_64-linux
+            artifact_name: mtbuddy-linux-x86_64
+            binary: mtbuddy
+            cpu: ""
+          - target: x86_64-linux
+            artifact_name: mtbuddy-linux-x86_64_v3
+            binary: mtbuddy
+            cpu: x86_64_v3
+          - target: aarch64-linux
+            artifact_name: mtbuddy-linux-aarch64
+            binary: mtbuddy
             cpu: ""
 
     steps:
@@ -65,7 +80,7 @@ jobs:
       - name: Package artifact
         run: |
           mkdir -p dist
-          cp zig-out/bin/mtproto-proxy dist/${{ matrix.artifact_name }}
+          cp zig-out/bin/${{ matrix.binary }} dist/${{ matrix.artifact_name }}
           chmod +x dist/${{ matrix.artifact_name }}
           tar -C dist -czf dist/${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
 
