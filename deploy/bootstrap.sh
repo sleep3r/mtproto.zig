@@ -27,14 +27,19 @@ step() { printf "  ${Y}●${N} %s...\n" "$*"; }
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)
-    # prefer v3 if CPU supports it
-    if grep -qE 'avx2|bmi1|bmi2' /proc/cpuinfo 2>/dev/null; then
+    # try v3 first (AVX2/BMI2 etc); runtime validation will fall back if unsupported
+    if grep -q 'avx2' /proc/cpuinfo 2>/dev/null; then
       ARTIFACT="mtproto-proxy-linux-x86_64_v3"
+      ARTIFACT_FALLBACK="mtproto-proxy-linux-x86_64"
     else
       ARTIFACT="mtproto-proxy-linux-x86_64"
+      ARTIFACT_FALLBACK=""
     fi
     ;;
-  aarch64) ARTIFACT="mtproto-proxy-linux-aarch64" ;;
+  aarch64)
+    ARTIFACT="mtproto-proxy-linux-aarch64"
+    ARTIFACT_FALLBACK=""
+    ;;
   *) fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -55,8 +60,22 @@ tar xzf "$TMP/mtbuddy.tar.gz" -C "$TMP"
 BUDDY_BIN="$TMP/$ARTIFACT"
 [ -f "$BUDDY_BIN" ] || fail "binary not found in archive: $ARTIFACT"
 
-# ── validate ──────────────────────────────────────────────────────
-"$BUDDY_BIN" --version > /dev/null 2>&1 || fail "Binary validation failed (illegal instruction?)"
+# ── validate (fallback to base if v3 causes illegal instruction) ──
+if ! "$BUDDY_BIN" --version > /dev/null 2>&1; then
+  if [ -n "$ARTIFACT_FALLBACK" ]; then
+    step "v3 binary unsupported by CPU, retrying with $ARTIFACT_FALLBACK"
+    ARTIFACT="$ARTIFACT_FALLBACK"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ARTIFACT}.tar.gz"
+    curl -fsSL "$DOWNLOAD_URL" -o "$TMP/mtbuddy.tar.gz" \
+      || fail "Download failed: $DOWNLOAD_URL"
+    tar xzf "$TMP/mtbuddy.tar.gz" -C "$TMP"
+    BUDDY_BIN="$TMP/$ARTIFACT"
+    [ -f "$BUDDY_BIN" ] || fail "binary not found in archive: $ARTIFACT"
+    "$BUDDY_BIN" --version > /dev/null 2>&1 || fail "Binary validation failed"
+  else
+    fail "Binary validation failed"
+  fi
+fi
 
 # ── install ───────────────────────────────────────────────────────
 install -m 0755 "$BUDDY_BIN" "$INSTALL_TO"
