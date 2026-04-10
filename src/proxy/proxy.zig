@@ -15,6 +15,7 @@ const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
+const upstream_mod = @import("upstream.zig");
 
 const log = std.log.scoped(.proxy);
 
@@ -823,6 +824,7 @@ pub const ProxyState = struct {
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
+    upstream: upstream_mod.Upstream,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -931,6 +933,7 @@ pub const ProxyState = struct {
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
+            .upstream = upstream_mod.Upstream.initDirect(),
         };
     }
 
@@ -1965,7 +1968,8 @@ const EventLoop = struct {
     }
 
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: net.Address, kind: UpstreamKind) !void {
-        const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+        const connect_result = try self.state.upstream.connect(addr);
+        const fd = connect_result.fd;
         errdefer posix.close(fd);
 
         try self.addFd(fd, false, true);
@@ -1984,12 +1988,9 @@ const EventLoop = struct {
             slot.current_upstream_addr = null;
         }
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-            error.WouldBlock, error.ConnectionPending => return,
-            else => return err,
-        };
-
-        self.onUpstreamConnectComplete(slot);
+        if (!connect_result.pending) {
+            self.onUpstreamConnectComplete(slot);
+        }
     }
 
     fn onUpstreamConnectComplete(self: *EventLoop, slot: *ConnectionSlot) void {
