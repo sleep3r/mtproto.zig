@@ -21,7 +21,8 @@ const tunnel_mod = @import("../tunnel.zig");
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
-const event_loop_wait_ms = 37;
+const event_loop_wait_ms: i32 = 37;
+const desync_wait_poll_ms: i32 = 3;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
 const accept_batch_limit: usize = 256;
@@ -37,6 +38,7 @@ const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 32 * 1024;
+const max_pipelined_handshake_bytes: usize = 128 * 1024;
 
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed-size open-addressed hash table — zero heap allocation.
@@ -159,6 +161,7 @@ const MsgBlock = struct {
 const msg_block_size: usize = 2048;
 const msg_free_cap_per_queue: usize = 4;
 const max_scatter_parts: usize = 64;
+const upstream_candidates_inline_cap: usize = 4;
 
 fn hasFatalEpollHangup(events: u32) bool {
     return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0;
@@ -199,12 +202,26 @@ const MessageQueue = struct {
         if (data.len == 0) return;
 
         var off: usize = 0;
+
+        if (self.blocks.items.len > 0) {
+            const last_blk = self.blocks.items[self.blocks.items.len - 1];
+            if (last_blk.len < msg_block_size) {
+                const space = msg_block_size - last_blk.len;
+                const take = @min(space, data.len);
+                @memcpy(last_blk.data[last_blk.len .. last_blk.len + take], data[off .. off + take]);
+                last_blk.len += take;
+                self.total_len += take;
+                off += take;
+            }
+        }
+
         while (off < data.len) {
             const rem = data.len - off;
-            const cap = msg_block_size;
-            const take = @min(rem, cap);
+            const take = @min(rem, msg_block_size);
 
             const blk = try self.acquireBlock();
+            errdefer self.recycleBlock(blk);
+
             blk.len = take;
             @memcpy(blk.data[0..take], data[off .. off + take]);
             try self.blocks.append(self.allocator, blk);
@@ -523,7 +540,9 @@ const ConnectionSlot = struct {
     use_middle_proxy: bool = false,
     is_media_path: bool = false,
 
-    upstream_candidates: ?[]net.Address = null,
+    upstream_candidates_inline: [upstream_candidates_inline_cap]net.Address = undefined,
+    upstream_candidates_heap: ?[]net.Address = null,
+    upstream_candidate_count: u8 = 0,
     upstream_candidate_next: u8 = 0,
     direct_fallback_addr: ?net.Address = null,
     direct_fallback_used: bool = false,
@@ -626,8 +645,9 @@ const ConnectionSlot = struct {
         if (self.middle_ctx) |*mp| mp.deinit(allocator);
         self.middle_ctx = null;
 
-        if (self.upstream_candidates) |buf| allocator.free(buf);
-        self.upstream_candidates = null;
+        if (self.upstream_candidates_heap) |buf| allocator.free(buf);
+        self.upstream_candidates_heap = null;
+        self.upstream_candidate_count = 0;
         self.upstream_candidate_next = 0;
         self.direct_fallback_addr = null;
         self.direct_fallback_used = false;
@@ -655,6 +675,57 @@ const ConnectionSlot = struct {
     fn clientHelloBuf(self: *ConnectionSlot) []u8 {
         if (self.client_hello_heap) |buf| return buf;
         return self.client_hello_inline[0..self.client_hello_len];
+    }
+
+    fn upstreamCandidates(self: *const ConnectionSlot) []const net.Address {
+        const count: usize = self.upstream_candidate_count;
+        if (count == 0) return &.{};
+        if (self.upstream_candidates_heap) |buf| return buf[0..count];
+        return self.upstream_candidates_inline[0..count];
+    }
+
+    fn setUpstreamCandidates(self: *ConnectionSlot, allocator: std.mem.Allocator, candidates: []const net.Address) !void {
+        if (self.upstream_candidates_heap) |buf| {
+            allocator.free(buf);
+            self.upstream_candidates_heap = null;
+        }
+
+        if (candidates.len == 0) {
+            self.upstream_candidate_count = 0;
+            return;
+        }
+
+        if (candidates.len <= self.upstream_candidates_inline.len) {
+            @memcpy(self.upstream_candidates_inline[0..candidates.len], candidates);
+            self.upstream_candidate_count = @intCast(candidates.len);
+            return;
+        }
+
+        const heap = try allocator.alloc(net.Address, candidates.len);
+        errdefer allocator.free(heap);
+
+        @memcpy(heap, candidates);
+        self.upstream_candidates_heap = heap;
+        self.upstream_candidate_count = @intCast(candidates.len);
+    }
+};
+
+pub const BenchCandidatePath = struct {
+    slot: ConnectionSlot = .{},
+
+    pub fn deinit(self: *BenchCandidatePath, allocator: std.mem.Allocator) void {
+        self.slot.resetOwnedBuffers(allocator);
+    }
+
+    pub fn apply(self: *BenchCandidatePath, allocator: std.mem.Allocator, candidates: []const net.Address) !usize {
+        if (candidates.len == 0) return error.BenchEmptyCandidates;
+
+        try self.slot.setUpstreamCandidates(allocator, candidates);
+
+        const prepared = self.slot.upstreamCandidates();
+        self.slot.upstream_candidate_next = 1;
+        self.slot.current_upstream_addr = prepared[0];
+        return prepared.len;
     }
 };
 
@@ -748,11 +819,6 @@ const ConnectionPool = struct {
         return self.slots[idx];
     }
 };
-
-fn slotCandidateCount(slot: *const ConnectionSlot) usize {
-    if (slot.upstream_candidates) |c| return c.len;
-    return 0;
-}
 
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
@@ -1055,8 +1121,11 @@ pub const ProxyState = struct {
     }
 
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
-        const cfg_bytes = try fetchUrlBytes(self.allocator, middle_proxy_config_url);
-        defer self.allocator.free(cfg_bytes);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
+
+        const cfg_bytes = try fetchUrlBytes(temp_alloc, middle_proxy_config_url);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
         var next_dc4_candidates: [16]net.Address = undefined;
@@ -1092,8 +1161,7 @@ pub const ProxyState = struct {
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
 
-        const next_secret = try fetchUrlBytes(self.allocator, middle_proxy_secret_url);
-        defer self.allocator.free(next_secret);
+        const next_secret = try fetchUrlBytes(temp_alloc, middle_proxy_secret_url);
 
         if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
             return error.BadMiddleProxySecret;
@@ -1241,7 +1309,12 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = std.time.nanoTimestamp();
 
         while (true) {
-            const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
+            var current_wait_ms: i32 = event_loop_wait_ms;
+            if (self.desync_wait_slots.items.len > 0) {
+                current_wait_ms = @min(current_wait_ms, desync_wait_poll_ms);
+            }
+
+            const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), current_wait_ms);
             switch (posix.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -1994,20 +2067,12 @@ const EventLoop = struct {
             });
         }
 
-        if (slot.upstream_candidates) |old| {
-            self.state.allocator.free(old);
-            slot.upstream_candidates = null;
-        }
-
-        slot.upstream_candidates = self.state.allocator.alloc(net.Address, plan.count) catch {
+        slot.setUpstreamCandidates(self.state.allocator, plan.candidates[0..plan.count]) catch {
             self.closeSlot(slot, "alloc upstream candidate list failed");
             return;
         };
-        const candidates = slot.upstream_candidates.?;
-        var idx: usize = 0;
-        while (idx < candidates.len) : (idx += 1) {
-            candidates[idx] = plan.candidates[idx];
-        }
+
+        const candidates = slot.upstreamCandidates();
         slot.upstream_candidate_next = 1;
         slot.current_upstream_addr = candidates[0];
 
@@ -2114,11 +2179,13 @@ const EventLoop = struct {
 
     fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror) bool {
         const attempt_addr = slot.current_upstream_addr;
-        const candidates = slot.upstream_candidates orelse return false;
-        const candidate_count = slotCandidateCount(slot);
+        const candidates = slot.upstreamCandidates();
+        if (candidates.len == 0) return false;
+        const candidate_count = candidates.len;
 
-        if (slot.upstream_candidate_next < candidates.len) {
-            const next_idx = slot.upstream_candidate_next;
+        const next_u: usize = slot.upstream_candidate_next;
+        if (next_u < candidates.len) {
+            const next_idx = next_u;
             const next_addr = candidates[next_idx];
             slot.upstream_candidate_next += 1;
             self.startConnectUpstream(slot, next_addr, .dc) catch |next_err| {
@@ -2151,15 +2218,10 @@ const EventLoop = struct {
             const fallback = slot.direct_fallback_addr.?;
             slot.upstream_candidate_next = 1;
 
-            if (slot.upstream_candidates) |old| {
-                self.state.allocator.free(old);
-                slot.upstream_candidates = null;
-            }
-            const one = self.state.allocator.alloc(net.Address, 1) catch {
+            var one = [_]net.Address{fallback};
+            slot.setUpstreamCandidates(self.state.allocator, one[0..]) catch {
                 return false;
             };
-            one[0] = fallback;
-            slot.upstream_candidates = one;
 
             self.startConnectUpstream(slot, fallback, .dc) catch |fallback_err| {
                 log.warn("[{d}] direct fallback connect failed: {any}", .{ slot.conn_id, fallback_err });
@@ -2717,15 +2779,10 @@ const EventLoop = struct {
         self.cleanupFailedUpstreamConnect(slot);
         slot.upstream_candidate_next = 1;
 
-        if (slot.upstream_candidates) |old| {
-            self.state.allocator.free(old);
-            slot.upstream_candidates = null;
-        }
-        const one = self.state.allocator.alloc(net.Address, 1) catch {
+        var one = [_]net.Address{fallback};
+        slot.setUpstreamCandidates(self.state.allocator, one[0..]) catch {
             return false;
         };
-        one[0] = fallback;
-        slot.upstream_candidates = one;
 
         self.startConnectUpstream(slot, fallback, .dc) catch |err| {
             log.warn("[{d}] direct fallback connect start failed: {any}", .{ slot.conn_id, err });
@@ -3122,15 +3179,24 @@ const EventLoop = struct {
 
     fn appendPipelined(self: *EventLoop, slot: *ConnectionSlot, extra: []const u8) !void {
         if (extra.len == 0) return;
+
+        const current_len: usize = if (slot.pipelined_data) |p| p.len else 0;
+        const next_len = std.math.add(usize, current_len, extra.len) catch {
+            return error.PipelinedDataTooLarge;
+        };
+        if (next_len > max_pipelined_handshake_bytes) {
+            return error.PipelinedDataTooLarge;
+        }
+
         if (slot.pipelined_data == null) {
-            const buf = try self.state.allocator.alloc(u8, extra.len);
+            const buf = try self.state.allocator.alloc(u8, next_len);
             @memcpy(buf, extra);
             slot.pipelined_data = buf;
             return;
         }
 
         const prev = slot.pipelined_data.?;
-        const next = try self.state.allocator.alloc(u8, prev.len + extra.len);
+        const next = try self.state.allocator.alloc(u8, next_len);
         @memcpy(next[0..prev.len], prev);
         @memcpy(next[prev.len..], extra);
         self.state.allocator.free(prev);
@@ -3847,6 +3913,9 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
         const n_iov = queue.prepareIovecs(iovecs[0..]);
         if (n_iov == 0) return true;
 
+        var total_req: usize = 0;
+        for (iovecs[0..n_iov]) |iov| total_req += iov.len;
+
         const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) return false;
             return err;
@@ -3855,7 +3924,7 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
         if (n == 0) return error.ConnectionReset;
         try queue.consume(n);
 
-        if (n < iovecs[0].len) return false;
+        if (n < total_req) return false;
     }
 
     return true;
@@ -4023,6 +4092,18 @@ test "message queue consume is stable" {
     try std.testing.expect(q.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), q.offset);
     try std.testing.expectEqual(@as(usize, 0), q.head_idx);
+}
+
+test "message queue append fills tail block" {
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    try q.appendCopy("abcde");
+    try q.appendCopy("fghij");
+
+    try std.testing.expectEqual(@as(usize, 10), q.total_len);
+    try std.testing.expectEqual(@as(usize, 1), q.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 10), q.blocks.items[0].len);
 }
 
 test "epoll hangup helper" {

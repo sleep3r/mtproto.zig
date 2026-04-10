@@ -50,6 +50,12 @@ jobs:
       - name: Run microbenchmark
         run: zig build -Doptimize=ReleaseFast bench 2>&1 | tee bench-output.txt
 
+      - name: Run handshake-path benchmark (inline candidates)
+        run: zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=4 2>&1 | tee handshake-path-inline-output.txt
+
+      - name: Run handshake-path benchmark (heap fallback)
+        run: zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=200000 --candidate-count=8 2>&1 | tee handshake-path-heap-output.txt
+
       - name: Run soak test
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -67,5 +73,7 @@ jobs:
           name: bench-soak-results
           path: |
             bench-output.txt
+            handshake-path-inline-output.txt
+            handshake-path-heap-output.txt
             soak-output.txt
           retention-days: 90
