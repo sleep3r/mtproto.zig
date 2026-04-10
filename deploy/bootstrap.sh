@@ -17,9 +17,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 # ── colour helpers ────────────────────────────────────────────────
 Y='\033[0;33m'; G='\033[0;32m'; R='\033[0;31m'; N='\033[0m'
-ok()   { printf "  ${G}✔${N} %s\n" "$*"; }
+ok()   { printf "  ${G}✔${N} %s\n" "$*" >&2; }
 fail() { printf "  ${R}✖${N} %s\n" "$*" >&2; exit 1; }
-step() { printf "  ${Y}●${N} %s...\n" "$*"; }
+step() { printf "  ${Y}●${N} %s...\n" "$*" >&2; }
 
 [ "$(id -u)" = "0" ] || fail "Run as root: sudo bash bootstrap.sh"
 
