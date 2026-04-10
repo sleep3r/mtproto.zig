@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.1](https://github.com/sleep3r/mtproto.zig/compare/v0.15.0...v0.15.1) (2026-04-10)
+
+
+### Bug Fixes
+
+* **proxy:** decouple tunnel routing from netns and add dashboard controls ([#160](https://github.com/sleep3r/mtproto.zig/issues/160)) ([95b5194](https://github.com/sleep3r/mtproto.zig/commit/95b5194c01a767208686de91dd8fb40befec8f8d))
+
 ## [0.15.0](https://github.com/sleep3r/mtproto.zig/compare/v0.14.8...v0.15.0) (2026-04-10)
 
 
