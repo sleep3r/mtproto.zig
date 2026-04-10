@@ -53,7 +53,9 @@ def _load_dashboard_config() -> dict:
                     "port": int(mon.get("port", defaults["port"])),
                 }
             except Exception as exc:
-                print(f"[dashboard] warning: failed to parse {p}: {exc}", file=sys.stderr)
+                print(
+                    f"[dashboard] warning: failed to parse {p}: {exc}", file=sys.stderr
+                )
     return defaults
 
 
@@ -222,7 +224,7 @@ AWG_CACHE_TTL = 10  # seconds
 
 
 def _awg_status() -> dict:
-    """Check AmneziaWG tunnel status. Returns None if not installed."""
+    """Check AmneziaWG tunnel status (host namespace)."""
     now = time.time()
     if now - _awg_cache["ts"] < AWG_CACHE_TTL:
         return _awg_cache["data"]
@@ -233,67 +235,20 @@ def _awg_status() -> dict:
         _awg_cache.update(ts=now, data=None)
         return None
 
-    # Check if namespace exists
-    try:
-        ns_out = subprocess.check_output(
-            ["ip", "netns", "list"], text=True, timeout=2, stderr=subprocess.DEVNULL
-        )
-        if "tg_proxy_ns" not in ns_out:
-            result = {
-                "installed": True,
-                "active": False,
-                "reason": "namespace not found",
-            }
-            _awg_cache.update(ts=now, data=result)
-            return result
-    except Exception:
-        _awg_cache.update(ts=now, data=None)
-        return None
+    tunnel = _detect_tunnel_interface("awg0", "awg")
+    result = {
+        "installed": True,
+        "active": bool(tunnel.get("active")),
+        "endpoint": tunnel.get("endpoint"),
+        "handshake": tunnel.get("handshake"),
+        "rx": tunnel.get("rx"),
+        "tx": tunnel.get("tx"),
+    }
+    if not result["active"]:
+        result["reason"] = tunnel.get("reason") or "awg0 not active"
 
-    try:
-        out = subprocess.check_output(
-            ["ip", "netns", "exec", "tg_proxy_ns", "awg", "show"],
-            text=True,
-            timeout=3,
-            stderr=subprocess.DEVNULL,
-        )
-        result = {
-            "installed": True,
-            "active": False,
-            "endpoint": None,
-            "handshake": None,
-            "rx": None,
-            "tx": None,
-        }
-
-        m = re.search(r"endpoint:\s*(\S+)", out)
-        if m:
-            result["endpoint"] = m[1]
-
-        m = re.search(r"latest handshake:\s*(.+)", out)
-        if m:
-            result["handshake"] = m[1].strip()
-
-        m = re.search(
-            r"transfer:\s*([\d.]+\s*\S+)\s+received,\s*([\d.]+\s*\S+)\s+sent", out
-        )
-        if m:
-            result["rx"] = m[1]
-            result["tx"] = m[2]
-
-        if result.get("endpoint"):
-            result["active"] = True
-            if not result.get("handshake"):
-                result["handshake"] = "none (idle)"
-        else:
-            result["reason"] = "no endpoint configured"
-
-        _awg_cache.update(ts=now, data=result)
-        return result
-    except Exception:
-        result = {"installed": True, "active": False, "reason": "awg show failed"}
-        _awg_cache.update(ts=now, data=result)
-        return result
+    _awg_cache.update(ts=now, data=result)
+    return result
 
 
 _mask_cache = {"ts": 0, "data": None}
@@ -320,6 +275,17 @@ def _load_proxy_runtime_config() -> dict:
         "mask": True,
         "mask_port": 443,
         "tls_domain": "google.com",
+        "use_middle_proxy": False,
+        "upstream_type": "auto",
+        "upstream_tunnel_interface": "awg0",
+        "upstream_socks5_host": "",
+        "upstream_socks5_port": 0,
+        "upstream_socks5_username": "",
+        "upstream_socks5_password": "",
+        "upstream_http_host": "",
+        "upstream_http_port": 0,
+        "upstream_http_username": "",
+        "upstream_http_password": "",
         "users": {},
         "direct_users": set(),
     }
@@ -339,6 +305,17 @@ def _load_proxy_runtime_config() -> dict:
         "mask": defaults["mask"],
         "mask_port": defaults["mask_port"],
         "tls_domain": defaults["tls_domain"],
+        "use_middle_proxy": defaults["use_middle_proxy"],
+        "upstream_type": defaults["upstream_type"],
+        "upstream_tunnel_interface": defaults["upstream_tunnel_interface"],
+        "upstream_socks5_host": defaults["upstream_socks5_host"],
+        "upstream_socks5_port": defaults["upstream_socks5_port"],
+        "upstream_socks5_username": defaults["upstream_socks5_username"],
+        "upstream_socks5_password": defaults["upstream_socks5_password"],
+        "upstream_http_host": defaults["upstream_http_host"],
+        "upstream_http_port": defaults["upstream_http_port"],
+        "upstream_http_username": defaults["upstream_http_username"],
+        "upstream_http_password": defaults["upstream_http_password"],
         "users": {},
         "direct_users": set(),
     }
@@ -378,6 +355,44 @@ def _load_proxy_runtime_config() -> dict:
                         if digits:
                             result["port"] = int(digits)
 
+                elif section == "[general]":
+                    if key == "use_middle_proxy":
+                        result["use_middle_proxy"] = _parse_bool(
+                            value, defaults["use_middle_proxy"]
+                        )
+
+                elif section == "[upstream]":
+                    if key == "type" and value:
+                        result["upstream_type"] = value.lower()
+
+                elif section == "[upstream.tunnel]":
+                    if key == "interface" and value:
+                        result["upstream_tunnel_interface"] = value
+
+                elif section == "[upstream.socks5]":
+                    if key == "host":
+                        result["upstream_socks5_host"] = value
+                    elif key == "port":
+                        digits = "".join(ch for ch in value if ch.isdigit())
+                        if digits:
+                            result["upstream_socks5_port"] = int(digits)
+                    elif key == "username":
+                        result["upstream_socks5_username"] = value
+                    elif key == "password":
+                        result["upstream_socks5_password"] = value
+
+                elif section == "[upstream.http]":
+                    if key == "host":
+                        result["upstream_http_host"] = value
+                    elif key == "port":
+                        digits = "".join(ch for ch in value if ch.isdigit())
+                        if digits:
+                            result["upstream_http_port"] = int(digits)
+                    elif key == "username":
+                        result["upstream_http_username"] = value
+                    elif key == "password":
+                        result["upstream_http_password"] = value
+
                 elif section == "[censorship]":
                     if key == "mask":
                         result["mask"] = _parse_bool(value, defaults["mask"])
@@ -412,6 +427,300 @@ def _load_censorship_config() -> dict:
     }
 
 
+_routing_cache = {"ts": 0, "data": None}
+ROUTING_CACHE_TTL = 8  # seconds
+
+
+def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> dict:
+    result = {
+        "interface": interface,
+        "tool": tool_hint or "-",
+        "link_up": False,
+        "active": False,
+        "endpoint": None,
+        "handshake": None,
+        "rx": None,
+        "tx": None,
+        "reason": None,
+    }
+
+    try:
+        link_check = subprocess.run(
+            ["ip", "link", "show", "dev", interface],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        result["link_up"] = link_check.returncode == 0
+    except Exception:
+        result["link_up"] = False
+
+    tools: list[str] = []
+    if tool_hint:
+        tools.append(tool_hint)
+    for name in ("awg", "wg"):
+        if name not in tools:
+            tools.append(name)
+
+    for tool in tools:
+        if not shutil.which(tool):
+            continue
+
+        try:
+            out = subprocess.check_output(
+                [tool, "show", interface],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+
+        result["tool"] = tool
+
+        m = re.search(r"endpoint:\s*(\S+)", out)
+        if m:
+            result["endpoint"] = m[1]
+
+        m = re.search(r"latest handshake:\s*(.+)", out)
+        if m:
+            result["handshake"] = m[1].strip()
+
+        m = re.search(
+            r"transfer:\s*([\d.]+\s*\S+)\s+received,\s*([\d.]+\s*\S+)\s+sent",
+            out,
+        )
+        if m:
+            result["rx"] = m[1]
+            result["tx"] = m[2]
+
+        if result.get("endpoint"):
+            result["active"] = True
+            if not result.get("handshake"):
+                result["handshake"] = "none (idle)"
+        elif result["link_up"]:
+            result["reason"] = "interface up, no endpoint"
+        else:
+            result["reason"] = "interface down"
+
+        return result
+
+    if result["link_up"]:
+        result["reason"] = "interface up, tool output unavailable"
+    else:
+        result["reason"] = "interface down"
+    return result
+
+
+def _policy_routing_status() -> dict:
+    result = {
+        "mark": 200,
+        "table": 200,
+        "rule_ok": False,
+        "route_ok": False,
+        "route_dev": None,
+    }
+
+    try:
+        rules = subprocess.check_output(
+            ["ip", "-4", "rule", "show"],
+            text=True,
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        rules = ""
+
+    for line in rules.splitlines():
+        low = line.lower()
+        has_mark = ("fwmark 200" in low) or ("fwmark 0xc8" in low)
+        has_table = ("lookup 200" in low) or ("table 200" in low)
+        if has_mark and has_table:
+            result["rule_ok"] = True
+            break
+
+    try:
+        routes = subprocess.check_output(
+            ["ip", "-4", "route", "show", "table", "200"],
+            text=True,
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        routes = ""
+
+    m = re.search(r"default\s+dev\s+(\S+)", routes)
+    if m:
+        result["route_ok"] = True
+        result["route_dev"] = m[1]
+
+    return result
+
+
+def _list_system_interfaces() -> list[str]:
+    names: list[str] = []
+    try:
+        out = subprocess.check_output(
+            ["ip", "-o", "link", "show"],
+            text=True,
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return names
+
+    for line in out.splitlines():
+        m = re.match(r"\d+:\s*([^:]+):", line)
+        if not m:
+            continue
+
+        name = m.group(1).strip()
+        if "@" in name:
+            name = name.split("@", 1)[0]
+
+        if not name or name == "lo":
+            continue
+        if name not in names:
+            names.append(name)
+
+    return names
+
+
+def _upstream_target_from_cfg(cfg: dict, policy: dict) -> str:
+    upstream_type = str(cfg.get("upstream_type", "auto") or "auto").lower().strip()
+
+    if upstream_type == "socks5":
+        host = str(cfg.get("upstream_socks5_host", "") or "").strip()
+        port = int(cfg.get("upstream_socks5_port", 0) or 0)
+        return f"{host}:{port}" if host and port > 0 else "proxy host/port not set"
+
+    if upstream_type == "http":
+        host = str(cfg.get("upstream_http_host", "") or "").strip()
+        port = int(cfg.get("upstream_http_port", 0) or 0)
+        return f"{host}:{port}" if host and port > 0 else "proxy host/port not set"
+
+    if upstream_type == "tunnel":
+        iface = str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip()
+        route_dev = policy.get("route_dev")
+        if route_dev:
+            return f"mark 200 -> table 200 -> dev {route_dev}"
+        return f"mark 200 -> table 200 (iface {iface})"
+
+    if upstream_type == "direct":
+        return "direct host routing"
+
+    return "auto (direct unless tunnel mode is selected)"
+
+
+def _routing_status() -> dict:
+    now = time.time()
+    if now - _routing_cache["ts"] < ROUTING_CACHE_TTL:
+        return _routing_cache["data"]
+
+    cfg = _load_proxy_runtime_config()
+    upstream_type = str(cfg.get("upstream_type", "auto") or "auto").lower().strip()
+    selected_iface = str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip()
+
+    if not selected_iface:
+        selected_iface = "awg0"
+
+    system_ifaces = _list_system_interfaces()
+    available_tunnel_ifaces: list[str] = []
+    for iface in system_ifaces:
+        low = iface.lower()
+        if not (low.startswith(("awg", "wg", "tun", "tap")) or iface == selected_iface):
+            continue
+        if iface and iface not in available_tunnel_ifaces:
+            available_tunnel_ifaces.append(iface)
+
+    interfaces = list(available_tunnel_ifaces)
+    for iface in ("awg0", "wg0"):
+        if iface not in interfaces:
+            interfaces.append(iface)
+
+    tunnels = []
+    for iface in interfaces:
+        hint = None
+        if iface.startswith("awg"):
+            hint = "awg"
+        elif iface.startswith("wg"):
+            hint = "wg"
+
+        tunnel = _detect_tunnel_interface(iface, hint)
+        if (
+            iface == selected_iface
+            or tunnel.get("link_up")
+            or tunnel.get("active")
+            or tunnel.get("endpoint")
+        ):
+            tunnels.append(tunnel)
+
+    policy = _policy_routing_status()
+    target = _upstream_target_from_cfg(cfg, policy)
+
+    primary_tunnel = None
+    route_dev = policy.get("route_dev")
+    if route_dev:
+        primary_tunnel = next((t for t in tunnels if t["interface"] == route_dev), None)
+    if primary_tunnel is None:
+        primary_tunnel = next(
+            (t for t in tunnels if t["interface"] == selected_iface), None
+        )
+    if primary_tunnel is None and tunnels:
+        primary_tunnel = tunnels[0]
+
+    active_tunnels = sum(1 for t in tunnels if t.get("active"))
+
+    if upstream_type == "tunnel":
+        healthy = bool(
+            policy.get("rule_ok")
+            and policy.get("route_ok")
+            and primary_tunnel
+            and primary_tunnel.get("link_up")
+        )
+    elif upstream_type == "socks5":
+        healthy = bool(
+            str(cfg.get("upstream_socks5_host", "") or "").strip()
+            and int(cfg.get("upstream_socks5_port", 0) or 0) > 0
+        )
+    elif upstream_type == "http":
+        healthy = bool(
+            str(cfg.get("upstream_http_host", "") or "").strip()
+            and int(cfg.get("upstream_http_port", 0) or 0) > 0
+        )
+    else:
+        healthy = True
+
+    result = {
+        "middle_proxy_enabled": bool(cfg.get("use_middle_proxy", False)),
+        "upstream_type": upstream_type,
+        "upstream_target": target,
+        "selected_tunnel_interface": selected_iface,
+        "available_tunnel_interfaces": available_tunnel_ifaces,
+        "policy": policy,
+        "tunnels": tunnels,
+        "active_tunnels": active_tunnels,
+        "detected_tunnels": len(tunnels),
+        "primary_tunnel": primary_tunnel,
+        "upstream_socks5": {
+            "host": str(cfg.get("upstream_socks5_host", "") or ""),
+            "port": int(cfg.get("upstream_socks5_port", 0) or 0),
+            "username": str(cfg.get("upstream_socks5_username", "") or ""),
+            "password": str(cfg.get("upstream_socks5_password", "") or ""),
+        },
+        "upstream_http": {
+            "host": str(cfg.get("upstream_http_host", "") or ""),
+            "port": int(cfg.get("upstream_http_port", 0) or 0),
+            "username": str(cfg.get("upstream_http_username", "") or ""),
+            "password": str(cfg.get("upstream_http_password", "") or ""),
+        },
+        "healthy": healthy,
+    }
+
+    _routing_cache.update(ts=now, data=result)
+    return result
+
+
 def _unit_active(unit: str) -> bool:
     return (
         subprocess.run(
@@ -434,25 +743,12 @@ def _unit_enabled(unit: str) -> bool:
     )
 
 
-def _probe_mask_endpoint(target: str, port: int, use_netns: bool) -> bool:
+def _probe_mask_endpoint(target: str, port: int) -> bool:
     if not shutil.which("curl"):
         return False
 
     url = f"https://{target}:{port}/"
-    if use_netns:
-        cmd = [
-            "ip",
-            "netns",
-            "exec",
-            "tg_proxy_ns",
-            "curl",
-            "-sk",
-            "--max-time",
-            "2",
-            url,
-        ]
-    else:
-        cmd = ["curl", "-sk", "--max-time", "2", url]
+    cmd = ["curl", "-sk", "--max-time", "2", url]
 
     try:
         return (
@@ -478,30 +774,7 @@ def _masking_status() -> dict:
     mask_port = int(censorship["mask_port"])
     tls_domain = censorship["tls_domain"]
 
-    netns_present = False
-    host_veth_present = False
-    try:
-        ns_out = subprocess.check_output(
-            ["ip", "netns", "list"], text=True, timeout=2, stderr=subprocess.DEVNULL
-        )
-        netns_present = "tg_proxy_ns" in ns_out
-    except Exception:
-        netns_present = False
-
-    try:
-        addr_out = subprocess.check_output(
-            ["ip", "-4", "addr", "show"],
-            text=True,
-            timeout=2,
-            stderr=subprocess.DEVNULL,
-        )
-        host_veth_present = "10.200.200.1/" in addr_out
-    except Exception:
-        host_veth_present = False
-
-    using_netns_target = (
-        mask_enabled and mask_port != 443 and netns_present and host_veth_present
-    )
+    using_netns_target = False
 
     if not mask_enabled:
         mode = "disabled"
@@ -511,11 +784,11 @@ def _masking_status() -> dict:
         target_host = tls_domain
     else:
         mode = "local"
-        target_host = "10.200.200.1" if using_netns_target else "127.0.0.1"
+        target_host = "127.0.0.1"
 
     endpoint_ok = None
     if mode == "local":
-        endpoint_ok = _probe_mask_endpoint(target_host, mask_port, using_netns_target)
+        endpoint_ok = _probe_mask_endpoint(target_host, mask_port)
 
     nginx_active = _unit_active("nginx.service")
     nginx_enabled = _unit_enabled("nginx.service")
@@ -558,11 +831,17 @@ def _detect_public_ip() -> str:
     if now - _public_ip_cache["ts"] < PUBLIC_IP_TTL and _public_ip_cache["ip"]:
         return _public_ip_cache["ip"]
 
-    for url in ("https://ifconfig.me/ip", "https://api.ipify.org", "https://icanhazip.com"):
+    for url in (
+        "https://ifconfig.me/ip",
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+    ):
         try:
             out = subprocess.check_output(
                 ["curl", "-s", "--max-time", "3", url],
-                text=True, timeout=5, stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+                stderr=subprocess.DEVNULL,
             ).strip()
             if out and re.match(r"^[\d.]+$", out):
                 _public_ip_cache.update(ts=now, ip=out)
@@ -631,6 +910,7 @@ def _users_status() -> dict:
 
 # ── Config file manipulation helpers ──
 
+
 def _find_config_path() -> Path | None:
     for p in _proxy_config_candidates():
         if p.is_file():
@@ -652,6 +932,171 @@ def _restart_proxy():
     # Invalidate caches
     _users_cache["ts"] = 0
     _mask_cache["ts"] = 0
+    _routing_cache["ts"] = 0
+
+
+def _set_toml_key(
+    lines: list[str],
+    section_header: str,
+    key: str,
+    value_literal: str,
+) -> list[str]:
+    section_l = section_header.strip().lower()
+    key_l = key.strip().lower()
+
+    in_section = False
+    section_found = False
+    insert_idx = None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_section and insert_idx is None:
+                insert_idx = i
+            in_section = stripped.lower() == section_l
+            if in_section:
+                section_found = True
+                insert_idx = i + 1
+            continue
+
+        if not in_section:
+            continue
+
+        if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+            continue
+
+        if "=" not in stripped:
+            continue
+
+        key_part = stripped.split("=", 1)[0].strip().lower()
+        if key_part != key_l:
+            continue
+
+        indent_len = len(line) - len(line.lstrip(" \t"))
+        indent = line[:indent_len]
+        lines[i] = f"{indent}{key} = {value_literal}\n"
+        return lines
+
+    if section_found:
+        if insert_idx is None:
+            insert_idx = len(lines)
+        lines.insert(insert_idx, f"{key} = {value_literal}\n")
+        return lines
+
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    if lines and lines[-1].strip():
+        lines.append("\n")
+
+    lines.append(f"{section_header}\n")
+    lines.append(f"{key} = {value_literal}\n")
+    return lines
+
+
+def _toml_string_literal(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _set_middle_proxy_enabled(enabled: bool) -> bool:
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    value = "true" if enabled else "false"
+    lines = _set_toml_key(lines, "[general]", "use_middle_proxy", value)
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _set_upstream_type(upstream_type: str) -> bool:
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    allowed = {"auto", "direct", "tunnel", "socks5", "http"}
+    if upstream_type not in allowed:
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    lines = _set_toml_key(
+        lines, "[upstream]", "type", _toml_string_literal(upstream_type)
+    )
+
+    if upstream_type == "tunnel":
+        lines = _set_toml_key(lines, "[upstream.tunnel]", "interface", '"awg0"')
+
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _set_upstream_tunnel_interface(interface: str) -> bool:
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    iface = str(interface or "").strip()
+    if not iface:
+        return False
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", iface):
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    lines = _set_toml_key(
+        lines, "[upstream.tunnel]", "interface", _toml_string_literal(iface)
+    )
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _set_upstream_proxy_target(
+    proxy_type: str,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+) -> bool:
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    ptype = str(proxy_type or "").strip().lower()
+    if ptype not in {"socks5", "http"}:
+        return False
+
+    host_value = str(host or "").strip()
+    if not host_value or any(ch.isspace() for ch in host_value):
+        return False
+
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return False
+
+    user_value = str(username or "")
+    pass_value = str(password or "")
+
+    if "\n" in user_value or "\r" in user_value:
+        return False
+    if "\n" in pass_value or "\r" in pass_value:
+        return False
+
+    section = "[upstream.socks5]" if ptype == "socks5" else "[upstream.http]"
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    lines = _set_toml_key(lines, section, "host", _toml_string_literal(host_value))
+    lines = _set_toml_key(lines, section, "port", str(port))
+    lines = _set_toml_key(lines, section, "username", _toml_string_literal(user_value))
+    lines = _set_toml_key(lines, section, "password", _toml_string_literal(pass_value))
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+    return True
 
 
 def _add_user_to_config(name: str, secret: str) -> bool:
@@ -660,7 +1105,9 @@ def _add_user_to_config(name: str, secret: str) -> bool:
     if cfg_path is None:
         return False
 
-    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
 
     # Find [access.users] section
     insert_idx = None
@@ -700,7 +1147,9 @@ def _remove_user_from_config(name: str) -> bool:
     if cfg_path is None:
         return False
 
-    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
     new_lines = []
     in_users = False
     in_direct = False
@@ -743,7 +1192,9 @@ def _set_user_direct(name: str, direct: bool) -> bool:
     if cfg_path is None:
         return False
 
-    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
     new_lines = []
     found_direct_section = False
     in_direct = False
@@ -838,13 +1289,180 @@ def api_stats():
             "proxy": _proxy_stats(),
             "proxy_info": _proxy_info(),
             "awg": _awg_status(),
+            "routing": _routing_status(),
             "masking": _masking_status(),
             "users": _users_status(),
         }
     )
 
 
+# ── Routing Management API ──
+
+
+@app.post("/api/routing/middle")
+async def api_routing_middle(request: Request):
+    """Set [general].use_middle_proxy. Body: { enabled: bool }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    raw_enabled = body.get("enabled", None)
+    if not isinstance(raw_enabled, bool):
+        return JSONResponse(
+            {"ok": False, "error": "enabled must be boolean"}, status_code=400
+        )
+
+    if not _set_middle_proxy_enabled(raw_enabled):
+        return JSONResponse(
+            {"ok": False, "error": "failed to update config"}, status_code=500
+        )
+
+    _restart_proxy()
+    return JSONResponse({"ok": True, "enabled": raw_enabled, "restarted": True})
+
+
+@app.post("/api/routing/upstream")
+async def api_routing_upstream(request: Request):
+    """Set [upstream].type. Body: { type: auto|direct|tunnel|socks5|http }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    upstream_type = str(body.get("type", "")).strip().lower()
+    if upstream_type not in {"auto", "direct", "tunnel", "socks5", "http"}:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "type must be one of: auto, direct, tunnel, socks5, http",
+            },
+            status_code=400,
+        )
+
+    if not _set_upstream_type(upstream_type):
+        return JSONResponse(
+            {"ok": False, "error": "failed to update config"}, status_code=500
+        )
+
+    _restart_proxy()
+
+    cfg = _load_proxy_runtime_config()
+    warning = None
+    if upstream_type == "socks5":
+        host = str(cfg.get("upstream_socks5_host", "") or "").strip()
+        port = int(cfg.get("upstream_socks5_port", 0) or 0)
+        if not host or port <= 0:
+            warning = (
+                "socks5 selected but [upstream.socks5] host/port are not configured"
+            )
+    elif upstream_type == "http":
+        host = str(cfg.get("upstream_http_host", "") or "").strip()
+        port = int(cfg.get("upstream_http_port", 0) or 0)
+        if not host or port <= 0:
+            warning = "http selected but [upstream.http] host/port are not configured"
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "type": upstream_type,
+            "restarted": True,
+            "warning": warning,
+        }
+    )
+
+
+@app.post("/api/routing/tunnel-interface")
+async def api_routing_tunnel_interface(request: Request):
+    """Set [upstream.tunnel].interface. Body: { interface: str }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    iface = str(body.get("interface", "")).strip()
+    if not iface:
+        return JSONResponse(
+            {"ok": False, "error": "interface is required"}, status_code=400
+        )
+
+    available = _list_system_interfaces()
+    if available and iface not in available:
+        return JSONResponse(
+            {"ok": False, "error": "interface is not present on host"},
+            status_code=400,
+        )
+
+    if not _set_upstream_tunnel_interface(iface):
+        return JSONResponse(
+            {"ok": False, "error": "failed to update config"}, status_code=500
+        )
+
+    _restart_proxy()
+    return JSONResponse({"ok": True, "interface": iface, "restarted": True})
+
+
+@app.post("/api/routing/proxy-target")
+async def api_routing_proxy_target(request: Request):
+    """Set [upstream.socks5]/[upstream.http] target + auth.
+    Body: { type: socks5|http, host: str, port: int, username?: str, password?: str }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    proxy_type = str(body.get("type", "")).strip().lower()
+    if proxy_type not in {"socks5", "http"}:
+        return JSONResponse(
+            {"ok": False, "error": "type must be socks5 or http"},
+            status_code=400,
+        )
+
+    host = str(body.get("host", "")).strip()
+    if not host:
+        return JSONResponse({"ok": False, "error": "host is required"}, status_code=400)
+
+    try:
+        port = int(body.get("port", 0))
+    except Exception:
+        port = 0
+
+    if port < 1 or port > 65535:
+        return JSONResponse(
+            {"ok": False, "error": "port must be 1..65535"}, status_code=400
+        )
+
+    username = str(body.get("username", "") or "")
+    password = str(body.get("password", "") or "")
+
+    if "\n" in username or "\r" in username or "\n" in password or "\r" in password:
+        return JSONResponse(
+            {"ok": False, "error": "username/password must not contain newlines"},
+            status_code=400,
+        )
+
+    if not _set_upstream_proxy_target(proxy_type, host, port, username, password):
+        return JSONResponse(
+            {"ok": False, "error": "failed to update config"}, status_code=500
+        )
+
+    _restart_proxy()
+    return JSONResponse(
+        {
+            "ok": True,
+            "type": proxy_type,
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "restarted": True,
+        }
+    )
+
+
 # ── User Management API ──
+
 
 @app.post("/api/users/add")
 async def api_user_add(request: Request):
@@ -856,21 +1474,30 @@ async def api_user_add(request: Request):
 
     name = str(body.get("name", "")).strip()
     if not name or not re.match(r"^[a-zA-Z0-9_-]+$", name):
-        return JSONResponse({"ok": False, "error": "invalid name (use a-z, 0-9, _, -)"}, status_code=400)
+        return JSONResponse(
+            {"ok": False, "error": "invalid name (use a-z, 0-9, _, -)"}, status_code=400
+        )
 
     # Check if user already exists
     cfg = _load_proxy_runtime_config()
     if name in cfg.get("users", {}):
-        return JSONResponse({"ok": False, "error": "user already exists"}, status_code=409)
+        return JSONResponse(
+            {"ok": False, "error": "user already exists"}, status_code=409
+        )
 
     secret = str(body.get("secret", "")).strip().lower()
     if not secret:
         secret = secrets.token_hex(16)
     if not USER_SECRET_RE.fullmatch(secret):
-        return JSONResponse({"ok": False, "error": "invalid secret (must be 32 hex chars)"}, status_code=400)
+        return JSONResponse(
+            {"ok": False, "error": "invalid secret (must be 32 hex chars)"},
+            status_code=400,
+        )
 
     if not _add_user_to_config(name, secret):
-        return JSONResponse({"ok": False, "error": "failed to write config"}, status_code=500)
+        return JSONResponse(
+            {"ok": False, "error": "failed to write config"}, status_code=500
+        )
 
     _users_cache["ts"] = 0
     _restart_proxy()
@@ -917,7 +1544,9 @@ async def api_user_direct(request: Request):
         return JSONResponse({"ok": False, "error": "user not found"}, status_code=404)
 
     if not _set_user_direct(name, direct):
-        return JSONResponse({"ok": False, "error": "failed to write config"}, status_code=500)
+        return JSONResponse(
+            {"ok": False, "error": "failed to write config"}, status_code=500
+        )
 
     _users_cache["ts"] = 0
     _restart_proxy()

@@ -13,11 +13,11 @@
 //!
 //! The `tunnel_info` field carries metadata about the active tunnel
 //! (see `tunnel.zig`). For namespace-based tunnels like AmneziaWG,
-//! the connect variant stays `direct` because the proxy process itself
-//! runs inside the namespace — so all TCP connects implicitly traverse
-//! the tunnel without socket-level wrapping.
+//! the connect variant stays `direct`, but may apply `SO_MARK` so Linux
+//! policy routing can steer selected sockets through the tunnel.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const net = std.net;
 const posix = std.posix;
 const tunnel_mod = @import("../tunnel.zig");
@@ -54,6 +54,10 @@ pub const Upstream = union(Tag) {
 
     pub fn initDirect() Upstream {
         return .{ .direct = .{} };
+    }
+
+    pub fn initDirectWithMark(mark: u32) Upstream {
+        return .{ .direct = .{ .socket_mark = mark } };
     }
 
     pub fn initSocks5(
@@ -122,13 +126,19 @@ pub const Upstream = union(Tag) {
 };
 
 pub const Direct = struct {
-    pub fn connect(_: Direct, addr: net.Address) !ConnectResult {
+    socket_mark: ?u32 = null,
+
+    pub fn connect(self: Direct, addr: net.Address) !ConnectResult {
         const fd = try posix.socket(
             addr.any.family,
             posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
         );
         errdefer posix.close(fd);
+
+        if (self.socket_mark) |mark| {
+            try applySocketMark(fd, mark);
+        }
 
         posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
@@ -145,6 +155,7 @@ pub const Socks5 = struct {
     proxy_addr: net.Address,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
+    socket_mark: ?u32 = null,
 
     /// Connect to the SOCKS5 proxy server (not the target DC).
     /// Returns a result with `.proxy_handshake = .socks5`.
@@ -155,6 +166,10 @@ pub const Socks5 = struct {
             posix.IPPROTO.TCP,
         );
         errdefer posix.close(fd);
+
+        if (self.socket_mark) |mark| {
+            try applySocketMark(fd, mark);
+        }
 
         posix.connect(fd, &self.proxy_addr.any, self.proxy_addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
@@ -177,6 +192,7 @@ pub const HttpConnect = struct {
     proxy_addr: net.Address,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
+    socket_mark: ?u32 = null,
 
     /// Connect to the HTTP proxy server (not the target DC).
     /// Returns a result with `.proxy_handshake = .http_connect`.
@@ -188,6 +204,10 @@ pub const HttpConnect = struct {
         );
         errdefer posix.close(fd);
 
+        if (self.socket_mark) |mark| {
+            try applySocketMark(fd, mark);
+        }
+
         posix.connect(fd, &self.proxy_addr.any, self.proxy_addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
                 return .{ .fd = fd, .pending = true, .proxy_handshake = .http_connect };
@@ -198,3 +218,11 @@ pub const HttpConnect = struct {
         return .{ .fd = fd, .pending = false, .proxy_handshake = .http_connect };
     }
 };
+
+fn applySocketMark(fd: posix.fd_t, mark: u32) !void {
+    if (builtin.os.tag != .linux) return;
+
+    const so_mark: u32 = 36;
+    var mark_value: u32 = mark;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, so_mark, std.mem.asBytes(&mark_value));
+}

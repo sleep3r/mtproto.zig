@@ -12,6 +12,7 @@ let pollingPaused = false;
 let lastSuccessAt = 0;
 let hasPollError = false;
 let lastData = null; // store last API response for tooltips
+let currentRouting = null;
 
 const tt = $('chartTooltip');
 function showTooltip(e, canvas, padLeft, dataArr, formatCb) {
@@ -533,6 +534,316 @@ function renderUsers(users) {
   });
 }
 
+function setRoutingAction(msg, cls) {
+  const note = $('routingActionNote');
+  if (!note) return;
+  note.textContent = msg || '';
+  note.className = 'routing-action-note' + (cls ? (' ' + cls) : '');
+}
+
+function setupRoutingControls() {
+  const middleBtn = $('routingMiddleBtn');
+  const upstreamSelect = $('routingUpstreamSelect');
+  const upstreamApply = $('routingUpstreamApply');
+  const tunnelIfaceSelect = $('routingTunnelIfaceSelect');
+  const tunnelIfaceApply = $('routingTunnelIfaceApply');
+  const proxyHostInput = $('routingProxyHost');
+  const proxyPortInput = $('routingProxyPort');
+  const proxyUserInput = $('routingProxyUser');
+  const proxyPassInput = $('routingProxyPass');
+  const proxyApply = $('routingProxyApply');
+  if (!middleBtn || !upstreamSelect || !upstreamApply) return;
+
+  middleBtn.addEventListener('click', async () => {
+    if (!currentRouting) return;
+
+    const target = !Boolean(currentRouting.middle_proxy_enabled);
+    middleBtn.disabled = true;
+    setRoutingAction('Updating middle proxy mode…');
+
+    try {
+      const data = await apiCall('/api/routing/middle', { enabled: target });
+      setRoutingAction('MiddleProxy ' + (data.enabled ? 'enabled' : 'disabled') + '. Proxy restarted.', 'ok');
+      showToast('MiddleProxy ' + (data.enabled ? 'enabled' : 'disabled') + '. Proxy restarted.', 'success');
+      await runPoll();
+    } catch (e) {
+      setRoutingAction('Failed: ' + e.message, 'error');
+      showToast('Failed: ' + e.message, 'error');
+    } finally {
+      middleBtn.disabled = false;
+    }
+  });
+
+  upstreamApply.addEventListener('click', async () => {
+    if (!currentRouting) return;
+
+    const nextType = String(upstreamSelect.value || '').toLowerCase();
+    if (!nextType) return;
+
+    if (nextType === String(currentRouting.upstream_type || '').toLowerCase()) {
+      setRoutingAction('Upstream is already set to ' + nextType + '.');
+      return;
+    }
+
+    upstreamApply.disabled = true;
+    upstreamSelect.disabled = true;
+    setRoutingAction('Switching upstream to ' + nextType + '…');
+
+    try {
+      const data = await apiCall('/api/routing/upstream', { type: nextType });
+      const warn = data.warning ? (' Warning: ' + data.warning) : '';
+      setRoutingAction('Upstream switched to ' + data.type + '. Proxy restarted.' + warn, data.warning ? '' : 'ok');
+      showToast('Upstream switched to ' + data.type + '. Proxy restarted.', 'success');
+      await runPoll();
+    } catch (e) {
+      setRoutingAction('Failed: ' + e.message, 'error');
+      showToast('Failed: ' + e.message, 'error');
+    } finally {
+      upstreamApply.disabled = false;
+      upstreamSelect.disabled = false;
+    }
+  });
+
+  if (tunnelIfaceApply && tunnelIfaceSelect) {
+    tunnelIfaceApply.addEventListener('click', async () => {
+      if (!currentRouting) return;
+
+      const iface = String(tunnelIfaceSelect.value || '').trim();
+      if (!iface) {
+        setRoutingAction('Select tunnel interface first.', 'error');
+        return;
+      }
+
+      if (iface === String(currentRouting.selected_tunnel_interface || '')) {
+        setRoutingAction('Tunnel interface is already set to ' + iface + '.');
+        return;
+      }
+
+      tunnelIfaceApply.disabled = true;
+      tunnelIfaceSelect.disabled = true;
+      setRoutingAction('Switching tunnel interface to ' + iface + '…');
+
+      try {
+        const data = await apiCall('/api/routing/tunnel-interface', { interface: iface });
+        setRoutingAction('Tunnel interface set to ' + data.interface + '. Proxy restarted.', 'ok');
+        showToast('Tunnel interface set to ' + data.interface + '. Proxy restarted.', 'success');
+        await runPoll();
+      } catch (e) {
+        setRoutingAction('Failed: ' + e.message, 'error');
+        showToast('Failed: ' + e.message, 'error');
+      } finally {
+        tunnelIfaceApply.disabled = false;
+        tunnelIfaceSelect.disabled = false;
+      }
+    });
+  }
+
+  if (proxyApply && proxyHostInput && proxyPortInput && proxyUserInput && proxyPassInput) {
+    proxyApply.addEventListener('click', async () => {
+      if (!currentRouting) return;
+
+      const proxyType = String(currentRouting.upstream_type || '').toLowerCase();
+      if (proxyType !== 'socks5' && proxyType !== 'http') {
+        setRoutingAction('Proxy target can be set only for socks5/http upstream.', 'error');
+        return;
+      }
+
+      const host = String(proxyHostInput.value || '').trim();
+      const port = Number(proxyPortInput.value || 0);
+      const username = String(proxyUserInput.value || '');
+      const password = String(proxyPassInput.value || '');
+      if (!host) {
+        setRoutingAction('Proxy host is required.', 'error');
+        return;
+      }
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        setRoutingAction('Proxy port must be 1..65535.', 'error');
+        return;
+      }
+      if (username.includes('\n') || username.includes('\r') || password.includes('\n') || password.includes('\r')) {
+        setRoutingAction('Username/password must not contain newlines.', 'error');
+        return;
+      }
+
+      proxyApply.disabled = true;
+      proxyHostInput.disabled = true;
+      proxyPortInput.disabled = true;
+      proxyUserInput.disabled = true;
+      proxyPassInput.disabled = true;
+      setRoutingAction('Updating ' + proxyType + ' target…');
+
+      try {
+        const data = await apiCall('/api/routing/proxy-target', { type: proxyType, host, port, username, password });
+        setRoutingAction('Updated ' + data.type + ' target to ' + data.host + ':' + data.port + '. Proxy restarted.', 'ok');
+        showToast('Updated ' + data.type + ' target. Proxy restarted.', 'success');
+        await runPoll();
+      } catch (e) {
+        setRoutingAction('Failed: ' + e.message, 'error');
+        showToast('Failed: ' + e.message, 'error');
+      } finally {
+        proxyApply.disabled = false;
+        proxyHostInput.disabled = false;
+        proxyPortInput.disabled = false;
+        proxyUserInput.disabled = false;
+        proxyPassInput.disabled = false;
+      }
+    });
+  }
+}
+
+function renderRouting(routing) {
+  const card = $('routingCard');
+  if (!card) return;
+
+  if (!routing) {
+    currentRouting = null;
+    card.style.display = 'none';
+    return;
+  }
+
+  currentRouting = routing;
+  card.style.display = '';
+
+  const middleBtn = $('routingMiddleBtn');
+  if (middleBtn) {
+    const enabled = Boolean(routing.middle_proxy_enabled);
+    middleBtn.textContent = enabled ? 'MiddleProxy: ON' : 'MiddleProxy: OFF';
+    middleBtn.classList.toggle('active', enabled);
+  }
+
+  const upstreamSelect = $('routingUpstreamSelect');
+  const upstreamType = String(routing.upstream_type || 'auto').toLowerCase();
+  if (upstreamSelect) {
+    upstreamSelect.value = upstreamType;
+  }
+
+  const tunnelCtl = $('routingTunnelCtl');
+  const tunnelSelect = $('routingTunnelIfaceSelect');
+  const tunnelApplyBtn = $('routingTunnelIfaceApply');
+  if (tunnelCtl && tunnelSelect) {
+    if (upstreamType === 'tunnel') {
+      tunnelCtl.style.display = '';
+      const choices = Array.isArray(routing.available_tunnel_interfaces)
+        ? routing.available_tunnel_interfaces
+        : [];
+      const selectedIface = String(routing.selected_tunnel_interface || '');
+      const seen = new Set();
+      const options = [];
+
+      if (selectedIface && choices.includes(selectedIface)) {
+        seen.add(selectedIface);
+        options.push(selectedIface);
+      }
+
+      choices.forEach((iface) => {
+        const v = String(iface || '').trim();
+        if (!v || seen.has(v)) return;
+        seen.add(v);
+        options.push(v);
+      });
+
+      if (!options.length) {
+        tunnelSelect.innerHTML = '<option value="">no interfaces</option>';
+        tunnelSelect.value = '';
+        tunnelSelect.disabled = true;
+        if (tunnelApplyBtn) tunnelApplyBtn.disabled = true;
+      } else {
+        tunnelSelect.disabled = false;
+        if (tunnelApplyBtn) tunnelApplyBtn.disabled = false;
+        tunnelSelect.innerHTML = options
+          .map((iface) => '<option value="' + esc(iface) + '">' + esc(iface) + '</option>')
+          .join('');
+        if (selectedIface) {
+          tunnelSelect.value = selectedIface;
+        }
+      }
+    } else {
+      tunnelCtl.style.display = 'none';
+    }
+  }
+
+  const proxyCtl = $('routingProxyCtl');
+  const proxyHost = $('routingProxyHost');
+  const proxyPort = $('routingProxyPort');
+  const proxyUser = $('routingProxyUser');
+  const proxyPass = $('routingProxyPass');
+  const proxyHostLabel = $('routingProxyHostLabel');
+  if (proxyCtl && proxyHost && proxyPort && proxyUser && proxyPass && proxyHostLabel) {
+    if (upstreamType === 'socks5' || upstreamType === 'http') {
+      proxyCtl.style.display = '';
+      const cfg = upstreamType === 'socks5'
+        ? (routing.upstream_socks5 || {})
+        : (routing.upstream_http || {});
+      const host = String(cfg.host || '');
+      const port = Number(cfg.port || 0);
+      const username = String(cfg.username || '');
+      const password = String(cfg.password || '');
+
+      proxyHostLabel.textContent = upstreamType + ' host';
+      proxyHost.placeholder = upstreamType === 'socks5' ? '127.0.0.1' : '127.0.0.1';
+      proxyPort.placeholder = upstreamType === 'socks5' ? '1080' : '8080';
+      proxyHost.value = host;
+      proxyPort.value = port > 0 ? String(port) : '';
+      proxyUser.value = username;
+      proxyPass.value = password;
+    } else {
+      proxyCtl.style.display = 'none';
+    }
+  }
+
+  const badge = $('routingBadge');
+  if (routing.healthy) {
+    badge.className = 'badge';
+    $('routingStatus').textContent = 'Healthy';
+  } else {
+    badge.className = 'badge off';
+    $('routingStatus').textContent = 'Degraded';
+  }
+
+  $('routingMiddle').textContent = routing.middle_proxy_enabled ? 'enabled' : 'disabled';
+  $('routingUpstream').textContent = upstreamType || '—';
+  $('routingTarget').textContent = routing.upstream_target || '—';
+
+  const policy = routing.policy || {};
+  const policyTxt = (policy.rule_ok ? 'rule ok' : 'rule missing') +
+    ' · ' +
+    (policy.route_ok ? ('route ok' + (policy.route_dev ? (' (' + policy.route_dev + ')') : '')) : 'route missing');
+  $('routingPolicy').textContent = policyTxt;
+
+  const list = $('routingTunnelsList');
+  const tunnels = Array.isArray(routing.tunnels) ? routing.tunnels : [];
+  if (!tunnels.length) {
+    list.innerHTML = '<div class="routing-empty">No tunnel interfaces detected.</div>';
+    return;
+  }
+
+  const selected = routing.selected_tunnel_interface || '';
+
+  list.innerHTML = tunnels.map((t) => {
+    const iface = String(t.interface || '—');
+    const isSelected = upstreamType === 'tunnel' && iface === selected;
+    const state = t.active ? 'active' : (t.link_up ? 'up' : 'down');
+    const stateClass = t.active ? 'on' : (t.link_up ? 'mid' : 'off');
+
+    const meta = [];
+    if (t.tool && t.tool !== '-') meta.push(String(t.tool));
+    if (t.endpoint) meta.push(String(t.endpoint));
+    if (t.handshake) meta.push('hs: ' + String(t.handshake));
+    if (!meta.length) meta.push(String(t.reason || '—'));
+
+    const xfer = '↓ ' + String(t.rx || '—') + ' · ↑ ' + String(t.tx || '—');
+
+    return '<div class="routing-row">' +
+      '<div class="routing-iface">' + esc(iface) +
+      (isSelected ? '<span class="routing-tag">selected</span>' : '') +
+      '</div>' +
+      '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
+      '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +
+      '<div class="routing-xfer">' + esc(xfer) + '</div>' +
+      '</div>';
+  }).join('');
+}
+
 // ── Polling ──
 async function poll() {
   const r = await fetch('/api/stats', { cache: 'no-store' });
@@ -579,26 +890,7 @@ async function poll() {
   $('pxDrops').style.color = drp > 0 ? 'var(--amber)' : 'var(--text-muted)';
   $('pxDropLbl').textContent = 'rate +' + drp + ' · cap +' + (p.cap_drops || 0) + ' · hs_t +' + (p.hs_timeout || 0);
 
-  // AmneziaWG tunnel
-  const awg = d.awg;
-  const tc = $('tunnelCard');
-  if (!awg) {
-    tc.style.display = 'none';
-  } else {
-    tc.style.display = '';
-    const badge = $('awgBadge');
-    if (awg.active) {
-      badge.className = 'badge';
-      $('awgStatus').textContent = 'Active';
-    } else {
-      badge.className = 'badge off';
-      $('awgStatus').textContent = awg.reason || 'Down';
-    }
-    $('awgEndpoint').textContent = awg.endpoint || '—';
-    $('awgHandshake').textContent = awg.handshake || '—';
-    $('awgRx').textContent = awg.rx || '—';
-    $('awgTx').textContent = awg.tx || '—';
-  }
+  renderRouting(d.routing || null);
 
   // Masking health
   const masking = d.masking;
@@ -751,6 +1043,7 @@ updatePollControls();
 updateFreshness();
 setupAddUserForm();
 setupDeleteModal();
+setupRoutingControls();
 runPoll();
 restartPollingLoop();
 setInterval(updateFreshness, 1000);

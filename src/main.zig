@@ -424,7 +424,7 @@ pub fn main() !void {
         const log_main = std.log.scoped(.config);
         log_main.warn(
             "AES backend is software-only for this build/target. MiddleProxy video traffic will be CPU-heavy. " ++
-                "Rebuild with CPU features enabled (example: -Dcpu=native or -Dcpu=x86_64_v3).",
+                "Rebuild with CPU features enabled (example: -Dcpu=native or -Dcpu=x86_64_v3+aes).",
             .{},
         );
     }

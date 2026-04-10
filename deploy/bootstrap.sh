@@ -24,11 +24,31 @@ step() { printf "  ${Y}●${N} %s...\n" "$*" >&2; }
 [ "$(id -u)" = "0" ] || fail "Run as root: sudo bash bootstrap.sh"
 
 # ── detect arch ───────────────────────────────────────────────────
+cpu_supports_x86_64_v3() {
+  local flags
+  flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
+  [ -n "$flags" ] || return 1
+
+  local required=(avx2 bmi1 bmi2 fma f16c movbe sse4_1 sse4_2 ssse3 popcnt aes)
+  local feat
+  for feat in "${required[@]}"; do
+    if ! grep -Eq "(^|[[:space:]:])${feat}([[:space:]]|$)" <<< "$flags"; then
+      return 1
+    fi
+  done
+
+  if ! grep -Eq "(^|[[:space:]:])(lzcnt|abm)([[:space:]]|$)" <<< "$flags"; then
+    return 1
+  fi
+
+  return 0
+}
+
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)
-    # try v3 first (requires AVX2/BMI2); fall back at runtime if unsupported
-    if grep -q 'avx2' /proc/cpuinfo 2>/dev/null; then
+    # try v3+aes first; fall back at runtime if unsupported
+    if cpu_supports_x86_64_v3; then
       ARTIFACT="mtbuddy-linux-x86_64_v3"
       ARTIFACT_FALLBACK="mtbuddy-linux-x86_64"
     else

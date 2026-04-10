@@ -80,7 +80,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     // 3. Remove user
     _ = sys.execForward(&.{ "userdel", "mtproto" }) catch {};
 
-    // 4. Remove netns if exists
+    // 4. Cleanup tunnel routing artifacts (new + legacy)
+    _ = sys.execForward(&.{ "ip", "-4", "rule", "del", "fwmark", "200", "table", "200" }) catch {};
+    _ = sys.execForward(&.{ "ip", "-4", "route", "flush", "table", "200" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_tunnel.sh" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_netns.sh" }) catch {};
     _ = sys.execForward(&.{ "ip", "netns", "del", "tg_proxy_ns" }) catch {};
 
     // 5. Remove masking config if exists

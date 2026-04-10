@@ -66,8 +66,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void
         \\set -euo pipefail
         \\
         \\CONFIG_FILE="/opt/mtproto-proxy/config.toml"
-        \\NS_NAME="tg_proxy_ns"
-        \\NS_HOST_IP="10.200.200.1"
         \\LOCAL_HOST_IP="127.0.0.1"
         \\
         \\read_censorship_value() {
@@ -90,12 +88,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void
         \\
         \\probe_endpoint() {
         \\    local host="$1" port="$2"
-        \\    if ip netns list 2>/dev/null | grep -qw "$NS_NAME"; then
-        \\        if ip -4 addr show 2>/dev/null | grep -q "${NS_HOST_IP}/"; then
-        \\            ip netns exec "$NS_NAME" curl -sk --max-time 3 "https://${host}:${port}/" >/dev/null 2>&1
-        \\            return $?
-        \\        fi
-        \\    fi
         \\    curl -sk --max-time 3 "https://${host}:${port}/" >/dev/null 2>&1
         \\}
         \\
@@ -111,11 +103,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: RecoveryOpts) !void
         \\[[ "$mask_port" == "443" ]] && exit 0
         \\
         \\target_host="$LOCAL_HOST_IP"
-        \\if ip netns list 2>/dev/null | grep -qw "$NS_NAME"; then
-        \\    if ip -4 addr show 2>/dev/null | grep -q "${NS_HOST_IP}/"; then
-        \\        target_host="$NS_HOST_IP"
-        \\    fi
-        \\fi
         \\
         \\if ! systemctl is-active --quiet nginx; then
         \\    logger -t mtproto-mask-health "nginx inactive, restarting"

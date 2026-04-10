@@ -68,18 +68,17 @@ port = 443
 
 [upstream]
 # Upstream egress mode for outgoing DC connections.
-# "auto"       — detect by runtime namespace (default)
-# "direct"     — direct TCP from current namespace
-# "tunnel"     — VPN tunnel via network namespace (AmneziaWG, WireGuard, ...)
+# "auto"       — direct TCP from host routing (default)
+# "direct"     — force direct TCP egress
+# "tunnel"     — direct TCP with socket policy routing (SO_MARK)
 # "socks5"     — route via SOCKS5 proxy
 # "http"       — route via HTTP CONNECT proxy
 # type = "auto"
 
 # ── VPN tunnel configuration ──
 # Activate with: type = "tunnel"
-# The interface name determines which VPN type is used:
-#   awg0 — AmneziaWG (default, via mtbuddy setup tunnel)
-#   wg0  — WireGuard
+# Interface metadata for mtbuddy tooling/status.
+# Runtime proxy routing uses SO_MARK=200 and Linux policy routing.
 # [upstream.tunnel]
 # interface = "awg0"
 

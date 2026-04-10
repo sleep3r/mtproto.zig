@@ -6,14 +6,13 @@
 const std = @import("std");
 
 pub const UpstreamMode = enum {
-    /// Infer egress mode from runtime environment (default).
-    /// If proxy runs in non-init netns, treat as tunnel; otherwise direct.
+    /// Automatic egress mode (default).
+    /// Uses direct routing without socket policy marks.
     auto,
     /// Explicit direct egress.
     direct,
-    /// VPN tunnel egress (AmneziaWG, WireGuard, etc.) — requires running
-    /// inside tunnel network namespace. The specific VPN type is an
-    /// mtbuddy/installer concern; for runtime proxy they are identical.
+    /// VPN tunnel egress via socket policy routing (SO_MARK/fwmask).
+    /// The specific VPN type is an mtbuddy/installer concern.
     tunnel,
     /// SOCKS5 proxy upstream.
     socks5,

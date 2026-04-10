@@ -198,7 +198,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 fn isTunnelServiceUnit() bool {
     if (!sys.fileExists(SERVICE_FILE)) return false;
     const result = sys.exec(std.heap.page_allocator, &.{
-        "grep", "-Eq", "setup_netns\\.sh|ip[[:space:]]+netns[[:space:]]+exec|AmneziaWG[[:space:]]+Tunnel", SERVICE_FILE,
+        "grep", "-Eq", "setup_(netns|tunnel)\\.sh|ip[[:space:]]+netns[[:space:]]+exec|AmneziaWG[[:space:]]+Tunnel|Tunnel[[:space:]]+Policy[[:space:]]+Routing", SERVICE_FILE,
     }) catch return false;
     defer result.deinit();
     return result.exit_code == 0;

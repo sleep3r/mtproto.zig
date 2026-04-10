@@ -281,6 +281,14 @@ test "socks5 - parse connect response failure" {
     try std.testing.expectEqual(Reply.connection_refused, result.?.reply);
 }
 
+test "socks5 - parse connect response with pipelined tail" {
+    const resp = [_]u8{ 0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xaa, 0xbb };
+    const result = parseConnectResponse(&resp);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(Reply.succeeded, result.?.reply);
+    try std.testing.expectEqual(@as(usize, 10), result.?.consumed);
+}
+
 test "socks5 - parse connect response too short" {
     const resp = [_]u8{ 0x05, 0x00, 0x00 };
     const result = parseConnectResponse(&resp);
