@@ -335,7 +335,32 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
-    const config_path = args.next() orelse "config.toml";
+    const first_arg = args.next();
+
+    if (first_arg) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            writeStderr(
+                \\
+                \\  Usage: mtproto-proxy [config.toml]
+                \\
+                \\  Starts the MTProto proxy using the given config file.
+                \\  Defaults to 'config.toml' in the current directory.
+                \\
+                \\  Options:
+                \\    -h, --help       Show this help message and exit
+                \\    -v, --version    Show version and exit
+                \\
+                \\
+            , .{});
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            writeStderr("mtproto-proxy v" ++ version ++ "\n", .{});
+            return;
+        }
+    }
+
+    const config_path = first_arg orelse "config.toml";
 
     // Parse config
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
