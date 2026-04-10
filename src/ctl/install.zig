@@ -1,7 +1,7 @@
 //! Install command for mtbuddy.
 //!
-//! Ports install.sh (296 lines of bash) into structured Zig code.
 //! Supports both interactive TUI mode and non-interactive CLI mode.
+//! Downloads pre-built release artifacts from GitHub (same path as update).
 //!
 //! One-liner usage:
 //!   sudo mtbuddy install --port 443 --domain wb.ru --yes
@@ -11,6 +11,7 @@ const std = @import("std");
 const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
+const release = @import("release.zig");
 const toml = @import("toml.zig");
 const masking = @import("masking.zig");
 const nfqws = @import("nfqws.zig");
@@ -19,10 +20,8 @@ const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
 const SummaryLine = tui_mod.SummaryLine;
 
-const ZIG_VERSION = "0.15.2";
-const INSTALL_DIR = "/opt/mtproto-proxy";
-const REPO_URL = "https://github.com/sleep3r/mtproto.zig.git";
-const SERVICE_NAME = "mtproto-proxy";
+const INSTALL_DIR = release.INSTALL_DIR;
+const SERVICE_NAME = release.SERVICE_NAME;
 
 pub const InstallOpts = struct {
     port: u16 = 443,
@@ -40,8 +39,8 @@ pub const InstallOpts = struct {
     user: ?[]const u8 = null,
     /// Skip confirmation prompt (non-interactive / one-liner mode).
     yes: bool = false,
-    /// Zig release tag to install from (overrides default ZIG_VERSION).
-    zig_tag: ?[]const u8 = null,
+    /// Release version to install (e.g. "v0.12.0"). If null, uses latest.
+    version: ?[]const u8 = null,
     /// Path to an existing config.toml to use.
     config_path: ?[]const u8 = null,
     /// Internal flags to track if user explicitly provided a value.
@@ -96,8 +95,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
             opts.enable_tcpmss = false;
         } else if (std.mem.eql(u8, arg, "--ipv6-hop")) {
             opts.enable_ipv6_hop = true;
-        } else if (std.mem.eql(u8, arg, "--zig-tag")) {
-            if (args.next()) |val| opts.zig_tag = val;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            opts.version = args.next();
         }
     }
 
@@ -258,92 +257,49 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.start();
         _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
         _ = sys.exec(allocator, &.{
-            "apt-get",  "install", "-y",
-            "iptables", "xxd",     "git",
-            "curl",     "openssl", "tar",
-            "xz-utils",
+            "apt-get", "install", "-y",
+            "iptables", "xxd",    "curl",
+            "openssl",  "tar",
         }) catch {};
         sp.stop(true, "");
     }
 
-    // ── Install Zig ──
-    const zig_ver = opts.zig_tag orelse ZIG_VERSION;
-    const has_zig = blk: {
-        const result = sys.exec(allocator, &.{ "zig", "version" }) catch break :blk false;
-        defer result.deinit();
-        const trimmed = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-        break :blk std.mem.startsWith(u8, trimmed, zig_ver);
-    };
-
-    if (has_zig) {
-        ui.stepOk(ui.str(.install_zig_ok), zig_ver);
-    } else {
-        var sp = ui.spinner(ui.str(.install_installing_zig));
+    // ── Resolve release tag ──
+    var tag = release.Tag{};
+    {
+        var sp = ui.spinner(ui.str(.install_resolving_tag));
         sp.start();
-
-        const arch = sys.getArch() catch {
+        if (!release.resolveTag(allocator, opts.version, &tag)) {
             sp.stop(false, "");
-            ui.fail(ui.str(.error_arch_unsupported));
-            return;
-        };
-
-        var zig_cmd_buf: [512]u8 = undefined;
-        const zig_cmd = std.fmt.bufPrint(&zig_cmd_buf,
-            \\cd /tmp && curl -sSfL -o zig.tar.xz https://ziglang.org/download/{[a]s}/zig-{[b]s}-linux-{[c]s}.tar.xz && tar xf zig.tar.xz && rm -rf /usr/local/zig && mv zig-{[b]s}-linux-{[c]s} /usr/local/zig && ln -sf /usr/local/zig/zig /usr/local/bin/zig && rm -f zig.tar.xz
-        , .{ .a = zig_ver, .b = arch.toStr(), .c = zig_ver }) catch {
-            sp.stop(false, "");
-            return;
-        };
-
-        const dl_result = sys.exec(allocator, &.{ "bash", "-c", zig_cmd }) catch {
-            sp.stop(false, "");
-            return;
-        };
-
-        if (dl_result.exit_code != 0) {
-            sp.stop(false, "");
-            if (dl_result.stderr.len > 0) {
-                ui.hint(dl_result.stderr[0..@min(dl_result.stderr.len, 200)]);
-            }
+            ui.fail(ui.str(.error_no_release));
             return;
         }
-        sp.stop(true, zig_ver);
+        sp.stop(true, tag.slice());
     }
 
-    // ── Clone & build ──
+    // ── Download + validate proxy binary ──
+    var artifact = release.Artifact{};
     {
-        var sp = ui.spinner(ui.str(.install_building));
+        var sp = ui.spinner(ui.str(.install_downloading));
         sp.start();
-        var cmd_buf: [1024]u8 = undefined;
-        const build_cmd = std.fmt.bufPrint(
-            &cmd_buf,
-            "TMPDIR=$(mktemp -d) && git clone --depth 1 {s} $TMPDIR 2>&1 && " ++
-                "cd $TMPDIR && zig build -Doptimize=ReleaseFast 2>&1 && " ++
-                "mkdir -p {s} && cp zig-out/bin/mtproto-proxy {s}/mtproto-proxy && " ++
-                "chmod +x {s}/mtproto-proxy && " ++
-                "cp $TMPDIR/deploy/*.sh {s}/ 2>/dev/null || true && " ++
-                "cp $TMPDIR/deploy/mtproto-proxy.service /etc/systemd/system/ && " ++
-                "chmod +x {s}/*.sh 2>/dev/null || true && rm -rf $TMPDIR",
-            .{ REPO_URL, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR, INSTALL_DIR },
-        ) catch {
+        if (!release.downloadProxyArtifact(allocator, tag.slice(), "install", &artifact)) {
             sp.stop(false, "");
-            return;
-        };
-
-        const build_result = sys.exec(allocator, &.{ "bash", "-c", build_cmd }) catch {
-            sp.stop(false, "");
-            return;
-        };
-        defer build_result.deinit();
-
-        if (build_result.exit_code != 0) {
-            sp.stop(false, "");
-            if (build_result.stderr.len > 0) {
-                ui.hint(build_result.stderr[0..@min(build_result.stderr.len, 200)]);
-            }
+            ui.fail(ui.str(.error_download_failed));
             return;
         }
-        sp.stop(true, "");
+        sp.stop(true, artifact.asset_name);
+    }
+
+    // ── Install binary + service file ──
+    {
+        _ = sys.exec(allocator, &.{ "mkdir", "-p", INSTALL_DIR }) catch {};
+        _ = sys.execForward(&.{
+            "install", "-m", "0755",
+            artifact.binaryPath(),
+            INSTALL_DIR ++ "/mtproto-proxy",
+        }) catch {};
+        release.downloadServiceFile(allocator, tag.slice());
+        release.cleanup(allocator, &artifact);
     }
     ui.ok(ui.str(.install_binary_ok));
 

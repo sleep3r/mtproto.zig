@@ -92,10 +92,10 @@ pub const S = enum(u16) {
     install_dpi_drs,
     install_dpi_drs_help,
     install_checking_deps,
-    install_installing_zig,
-    install_zig_ok,
-    install_cloning,
-    install_building,
+    install_resolving_tag,
+    install_download_ok,
+    install_downloading,
+    install_validating,
     install_binary_ok,
     install_config_generated,
     install_config_exists,
@@ -279,14 +279,14 @@ const en_strings = [_][]const u8{
     "Ramp TLS records 1369→16384 bytes to mimic browser behavior, evade traffic analysis.",
     // install_checking_deps
     "Installing system dependencies...",
-    // install_installing_zig
-    "Installing Zig",
-    // install_zig_ok
-    "Zig installed",
-    // install_cloning
-    "Cloning repository...",
-    // install_building
-    "Building mtproto-proxy...",
+    // install_resolving_tag
+    "Resolving latest release...",
+    // install_download_ok
+    "Binary downloaded",
+    // install_downloading
+    "Downloading proxy binary...",
+    // install_validating
+    "Validating binary compatibility...",
     // install_binary_ok
     "Binary installed",
     // install_config_generated
@@ -504,14 +504,14 @@ const ru_strings = [_][]const u8{
     "Наращивание TLS записей 1369→16384 байт, имитируя браузер, обход анализа трафика.",
     // install_checking_deps
     "Установка системных зависимостей...",
-    // install_installing_zig
-    "Установка Zig",
-    // install_zig_ok
-    "Zig установлен",
-    // install_cloning
-    "Клонирование репозитория...",
-    // install_building
-    "Сборка mtproto-proxy...",
+    // install_resolving_tag
+    "Определение последней версии...",
+    // install_download_ok
+    "Бинарник скачан",
+    // install_downloading
+    "Скачивание бинарника прокси...",
+    // install_validating
+    "Проверка совместимости бинарника...",
     // install_binary_ok
     "Бинарник установлен",
     // install_config_generated
