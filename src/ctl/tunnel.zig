@@ -249,20 +249,32 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     };
     ui.ok(mode_label);
 
-    // ── Inject public IP ──
-    const public_ip = sys.detectPublicIp(allocator) orelse "";
-    if (public_ip.len > 0) {
-        var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
-        if (doc) |*d| {
-            defer d.deinit();
-            var quoted_buf: [64]u8 = undefined;
-            const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{public_ip}) catch "";
-            if (quoted.len > 0) {
-                d.set("server", "public_ip", quoted) catch {};
-                d.save(INSTALL_DIR ++ "/config.toml") catch {};
+    // ── Inject public IP (preserve existing custom value) ──
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
+    if (doc) |*d| {
+        defer d.deinit();
+
+        var should_inject = true;
+        if (d.get("server", "public_ip")) |configured_public_ip| {
+            const configured = std.mem.trim(u8, configured_public_ip, &[_]u8{ ' ', '\t' });
+            if (configured.len > 0 and !std.mem.eql(u8, configured, "<SERVER_IP>")) {
+                should_inject = false;
+                ui.stepOk("Keeping configured public IP", configured);
             }
         }
-        ui.stepOk("Injected public IP", public_ip);
+
+        if (should_inject) {
+            const public_ip = sys.detectPublicIp(allocator) orelse "";
+            if (public_ip.len > 0) {
+                var quoted_buf: [64]u8 = undefined;
+                const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{public_ip}) catch "";
+                if (quoted.len > 0) {
+                    d.set("server", "public_ip", quoted) catch {};
+                    d.save(INSTALL_DIR ++ "/config.toml") catch {};
+                    ui.stepOk("Injected public IP", public_ip);
+                }
+            }
+        }
     }
 
     // ── Preserve promotion tag from env.sh ──

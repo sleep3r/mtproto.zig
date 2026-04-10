@@ -474,22 +474,62 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     const public_ip = sys.detectPublicIp(allocator) orelse "<SERVER_IP>";
     sp.stop(true, public_ip);
 
-    // Read secret from generated config
+    // Read summary values from active config
+    var summary_server: []const u8 = public_ip;
+    var summary_server_buf: [256]u8 = undefined;
+    var summary_port: u16 = opts.port;
+    var summary_tls_domain: []const u8 = opts.tls_domain;
+    var summary_tls_domain_buf: [256]u8 = undefined;
     var secret_from_cfg: []const u8 = "unknown";
+    var secret_buf: [128]u8 = undefined;
+
     {
         var cfg_doc = toml.TomlDoc.load(allocator, config_path_buf) catch {
-            printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts, config_path_buf);
+            printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts.tls_domain, opts, config_path_buf);
             return;
         };
         defer cfg_doc.deinit();
 
+        if (cfg_doc.get("server", "public_ip")) |configured_server| {
+            const trimmed = std.mem.trim(u8, configured_server, &[_]u8{ ' ', '\t' });
+            if (trimmed.len > 0) {
+                const copy_len = @min(trimmed.len, summary_server_buf.len);
+                @memcpy(summary_server_buf[0..copy_len], trimmed[0..copy_len]);
+                summary_server = summary_server_buf[0..copy_len];
+            }
+        }
+
+        if (cfg_doc.get("server", "port")) |configured_port| {
+            summary_port = std.fmt.parseInt(u16, configured_port, 10) catch summary_port;
+        }
+
+        if (cfg_doc.get("censorship", "tls_domain")) |configured_domain| {
+            const trimmed = std.mem.trim(u8, configured_domain, &[_]u8{ ' ', '\t' });
+            if (trimmed.len > 0) {
+                const copy_len = @min(trimmed.len, summary_tls_domain_buf.len);
+                @memcpy(summary_tls_domain_buf[0..copy_len], trimmed[0..copy_len]);
+                summary_tls_domain = summary_tls_domain_buf[0..copy_len];
+            }
+        }
+
         const user_name = opts.user orelse "user";
-        secret_from_cfg = cfg_doc.get("access.users", user_name) orelse
-            cfg_doc.get("access.users", "user") orelse
-            "unknown";
+        if (cfg_doc.get("access.users", user_name) orelse cfg_doc.get("access.users", "user")) |configured_secret| {
+            const copy_len = @min(configured_secret.len, secret_buf.len);
+            @memcpy(secret_buf[0..copy_len], configured_secret[0..copy_len]);
+            secret_from_cfg = secret_buf[0..copy_len];
+        }
     }
 
-    printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts, config_path_buf);
+    printSummary(
+        ui,
+        allocator,
+        summary_server,
+        summary_port,
+        secret_from_cfg,
+        summary_tls_domain,
+        opts,
+        config_path_buf,
+    );
 }
 
 fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) []const u8 {
@@ -610,6 +650,7 @@ fn printSummary(
     public_ip: []const u8,
     port: u16,
     secret: []const u8,
+    tls_domain: []const u8,
     opts: InstallOpts,
     config_path: []const u8,
 ) void {
@@ -649,9 +690,9 @@ fn printSummary(
     ui.writeRaw("\n");
     ui.print("  {s}╭─ {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.bold, ui.str(.install_connection_link) });
 
-    if (!printLinksFromConfig(ui, allocator, public_ip, port, opts.tls_domain, config_path)) {
+    if (!printLinksFromConfig(ui, allocator, public_ip, port, tls_domain, config_path)) {
         var ee_buf: [512]u8 = undefined;
-        const ee_secret = buildEeSecret(secret, opts.tls_domain, &ee_buf);
+        const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
 
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
