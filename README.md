@@ -424,6 +424,8 @@ docker build -t mtproto-zig .
 docker buildx build --platform linux/amd64,linux/arm64 -t your-registry/mtproto-zig:latest --push .
 ```
 
+Published `linux/amd64` images are built with a portable CPU profile (`-Dcpu=x86_64`) to avoid `Illegal instruction` crashes on older VPS CPUs.
+
 > OS-level mitigations (iptables TCPMSS, nfqws, etc.) are not applied inside the container; only the proxy binary runs there.
 
 ---

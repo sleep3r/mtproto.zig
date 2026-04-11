@@ -45,7 +45,27 @@ WORKDIR /build
 COPY build.zig ./
 COPY src ./src
 
-RUN zig build -Doptimize=ReleaseFast
+RUN set -eu \
+    && arch="${TARGETARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}" \
+    && case "$arch" in \
+        amd64|x86_64) \
+            target="x86_64-linux"; \
+            cpu="x86_64"; \
+            ;; \
+        arm64|aarch64) \
+            target="aarch64-linux"; \
+            cpu=""; \
+            ;; \
+        *) \
+            echo "unsupported TARGETARCH=$arch" >&2; \
+            exit 1; \
+            ;; \
+       esac \
+    && if [ -n "$cpu" ]; then \
+         zig build -Doptimize=ReleaseFast -Dtarget="$target" -Dcpu="$cpu"; \
+       else \
+         zig build -Doptimize=ReleaseFast -Dtarget="$target"; \
+       fi
 
 FROM debian:bookworm-slim
 
