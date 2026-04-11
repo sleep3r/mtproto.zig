@@ -226,6 +226,16 @@ sudo mtbuddy setup tunnel /path/to/awg0.conf
 `mtbuddy` keeps `[general].use_middle_proxy` unchanged and only configures transport (`[upstream].type = "tunnel"`).
 After setup, it validates policy routes (`mark 200`) to Telegram DC ranges and prints operational commands.
 
+You can also explicitly configure the tunnel interface in `config.toml`:
+
+```toml
+[upstream]
+type = "tunnel"
+
+[upstream.tunnel]
+tunnel_interface = "awg0"
+```
+
 ### SOCKS5 proxy
 
 Route DC connections through an external SOCKS5 proxy. Supports RFC 1928 auth.
@@ -302,6 +312,7 @@ alice = true   # bypass MiddleProxy for this user
 | Key | Default | Description |
 |-----|---------|-------------|
 | `[upstream].type` | `auto` | Egress mode: `auto` (direct), `direct`, `tunnel` (VPN via socket policy routing), `socks5`, or `http` |
+| `[upstream.tunnel] tunnel_interface` | `"awg0"` | Name of the VPN network interface for SO_MARK routing |
 | `[upstream.socks5] host` | — | SOCKS5 proxy address |
 | `[upstream.socks5] port` | — | SOCKS5 proxy port |
 | `[upstream.socks5] username` | — | SOCKS5 username (empty = no auth) |
