@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.2](https://github.com/sleep3r/mtproto.zig/compare/v0.15.1...v0.15.2) (2026-04-11)
+
+
+### Bug Fixes
+
+* **ci:** use valid Zig CLI args in release AES check ([#162](https://github.com/sleep3r/mtproto.zig/issues/162)) ([816f702](https://github.com/sleep3r/mtproto.zig/commit/816f70255bccf1ece4b4fe2132a10f08db4c4d49))
+* **ctl:** remove legacy netns listen directives from nginx masking config ([#165](https://github.com/sleep3r/mtproto.zig/issues/165)) ([60af41c](https://github.com/sleep3r/mtproto.zig/commit/60af41c9b8c330f9d901b73eb6a689d88d19f7dc))
+
 ## [0.15.1](https://github.com/sleep3r/mtproto.zig/compare/v0.15.0...v0.15.1) (2026-04-10)
 
 
