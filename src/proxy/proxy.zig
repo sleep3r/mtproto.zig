@@ -1267,7 +1267,7 @@ pub const ProxyState = struct {
 
         for (0..next_primary.len) |i| {
             if (next_primary[i]) |addr| {
-                if (!isSameIpEndpoint(self.middle_proxy_addrs_primary[i], addr)) {
+                if (!self.middle_proxy_addrs_primary[i].eql(addr)) {
                     self.middle_proxy_addrs_primary[i] = addr;
                     changed = true;
                 }
@@ -1275,7 +1275,7 @@ pub const ProxyState = struct {
         }
 
         if (next_addr_203) |addr| {
-            if (!isSameIpEndpoint(self.middle_proxy_addr_203, addr)) {
+            if (!self.middle_proxy_addr_203.eql(addr)) {
                 self.middle_proxy_addr_203 = addr;
                 changed = true;
             }
@@ -1302,7 +1302,7 @@ pub const ProxyState = struct {
         }
 
         if (self.middle_proxy_secret_len != next_secret.len or
-            !bytesEqualScalar(self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
+            !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
         {
             @memset(self.middle_proxy_secret[0..], 0);
             @memcpy(self.middle_proxy_secret[0..next_secret.len], next_secret);
@@ -4058,14 +4058,6 @@ fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
     return false;
 }
 
-fn bytesEqualScalar(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |lhs, rhs| {
-        if (lhs != rhs) return false;
-    }
-    return true;
-}
-
 fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address) void {
     if (count.* >= addrs.len) return;
     for (addrs[0..count.*]) |existing| {
@@ -4179,7 +4171,7 @@ fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, out: 
 
         var dup = false;
         for (out[0..count]) |existing| {
-            if (isSameIpEndpoint(existing, parsed)) {
+            if (existing.eql(parsed)) {
                 dup = true;
                 break;
             }
@@ -4204,7 +4196,7 @@ fn trySelectReachableMiddleProxy(candidates: []const net.Address, timeout_ms: i3
 fn addressesEqual(a: []const net.Address, b: []const net.Address) bool {
     if (a.len != b.len) return false;
     for (a, b) |lhs, rhs| {
-        if (!isSameIpEndpoint(lhs, rhs)) return false;
+        if (!lhs.eql(rhs)) return false;
     }
     return true;
 }
