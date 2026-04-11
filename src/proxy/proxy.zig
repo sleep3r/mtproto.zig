@@ -149,7 +149,9 @@ const SubnetRateLimit = struct {
         } else if (addr.any.family == posix.AF.INET6) {
             // /48 subnet: first 6 bytes hashed to u32
             const ip6 = &addr.in6.sa.addr;
-            return @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]) ^ (@as(u32, ip6[4]) << 8 | @as(u32, ip6[5]));
+            const hi: u32 = @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]);
+            const lo: u32 = @as(u32, ip6[4]) << 8 | @as(u32, ip6[5]);
+            return hi ^ lo;
         }
         return 0;
     }

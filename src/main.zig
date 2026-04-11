@@ -237,14 +237,6 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
     const configured_limit = cfg.max_connections;
     cfg.max_connections = est.safe_connections;
 
-    if (cfg.max_connections > est.safe_connections) {
-        log_main.err(
-            "failed to enforce RAM safety limit: max_connections={d}, safe={d}; refusing startup",
-            .{ cfg.max_connections, est.safe_connections },
-        );
-        return error.CapacitySafetyEnforcementFailed;
-    }
-
     log_main.warn(
         "auto-clamping max_connections from {d} to {d} " ++
             "(host has {d} MiB RAM, ~{d} KiB/connection). " ++

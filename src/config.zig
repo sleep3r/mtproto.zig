@@ -90,6 +90,8 @@ pub const Config = struct {
     handshake_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
+    /// Whether tls_domain was allocated and needs freeing in deinit.
+    tls_domain_owned: bool = false,
     users: std.StringHashMap([16]u8),
     /// Users that always bypass MiddleProxy and connect to DC directly.
     /// Section: [access.direct_users] (alias: [access.admins])
@@ -325,6 +327,7 @@ pub const Config = struct {
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
                         cfg.tls_domain = try allocator.dupe(u8, value);
+                        cfg.tls_domain_owned = true;
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "mask_port")) {
@@ -357,6 +360,7 @@ pub const Config = struct {
                     }
                 } else if (in_upstream_tunnel_section) {
                     if (std.mem.eql(u8, key, "interface")) {
+                        if (cfg.upstream_tunnel_interface) |old| allocator.free(old);
                         cfg.upstream_tunnel_interface = try allocator.dupe(u8, value);
                     }
                 }
@@ -382,7 +386,7 @@ pub const Config = struct {
         direct_users.deinit();
 
         // Free tls_domain if it was allocated (not the default)
-        if (!std.mem.eql(u8, self.tls_domain, "google.com")) {
+        if (self.tls_domain_owned) {
             allocator.free(self.tls_domain);
         }
         if (self.public_ip) |ip| {
