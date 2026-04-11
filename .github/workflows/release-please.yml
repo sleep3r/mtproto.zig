@@ -83,7 +83,7 @@ jobs:
 
           pub fn main() void {}
           EOF
-          zig build-exe -target=${{ matrix.target }} -mcpu=${{ matrix.cpu }} /tmp/check_aes_target.zig
+          zig build-exe -target "${{ matrix.target }}" -mcpu "${{ matrix.cpu }}" /tmp/check_aes_target.zig
 
       - name: Build release binary
         run: |
