@@ -33,6 +33,9 @@ pub const InstallOpts = struct {
     enable_ipv6_hop: bool = false,
     enable_desync: bool = true,
     enable_drs: bool = false,
+    /// Enable MiddleProxy (Telegram relay). Required for promo tags and
+    /// non-Premium media loading.
+    enable_middle_proxy: bool = false,
     /// Pre-set user secret (32-char hex). If null, auto-generated.
     secret: ?[32]u8 = null,
     /// User name for config.toml. If null, defaults to "user".
@@ -95,6 +98,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
             opts.enable_tcpmss = false;
         } else if (std.mem.eql(u8, arg, "--ipv6-hop")) {
             opts.enable_ipv6_hop = true;
+        } else if (std.mem.eql(u8, arg, "--middle-proxy")) {
+            opts.enable_middle_proxy = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             opts.version = args.next();
         }
@@ -132,6 +137,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
         ui.print("  {s}TCPMSS:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_tcpmss) "enabled" else "disabled" });
         ui.print("  {s}Masking:{s}  {s}\n", .{ Color.dim, Color.reset, if (opts.enable_masking) "enabled" else "disabled" });
         ui.print("  {s}nfqws:{s}    {s}\n", .{ Color.dim, Color.reset, if (opts.enable_nfqws) "enabled" else "disabled" });
+        ui.print("  {s}Middle:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_middle_proxy) "enabled" else "disabled" });
         ui.writeRaw("\n");
 
         if (!try ui.confirm("Proceed with installation?", true)) {
@@ -229,6 +235,28 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     opts.enable_drs = (dpi_result & 16) != 0;
     opts.enable_ipv6_hop = (dpi_result & 32) != 0;
     opts.secret = secret_hex;
+
+    // MiddleProxy toggle
+    ui.writeRaw("\n");
+    ui.print("  {s}╭─ {s}{s}{s}\n", .{ Color.gray, Color.bold, ui.str(.install_middle_proxy_prompt), Color.reset });
+    // Print multi-line help with border
+    {
+        var help_lines = std.mem.splitScalar(u8, ui.str(.install_middle_proxy_help), '\n');
+        while (help_lines.next()) |line| {
+            ui.print("  {s}│{s}  {s}{s}{s}\n", .{
+                Color.gray, Color.reset,
+                Color.dim,  line,
+                Color.reset,
+            });
+        }
+    }
+    ui.print("  {s}╰─{s}\n", .{ Color.gray, Color.reset });
+    opts.enable_middle_proxy = try ui.confirm(ui.str(.install_middle_proxy_prompt), false);
+
+    if (!opts.enable_middle_proxy) {
+        ui.warn(ui.str(.install_middle_proxy_warn));
+    }
+
     opts.yes = true; // already confirmed via wizard
 
     // Confirm
@@ -340,6 +368,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         try doc.addKv("desync", if (opts.enable_desync) "true" else "false");
         try doc.addKv("drs", if (opts.enable_drs) "true" else "false");
         try doc.addKv("fast_mode", "true");
+
+        try doc.addSection("general");
+        try doc.addKv("use_middle_proxy", if (opts.enable_middle_proxy) "true" else "false");
 
         try doc.addSection("access.users");
         try doc.addKvStr(user_name, &secret_hex);
@@ -643,6 +674,11 @@ fn printSummary(
         .{
             .label = if (opts.enable_drs) "Dynamic Record Sizing (built-in)" else "",
             .style = if (opts.enable_drs) .success else .blank,
+        },
+        .{ .label = "", .style = .blank },
+        .{
+            .label = if (opts.enable_middle_proxy) "MiddleProxy (Telegram relay)" else "MiddleProxy: disabled",
+            .style = if (opts.enable_middle_proxy) .success else .label_value,
         },
     });
 

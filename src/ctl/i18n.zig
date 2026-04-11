@@ -91,6 +91,9 @@ pub const S = enum(u16) {
     install_dpi_desync_help,
     install_dpi_drs,
     install_dpi_drs_help,
+    install_middle_proxy_prompt,
+    install_middle_proxy_help,
+    install_middle_proxy_warn,
     install_checking_deps,
     install_resolving_tag,
     install_download_ok,
@@ -277,6 +280,12 @@ const en_strings = [_][]const u8{
     "Dynamic Record Sizing (DRS)",
     // install_dpi_drs_help
     "Ramp TLS records 1369→16384 bytes to mimic browser behavior, evade traffic analysis.",
+    // install_middle_proxy_prompt
+    "Enable MiddleProxy (Telegram relay)?",
+    // install_middle_proxy_help
+    "Routes traffic through Telegram's relay servers.\nUses more RAM (~2 MB per connection) but is required for:\n  • Promo tag / sponsored messages (ad_tag)\n  • Media loading (photos, video, stories) on non-Premium accounts",
+    // install_middle_proxy_warn
+    "Without MiddleProxy: promo tags will not work, and non-Premium users may fail to load media.",
     // install_checking_deps
     "Installing system dependencies...",
     // install_resolving_tag
@@ -502,6 +511,12 @@ const ru_strings = [_][]const u8{
     "Dynamic Record Sizing (DRS)",
     // install_dpi_drs_help
     "Наращивание TLS записей 1369→16384 байт, имитируя браузер, обход анализа трафика.",
+    // install_middle_proxy_prompt
+    "Включить MiddleProxy (релей Telegram)?",
+    // install_middle_proxy_help
+    "Маршрутизирует трафик через релей-серверы Telegram.\nПотребляет больше RAM (~2 МБ на подключение), но необходим для:\n  • Промо-тега / спонсорских сообщений (ad_tag)\n  • Загрузки медиа (фото, видео, истории) на аккаунтах без Premium",
+    // install_middle_proxy_warn
+    "Без MiddleProxy: промо-тег не будет работать, а у пользователей без Premium могут не загружаться медиа.",
     // install_checking_deps
     "Установка системных зависимостей...",
     // install_resolving_tag
