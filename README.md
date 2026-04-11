@@ -16,6 +16,12 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ---
 
+<p align="center">
+<a href="#why-this-one">Why this one?</a> · <a href="#install">Install</a> · <a href="#update">Update</a> · <a href="#other-mtbuddy-commands">Commands</a> · <a href="#upstream-routing">Routing</a> · <a href="#configuration">Config</a> · <a href="#monitoring-dashboard">Dashboard</a> · <a href="#building-locally">Build</a> · <a href="#docker">Docker</a> · <a href="#troubleshooting--stuck-on-updating">FAQ</a>
+</p>
+
+---
+
 ## Why this one?
 
 Most MTProto proxies are large, dependency-heavy, and use lots of memory. This one is different:
@@ -102,14 +108,13 @@ sudo mtbuddy --interactive
 
 ### What the install does
 
-1. Installs **Zig 0.15.2** (downloads from `ziglang.org` if not present)
-2. Clones the repo and builds with `ReleaseFast`
-3. Generates a random secret (or uses `--secret`)
-4. Creates a systemd service (`mtproto-proxy`)
-5. Opens the port in `ufw` (if active)
-6. Applies TCPMSS=88 iptables rules
-7. Sets up Nginx masking + nfqws TCP desync (unless `--no-dpi`)
-8. Prints `tg://` link
+1. Downloads the **pre-built proxy binary** from GitHub Releases (auto-detects CPU: `x86_64_v3` → `x86_64` → `aarch64`)
+2. Generates a random secret (or uses `--secret`)
+3. Creates a systemd service (`mtproto-proxy`)
+4. Opens the port in `ufw` (if active)
+5. Applies TCPMSS=88 iptables rules
+6. Sets up Nginx masking + nfqws TCP desync (unless `--no-dpi`)
+7. Prints `tg://` link
 
 ### Install options
 
@@ -337,7 +342,7 @@ alice = true   # bypass MiddleProxy for this user
 
 ## Monitoring dashboard
 
-A lightweight web dashboard (FastAPI + WebSocket, ~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, tunnel metrics, user management, and streaming logs.
+A lightweight web dashboard (~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, tunnel metrics, user management, and streaming logs.
 
 The dashboard is **embedded directly into the `mtbuddy` binary** — no extra files needed.
 
