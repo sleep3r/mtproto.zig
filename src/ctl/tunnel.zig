@@ -232,6 +232,13 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         ui.stepOk("Preserved promotion tag", tag);
     }
 
+    // ── Cleanup legacy netns nginx listen directives ──
+    const nginx_cleaned = cleanupNetnsNginxListen(allocator);
+    if (nginx_cleaned) {
+        ui.ok("Removed legacy netns listen directives from nginx masking config");
+        _ = sys.execForward(&.{ "systemctl", "try-reload-or-restart", "nginx" }) catch {};
+    }
+
     // ── Apply masking monitor (if recovery is already installed) ──
     if (sys.isServiceActive("mtproto-mask-health.timer") or sys.fileExists("/usr/local/bin/mtproto-mask-health.sh")) {
         const recovery = @import("recovery.zig");
@@ -418,6 +425,49 @@ fn ensureAwgTableOff(allocator: std.mem.Allocator, path: []const u8) !bool {
     defer allocator.free(sanitized);
 
     try sys.writeFileMode(path, sanitized, 0o600);
+    return true;
+}
+
+const NGINX_MASKING_CONF = "/etc/nginx/sites-available/mtproto-masking";
+
+/// Strip legacy netns listen directives (e.g. `listen 10.200.200.1:8443 ssl;`)
+/// from the nginx masking config. Returns true if any lines were removed.
+fn cleanupNetnsNginxListen(allocator: std.mem.Allocator) bool {
+    const file = std.fs.cwd().openFile(NGINX_MASKING_CONF, .{}) catch return false;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 256 * 1024) catch return false;
+    defer allocator.free(content);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var removed_any = false;
+    var wrote_any = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+
+        // Match directives like: listen 10.200.200.1:8443 ssl;
+        if (std.mem.startsWith(u8, trimmed, "listen ") and
+            std.mem.indexOf(u8, trimmed, "10.200.200.") != null)
+        {
+            removed_any = true;
+            continue;
+        }
+
+        if (wrote_any) output.append(allocator, '\n') catch return false;
+        output.appendSlice(allocator, line) catch return false;
+        wrote_any = true;
+    }
+
+    if (!removed_any) return false;
+
+    const sanitized = output.toOwnedSlice(allocator) catch return false;
+    defer allocator.free(sanitized);
+
+    sys.writeFile(NGINX_MASKING_CONF, sanitized) catch return false;
     return true;
 }
 

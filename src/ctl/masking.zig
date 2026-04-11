@@ -64,17 +64,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         return;
     }
 
-    // Detect tunnel veth
-    var tunnel_host_ip: ?[]const u8 = null;
-    {
-        const r = sys.exec(allocator, &.{ "ip", "-4", "addr", "show" }) catch null;
-        if (r) |result| {
-            defer result.deinit();
-            if (std.mem.indexOf(u8, result.stdout, "10.200.200.1/") != null) {
-                tunnel_host_ip = "10.200.200.1";
-            }
-        }
-    }
+
 
     // ── Install Nginx ──
     if (sys.commandExists("nginx")) {
@@ -135,19 +125,14 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     sys.execSilent(allocator, &.{ "mkdir", "-p", "/var/www/masking" });
     sys.writeFile("/var/www/masking/index.html", "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n") catch {};
 
-    // Build nginx config
-    var extra_listen: []const u8 = "";
-    var extra_listen_buf: [128]u8 = undefined;
-    if (tunnel_host_ip) |tip| {
-        extra_listen = std.fmt.bufPrint(&extra_listen_buf, "    listen {s}:{s} ssl;\n", .{ tip, NGINX_PORT }) catch "";
-    }
+
 
     var nginx_cfg_buf: [2048]u8 = undefined;
     const nginx_cfg = std.fmt.bufPrint(&nginx_cfg_buf,
         \\# MTProto proxy masking server — local only
         \\server {{
         \\    listen 127.0.0.1:{[port]s} ssl;
-        \\{[extra]s}
+        \\
         \\    server_name {[domain]s};
         \\
         \\    ssl_certificate     {[cert_dir]s}/cert.pem;
@@ -168,7 +153,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         \\}}
     , .{
         .port = NGINX_PORT,
-        .extra = extra_listen,
         .domain = opts.tls_domain,
         .cert_dir = CERT_DIR,
     }) catch "";
@@ -196,9 +180,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     _ = sys.execForward(&.{ "systemctl", "restart", "nginx" }) catch {};
     _ = sys.exec(allocator, &.{ "systemctl", "enable", "nginx" }) catch {};
     ui.ok("Nginx configured on 127.0.0.1:" ++ NGINX_PORT);
-    if (tunnel_host_ip != null) {
-        ui.ok("Nginx configured on 10.200.200.1:" ++ NGINX_PORT ++ " for tunnel netns");
-    }
 
     // ── Verify Nginx ──
     {
