@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/sleep3r/mtproto.zig/compare/v0.15.3...v0.16.0) (2026-04-11)
+
+
+### Features
+
+* **mtbuddy:** ask about MiddleProxy during install ([#174](https://github.com/sleep3r/mtproto.zig/issues/174)) ([6985478](https://github.com/sleep3r/mtproto.zig/commit/69854788f41f7bc2c429e00e26f3752677c0072c))
+
 ## [0.15.3](https://github.com/sleep3r/mtproto.zig/compare/v0.15.2...v0.15.3) (2026-04-11)
 
 
