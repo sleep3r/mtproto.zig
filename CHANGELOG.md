@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.3](https://github.com/sleep3r/mtproto.zig/compare/v0.15.2...v0.15.3) (2026-04-11)
+
+
+### Bug Fixes
+
+* **docker:** build portable amd64 image to avoid invalid opcode ([#170](https://github.com/sleep3r/mtproto.zig/issues/170)) ([79f3e34](https://github.com/sleep3r/mtproto.zig/commit/79f3e342bfed117a9d3a5b9b7d016170342f2bb3))
+
 ## [0.15.2](https://github.com/sleep3r/mtproto.zig/compare/v0.15.1...v0.15.2) (2026-04-11)
 
 
