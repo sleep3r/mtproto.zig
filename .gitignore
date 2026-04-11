@@ -17,3 +17,4 @@ fix_tui.py
 test_list.zig
 bundle.sh
 codebase.txt
+.agent/skills/local-env/
