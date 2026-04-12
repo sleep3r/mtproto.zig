@@ -72,6 +72,17 @@ port = 443
 # TCP port for the monitoring dashboard.
 # port = 61208
 
+[monitoring]
+# Embedded Prometheus-compatible metrics endpoint.
+# Disabled by default; enable explicitly when scraping from Docker/Prometheus.
+# enabled = true
+
+# Bind address for the metrics listener.
+# host = "127.0.0.1"
+
+# TCP port for GET /metrics.
+# port = 9100
+
 [upstream]
 # Upstream egress mode for outgoing DC connections.
 # "auto"       — direct TCP from host routing (default)

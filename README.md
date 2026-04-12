@@ -339,6 +339,9 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` |
 | `[monitor] host` | `"127.0.0.1"` | Dashboard bind address |
 | `[monitor] port` | `61208` | Dashboard port |
+| `[monitoring] enabled` | `false` | Enable embedded Prometheus `/metrics` endpoint |
+| `[monitoring] host` | `"127.0.0.1"` | Metrics bind address |
+| `[monitoring] port` | `9100` | Metrics port |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
 | `[censorship] mask` | `true` | Forward unauthenticated clients to `tls_domain` |
 | `[censorship] mask_port` | `443` | Local masking port (use `8443` for Nginx zero-RTT) |
@@ -380,6 +383,37 @@ Alternatively, expose the dashboard port via `[monitor]` config section and acce
 <br>
 
 </details>
+
+---
+
+## Prometheus metrics
+
+`mtproto-proxy` can expose an embedded Prometheus-compatible metrics endpoint on a dedicated port.
+
+```toml
+[monitoring]
+enabled = true
+host = "127.0.0.1"
+port = 9100
+```
+
+The endpoint is plaintext HTTP and serves:
+
+```text
+GET /metrics
+```
+
+Typical Docker usage:
+
+```bash
+docker run --rm \
+  -p 443:443 \
+  -p 9100:9100 \
+  -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
+  mtproto-zig
+```
+
+It exposes proxy counters plus process metrics such as RSS, virtual memory, CPU time, and open file descriptors.
 
 ---
 

@@ -869,12 +869,42 @@ const ConnectionPool = struct {
 };
 
 pub const ProxyState = struct {
+    pub const MetricsSnapshot = struct {
+        start_time_seconds: i64,
+        uptime_seconds: i64,
+        connections_active: u32,
+        connections_max: u32,
+        handshakes_inflight: u32,
+        connections_accepted_total: u64,
+        connections_closed_total: u64,
+        connections_total: u64,
+        accept_paused: bool,
+        saturation_paused: bool,
+        drops_capacity_total: u64,
+        drops_saturation_total: u64,
+        drops_rate_limit_total: u64,
+        drops_handshake_budget_total: u64,
+        handshake_timeouts_total: u64,
+        middleproxy_fallback_total: u64,
+        config_port: u16,
+        config_max_connections: u32,
+        middleproxy_enabled: bool,
+        fast_mode_enabled: bool,
+        mask_enabled: bool,
+        desync_enabled: bool,
+        drs_enabled: bool,
+    };
+
     allocator: std.mem.Allocator,
     config: Config,
     user_secrets: []const obfuscation.UserSecret,
+    start_time_seconds: i64,
     connection_count: std.atomic.Value(u64),
+    closed_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
     handshakes_inflight: std.atomic.Value(u32),
+    accept_paused: std.atomic.Value(bool),
+    saturation_paused: std.atomic.Value(bool),
     mask_addr: ?net.Address,
     replay_cache: ReplayCache,
     tls_server_hello_template: [tls.server_hello_template_len]u8,
@@ -977,9 +1007,13 @@ pub const ProxyState = struct {
             .allocator = allocator,
             .config = cfg,
             .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
+            .start_time_seconds = std.time.timestamp(),
             .connection_count = std.atomic.Value(u64).init(0),
+            .closed_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
             .handshakes_inflight = std.atomic.Value(u32).init(0),
+            .accept_paused = std.atomic.Value(bool).init(false),
+            .saturation_paused = std.atomic.Value(bool).init(false),
             .mask_addr = resolved_addr,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls.buildServerHelloTemplate(null),
@@ -1078,6 +1112,36 @@ pub const ProxyState = struct {
         self.allocator.free(self.user_secrets);
     }
 
+    pub fn getMetricsSnapshot(self: *const ProxyState) MetricsSnapshot {
+        const now = std.time.timestamp();
+        const accepted_total = self.connection_count.load(.monotonic);
+        return .{
+            .start_time_seconds = self.start_time_seconds,
+            .uptime_seconds = @max(@as(i64, 0), now - self.start_time_seconds),
+            .connections_active = self.active_connections.load(.monotonic),
+            .connections_max = self.config.max_connections,
+            .handshakes_inflight = self.handshakes_inflight.load(.monotonic),
+            .connections_accepted_total = accepted_total,
+            .connections_closed_total = self.closed_count.load(.monotonic),
+            .connections_total = accepted_total,
+            .accept_paused = self.accept_paused.load(.monotonic),
+            .saturation_paused = self.saturation_paused.load(.monotonic),
+            .drops_capacity_total = self.stats_dropped_cap.load(.monotonic),
+            .drops_saturation_total = self.stats_dropped_saturation.load(.monotonic),
+            .drops_rate_limit_total = self.stats_dropped_rate_limit.load(.monotonic),
+            .drops_handshake_budget_total = self.stats_dropped_hs_budget.load(.monotonic),
+            .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
+            .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
+            .config_port = self.config.port,
+            .config_max_connections = self.config.max_connections,
+            .middleproxy_enabled = self.config.use_middle_proxy,
+            .fast_mode_enabled = self.config.fast_mode,
+            .mask_enabled = self.config.mask,
+            .desync_enabled = self.config.desync,
+            .drs_enabled = self.config.drs,
+        };
+    }
+
     pub fn run(self: *ProxyState) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
@@ -1164,6 +1228,10 @@ pub const ProxyState = struct {
 
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
+
+        if (self.config.monitoring.enabled) {
+            try @import("../monitoring.zig").start(self);
+        }
 
         var loop = try EventLoop.init(self, server.stream.handle);
         defer loop.deinit();
@@ -1659,6 +1727,7 @@ const EventLoop = struct {
         };
 
         self.accept_paused = true;
+        self.state.accept_paused.store(true, .monotonic);
         const needed = requiredFdsForConnections(self.state.config.max_connections);
         log.warn("fd quota reached ({any}); pausing accepts for {d}ms (recommended LimitNOFILE >= {d})", .{
             err,
@@ -1678,6 +1747,7 @@ const EventLoop = struct {
 
         self.accept_paused = false;
         self.accept_resume_ns = 0;
+        self.state.accept_paused.store(false, .monotonic);
     }
 
     fn pauseSaturation(self: *EventLoop) void {
@@ -1689,6 +1759,7 @@ const EventLoop = struct {
         };
 
         self.saturation_paused = true;
+        self.state.saturation_paused.store(true, .monotonic);
         const active = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
         log.warn(
@@ -1708,6 +1779,7 @@ const EventLoop = struct {
         };
 
         self.saturation_paused = false;
+        self.state.saturation_paused.store(false, .monotonic);
         const active = self.state.active_connections.load(.monotonic);
         log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
     }
@@ -3569,6 +3641,7 @@ const EventLoop = struct {
 
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
+            _ = self.state.closed_count.fetchAdd(1, .monotonic);
             // If connection was still in handshake phase, release from handshake budget
             if (slot.handshakeInProgress()) {
                 _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
