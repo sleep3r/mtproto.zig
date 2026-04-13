@@ -126,10 +126,12 @@ sudo mtbuddy --interactive
 | `--user, -u` | `user` | Username in `config.toml` |
 | `--config, -c` | — | Use existing `config.toml` file |
 | `--yes, -y` | — | Skip confirmation prompt |
+| `--bind, -b` | — | Bind to specific IP (default: all interfaces) |
 | `--no-masking` | — | Disable Nginx masking |
 | `--no-nfqws` | — | Disable nfqws TCP desync |
 | `--no-tcpmss` | — | Disable TCPMSS=88 |
 | `--no-dpi` | — | Disable all DPI modules |
+| `--middle-proxy` | — | Enable Telegram MiddleProxy relay |
 
 ---
 
@@ -324,7 +326,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[general] use_middle_proxy` | `false` | ME mode for DC1..5 (recommended for promo parity) |
 | `[general] ad_tag` | — | Alias for `[server].tag` |
 | `[server] port` | `443` | TCP listen port |
-| `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel |
+| `[server] bind_address` | — | Specific IP to bind the listen socket (default: all interfaces) |
+| `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel; set IPv4 explicitly if clients fail on IPv6 links |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |

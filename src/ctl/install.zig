@@ -25,6 +25,8 @@ const SERVICE_NAME = release.SERVICE_NAME;
 
 pub const InstallOpts = struct {
     port: u16 = 443,
+    /// Bind to a specific IP address instead of all interfaces.
+    bind_address: ?[]const u8 = null,
     tls_domain: []const u8 = "wb.ru",
     max_connections: u32 = 512,
     enable_tcpmss: bool = true,
@@ -98,6 +100,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
             opts.enable_tcpmss = false;
         } else if (std.mem.eql(u8, arg, "--ipv6-hop")) {
             opts.enable_ipv6_hop = true;
+        } else if (std.mem.eql(u8, arg, "--bind") or std.mem.eql(u8, arg, "-b")) {
+            if (args.next()) |val| opts.bind_address = val;
         } else if (std.mem.eql(u8, arg, "--middle-proxy")) {
             opts.enable_middle_proxy = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -244,8 +248,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         var help_lines = std.mem.splitScalar(u8, ui.str(.install_middle_proxy_help), '\n');
         while (help_lines.next()) |line| {
             ui.print("  {s}│{s}  {s}{s}{s}\n", .{
-                Color.gray, Color.reset,
-                Color.dim,  line,
+                Color.gray,  Color.reset,
+                Color.dim,   line,
                 Color.reset,
             });
         }
@@ -285,8 +289,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.start();
         _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
         _ = sys.exec(allocator, &.{
-            "apt-get", "install", "-y",
-            "iptables", "xxd",    "curl",
+            "apt-get",  "install", "-y",
+            "iptables", "xxd",     "curl",
             "openssl",  "tar",
         }) catch {};
         sp.stop(true, "");
@@ -323,9 +327,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     {
         _ = sys.exec(allocator, &.{ "mkdir", "-p", INSTALL_DIR }) catch {};
         _ = sys.execForward(&.{
-            "install", "-m", "0755",
-            artifact.binaryPath(),
-            INSTALL_DIR ++ "/mtproto-proxy",
+            "install",             "-m",                            "0755",
+            artifact.binaryPath(), INSTALL_DIR ++ "/mtproto-proxy",
         }) catch {};
         release.writeServiceFile();
     }
@@ -355,6 +358,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         var port_val_buf: [8]u8 = undefined;
         const port_val = std.fmt.bufPrint(&port_val_buf, "{d}", .{opts.port}) catch "443";
         try doc.addKv("port", port_val);
+        if (opts.bind_address) |ba| {
+            try doc.addKvStr("bind_address", ba);
+        }
         try doc.addKv("max_connections", "512");
         try doc.addKv("idle_timeout_sec", "120");
         try doc.addKv("handshake_timeout_sec", "15");
@@ -573,6 +579,34 @@ fn isValidSecretHex(secret: []const u8) bool {
     return true;
 }
 
+fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
+    var required_len: usize = 0;
+    for (server) |c| {
+        required_len += if (c == ':' or c == '[' or c == ']') 3 else 1;
+    }
+
+    // Keep original value if it does not fit to avoid silent truncation.
+    if (required_len > out.len) return server;
+
+    var pos: usize = 0;
+    for (server) |c| {
+        if (c == ':') {
+            @memcpy(out[pos..][0..3], "%3A");
+            pos += 3;
+        } else if (c == '[') {
+            @memcpy(out[pos..][0..3], "%5B");
+            pos += 3;
+        } else if (c == ']') {
+            @memcpy(out[pos..][0..3], "%5D");
+            pos += 3;
+        } else {
+            out[pos] = c;
+            pos += 1;
+        }
+    }
+    return out[0..pos];
+}
+
 fn printLinksFromConfig(
     ui: *Tui,
     allocator: std.mem.Allocator,
@@ -611,9 +645,12 @@ fn printLinksFromConfig(
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret_hex, tls_domain, &ee_buf);
 
+        var encoded_ip_buf: [768]u8 = undefined;
+        const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
+
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
-            public_ip,
+            safe_public_ip,
             port,
             ee_secret,
         }) catch continue;
@@ -689,9 +726,12 @@ fn printSummary(
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
 
+        var encoded_ip_buf: [768]u8 = undefined;
+        const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
+
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
-            public_ip,
+            safe_public_ip,
             port,
             ee_secret,
         }) catch "error building link";

@@ -108,13 +108,31 @@ fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
 /// Try to detect the server's public IP address via external services.
 /// Returns the IP string (caller owns memory) or null on failure.
 fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
-    // Try multiple services in order
-    const services = [_][]const u8{
+    // Prefer IPv4 first because many Telegram clients/networks still fail on
+    // deep links that only contain an IPv6 endpoint.
+    const ipv4_services = [_][]const u8{
+        "https://api4.ipify.org",
+        "https://ipv4.icanhazip.com",
+        "https://v4.ident.me",
+    };
+    if (detectPublicIpFromServices(allocator, ipv4_services[0..], true)) |ip| {
+        return ip;
+    }
+
+    // Fallback to any detected public IP (IPv4 or IPv6).
+    const fallback_services = [_][]const u8{
         "https://ifconfig.me",
         "https://api.ipify.org",
         "https://icanhazip.com",
     };
+    return detectPublicIpFromServices(allocator, fallback_services[0..], false);
+}
 
+fn detectPublicIpFromServices(
+    allocator: std.mem.Allocator,
+    services: []const []const u8,
+    ipv4_only: bool,
+) ?[]const u8 {
     for (services) |url| {
         const stdout = fetchUrlBytes(allocator, url) catch continue;
         // Trim whitespace/newlines
@@ -125,9 +143,14 @@ fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
         }
 
         // Basic validation: should look like an IP
-        if (std.mem.indexOfScalar(u8, trimmed, '.') != null or
-            std.mem.indexOfScalar(u8, trimmed, ':') != null)
-        {
+        const has_dot = std.mem.indexOfScalar(u8, trimmed, '.') != null;
+        const has_colon = std.mem.indexOfScalar(u8, trimmed, ':') != null;
+        const is_valid = if (ipv4_only)
+            (has_dot and !has_colon)
+        else
+            (has_dot or has_colon);
+
+        if (is_valid) {
             // If trimmed is a sub-slice of stdout, dupe it so we can free stdout
             const ip = allocator.dupe(u8, trimmed) catch {
                 allocator.free(stdout);
@@ -139,6 +162,34 @@ fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
         allocator.free(stdout);
     }
     return null;
+}
+
+fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
+    var required_len: usize = 0;
+    for (server) |c| {
+        required_len += if (c == ':' or c == '[' or c == ']') 3 else 1;
+    }
+
+    // Keep original value if it does not fit to avoid silent truncation.
+    if (required_len > out.len) return server;
+
+    var pos: usize = 0;
+    for (server) |c| {
+        if (c == ':') {
+            @memcpy(out[pos..][0..3], "%3A");
+            pos += 3;
+        } else if (c == '[') {
+            @memcpy(out[pos..][0..3], "%5B");
+            pos += 3;
+        } else if (c == ']') {
+            @memcpy(out[pos..][0..3], "%5D");
+            pos += 3;
+        } else {
+            out[pos] = c;
+            pos += 1;
+        }
+    }
+    return out[0..pos];
 }
 
 const CapacityEstimate = struct {
@@ -296,7 +347,11 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
 
     // ─── SERVER ─────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
-    writeStdout("      Listen       " ++ B ++ green ++ "0.0.0.0:{d}" ++ R ++ "\n", .{cfg.port});
+    if (cfg.bind_address) |ba| {
+        writeStdout("      Listen       " ++ B ++ green ++ "{s}:{d}" ++ R ++ "\n", .{ ba, cfg.port });
+    } else {
+        writeStdout("      Listen       " ++ B ++ green ++ "0.0.0.0:{d}" ++ R ++ "\n", .{cfg.port});
+    }
     writeStdout("      Public IP    " ++ B ++ "{s}{s}" ++ R ++ "\n", .{
         if (has_ip) green else yellow,
         server_ip,
@@ -342,12 +397,15 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
+    var encoded_ip_buf: [768]u8 = undefined;
+    const safe_server_ip = encodeServerForProxyLink(server_ip, &encoded_ip_buf);
+
     var it2 = @constCast(&cfg.users).iterator();
     while (it2.next()) |entry| {
         writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
 
         // tg:// deep link
-        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
+        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ safe_server_ip, cfg.port });
         writeRaw(green ++ "ee");
         for (entry.value_ptr.*) |byte| {
             writeHexByte(byte);
@@ -358,7 +416,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         writeRaw(R ++ "\n");
 
         // t.me link
-        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
+        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ safe_server_ip, cfg.port });
         for (entry.value_ptr.*) |byte| {
             writeHexByte(byte);
         }
