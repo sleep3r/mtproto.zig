@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/sleep3r/mtproto.zig/compare/v0.16.0...v0.17.0) (2026-04-13)
+
+
+### Features
+
+* mtbuddy enhancements and custom bind IP ([#177](https://github.com/sleep3r/mtproto.zig/issues/177)) ([8c6796f](https://github.com/sleep3r/mtproto.zig/commit/8c6796f69030557f422d2aa6480ab440db9e2432))
+
 ## [0.16.0](https://github.com/sleep3r/mtproto.zig/compare/v0.15.3...v0.16.0) (2026-04-11)
 
 
