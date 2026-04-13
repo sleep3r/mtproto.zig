@@ -432,6 +432,30 @@ _routing_cache = {"ts": 0, "data": None}
 ROUTING_CACHE_TTL = 8  # seconds
 
 
+def _parse_transfer_bytes(value: str | None) -> float:
+    """Parse a WireGuard transfer string like '5.69 KiB' into bytes."""
+    if not value:
+        return 0.0
+    m = re.match(r"([\d.]+)\s*(\S+)", value.strip())
+    if not m:
+        return 0.0
+    num = float(m[1])
+    unit = m[2].lower()
+    multipliers = {"b": 1, "kib": 1024, "mib": 1048576, "gib": 1073741824, "tib": 1099511627776}
+    return num * multipliers.get(unit, 1)
+
+
+def _has_valid_handshake(handshake: str | None) -> bool:
+    """Check whether the WireGuard handshake value indicates a completed handshake.
+
+    Returns False for None, empty, 'none (idle)', or '0' (epoch = never).
+    """
+    if not handshake:
+        return False
+    hs = handshake.strip().lower()
+    return hs not in ("", "0", "none", "none (idle)")
+
+
 def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> dict:
     result = {
         "interface": interface,
@@ -440,6 +464,7 @@ def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> di
         "active": False,
         "endpoint": None,
         "handshake": None,
+        "handshake_ok": False,
         "rx": None,
         "tx": None,
         "reason": None,
@@ -495,8 +520,22 @@ def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> di
             result["rx"] = m[1]
             result["tx"] = m[2]
 
+        # A tunnel is truly active only if the handshake completed AND
+        # we have received data. A configured endpoint with handshake=0
+        # and rx=0 means the VPN server is unreachable.
+        hs_ok = _has_valid_handshake(result.get("handshake"))
+        rx_ok = _parse_transfer_bytes(result.get("rx")) > 0
+        result["handshake_ok"] = hs_ok
+
         if result.get("endpoint"):
-            result["active"] = True
+            if hs_ok and rx_ok:
+                result["active"] = True
+            elif hs_ok:
+                result["active"] = True  # handshake done, rx may lag behind
+            else:
+                # endpoint configured but handshake never completed
+                result["active"] = False
+                result["reason"] = "endpoint configured, no handshake (VPN server unreachable)"
             if not result.get("handshake"):
                 result["handshake"] = "none (idle)"
         elif result["link_up"]:
@@ -678,6 +717,8 @@ def _routing_status() -> dict:
             and policy.get("route_ok")
             and primary_tunnel
             and primary_tunnel.get("link_up")
+            and primary_tunnel.get("active")
+            and primary_tunnel.get("handshake_ok")
         )
     elif upstream_type == "socks5":
         healthy = bool(
