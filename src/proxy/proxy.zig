@@ -600,6 +600,8 @@ const ConnectionSlot = struct {
     },
     c2s_bytes: u64 = 0,
     s2c_bytes: u64 = 0,
+    traffic_client_to_upstream_counter: ?*std.atomic.Value(u64) = null,
+    traffic_upstream_to_client_counter: ?*std.atomic.Value(u64) = null,
 
     // Non-blocking write queues (slab-like chain buffers)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
@@ -886,6 +888,8 @@ pub const ProxyState = struct {
         drops_handshake_budget_total: u64,
         handshake_timeouts_total: u64,
         middleproxy_fallback_total: u64,
+        client_to_upstream_bytes_total: u64,
+        upstream_to_client_bytes_total: u64,
         config_port: u16,
         config_max_connections: u32,
         middleproxy_enabled: bool,
@@ -901,6 +905,8 @@ pub const ProxyState = struct {
     start_time_seconds: i64,
     connection_count: std.atomic.Value(u64),
     closed_count: std.atomic.Value(u64),
+    client_to_upstream_bytes_total: std.atomic.Value(u64),
+    upstream_to_client_bytes_total: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
     handshakes_inflight: std.atomic.Value(u32),
     accept_paused: std.atomic.Value(bool),
@@ -1010,6 +1016,8 @@ pub const ProxyState = struct {
             .start_time_seconds = std.time.timestamp(),
             .connection_count = std.atomic.Value(u64).init(0),
             .closed_count = std.atomic.Value(u64).init(0),
+            .client_to_upstream_bytes_total = std.atomic.Value(u64).init(0),
+            .upstream_to_client_bytes_total = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
             .handshakes_inflight = std.atomic.Value(u32).init(0),
             .accept_paused = std.atomic.Value(bool).init(false),
@@ -1132,6 +1140,8 @@ pub const ProxyState = struct {
             .drops_handshake_budget_total = self.stats_dropped_hs_budget.load(.monotonic),
             .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
             .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
+            .client_to_upstream_bytes_total = self.client_to_upstream_bytes_total.load(.monotonic),
+            .upstream_to_client_bytes_total = self.upstream_to_client_bytes_total.load(.monotonic),
             .config_port = self.config.port,
             .config_max_connections = self.config.max_connections,
             .middleproxy_enabled = self.config.use_middle_proxy,
@@ -1641,6 +1651,8 @@ const EventLoop = struct {
             };
 
             slot.active_reserved = true;
+            slot.traffic_client_to_upstream_counter = &self.state.client_to_upstream_bytes_total;
+            slot.traffic_upstream_to_client_counter = &self.state.upstream_to_client_bytes_total;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
@@ -4333,7 +4345,12 @@ fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Ad
     return one[0];
 }
 
-fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool {
+fn noteTraffic(counter: *std.atomic.Value(u64), bytes: usize) void {
+    if (bytes == 0) return;
+    _ = counter.fetchAdd(@intCast(bytes), .monotonic);
+}
+
+fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8, counter: *std.atomic.Value(u64)) !bool {
     if (data.len == 0) return true;
 
     if (queue.isEmpty()) {
@@ -4345,6 +4362,7 @@ fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool
             return err;
         };
 
+        noteTraffic(counter, n);
         if (n == data.len) return true;
         try queue.appendCopy(data[n..]);
         return false;
@@ -4354,7 +4372,7 @@ fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool
     return false;
 }
 
-fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
+fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8, counter: *std.atomic.Value(u64)) !bool {
     if (first.len == 0 and second.len == 0) return true;
 
     if (queue.isEmpty()) {
@@ -4380,6 +4398,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
         };
 
         if (n == 0) return error.ConnectionReset;
+        noteTraffic(counter, n);
         if (n == total_len) return true;
 
         if (n < first.len) {
@@ -4400,7 +4419,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
     return false;
 }
 
-fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8) !bool {
+fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8, counter: *std.atomic.Value(u64)) !bool {
     if (owned.len == 0) {
         queue.allocator.free(owned);
         return true;
@@ -4416,6 +4435,7 @@ fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8) !bool
             return err;
         };
 
+        noteTraffic(counter, n);
         if (n == owned.len) {
             queue.allocator.free(owned);
             return true;
@@ -4431,7 +4451,7 @@ fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8) !bool
     return false;
 }
 
-fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
+fn flushQueue(fd: posix.fd_t, queue: *MessageQueue, counter: *std.atomic.Value(u64)) !bool {
     if (queue.isEmpty()) return true;
 
     var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
@@ -4449,6 +4469,7 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
         };
 
         if (n == 0) return error.ConnectionReset;
+        noteTraffic(counter, n);
         try queue.consume(n);
 
         if (n < total_req) return false;
@@ -4459,32 +4480,32 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
 
 fn slotQueueClient(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
     _ = allocator;
-    return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data);
+    return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data, slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter);
 }
 
 fn slotQueueClientPair(slot: *ConnectionSlot, allocator: std.mem.Allocator, first: []const u8, second: []const u8) !bool {
     _ = allocator;
-    return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second);
+    return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second, slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter);
 }
 
 fn slotQueueClientOwned(slot: *ConnectionSlot, allocator: std.mem.Allocator, owned: []u8) !bool {
     _ = allocator;
-    return queueOrWriteOwnedMsg(slot.client_fd, &slot.client_queue, owned);
+    return queueOrWriteOwnedMsg(slot.client_fd, &slot.client_queue, owned, slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter);
 }
 
 fn slotQueueUpstream(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
     _ = allocator;
-    return queueOrWriteMsg(slot.upstream_fd, &slot.upstream_queue, data);
+    return queueOrWriteMsg(slot.upstream_fd, &slot.upstream_queue, data, slot.traffic_client_to_upstream_counter orelse return error.MissingTrafficCounter);
 }
 
 fn slotFlushClientPending(slot: *ConnectionSlot, allocator: std.mem.Allocator) !bool {
     _ = allocator;
-    return flushQueue(slot.client_fd, &slot.client_queue);
+    return flushQueue(slot.client_fd, &slot.client_queue, slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter);
 }
 
 fn slotFlushUpstreamPending(slot: *ConnectionSlot, allocator: std.mem.Allocator) !bool {
     _ = allocator;
-    return flushQueue(slot.upstream_fd, &slot.upstream_queue);
+    return flushQueue(slot.upstream_fd, &slot.upstream_queue, slot.traffic_client_to_upstream_counter orelse return error.MissingTrafficCounter);
 }
 
 fn slotMpReadReset(slot: *ConnectionSlot, encrypted: bool) void {

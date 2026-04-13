@@ -16,6 +16,8 @@ const ProcessMetrics = struct {
     cpu_seconds_total: ?f64 = null,
     open_fds: ?u64 = null,
     max_fds: ?u64 = null,
+    cgroup_memory_usage_bytes: ?u64 = null,
+    cgroup_memory_limit_bytes: ?u64 = null,
 };
 
 pub fn start(state: *proxy.ProxyState) !void {
@@ -144,6 +146,8 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeCounter(writer, "mtproto_drops_handshake_budget_total", "connections dropped because handshake budget was exhausted", snapshot.drops_handshake_budget_total);
     try writeCounter(writer, "mtproto_handshake_timeouts_total", "connections dropped due to handshake timeout", snapshot.handshake_timeouts_total);
     try writeCounter(writer, "mtproto_middleproxy_fallback_total", "times middleproxy fell back to direct path", snapshot.middleproxy_fallback_total);
+    try writeCounter(writer, "mtproto_client_to_upstream_bytes_total", "bytes successfully written from client side toward upstream", snapshot.client_to_upstream_bytes_total);
+    try writeCounter(writer, "mtproto_upstream_to_client_bytes_total", "bytes successfully written from upstream toward client side", snapshot.upstream_to_client_bytes_total);
     try writeGauge(writer, "mtproto_config_max_connections", "configured max_connections", snapshot.config_max_connections);
     try writeGauge(writer, "mtproto_config_port", "configured MTProto listen port", snapshot.config_port);
     try writeGauge(writer, "mtproto_middleproxy_enabled", "whether middleproxy mode is enabled", boolToInt(snapshot.middleproxy_enabled));
@@ -167,6 +171,12 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     }
     if (process.max_fds) |value| {
         try writeGauge(writer, "process_max_fds", "maximum file descriptors", value);
+    }
+    if (process.cgroup_memory_usage_bytes) |value| {
+        try writeGauge(writer, "mtproto_cgroup_memory_usage_bytes", "memory usage reported by cgroup", value);
+    }
+    if (process.cgroup_memory_limit_bytes) |value| {
+        try writeGauge(writer, "mtproto_cgroup_memory_limit_bytes", "memory limit reported by cgroup", value);
     }
 }
 
@@ -196,7 +206,35 @@ fn collectProcessMetrics() ProcessMetrics {
         .cpu_seconds_total = readCpuSecondsTotal(),
         .open_fds = countOpenFds(),
         .max_fds = readMaxFds(),
+        .cgroup_memory_usage_bytes = readCgroupMemoryCurrent(),
+        .cgroup_memory_limit_bytes = readCgroupMemoryLimit(),
     };
+}
+
+fn readCgroupMemoryCurrent() ?u64 {
+    return readNumericFileAbsolute("/sys/fs/cgroup/memory.current") orelse
+        readNumericFileAbsolute("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+}
+
+fn readCgroupMemoryLimit() ?u64 {
+    return readCgroupMemoryLimitFile("/sys/fs/cgroup/memory.max") orelse
+        readCgroupMemoryLimitFile("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+}
+
+fn readCgroupMemoryLimitFile(path: []const u8) ?u64 {
+    var buf: [256]u8 = undefined;
+    const text = readFileAbsolute(path, &buf) orelse return null;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "max")) return null;
+    return std.fmt.parseInt(u64, trimmed, 10) catch null;
+}
+
+fn readNumericFileAbsolute(path: []const u8) ?u64 {
+    var buf: [256]u8 = undefined;
+    const text = readFileAbsolute(path, &buf) orelse return null;
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(u64, trimmed, 10) catch null;
 }
 
 fn readStatusValueBytes(label: []const u8) ?u64 {
@@ -282,6 +320,7 @@ test "monitoring metrics output contains required metrics" {
     const out = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_connections_active") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_build_info") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_client_to_upstream_bytes_total") != null);
 }
 
 test "monitoring rejects unknown path" {
