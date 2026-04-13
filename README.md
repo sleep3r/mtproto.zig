@@ -390,6 +390,8 @@ Alternatively, expose the dashboard port via `[monitor]` config section and acce
 
 `mtproto-proxy` can expose an embedded Prometheus-compatible metrics endpoint on a dedicated port.
 
+For a complete Docker-based monitoring stack with `mtproto-zig`, Prometheus, Grafana, and an importable dashboard, see [hack/docker/README.md](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/README.md).
+
 ```toml
 [monitoring]
 enabled = true

@@ -1,0 +1,46 @@
+services:
+  mtg-zig:
+    image: mtproto-zig:<change_me>
+    container_name: mtg-zig
+    restart: unless-stopped
+    pids_limit: 65535
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      nproc: 65535
+    volumes:
+      - ./zigconf.toml:/etc/mtproto-proxy/config.toml:ro
+    ports:
+      - "10000:8443"
+      - "127.0.0.1:9100:9100"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mtg-prometheus
+    restart: unless-stopped
+    depends_on:
+      - mtg-zig
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mtg-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  prometheus-data:
+  grafana-data:
