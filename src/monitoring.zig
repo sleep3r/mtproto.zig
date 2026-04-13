@@ -155,6 +155,7 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeGauge(writer, "mtproto_mask_enabled", "whether masking is enabled", boolToInt(snapshot.mask_enabled));
     try writeGauge(writer, "mtproto_desync_enabled", "whether desync is enabled", boolToInt(snapshot.desync_enabled));
     try writeGauge(writer, "mtproto_drs_enabled", "whether dynamic record sizing is enabled", boolToInt(snapshot.drs_enabled));
+    try writePerUserMetrics(writer, state);
 
     if (process.resident_memory_bytes) |value| {
         try writeGauge(writer, "process_resident_memory_bytes", "resident set size", value);
@@ -183,6 +184,55 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
 fn writeMetricHeader(writer: anytype, name: []const u8, help: []const u8, metric_type: []const u8) !void {
     try writer.print("# HELP {s} {s}\n", .{ name, help });
     try writer.print("# TYPE {s} {s}\n", .{ name, metric_type });
+}
+
+fn writePerUserMetrics(writer: anytype, state: *proxy.ProxyState) !void {
+    try writeMetricHeader(writer, "mtproto_user_connections_active", "active connections by configured user", "gauge");
+    for (state.user_metrics) |entry| {
+        try writeLabeledMetricLine(
+            writer,
+            "mtproto_user_connections_active",
+            entry.name,
+            entry.connections_active.load(.monotonic),
+        );
+    }
+
+    try writeMetricHeader(writer, "mtproto_user_client_to_upstream_bytes_total", "bytes successfully written upstream by configured user", "counter");
+    for (state.user_metrics) |entry| {
+        try writeLabeledMetricLine(
+            writer,
+            "mtproto_user_client_to_upstream_bytes_total",
+            entry.name,
+            entry.client_to_upstream_bytes_total.load(.monotonic),
+        );
+    }
+
+    try writeMetricHeader(writer, "mtproto_user_upstream_to_client_bytes_total", "bytes successfully written to client by configured user", "counter");
+    for (state.user_metrics) |entry| {
+        try writeLabeledMetricLine(
+            writer,
+            "mtproto_user_upstream_to_client_bytes_total",
+            entry.name,
+            entry.upstream_to_client_bytes_total.load(.monotonic),
+        );
+    }
+}
+
+fn writeLabeledMetricLine(writer: anytype, metric_name: []const u8, user_name: []const u8, value: anytype) !void {
+    try writer.print("{s}{{user=\"", .{metric_name});
+    try writePrometheusLabelValue(writer, user_name);
+    try writer.print("\"}} {d}\n", .{value});
+}
+
+fn writePrometheusLabelValue(writer: anytype, value: []const u8) !void {
+    for (value) |ch| {
+        switch (ch) {
+            '\\' => try writer.writeAll("\\\\"),
+            '"' => try writer.writeAll("\\\""),
+            '\n' => try writer.writeAll("\\n"),
+            else => try writer.writeByte(ch),
+        }
+    }
 }
 
 fn writeGauge(writer: anytype, name: []const u8, help: []const u8, value: anytype) !void {
