@@ -1081,35 +1081,52 @@ pub const ProxyState = struct {
     pub fn run(self: *ProxyState) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
-        const address = net.Address.initIp6(
-            .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-            self.config.port,
-            0,
-            0,
-        );
         var ipv6_ok = true;
-        var server = address.listen(.{
-            .reuse_address = true,
-            .kernel_backlog = @intCast(self.config.backlog),
-        }) catch |err| blk: {
-            if (err == error.AddressFamilyNotSupported) {
-                ipv6_ok = false;
-                log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
-                const address_v4 = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.config.port);
-                break :blk try address_v4.listen(.{
-                    .reuse_address = true,
-                    .kernel_backlog = @intCast(self.config.backlog),
-                });
-            }
-            return err;
-        };
-        defer server.deinit();
+        var server: net.Server = undefined;
 
-        if (ipv6_ok) {
-            log.info("Listening on [::]:{d} (epoll, single-thread)", .{self.config.port});
+        if (self.config.bind_address) |bind_str| {
+            // Explicit bind address from config
+            const parsed = parseListenAddress(bind_str, self.config.port) orelse {
+                log.err("Invalid bind_address '{s}', cannot start", .{bind_str});
+                return error.InvalidBindAddress;
+            };
+            ipv6_ok = (parsed.any.family == std.posix.AF.INET6);
+            server = try parsed.listen(.{
+                .reuse_address = true,
+                .kernel_backlog = @intCast(self.config.backlog),
+            });
+            log.info("Listening on {s}:{d} (epoll, single-thread)", .{ bind_str, self.config.port });
         } else {
-            log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
+            // Default: try [::] (dual-stack), fall back to 0.0.0.0
+            const address = net.Address.initIp6(
+                .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+                self.config.port,
+                0,
+                0,
+            );
+            server = address.listen(.{
+                .reuse_address = true,
+                .kernel_backlog = @intCast(self.config.backlog),
+            }) catch |err| blk: {
+                if (err == error.AddressFamilyNotSupported) {
+                    ipv6_ok = false;
+                    log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
+                    const address_v4 = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.config.port);
+                    break :blk try address_v4.listen(.{
+                        .reuse_address = true,
+                        .kernel_backlog = @intCast(self.config.backlog),
+                    });
+                }
+                return err;
+            };
+
+            if (ipv6_ok) {
+                log.info("Listening on [::]:{d} (epoll, single-thread)", .{self.config.port});
+            } else {
+                log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
+            }
         }
+        defer server.deinit();
 
         setNonBlocking(server.stream.handle);
 
@@ -3919,6 +3936,21 @@ fn parseIpv4Literal(text: []const u8) ?[4]u8 {
 
     if (idx != ip.len) return null;
     return ip;
+}
+
+/// Parse a user-supplied bind address string into a net.Address.
+/// Accepts IPv4 literals like "1.2.3.4" and IPv6 literals like "::1".
+fn parseListenAddress(text: []const u8, port: u16) ?net.Address {
+    // Try IPv4 first
+    if (parseIpv4Literal(text)) |ip4| {
+        return net.Address.initIp4(ip4, port);
+    }
+    // Try IPv6 (may or may not have brackets)
+    var ip6_str = text;
+    if (ip6_str.len >= 2 and ip6_str[0] == '[' and ip6_str[ip6_str.len - 1] == ']') {
+        ip6_str = ip6_str[1 .. ip6_str.len - 1];
+    }
+    return net.Address.parseIp6(ip6_str, port) catch return null;
 }
 
 fn isRunningInNonInitNetns() bool {

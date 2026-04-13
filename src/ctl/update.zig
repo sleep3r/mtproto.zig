@@ -8,6 +8,7 @@ const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
 const release = @import("release.zig");
+const dashboard = @import("dashboard.zig");
 const recovery = @import("recovery.zig");
 
 const Tui = tui_mod.Tui;
@@ -174,6 +175,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     // ── Apply masking monitor (if recovery is already installed) ──
     if (sys.isServiceActive("mtproto-mask-health.timer") or sys.fileExists("/usr/local/bin/mtproto-mask-health.sh")) {
         recovery.execute(ui, allocator, .{ .quiet = true }) catch {};
+    }
+
+    // ── Redeploy dashboard (if already installed) ──
+    if (sys.isServiceActive("proxy-monitor")) {
+        dashboard.execute(ui, allocator, .{ .quiet = true }) catch {};
     }
 
     // ── Summary ──

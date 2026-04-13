@@ -13,6 +13,7 @@ import subprocess
 import sys
 import shutil
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     import tomllib  # Python 3.11+
@@ -879,9 +880,10 @@ def _users_status() -> dict:
         tg_link = None
         tme_link = None
         if server:
-            tg_link = f"tg://proxy?server={server}&port={port}&secret={ee_secret}"
+            safe_server = quote(server)
+            tg_link = f"tg://proxy?server={safe_server}&port={port}&secret={ee_secret}"
             tme_link = (
-                f"https://t.me/proxy?server={server}&port={port}&secret={ee_secret}"
+                f"https://t.me/proxy?server={safe_server}&port={port}&secret={ee_secret}"
             )
 
         items.append(

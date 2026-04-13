@@ -25,6 +25,8 @@ const SERVICE_NAME = release.SERVICE_NAME;
 
 pub const InstallOpts = struct {
     port: u16 = 443,
+    /// Bind to a specific IP address instead of all interfaces.
+    bind_address: ?[]const u8 = null,
     tls_domain: []const u8 = "wb.ru",
     max_connections: u32 = 512,
     enable_tcpmss: bool = true,
@@ -98,6 +100,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
             opts.enable_tcpmss = false;
         } else if (std.mem.eql(u8, arg, "--ipv6-hop")) {
             opts.enable_ipv6_hop = true;
+        } else if (std.mem.eql(u8, arg, "--bind") or std.mem.eql(u8, arg, "-b")) {
+            if (args.next()) |val| opts.bind_address = val;
         } else if (std.mem.eql(u8, arg, "--middle-proxy")) {
             opts.enable_middle_proxy = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -355,6 +359,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         var port_val_buf: [8]u8 = undefined;
         const port_val = std.fmt.bufPrint(&port_val_buf, "{d}", .{opts.port}) catch "443";
         try doc.addKv("port", port_val);
+        if (opts.bind_address) |ba| {
+            try doc.addKvStr("bind_address", ba);
+        }
         try doc.addKv("max_connections", "512");
         try doc.addKv("idle_timeout_sec", "120");
         try doc.addKv("handshake_timeout_sec", "15");
@@ -611,9 +618,36 @@ fn printLinksFromConfig(
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret_hex, tls_domain, &ee_buf);
 
+        var encoded_ip_buf: [128]u8 = undefined;
+        var encoded_ip_len: usize = 0;
+        for (public_ip) |c| {
+            if (c == ':') {
+                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%3A");
+                    encoded_ip_len += 3;
+                }
+            } else if (c == '[') {
+                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5B");
+                    encoded_ip_len += 3;
+                }
+            } else if (c == ']') {
+                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5D");
+                    encoded_ip_len += 3;
+                }
+            } else {
+                if (encoded_ip_len < encoded_ip_buf.len) {
+                    encoded_ip_buf[encoded_ip_len] = c;
+                    encoded_ip_len += 1;
+                }
+            }
+        }
+        const safe_public_ip = encoded_ip_buf[0..encoded_ip_len];
+
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
-            public_ip,
+            safe_public_ip,
             port,
             ee_secret,
         }) catch continue;
@@ -689,9 +723,36 @@ fn printSummary(
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
 
+        var encoded_ip_buf: [128]u8 = undefined;
+        var encoded_ip_len: usize = 0;
+        for (public_ip) |c| {
+            if (c == ':') {
+                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%3A");
+                    encoded_ip_len += 3;
+                }
+            } else if (c == '[') {
+                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5B");
+                    encoded_ip_len += 3;
+                }
+            } else if (c == ']') {
+                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5D");
+                    encoded_ip_len += 3;
+                }
+            } else {
+                if (encoded_ip_len < encoded_ip_buf.len) {
+                    encoded_ip_buf[encoded_ip_len] = c;
+                    encoded_ip_len += 1;
+                }
+            }
+        }
+        const safe_public_ip = encoded_ip_buf[0..encoded_ip_len];
+
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
-            public_ip,
+            safe_public_ip,
             port,
             ee_secret,
         }) catch "error building link";

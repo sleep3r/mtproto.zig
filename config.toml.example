@@ -10,6 +10,12 @@ use_middle_proxy = true
 [server]
 port = 443
 
+# Bind address for the listen socket. When uncommented, the proxy listens
+# only on this specific interface IP. When commented out (default), the proxy
+# listens on all interfaces (IPv6 [::] with fallback to IPv4 0.0.0.0).
+# Set to a specific IP when sharing the host with other services (e.g. web server).
+# bind_address = "127.0.0.1"
+
 # Override the auto-detected public IP shown in startup links.
 # Useful when running inside a VPN tunnel (AmneziaWG) where ifconfig.me
 # returns the tunnel exit IP instead of the server's real address.

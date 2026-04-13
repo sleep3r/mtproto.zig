@@ -73,6 +73,10 @@ pub const Config = struct {
     /// even when use_middle_proxy is false.
     force_media_middle_proxy: bool = true,
     port: u16 = 443,
+    /// Bind address for the listen socket.  When null the proxy listens on
+    /// all interfaces ([::]  with IPv4 fallback to 0.0.0.0).
+    /// Set to a specific IP when sharing the host with other services.
+    bind_address: ?[]const u8 = null,
     /// Explicit public IP address. If set, bypasses detection via external services.
     public_ip: ?[]const u8 = null,
     /// Explicit IPv4 to use in Telegram MiddleProxy AES key derivation.
@@ -279,6 +283,8 @@ pub const Config = struct {
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
                         cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
+                    } else if (std.mem.eql(u8, key, "bind_address")) {
+                        cfg.bind_address = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "backlog")) {
                         cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
                     } else if (std.mem.eql(u8, key, "max_connections")) {
@@ -402,6 +408,9 @@ pub const Config = struct {
         }
         if (self.upstream_tunnel_interface) |iface| {
             allocator.free(iface);
+        }
+        if (self.bind_address) |ba| {
+            allocator.free(ba);
         }
     }
 
@@ -786,6 +795,20 @@ test "parse config - rate_limit_per_subnet custom" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u8, 20), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - bind_address" {
+    const content =
+        \\[server]
+        \\bind_address = "127.0.0.1"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_address.?);
 }
 
 test "parse config - rate_limit_per_subnet disabled" {

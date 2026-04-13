@@ -51,8 +51,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     try execute(ui, allocator, .{});
 }
 
-fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !void {
-    _ = opts;
+pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !void {
 
     if (!sys.isRoot()) {
         ui.fail(i18n.get(ui.lang, .error_not_root));
@@ -146,15 +145,17 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !void {
     ui.ok("Dashboard started successfully");
 
     // ── Summary ──
-    ui.summaryBox("Monitoring Dashboard Installed", &.{
-        .{ .label = "Status:", .value = "systemctl status " ++ SERVICE_NAME },
-        .{ .label = "Logs:",   .value = "journalctl -u " ++ SERVICE_NAME ++ " -f" },
-        .{ .label = "Port:",   .value = "61208 (default, see config.toml)" },
-        .{ .label = "", .style = .blank },
-        .{ .label = "Access via secure SSH Tunnel:", .style = .success },
-        .{ .label = "  ssh -L 61208:localhost:61208 root@<server_ip>", .style = .success },
-        .{ .label = "  open http://localhost:61208", .style = .success },
-        .{ .label = "", .style = .blank },
-        .{ .label = "Or expose to internet via Nginx proxy_pass", .style = .success },
-    });
+    if (!opts.quiet) {
+        ui.summaryBox("Monitoring Dashboard Installed", &.{
+            .{ .label = "Status:", .value = "systemctl status " ++ SERVICE_NAME },
+            .{ .label = "Logs:",   .value = "journalctl -u " ++ SERVICE_NAME ++ " -f" },
+            .{ .label = "Port:",   .value = "61208 (default, see config.toml)" },
+            .{ .label = "", .style = .blank },
+            .{ .label = "Access via secure SSH Tunnel:", .style = .success },
+            .{ .label = "  ssh -L 61208:localhost:61208 root@<server_ip>", .style = .success },
+            .{ .label = "  open http://localhost:61208", .style = .success },
+            .{ .label = "", .style = .blank },
+            .{ .label = "Or expose to internet via Nginx proxy_pass", .style = .success },
+        });
+    }
 }

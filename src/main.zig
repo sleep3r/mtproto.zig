@@ -296,7 +296,11 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
 
     // ─── SERVER ─────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
-    writeStdout("      Listen       " ++ B ++ green ++ "0.0.0.0:{d}" ++ R ++ "\n", .{cfg.port});
+    if (cfg.bind_address) |ba| {
+        writeStdout("      Listen       " ++ B ++ green ++ "{s}:{d}" ++ R ++ "\n", .{ ba, cfg.port });
+    } else {
+        writeStdout("      Listen       " ++ B ++ green ++ "0.0.0.0:{d}" ++ R ++ "\n", .{cfg.port});
+    }
     writeStdout("      Public IP    " ++ B ++ "{s}{s}" ++ R ++ "\n", .{
         if (has_ip) green else yellow,
         server_ip,
@@ -342,12 +346,39 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
+    var encoded_ip_buf: [128]u8 = undefined;
+    var encoded_ip_len: usize = 0;
+    for (server_ip) |c| {
+        if (c == ':') {
+            if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%3A");
+                encoded_ip_len += 3;
+            }
+        } else if (c == '[') {
+            if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5B");
+                encoded_ip_len += 3;
+            }
+        } else if (c == ']') {
+            if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
+                @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5D");
+                encoded_ip_len += 3;
+            }
+        } else {
+            if (encoded_ip_len < encoded_ip_buf.len) {
+                encoded_ip_buf[encoded_ip_len] = c;
+                encoded_ip_len += 1;
+            }
+        }
+    }
+    const safe_server_ip = encoded_ip_buf[0..encoded_ip_len];
+
     var it2 = @constCast(&cfg.users).iterator();
     while (it2.next()) |entry| {
         writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
 
         // tg:// deep link
-        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
+        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ safe_server_ip, cfg.port });
         writeRaw(green ++ "ee");
         for (entry.value_ptr.*) |byte| {
             writeHexByte(byte);
@@ -358,7 +389,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         writeRaw(R ++ "\n");
 
         // t.me link
-        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
+        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ safe_server_ip, cfg.port });
         for (entry.value_ptr.*) |byte| {
             writeHexByte(byte);
         }
