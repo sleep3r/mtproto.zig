@@ -27,7 +27,7 @@ const uninstall = @import("uninstall.zig");
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
 
-const version = "0.15.3"; // x-release-please-version
+const version = "0.16.0"; // x-release-please-version
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -341,6 +341,7 @@ fn printHelp() void {
     printOpt(&ui, "--no-tcpmss", "Disable TCPMSS=88 clamping");
     printOpt(&ui, "--no-dpi", "Disable all DPI bypass modules");
     printOpt(&ui, "--bind,   -b <ip>", "Bind to specific IP (default: all interfaces)");
+    printOpt(&ui, "--middle-proxy", "Enable Telegram MiddleProxy relay");
     printOpt(&ui, "--ipv6-hop", "Enable IPv6 auto-hopping");
     printOpt(&ui, "--version, -v <tag>", "Release version to install (default: latest)");
     ui.writeRaw("\n");

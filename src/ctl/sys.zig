@@ -119,7 +119,7 @@ pub fn supportsV3(allocator: std.mem.Allocator) bool {
 
         // Check required features for x86_64_v3
         const required = [_][]const u8{
-            "avx2", "bmi1", "bmi2", "fma", "f16c", "movbe",
+            "avx2",   "bmi1",   "bmi2",  "fma",    "f16c", "movbe",
             "sse4_1", "sse4_2", "ssse3", "popcnt", "aes",
         };
 
@@ -242,13 +242,31 @@ pub fn domainToHex(domain: []const u8, buf: []u8) []const u8 {
 
 /// Detect public IP address via external HTTP services.
 pub fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
-    // Use curl subprocess — simpler and doesn't pull in std.http into ctl binary
-    const services = [_][]const u8{
+    // Prefer IPv4 first because many Telegram clients/networks still fail on
+    // deep links that only contain an IPv6 endpoint.
+    const ipv4_services = [_][]const u8{
+        "https://api4.ipify.org",
+        "https://ipv4.icanhazip.com",
+        "https://v4.ident.me",
+    };
+    if (detectPublicIpFromServices(allocator, ipv4_services[0..], true)) |ip| {
+        return ip;
+    }
+
+    // Fallback to any detected public IP (IPv4 or IPv6).
+    const fallback_services = [_][]const u8{
         "https://ifconfig.me",
         "https://api.ipify.org",
         "https://icanhazip.com",
     };
+    return detectPublicIpFromServices(allocator, fallback_services[0..], false);
+}
 
+fn detectPublicIpFromServices(
+    allocator: std.mem.Allocator,
+    services: []const []const u8,
+    ipv4_only: bool,
+) ?[]const u8 {
     for (services) |url| {
         const result = exec(allocator, &.{ "curl", "-s", "--max-time", "5", url }) catch continue;
 
@@ -263,7 +281,12 @@ pub fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
         const has_dot = std.mem.indexOfScalar(u8, trimmed, '.') != null;
         const has_colon = std.mem.indexOfScalar(u8, trimmed, ':') != null;
 
-        if (has_dot or has_colon) {
+        const is_valid = if (ipv4_only)
+            (has_dot and !has_colon)
+        else
+            (has_dot or has_colon);
+
+        if (is_valid) {
             const ip = allocator.dupe(u8, trimmed) catch {
                 result.deinit();
                 continue;

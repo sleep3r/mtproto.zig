@@ -131,6 +131,7 @@ sudo mtbuddy --interactive
 | `--no-nfqws` | — | Disable nfqws TCP desync |
 | `--no-tcpmss` | — | Disable TCPMSS=88 |
 | `--no-dpi` | — | Disable all DPI modules |
+| `--middle-proxy` | — | Enable Telegram MiddleProxy relay |
 
 ---
 
@@ -326,7 +327,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[general] ad_tag` | — | Alias for `[server].tag` |
 | `[server] port` | `443` | TCP listen port |
 | `[server] bind_address` | — | Specific IP to bind the listen socket (default: all interfaces) |
-| `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel |
+| `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel; set IPv4 explicitly if clients fail on IPv6 links |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |

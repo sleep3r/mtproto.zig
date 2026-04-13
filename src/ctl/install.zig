@@ -248,8 +248,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         var help_lines = std.mem.splitScalar(u8, ui.str(.install_middle_proxy_help), '\n');
         while (help_lines.next()) |line| {
             ui.print("  {s}│{s}  {s}{s}{s}\n", .{
-                Color.gray, Color.reset,
-                Color.dim,  line,
+                Color.gray,  Color.reset,
+                Color.dim,   line,
                 Color.reset,
             });
         }
@@ -289,8 +289,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.start();
         _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
         _ = sys.exec(allocator, &.{
-            "apt-get", "install", "-y",
-            "iptables", "xxd",    "curl",
+            "apt-get",  "install", "-y",
+            "iptables", "xxd",     "curl",
             "openssl",  "tar",
         }) catch {};
         sp.stop(true, "");
@@ -327,9 +327,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     {
         _ = sys.exec(allocator, &.{ "mkdir", "-p", INSTALL_DIR }) catch {};
         _ = sys.execForward(&.{
-            "install", "-m", "0755",
-            artifact.binaryPath(),
-            INSTALL_DIR ++ "/mtproto-proxy",
+            "install",             "-m",                            "0755",
+            artifact.binaryPath(), INSTALL_DIR ++ "/mtproto-proxy",
         }) catch {};
         release.writeServiceFile();
     }
@@ -580,6 +579,34 @@ fn isValidSecretHex(secret: []const u8) bool {
     return true;
 }
 
+fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
+    var required_len: usize = 0;
+    for (server) |c| {
+        required_len += if (c == ':' or c == '[' or c == ']') 3 else 1;
+    }
+
+    // Keep original value if it does not fit to avoid silent truncation.
+    if (required_len > out.len) return server;
+
+    var pos: usize = 0;
+    for (server) |c| {
+        if (c == ':') {
+            @memcpy(out[pos..][0..3], "%3A");
+            pos += 3;
+        } else if (c == '[') {
+            @memcpy(out[pos..][0..3], "%5B");
+            pos += 3;
+        } else if (c == ']') {
+            @memcpy(out[pos..][0..3], "%5D");
+            pos += 3;
+        } else {
+            out[pos] = c;
+            pos += 1;
+        }
+    }
+    return out[0..pos];
+}
+
 fn printLinksFromConfig(
     ui: *Tui,
     allocator: std.mem.Allocator,
@@ -618,32 +645,8 @@ fn printLinksFromConfig(
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret_hex, tls_domain, &ee_buf);
 
-        var encoded_ip_buf: [128]u8 = undefined;
-        var encoded_ip_len: usize = 0;
-        for (public_ip) |c| {
-            if (c == ':') {
-                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
-                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%3A");
-                    encoded_ip_len += 3;
-                }
-            } else if (c == '[') {
-                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
-                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5B");
-                    encoded_ip_len += 3;
-                }
-            } else if (c == ']') {
-                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
-                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5D");
-                    encoded_ip_len += 3;
-                }
-            } else {
-                if (encoded_ip_len < encoded_ip_buf.len) {
-                    encoded_ip_buf[encoded_ip_len] = c;
-                    encoded_ip_len += 1;
-                }
-            }
-        }
-        const safe_public_ip = encoded_ip_buf[0..encoded_ip_len];
+        var encoded_ip_buf: [768]u8 = undefined;
+        const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
 
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
@@ -723,32 +726,8 @@ fn printSummary(
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
 
-        var encoded_ip_buf: [128]u8 = undefined;
-        var encoded_ip_len: usize = 0;
-        for (public_ip) |c| {
-            if (c == ':') {
-                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
-                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%3A");
-                    encoded_ip_len += 3;
-                }
-            } else if (c == '[') {
-                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
-                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5B");
-                    encoded_ip_len += 3;
-                }
-            } else if (c == ']') {
-                if (encoded_ip_len + 3 <= encoded_ip_buf.len) {
-                    @memcpy(encoded_ip_buf[encoded_ip_len..][0..3], "%5D");
-                    encoded_ip_len += 3;
-                }
-            } else {
-                if (encoded_ip_len < encoded_ip_buf.len) {
-                    encoded_ip_buf[encoded_ip_len] = c;
-                    encoded_ip_len += 1;
-                }
-            }
-        }
-        const safe_public_ip = encoded_ip_buf[0..encoded_ip_len];
+        var encoded_ip_buf: [768]u8 = undefined;
+        const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
 
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
