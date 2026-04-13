@@ -11,6 +11,7 @@ const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
+const version_mod = @import("version");
 
 // Custom lock-free log function: formats into a stack buffer and writes
 // to stderr in a single write() syscall. On Linux, write() is atomic for
@@ -47,7 +48,7 @@ fn lockFreeLog(
 
 const log = std.log.scoped(.mtproto);
 
-const version = "0.17.1"; // x-release-please-version
+pub const version = version_mod.version;
 
 // ============= Output Helpers (Zig 0.15 compatible) =============
 

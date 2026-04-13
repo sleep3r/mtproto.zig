@@ -22,12 +22,13 @@ const tunnel = @import("tunnel.zig");
 const recovery = @import("recovery.zig");
 const dashboard = @import("dashboard.zig");
 const ipv6hop = @import("ipv6hop.zig");
+const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
 
-const version = "0.17.1"; // x-release-please-version
+pub const version = version_mod.version;
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

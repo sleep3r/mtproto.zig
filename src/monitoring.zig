@@ -5,7 +5,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const proxy = @import("proxy/proxy.zig");
 const config = @import("config.zig");
-const version = @import("version.zig").version;
+const version = @import("version").version;
 
 const log = std.log.scoped(.monitoring);
 const metrics_content_type = "text/plain; version=0.0.4";

@@ -3,11 +3,19 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version_mod = b.createModule(.{
+        .root_source_file = b.path("src/version.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "version", .module = version_mod },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -69,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "tunnel", .module = tunnel_mod },
+            .{ .name = "version", .module = version_mod },
         },
     });
 
@@ -93,6 +102,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "version", .module = version_mod },
+        },
     });
 
     const unit_tests = b.addTest(.{
