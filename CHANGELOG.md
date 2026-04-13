@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/sleep3r/mtproto.zig/compare/v0.17.0...v0.17.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* **dashboard:** detect dead tunnels as unhealthy ([#180](https://github.com/sleep3r/mtproto.zig/issues/180)) ([b6e6b8c](https://github.com/sleep3r/mtproto.zig/commit/b6e6b8cd3ee634bdf905ea6e0ca931a876b86996))
+
 ## [0.17.0](https://github.com/sleep3r/mtproto.zig/compare/v0.16.0...v0.17.0) (2026-04-13)
 
 
