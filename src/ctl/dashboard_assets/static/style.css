@@ -62,6 +62,18 @@ body::after {
 }
 .header h1 .accent { color: var(--zig); }
 .header h1 .dim { color: var(--text-dim); font-weight: 400; font-size: 15px; }
+.version-pill {
+  font-size: 10px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--zig);
+  background: rgba(247,164,29,0.08);
+  border: 1px solid rgba(247,164,29,0.18);
+  border-radius: 100px;
+  padding: 2px 10px;
+  letter-spacing: 0.5px;
+  vertical-align: middle;
+}
 .header-right {
   display: flex;
   align-items: center;

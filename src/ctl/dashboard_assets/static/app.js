@@ -893,7 +893,7 @@ async function poll() {
   // Version
   const vEl = $('dashboardVersion');
   if (vEl && d.proxy_version) {
-    vEl.textContent = ' · v' + d.proxy_version;
+    vEl.textContent = 'v' + d.proxy_version;
   }
 
   renderRouting(d.routing || null);
