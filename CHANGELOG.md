@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/sleep3r/mtproto.zig/compare/v0.18.0...v0.19.0) (2026-04-15)
+
+
+### Features
+
+* **dashboard:** show proxy version in header ([#191](https://github.com/sleep3r/mtproto.zig/issues/191)) ([99b5d7d](https://github.com/sleep3r/mtproto.zig/commit/99b5d7d19431ea3a859e3fa4ab8028009ccd2a72))
+
 ## [0.18.0](https://github.com/sleep3r/mtproto.zig/compare/v0.17.1...v0.18.0) (2026-04-15)
 
 
