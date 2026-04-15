@@ -890,6 +890,12 @@ async function poll() {
   $('pxDrops').style.color = drp > 0 ? 'var(--amber)' : 'var(--text-muted)';
   $('pxDropLbl').textContent = 'rate +' + drp + ' · cap +' + (p.cap_drops || 0) + ' · hs_t +' + (p.hs_timeout || 0);
 
+  // Version
+  const vEl = $('dashboardVersion');
+  if (vEl && d.proxy_version) {
+    vEl.textContent = ' · v' + d.proxy_version;
+  }
+
   renderRouting(d.routing || null);
 
   // Masking health

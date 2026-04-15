@@ -64,6 +64,57 @@ DASHBOARD_CFG = _load_dashboard_config()
 
 STATIC_DIR = Path(__file__).parent / "static"
 
+_version_cache = {"ts": 0, "version": None}
+VERSION_CACHE_TTL = 300  # 5 minutes
+
+
+def _proxy_version() -> str | None:
+    """Detect proxy version. Cached for 5 minutes."""
+    now = time.time()
+    if now - _version_cache["ts"] < VERSION_CACHE_TTL and _version_cache["version"]:
+        return _version_cache["version"]
+
+    version = None
+
+    # 1. Try running the binary
+    for binary in ("/opt/mtproto-proxy/mtproto-proxy",):
+        if not Path(binary).is_file():
+            continue
+        try:
+            out = subprocess.check_output(
+                [binary, "--version"],
+                text=True,
+                timeout=3,
+                stderr=subprocess.STDOUT,
+            ).strip()
+            # Output may be like "mtproto-proxy 0.17.1" or just "0.17.1"
+            m = re.search(r"(\d+\.\d+\.\d+)", out)
+            if m:
+                version = m[1]
+                break
+        except Exception:
+            pass
+
+    # 2. Fallback: parse version.zig from install directory
+    if not version:
+        for p in (
+            Path(__file__).parent.parent / "version.zig",  # dev layout
+            Path("/opt/mtproto-proxy/version.zig"),
+        ):
+            if p.is_file():
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    m = re.search(r'"(\d+\.\d+\.\d+)"', text)
+                    if m:
+                        version = m[1]
+                        break
+                except Exception:
+                    pass
+
+    _version_cache.update(ts=now, version=version)
+    return version
+
+
 app = FastAPI()
 
 _prev_net = {"ts": 0, "rx": 0, "tx": 0}
@@ -1331,6 +1382,7 @@ def api_stats():
             "uptime": f"{d}d {h}h {rem2 // 60}m",
             "proxy": _proxy_stats(),
             "proxy_info": _proxy_info(),
+            "proxy_version": _proxy_version(),
             "awg": _awg_status(),
             "routing": _routing_status(),
             "masking": _masking_status(),
