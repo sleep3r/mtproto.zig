@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.18.0](https://github.com/sleep3r/mtproto.zig/compare/v0.17.1...v0.18.0) (2026-04-15)
+
+
+### Features
+
+* **dashboard:** replace pip3 with uv for dependency management ([#189](https://github.com/sleep3r/mtproto.zig/issues/189)) ([83614bc](https://github.com/sleep3r/mtproto.zig/commit/83614bcf57ee78538de42b93f0733cd0b977231e)), closes [#185](https://github.com/sleep3r/mtproto.zig/issues/185)
+* Metrics endpoint ([#179](https://github.com/sleep3r/mtproto.zig/issues/179)) ([6cc6674](https://github.com/sleep3r/mtproto.zig/commit/6cc6674c21d52916f6b6d8492772bb0af3845f71))
+
 ## [0.17.1](https://github.com/sleep3r/mtproto.zig/compare/v0.17.0...v0.17.1) (2026-04-13)
 
 
