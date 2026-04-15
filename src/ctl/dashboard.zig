@@ -134,6 +134,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     // ── Create virtualenv & install dependencies ──
     ui.step("Setting up Python virtualenv via uv...");
 
+    // Remove stale venv first — `make deploy` chowns everything to mtproto:mtproto,
+    // so `uv venv` (running as root) can fail to overwrite it.
+    _ = sys.exec(allocator, &.{ "rm", "-rf", VENV_DIR }) catch {};
+
     const venv_res = sys.exec(allocator, &.{
         "uv", "venv", VENV_DIR, "--python", "python3",
     }) catch {
