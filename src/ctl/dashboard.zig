@@ -1,8 +1,9 @@
 //! Setup dashboard command for mtbuddy.
 //!
 //! Embeds the Python FastAPI dashboard and its static files directly into the
-//! mtbuddy binary using @embedFile. Provisions the python dependencies, writes
-//! the files to /opt/mtproto-proxy/monitor, and starts the systemd service.
+//! mtbuddy binary using @embedFile. Uses `uv` (astral.sh) to manage an
+//! isolated virtualenv with all Python dependencies, avoiding PEP 668 breakage
+//! on modern Debian/Ubuntu systems.
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -14,6 +15,8 @@ const Color = tui_mod.Color;
 const SummaryLine = tui_mod.SummaryLine;
 
 const INSTALL_DIR = "/opt/mtproto-proxy/monitor";
+const VENV_DIR = INSTALL_DIR ++ "/.venv";
+const VENV_PYTHON = VENV_DIR ++ "/bin/python";
 const SERVICE_NAME = "proxy-monitor";
 const SERVICE_FILE = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
 
@@ -51,40 +54,66 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     try execute(ui, allocator, .{});
 }
 
-pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !void {
+/// Check if `uv` is available on the system.
+fn uvExists() bool {
+    return sys.commandExists("uv");
+}
 
+/// Install `uv` via the official astral.sh installer.
+fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
+    ui.step("Installing uv package manager...");
+
+    // Download and run the official installer (installs to ~/.local/bin or /usr/local/bin)
+    const result = sys.exec(allocator, &.{
+        "sh", "-c", "curl -fsSL https://astral.sh/uv/install.sh | sh",
+    }) catch {
+        ui.fail("Failed to download uv installer");
+        return false;
+    };
+    defer result.deinit();
+
+    if (result.exit_code != 0) {
+        ui.fail("uv installer exited with an error");
+        return false;
+    }
+
+    // The installer puts uv in ~/.local/bin for root → /root/.local/bin
+    // Also check /usr/local/bin.  Symlink to /usr/local/bin for PATH stability.
+    if (!sys.commandExists("uv")) {
+        const symlink_result = sys.exec(allocator, &.{
+            "sh", "-c",
+            \\if [ -f /root/.local/bin/uv ]; then
+            \\  ln -sf /root/.local/bin/uv /usr/local/bin/uv
+            \\  ln -sf /root/.local/bin/uvx /usr/local/bin/uvx 2>/dev/null
+            \\fi
+        }) catch {
+            ui.fail("uv installed but not found on PATH");
+            return false;
+        };
+        defer symlink_result.deinit();
+
+        if (!sys.commandExists("uv")) {
+            ui.fail("uv installed but not found on PATH");
+            return false;
+        }
+    }
+
+    ui.ok("uv installed successfully");
+    return true;
+}
+
+pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !void {
     if (!sys.isRoot()) {
         ui.fail(i18n.get(ui.lang, .error_not_root));
         return;
     }
 
-    // ── Check Python ──
-    if (!sys.commandExists("python3") or !sys.commandExists("pip3")) {
-        ui.fail("python3 or pip3 not found. Please install python3-pip first.");
-        return;
-    }
-
-    // ── Install Python Dependencies ──
-    ui.step("Installing Python dependencies (fastapi, uvicorn, psutil, websockets)...");
-    
-    // First try with --break-system-packages (for newer Debians/Ubuntu)
-    const pip_res = sys.exec(allocator, &.{
-        "pip3", "install", "--break-system-packages", "--quiet",
-        "fastapi", "uvicorn", "psutil", "websockets", "starlette"
-    }) catch null;
-    
-    if (pip_res) |p| {
-        defer p.deinit();
-        if (p.exit_code != 0) {
-            // Fallback for older systems
-            _ = sys.execForward(&.{
-                "pip3", "install", "--quiet",
-                "fastapi", "uvicorn", "psutil", "websockets", "starlette"
-            }) catch {};
+    // ── Ensure uv is available ──
+    if (!uvExists()) {
+        if (!bootstrapUv(ui, allocator)) {
+            return;
         }
     }
-
-    ui.ok("Python dependencies installed");
 
     // ── Provision Dashboard Files ──
     ui.step("Extracting embedded dashboard files...");
@@ -102,6 +131,43 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
 
     ui.ok("Dashboard files extracted to " ++ INSTALL_DIR);
 
+    // ── Create virtualenv & install dependencies ──
+    ui.step("Setting up Python virtualenv via uv...");
+
+    const venv_res = sys.exec(allocator, &.{
+        "uv", "venv", VENV_DIR, "--python", "python3",
+    }) catch {
+        ui.fail("Failed to create virtualenv with uv");
+        return;
+    };
+    defer venv_res.deinit();
+
+    if (venv_res.exit_code != 0) {
+        ui.fail("uv venv creation failed");
+        return;
+    }
+
+    ui.ok("Virtualenv created at " ++ VENV_DIR);
+
+    ui.step("Installing Python dependencies (fastapi, uvicorn, psutil, websockets)...");
+
+    const pip_res = sys.exec(allocator, &.{
+        "uv",     "pip",   "install",
+        "--python", VENV_PYTHON,
+        "fastapi", "uvicorn", "psutil", "websockets", "starlette",
+    }) catch {
+        ui.fail("Failed to install Python dependencies via uv");
+        return;
+    };
+    defer pip_res.deinit();
+
+    if (pip_res.exit_code != 0) {
+        ui.fail("uv pip install failed — check network connectivity");
+        return;
+    }
+
+    ui.ok("Python dependencies installed");
+
     // ── Setup Systemd Service ──
     ui.step("Configuring systemd service...");
 
@@ -111,7 +177,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
         \\After=network.target mtproto-proxy.service
         \\
         \\[Service]
-        \\ExecStart=/usr/bin/python3 /opt/mtproto-proxy/monitor/server.py
+        \\ExecStart=/opt/mtproto-proxy/monitor/.venv/bin/python /opt/mtproto-proxy/monitor/server.py
         \\Restart=on-failure
         \\RestartSec=5
         \\WorkingDirectory=/opt/mtproto-proxy/monitor
@@ -127,7 +193,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
 
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
     _ = sys.execForward(&.{ "systemctl", "enable", SERVICE_NAME }) catch {};
-    
+
     ui.ok("Systemd service " ++ SERVICE_NAME ++ " enabled");
 
     // ── Start Service ──
@@ -141,7 +207,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
         ui.fail("Dashboard failed to start. Check: journalctl -u " ++ SERVICE_NAME ++ " -n 30");
         return;
     }
-    
+
     ui.ok("Dashboard started successfully");
 
     // ── Summary ──
