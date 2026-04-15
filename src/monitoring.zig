@@ -7,7 +7,7 @@ const proxy = @import("proxy/proxy.zig");
 const config = @import("config.zig");
 const version = @import("version").version;
 
-const log = std.log.scoped(.monitoring);
+const log = std.log.scoped(.metrics);
 const metrics_content_type = "text/plain; version=0.0.4";
 
 const ProcessMetrics = struct {
@@ -23,8 +23,8 @@ const ProcessMetrics = struct {
 pub fn start(state: *proxy.ProxyState) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
-    const host = state.config.monitoring.host;
-    const port = state.config.monitoring.port;
+    const host = state.config.metrics.effectiveHost();
+    const port = state.config.metrics.port;
 
     const addr_list = try net.getAddressList(std.heap.page_allocator, host, port);
     defer addr_list.deinit();
@@ -60,6 +60,13 @@ fn acceptLoop(state: *proxy.ProxyState, server: net.Server) void {
 fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
     defer posix.close(fd);
 
+    // Prevent slow clients from blocking the accept thread.
+    if (builtin.os.tag == .linux) {
+        const timeout = posix.timeval{ .sec = 5, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
+
     var req_buf: [2048]u8 = undefined;
     const req_len = posix.read(fd, &req_buf) catch return;
     if (req_len == 0) return;
@@ -79,7 +86,7 @@ fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
 }
 
 fn writeMetricsResponse(fd: posix.fd_t, state: *proxy.ProxyState) !void {
-    var body_buf: [16 * 1024]u8 = undefined;
+    var body_buf: [32 * 1024]u8 = undefined;
     var body_stream = std.io.fixedBufferStream(&body_buf);
     try writeMetrics(body_stream.writer(), state, collectProcessMetrics());
     const body = body_stream.getWritten();
@@ -354,7 +361,7 @@ fn readFileAbsolute(path: []const u8, buffer: []u8) ?[]const u8 {
     return buffer[0..len];
 }
 
-test "monitoring metrics output contains required metrics" {
+test "metrics output contains required metrics" {
     var cfg = config.Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -364,7 +371,7 @@ test "monitoring metrics output contains required metrics" {
     var state = proxy.ProxyState.init(std.testing.allocator, cfg);
     defer state.deinit();
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [32 * 1024]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
     try writeMetrics(stream.writer(), &state, .{});
     const out = stream.getWritten();
@@ -373,7 +380,7 @@ test "monitoring metrics output contains required metrics" {
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_client_to_upstream_bytes_total") != null);
 }
 
-test "monitoring rejects unknown path" {
+test "metrics rejects unknown path" {
     var cfg = config.Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),

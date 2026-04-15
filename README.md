@@ -339,9 +339,9 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` |
 | `[monitor] host` | `"127.0.0.1"` | Dashboard bind address |
 | `[monitor] port` | `61208` | Dashboard port |
-| `[monitoring] enabled` | `false` | Enable embedded Prometheus `/metrics` endpoint |
-| `[monitoring] host` | `"127.0.0.1"` | Metrics bind address |
-| `[monitoring] port` | `9100` | Metrics port |
+| `[metrics] enabled` | `false` | Enable embedded Prometheus `/metrics` endpoint |
+| `[metrics] host` | `"127.0.0.1"` | Metrics bind address |
+| `[metrics] port` | `9400` | Metrics port |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
 | `[censorship] mask` | `true` | Forward unauthenticated clients to `tls_domain` |
 | `[censorship] mask_port` | `443` | Local masking port (use `8443` for Nginx zero-RTT) |
@@ -390,13 +390,13 @@ Alternatively, expose the dashboard port via `[monitor]` config section and acce
 
 `mtproto-proxy` can expose an embedded Prometheus-compatible metrics endpoint on a dedicated port.
 
-For a complete Docker-based monitoring stack with `mtproto-zig`, Prometheus, Grafana, and an importable dashboard, see [hack/docker/README.md](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/README.md).
+For a complete Docker-based monitoring stack with `mtproto-zig`, Prometheus, Grafana, and an importable dashboard, see [hack/docker/README.md](hack/docker/README.md).
 
 ```toml
-[monitoring]
+[metrics]
 enabled = true
 host = "127.0.0.1"
-port = 9100
+port = 9400
 ```
 
 The endpoint is plaintext HTTP and serves:
@@ -410,7 +410,7 @@ Typical Docker usage:
 ```bash
 docker run --rm \
   -p 443:443 \
-  -p 9100:9100 \
+  -p 9400:9400 \
   -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
   mtproto-zig
 ```

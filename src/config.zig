@@ -65,10 +65,15 @@ fn stripInlineComment(value: []const u8) []const u8 {
 
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
-    pub const Monitoring = struct {
+    pub const Metrics = struct {
         enabled: bool = false,
-        host: []const u8 = "127.0.0.1",
-        port: u16 = 9100,
+        host: ?[]const u8 = null,
+        port: u16 = 9400,
+
+        /// Return bound host, falling back to localhost.
+        pub fn effectiveHost(self: *const Metrics) []const u8 {
+            return self.host orelse "127.0.0.1";
+        }
     };
 
     /// Route regular DC traffic via Telegram MiddleProxy transport.
@@ -145,7 +150,7 @@ pub const Config = struct {
     /// VPN tunnel interface name (e.g. "awg0", "wg0").
     /// Parsed from [upstream.tunnel].interface.
     upstream_tunnel_interface: ?[]const u8 = null,
-    monitoring: Monitoring = .{},
+    metrics: Metrics = .{},
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -211,7 +216,7 @@ pub const Config = struct {
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
-        var in_monitoring_section = false;
+        var in_metrics_section = false;
         var in_upstream_section = false;
         var in_upstream_socks5_section = false;
         var in_upstream_http_section = false;
@@ -231,7 +236,7 @@ pub const Config = struct {
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
-                in_monitoring_section = std.mem.eql(u8, line, "[monitoring]");
+                in_metrics_section = std.mem.eql(u8, line, "[metrics]");
                 in_upstream_section = std.mem.eql(u8, line, "[upstream]");
                 in_upstream_socks5_section = std.mem.eql(u8, line, "[upstream.socks5]");
                 in_upstream_http_section = std.mem.eql(u8, line, "[upstream.http]");
@@ -350,16 +355,14 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
                     }
-                } else if (in_monitoring_section) {
+                } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
-                        cfg.monitoring.enabled = std.mem.eql(u8, value, "true");
+                        cfg.metrics.enabled = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "host")) {
-                        if (!std.mem.eql(u8, cfg.monitoring.host, "127.0.0.1")) {
-                            allocator.free(cfg.monitoring.host);
-                        }
-                        cfg.monitoring.host = try allocator.dupe(u8, value);
+                        if (cfg.metrics.host) |prev| allocator.free(prev);
+                        cfg.metrics.host = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "port")) {
-                        cfg.monitoring.port = std.fmt.parseInt(u16, value, 10) catch cfg.monitoring.port;
+                        cfg.metrics.port = std.fmt.parseInt(u16, value, 10) catch cfg.metrics.port;
                     }
                 } else if (in_upstream_section) {
                     if (std.mem.eql(u8, key, "type")) {
@@ -431,8 +434,8 @@ pub const Config = struct {
         if (self.bind_address) |ba| {
             allocator.free(ba);
         }
-        if (!std.mem.eql(u8, self.monitoring.host, "127.0.0.1")) {
-            allocator.free(self.monitoring.host);
+        if (self.metrics.host) |h| {
+            allocator.free(h);
         }
     }
 
@@ -517,16 +520,16 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
     try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
     try std.testing.expect(!cfg.unsafe_override_limits);
-    try std.testing.expect(!cfg.monitoring.enabled);
-    try std.testing.expectEqualStrings("127.0.0.1", cfg.monitoring.host);
-    try std.testing.expectEqual(@as(u16, 9100), cfg.monitoring.port);
+    try std.testing.expect(!cfg.metrics.enabled);
+    try std.testing.expect(cfg.metrics.host == null);
+    try std.testing.expectEqual(@as(u16, 9400), cfg.metrics.port);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
     try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
 }
 
-test "parse config - monitoring section" {
+test "parse config - metrics section" {
     const content =
-        \\[monitoring]
+        \\[metrics]
         \\enabled = true
         \\host = "0.0.0.0"
         \\port = 9200
@@ -537,9 +540,9 @@ test "parse config - monitoring section" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expect(cfg.monitoring.enabled);
-    try std.testing.expectEqualStrings("0.0.0.0", cfg.monitoring.host);
-    try std.testing.expectEqual(@as(u16, 9200), cfg.monitoring.port);
+    try std.testing.expect(cfg.metrics.enabled);
+    try std.testing.expectEqualStrings("0.0.0.0", cfg.metrics.host.?);
+    try std.testing.expectEqual(@as(u16, 9200), cfg.metrics.port);
 }
 
 test "parse config - direct users allowlist" {

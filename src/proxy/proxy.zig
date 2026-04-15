@@ -1265,7 +1265,7 @@ pub const ProxyState = struct {
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
-        if (self.config.monitoring.enabled) {
+        if (self.config.metrics.enabled) {
             try @import("../monitoring.zig").start(self);
         }
 
@@ -4381,6 +4381,11 @@ fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Ad
     return one[0];
 }
 
+/// Dummy counter for slots that don't yet have traffic counters attached
+/// (e.g. during mask phase or before handshake completes).  Writes are
+/// silently absorbed so the data path never errors out on missing metrics.
+var noop_counter = std.atomic.Value(u64).init(0);
+
 fn noteTraffic(counter: *std.atomic.Value(u64), bytes: usize) void {
     if (bytes == 0) return;
     _ = counter.fetchAdd(@intCast(bytes), .monotonic);
@@ -4528,7 +4533,7 @@ fn slotQueueClient(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []
         slot.client_fd,
         &slot.client_queue,
         data,
-        slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter,
+        slot.traffic_upstream_to_client_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null,
     );
 }
@@ -4540,7 +4545,7 @@ fn slotQueueClientPair(slot: *ConnectionSlot, allocator: std.mem.Allocator, firs
         &slot.client_queue,
         first,
         second,
-        slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter,
+        slot.traffic_upstream_to_client_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null,
     );
 }
@@ -4551,7 +4556,7 @@ fn slotQueueClientOwned(slot: *ConnectionSlot, allocator: std.mem.Allocator, own
         slot.client_fd,
         &slot.client_queue,
         owned,
-        slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter,
+        slot.traffic_upstream_to_client_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null,
     );
 }
@@ -4562,7 +4567,7 @@ fn slotQueueUpstream(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: 
         slot.upstream_fd,
         &slot.upstream_queue,
         data,
-        slot.traffic_client_to_upstream_counter orelse return error.MissingTrafficCounter,
+        slot.traffic_client_to_upstream_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.client_to_upstream_bytes_total else null,
     );
 }
@@ -4572,7 +4577,7 @@ fn slotFlushClientPending(slot: *ConnectionSlot, allocator: std.mem.Allocator) !
     return flushQueue(
         slot.client_fd,
         &slot.client_queue,
-        slot.traffic_upstream_to_client_counter orelse return error.MissingTrafficCounter,
+        slot.traffic_upstream_to_client_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null,
     );
 }
@@ -4582,7 +4587,7 @@ fn slotFlushUpstreamPending(slot: *ConnectionSlot, allocator: std.mem.Allocator)
     return flushQueue(
         slot.upstream_fd,
         &slot.upstream_queue,
-        slot.traffic_client_to_upstream_counter orelse return error.MissingTrafficCounter,
+        slot.traffic_client_to_upstream_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.client_to_upstream_bytes_total else null,
     );
 }

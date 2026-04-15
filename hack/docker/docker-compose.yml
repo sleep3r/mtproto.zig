@@ -13,7 +13,7 @@ services:
       - ./zigconf.toml:/etc/mtproto-proxy/config.toml:ro
     ports:
       - "10000:8443"
-      - "127.0.0.1:9100:9100"
+      - "127.0.0.1:9400:9400"
 
   prometheus:
     image: prom/prometheus:latest

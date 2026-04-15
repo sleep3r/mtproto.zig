@@ -15,28 +15,28 @@ The stack is intended for a VPS or any other Linux host where you want:
 
 ## Files
 
-- [docker-compose.yml](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/docker-compose.yml)
-- [prometheus.yml](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/prometheus.yml)
-- [mtproto-zig-grafana.json](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/mtproto-zig-grafana.json)
+- [docker-compose.yml](docker-compose.yml)
+- [prometheus.yml](prometheus.yml)
+- [mtproto-zig-grafana.json](mtproto-zig-grafana.json)
 
 ## 1. Prepare the proxy config
 
-Create `zigconf.toml` next to [docker-compose.yml](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/docker-compose.yml).
+Create `zigconf.toml` next to [docker-compose.yml](docker-compose.yml).
 
 The important part for metrics is:
 
 ```toml
-[monitoring]
+[metrics]
 enabled = true
 host = "0.0.0.0"
-port = 9100
+port = 9400
 ```
 
 `host = "0.0.0.0"` is required because Prometheus connects to the proxy from another container over the Docker network.
 
 ## 2. Set the proxy image tag
 
-Edit [docker-compose.yml](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/docker-compose.yml) and replace:
+Edit [docker-compose.yml](docker-compose.yml) and replace:
 
 ```yaml
 mtproto-zig:<change_me>
@@ -66,7 +66,7 @@ internal port inside container and 10000 as exposed port on the host.
 On the VM:
 
 ```bash
-curl -s http://127.0.0.1:9100/metrics | head
+curl -s http://127.0.0.1:9400/metrics | head
 ```
 
 Prometheus target check:
@@ -75,7 +75,7 @@ Prometheus target check:
 curl -s http://127.0.0.1:9090/api/v1/targets | jq .
 ```
 
-You should see `mtg-zig:9100` in the target list with `health: "up"`.
+You should see `mtg-zig:9400` in the target list with `health: "up"`.
 
 ## 5. Open Grafana over SSH
 
@@ -91,7 +91,7 @@ Then open:
 http://127.0.0.1:3000
 ```
 
-Default login from [docker-compose.yml](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/docker-compose.yml):
+Default login from [docker-compose.yml](docker-compose.yml):
 
 - username: `admin`
 - password: `admin`
@@ -118,7 +118,7 @@ This works because Grafana and Prometheus run in the same Compose network.
 In Grafana:
 
 1. Open `Dashboards` -> `New` -> `Import`
-2. Upload [mtproto-zig-grafana.json](/Users/freerunner/Work/misc/mtproto.zig/hack/docker/mtproto-zig-grafana.json)
+2. Upload [mtproto-zig-grafana.json](mtproto-zig-grafana.json)
 3. Select your Prometheus datasource
 4. Click `Import`
 
@@ -135,6 +135,6 @@ The dashboard includes:
 
 ## Notes
 
-- The proxy metrics are exposed on `127.0.0.1:9100` on the host, not publicly.
+- The proxy metrics are exposed on `127.0.0.1:9400` on the host, not publicly.
 - Per-user metrics are generated from users in the proxy config loaded by the current process.
 - Counter-based totals reset on proxy restart, which is expected for Prometheus counters.

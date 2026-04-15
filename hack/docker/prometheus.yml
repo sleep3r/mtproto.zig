@@ -4,4 +4,4 @@ global:
 scrape_configs:
   - job_name: mtproto-zig
     static_configs:
-      - targets: ["mtg-zig:9100"]
+      - targets: ["mtg-zig:9400"]
