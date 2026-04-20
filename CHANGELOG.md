@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/sleep3r/mtproto.zig/compare/v0.19.0...v0.19.1) (2026-04-20)
+
+
+### Bug Fixes
+
+* **proxy:** address critical review findings (data corruption, DoS, perf) ([#197](https://github.com/sleep3r/mtproto.zig/issues/197)) ([a6b6c80](https://github.com/sleep3r/mtproto.zig/commit/a6b6c80cd5a340eca74bcc5183df4a65724fcede))
+
 ## [0.19.0](https://github.com/sleep3r/mtproto.zig/compare/v0.18.0...v0.19.0) (2026-04-15)
 
 
