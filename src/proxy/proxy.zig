@@ -3075,16 +3075,14 @@ const EventLoop = struct {
         var msg: [32]u8 = undefined;
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
         self.state.middle_proxy_lock.lockShared();
-        // Zig's @memcpy panics on mismatched slice lengths. If the upstream
-        // middle-proxy refresh ever hands us a secret shorter than 4 bytes
-        // (defensive: refresh already rejects <16, but we keep this safe even
-        // if the invariant is ever broken) a blind @memcpy(msg[4..8], src[..<4])
-        // would crash the daemon. Zero first, then copy into a matching prefix.
+        // Defensive copy: refresh rejects secrets shorter than 16 bytes, but
+        // if that invariant is ever broken we must avoid a length-mismatched
+        // memcpy panic when filling the 4-byte key selector field.
         @memset(msg[4..8], 0);
-        const key_sel_len = @min(@as(usize, 4), self.state.middle_proxy_secret_len);
-        if (key_sel_len > 0) {
-            @memcpy(msg[4 .. 4 + key_sel_len], self.state.middle_proxy_secret[0..key_sel_len]);
-        }
+        if (self.state.middle_proxy_secret_len > 0) msg[4] = self.state.middle_proxy_secret[0];
+        if (self.state.middle_proxy_secret_len > 1) msg[5] = self.state.middle_proxy_secret[1];
+        if (self.state.middle_proxy_secret_len > 2) msg[6] = self.state.middle_proxy_secret[2];
+        if (self.state.middle_proxy_secret_len > 3) msg[7] = self.state.middle_proxy_secret[3];
         self.state.middle_proxy_lock.unlockShared();
         @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
         @memcpy(msg[12..16], &crypto_ts);
