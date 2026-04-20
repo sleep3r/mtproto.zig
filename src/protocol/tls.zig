@@ -163,12 +163,15 @@ pub fn buildServerHelloWithTemplate(
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
-    const hmac_input = try allocator.alloc(u8, constants.tls_digest_len + response.len);
-    defer allocator.free(hmac_input);
-    @memcpy(hmac_input[0..constants.tls_digest_len], client_digest);
-    @memcpy(hmac_input[constants.tls_digest_len..], response);
-
-    const response_digest = crypto.sha256Hmac(secret, hmac_input);
+    //    Stream bytes sequentially into the hasher to avoid a ~3KB heap
+    //    allocation for every TLS handshake (which under active DPI probing
+    //    causes serious allocator pressure on this hot path).
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = HmacSha256.init(secret);
+    hmac.update(client_digest);
+    hmac.update(response);
+    var response_digest: [32]u8 = undefined;
+    hmac.final(&response_digest);
 
     // 5. Insert HMAC digest into Server Random field
     @memcpy(response[tmpl_random_offset..][0..32], &response_digest);

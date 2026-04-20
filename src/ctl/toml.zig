@@ -200,10 +200,24 @@ fn parseKeyValue(line: []const u8) ?KeyValue {
     const raw_key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
     var raw_value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
 
-    // Strip inline comment (find first # NOT inside quotes)
+    // Strip inline comment (find first # NOT inside quotes).
+    //
+    // Mirror the escape-aware logic from the runtime parser in src/config.zig
+    // so that values containing escaped quotes (e.g. `"a \" b"`) don't
+    // prematurely toggle the in_quotes state and truncate at a later `#`,
+    // corrupting config.toml when mtbuddy rewrites it.
     var in_quotes = false;
+    var escaped = false;
     var comment_pos: ?usize = null;
     for (raw_value, 0..) |c, ci| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (in_quotes and c == '\\') {
+            escaped = true;
+            continue;
+        }
         if (c == '"') {
             in_quotes = !in_quotes;
         } else if (c == '#' and !in_quotes) {
@@ -227,4 +241,24 @@ fn formatKv(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![
     var buf: [512]u8 = undefined;
     const formatted = std.fmt.bufPrint(&buf, "{s} = {s}", .{ key, value }) catch return error.OutOfMemory;
     return try allocator.dupe(u8, formatted);
+}
+
+test "parseKeyValue: escaped quote does not truncate at a following '#'" {
+    // Regression: the previous naive parser toggled in_quotes on every '"'
+    // (even escaped ones), so `"a \" # b"` was read as `a \` + comment,
+    // corrupting config.toml on save.
+    const kv = parseKeyValue("secret = \"abc \\\" # def\"") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("secret", kv.key);
+    try std.testing.expectEqualStrings("abc \\\" # def", kv.value);
+}
+
+test "parseKeyValue: inline comment stripped when outside quotes" {
+    const kv = parseKeyValue("port = 443 # bind port") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("port", kv.key);
+    try std.testing.expectEqualStrings("443", kv.value);
+}
+
+test "parseKeyValue: quoted '#' preserved" {
+    const kv = parseKeyValue("secret = \"abc#def\"") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("abc#def", kv.value);
 }

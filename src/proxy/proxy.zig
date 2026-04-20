@@ -147,8 +147,20 @@ const SubnetRateLimit = struct {
             const ip_bytes = std.mem.asBytes(&addr.in.sa.addr);
             return @as(u32, ip_bytes[0]) << 16 | @as(u32, ip_bytes[1]) << 8 | @as(u32, ip_bytes[2]);
         } else if (addr.any.family == posix.AF.INET6) {
-            // /48 subnet: first 6 bytes hashed to u32
             const ip6 = &addr.in6.sa.addr;
+
+            // Detect IPv4-mapped IPv6 (::ffff:a.b.c.d).
+            // On dual-stack [::] listeners every IPv4 client arrives in this form;
+            // without this branch all IPv4 clients would collapse to key 0 and the
+            // entire IPv4 internet would share a single /24 token bucket.
+            const is_ipv4_mapped = std.mem.eql(u8, ip6[0..10], &[_]u8{0} ** 10) and
+                ip6[10] == 0xff and ip6[11] == 0xff;
+            if (is_ipv4_mapped) {
+                // Apply IPv4 /24 logic on the embedded IPv4 octets (bytes 12..14).
+                return @as(u32, ip6[12]) << 16 | @as(u32, ip6[13]) << 8 | @as(u32, ip6[14]);
+            }
+
+            // Native IPv6 /48 subnet: hash first 6 bytes into u32.
             return @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]) ^ (@as(u32, ip6[4]) << 8 | @as(u32, ip6[5]));
         }
         return 0;
@@ -418,8 +430,12 @@ const DynamicRecordSizer = struct {
     const ramp_byte_threshold: u64 = 128 * 1024;
 
     fn init(enabled: bool) DynamicRecordSizer {
+        // When DRS is disabled the user opted out of anti-DPI record-size
+        // masking, so there is no reason to keep clamping records to the
+        // probe-friendly 1369-byte size — doing so only hurts throughput.
+        // Start at the full TLS plaintext size and short-circuit ramp-up.
         return .{
-            .current_size = initial_size,
+            .current_size = if (enabled) initial_size else full_size,
             .records_sent = 0,
             .bytes_sent = 0,
             .enabled = enabled,
@@ -592,8 +608,11 @@ const ConnectionSlot = struct {
     relay_tls_body_pos: u16 = 0,
     relay_record_type: u8 = 0,
 
+    // Placeholder until `DynamicRecordSizer.init` is called with the runtime
+    // config value; kept consistent with the enabled=false invariant so the
+    // sizer is immediately usable even if init() is ever skipped.
     drs: DynamicRecordSizer = DynamicRecordSizer{
-        .current_size = DynamicRecordSizer.initial_size,
+        .current_size = DynamicRecordSizer.full_size,
         .records_sent = 0,
         .bytes_sent = 0,
         .enabled = false,
@@ -1630,7 +1649,22 @@ const EventLoop = struct {
             const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
                 switch (err) {
                     error.WouldBlock => return,
-                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+
+                    // TCP three-way-handshake aborts between the kernel's
+                    // accept queue and our accept() call. These are benign —
+                    // bubbling them up causes the whole batch to abort and
+                    // (worse) starves other connections waiting in the queue.
+                    error.ConnectionAborted, error.ConnectionResetByPeer => continue,
+
+                    // Resource exhaustion: either we hit an FD limit or the
+                    // kernel ran out of socket buffers (ENOBUFS). In LT epoll
+                    // mode the listen socket stays readable, so returning the
+                    // error here without pausing would spin the event loop at
+                    // 100% CPU. Pause accepts with back-off instead.
+                    error.ProcessFdQuotaExceeded,
+                    error.SystemFdQuotaExceeded,
+                    error.SystemResources,
+                    => {
                         self.pauseAccepting(err);
                         return;
                     },
@@ -2266,7 +2300,17 @@ const EventLoop = struct {
     }
 
     fn finishClientHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
-        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, self.state.user_secrets) orelse {
+        // The user and their secret were already resolved during FakeTLS
+        // validation (`onTlsClientHelloComplete`), so the obfuscation
+        // parameters can be derived in strict O(1) instead of iterating the
+        // full user list with a SHA-256 + AES-CTR per candidate. With large
+        // configs (hundreds of users) this saves a significant amount of CPU
+        // per handshake and shrinks the DPI-probe amplification factor.
+        const known_secret = [_]obfuscation.UserSecret{.{
+            .name = slot.validation_user[0..slot.validation_user_len],
+            .secret = slot.validation_secret,
+        }};
+        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, &known_secret) orelse {
             self.closeSlot(slot, "bad mtproto obfuscation handshake");
             return;
         };
@@ -2543,11 +2587,22 @@ const EventLoop = struct {
                     return;
                 }
 
+                // Telegram DCs (and MiddleProxies) never speak first after a
+                // SOCKS5 CONNECT success — they wait for our 64-byte handshake
+                // nonce. Any bytes piggy-backed onto the SOCKS5 reply are either
+                // garbage from a misbehaving upstream or an active MITM probe.
+                //
+                // Critically, `slot.pipelined_data` is the *client-side* pipeline
+                // buffer: on startRelay it is fed through `client_decryptor.apply`.
+                // Mixing upstream bytes into it desynchronises the client CTR
+                // stream (and, with MiddleProxy, encapsulates garbage into a
+                // valid RPC_PROXY_REQ frame). Drop the connection instead.
                 if (have.len > result.consumed) {
-                    self.appendPipelined(slot, have[result.consumed..]) catch {
-                        self.closeSlot(slot, "socks5 pipelined append failed");
-                        return;
-                    };
+                    log.warn("[{d}] socks5 upstream sent {d} unsolicited bytes after CONNECT success", .{
+                        slot.conn_id, have.len - result.consumed,
+                    });
+                    self.closeSlot(slot, "socks5 unsolicited upstream data");
+                    return;
                 }
 
                 // SOCKS5 handshake complete — proceed to DC path
@@ -2671,11 +2726,16 @@ const EventLoop = struct {
             return;
         }
 
+        // Same invariant as SOCKS5: the DC never speaks first. Any bytes the
+        // HTTP proxy appended after the "200 OK" line would be wrongly routed
+        // through the *client* decryption path in startRelay, corrupting the
+        // CTR stream. Reject the upstream.
         if (have.len > result.header_end) {
-            self.appendPipelined(slot, have[result.header_end..]) catch {
-                self.closeSlot(slot, "http connect pipelined append failed");
-                return;
-            };
+            log.warn("[{d}] http connect upstream sent {d} unsolicited bytes after 2xx", .{
+                slot.conn_id, have.len - result.header_end,
+            });
+            self.closeSlot(slot, "http connect unsolicited upstream data");
+            return;
         }
 
         // HTTP CONNECT handshake complete — proceed to DC path
@@ -3015,8 +3075,16 @@ const EventLoop = struct {
         var msg: [32]u8 = undefined;
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
         self.state.middle_proxy_lock.lockShared();
+        // Zig's @memcpy panics on mismatched slice lengths. If the upstream
+        // middle-proxy refresh ever hands us a secret shorter than 4 bytes
+        // (defensive: refresh already rejects <16, but we keep this safe even
+        // if the invariant is ever broken) a blind @memcpy(msg[4..8], src[..<4])
+        // would crash the daemon. Zero first, then copy into a matching prefix.
+        @memset(msg[4..8], 0);
         const key_sel_len = @min(@as(usize, 4), self.state.middle_proxy_secret_len);
-        @memcpy(msg[4..8], self.state.middle_proxy_secret[0..key_sel_len]);
+        if (key_sel_len > 0) {
+            @memcpy(msg[4 .. 4 + key_sel_len], self.state.middle_proxy_secret[0..key_sel_len]);
+        }
         self.state.middle_proxy_lock.unlockShared();
         @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
         @memcpy(msg[12..16], &crypto_ts);
@@ -3643,7 +3711,20 @@ const EventLoop = struct {
 
     fn ensureMpC2sScratch(self: *EventLoop) ![]u8 {
         if (self.mp_c2s_scratch) |buf| return buf;
-        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
+
+        // Worst-case RPC_PROXY_REQ expansion.
+        // The smallest consumable input is a single abridged header byte with
+        // len_val=0 → 0-byte payload → encrypted_len = 96 with ad_tag.
+        // A pathological client pipelining 1MB of such bytes would expand to
+        // ~96MB of encapsulated frames. Sizing the scratch buffer to match
+        // keeps encapsulateC2S overflow-free under adversarial load and
+        // prevents the spurious connection drops observed in production.
+        //
+        // One allocation per EventLoop (single-threaded), so the memory cost
+        // is bounded regardless of connection count.
+        const mp_max_expansion: usize = 96;
+        const capacity = self.state.config.middleProxyBufferBytes() * mp_max_expansion + 256;
+        const buf = try self.state.allocator.alloc(u8, capacity);
         self.mp_c2s_scratch = buf;
         return buf;
     }
@@ -4691,11 +4772,15 @@ test "direct users bypass middle-proxy routing" {
     try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
 
-test "DRS disabled fixed size" {
+test "DRS disabled skips ramp and uses full TLS record size" {
+    // Regression: prior behaviour initialised `current_size` to the probe-
+    // friendly 1369-byte size even when the user disabled DRS, bottlenecking
+    // downstream throughput forever. Disabled DRS must start (and stay) at
+    // the full TLS plaintext size.
     var drs = DynamicRecordSizer.init(false);
-    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
     for (0..32) |_| drs.recordSent(1369);
-    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
 }
 
 test "DRS enabled ramps" {
@@ -4800,6 +4885,31 @@ test "subnet rate limit - subnet key groups /24 IPv4" {
 
     try std.testing.expectEqual(key1, key2); // same /24
     try std.testing.expect(key1 != key3); // different /24
+}
+
+test "subnet rate limit - IPv4-mapped IPv6 keys match native IPv4 /24" {
+    // On dual-stack [::] listeners IPv4 clients arrive as ::ffff:a.b.c.d.
+    // Regression: prior to the mapped-detection branch every mapped address
+    // produced key = 0, collapsing the whole IPv4 internet into one bucket.
+    const native_v4 = net.Address.initIp4(.{ 203, 0, 113, 42 }, 443);
+
+    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 42 };
+    const mapped = net.Address.initIp6(mapped_bytes, 443, 0, 0);
+
+    const k_native = SubnetRateLimit.subnetKey(native_v4);
+    const k_mapped = SubnetRateLimit.subnetKey(mapped);
+    try std.testing.expectEqual(k_native, k_mapped);
+
+    // Two different mapped /24s must diverge (otherwise we'd still have the
+    // global IPv4 collision after the fix).
+    const mapped_other_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 198, 51, 100, 1 };
+    const mapped_other = net.Address.initIp6(mapped_other_bytes, 443, 0, 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(mapped_other) != k_mapped);
+
+    // Native IPv6 path must stay on the /48 hash (not collide with mapped form).
+    const native6_bytes = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const native6 = net.Address.initIp6(native6_bytes, 443, 0, 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(native6) != k_mapped);
 }
 
 test "subnet rate limit - allows up to max then blocks" {
