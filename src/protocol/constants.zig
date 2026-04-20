@@ -24,7 +24,7 @@ pub const tg_datacenters_v6 = [5]std.net.Address{
 
 pub const tg_middle_proxy_port: u16 = 8888;
 
-/// Default MiddleProxy endpoints per primary DC (1..5).
+/// Default MiddleProxy endpoints per primary DC (1..5), regular (non-media) path.
 /// Refreshed at runtime from getProxyConfig when available.
 pub const tg_middle_proxies_v4 = [5]std.net.Address{
     std.net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
@@ -32,6 +32,19 @@ pub const tg_middle_proxies_v4 = [5]std.net.Address{
     std.net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
     std.net.Address.initIp4(.{ 91, 108, 4, 136 }, tg_middle_proxy_port),
     std.net.Address.initIp4(.{ 91, 108, 56, 183 }, tg_middle_proxy_port),
+};
+
+/// Default MiddleProxy endpoints per primary DC (1..5), media path (dc_idx < 0).
+/// Telegram serves media through a separate MP fleet; connecting a media
+/// client to a regular MP causes large file downloads to stall or silently
+/// drop. Keep these in sync with `proxy_for -N` lines in getProxyConfig.
+/// Refreshed at runtime from getProxyConfig when available.
+pub const tg_media_middle_proxies_v4 = [5]std.net.Address{
+    std.net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 149, 154, 161, 184 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 149, 154, 164, 250 }, tg_middle_proxy_port),
+    std.net.Address.initIp4(.{ 91, 108, 56, 180 }, tg_middle_proxy_port),
 };
 
 /// Resolves physical Datacenter IP by its index, handling special media DCs.
