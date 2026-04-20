@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/sleep3r/mtproto.zig/compare/v0.19.1...v0.19.2) (2026-04-20)
+
+
+### Bug Fixes
+
+* **constants:** correct bundled middle-proxy addresses to match getProxyConfig ([#199](https://github.com/sleep3r/mtproto.zig/issues/199)) ([20c5089](https://github.com/sleep3r/mtproto.zig/commit/20c508908a839bf42e3152d303f29e1309dbe417))
+
 ## [0.19.1](https://github.com/sleep3r/mtproto.zig/compare/v0.19.0...v0.19.1) (2026-04-20)
 
 
