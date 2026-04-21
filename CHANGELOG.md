@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.3](https://github.com/sleep3r/mtproto.zig/compare/v0.19.2...v0.19.3) (2026-04-21)
+
+
+### Bug Fixes
+
+* **dashboard:** fix config corruption on user add missing trailing newline ([#204](https://github.com/sleep3r/mtproto.zig/issues/204)) ([811b0f7](https://github.com/sleep3r/mtproto.zig/commit/811b0f7b25a0892b80f8fbea502223c8a36b52e2))
+
 ## [0.19.2](https://github.com/sleep3r/mtproto.zig/compare/v0.19.1...v0.19.2) (2026-04-20)
 
 
