@@ -42,11 +42,9 @@ pub const TomlDoc = struct {
         const file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
 
-        for (self.lines.items, 0..) |line, idx| {
+        for (self.lines.items) |line| {
             try file.writeAll(line);
-            if (idx < self.lines.items.len - 1) {
-                try file.writeAll("\n");
-            }
+            try file.writeAll("\n");
         }
     }
 

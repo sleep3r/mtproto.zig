@@ -1202,6 +1202,8 @@ def _add_user_to_config(name: str, secret: str) -> bool:
     lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
         keepends=True
     )
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
 
     # Find [access.users] section
     insert_idx = None
@@ -1244,6 +1246,8 @@ def _remove_user_from_config(name: str) -> bool:
     lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
         keepends=True
     )
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
     new_lines = []
     in_users = False
     in_direct = False
@@ -1289,6 +1293,8 @@ def _set_user_direct(name: str, direct: bool) -> bool:
     lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
         keepends=True
     )
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
     new_lines = []
     found_direct_section = False
     in_direct = False
