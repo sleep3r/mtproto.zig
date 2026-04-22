@@ -258,6 +258,14 @@ def _proxy_stats() -> dict:
                     if m2:
                         s[k] = int(m2[1])
                 break
+
+        users_active_total = sum(
+            int(v) for v in s.get("per_user_active", {}).values() if isinstance(v, int)
+        )
+        active_total = int(s.get("active", 0) or 0)
+        s["users_active_total"] = users_active_total
+        s["unassigned_active"] = max(active_total - users_active_total, 0)
+
         return s
     except Exception:
         return {}

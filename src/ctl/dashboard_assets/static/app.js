@@ -460,10 +460,11 @@ function _users_cache_bust() {
   }
 }
 
-function renderUsers(users, perUserActive) {
+function renderUsers(users, perUserActive, proxyStats) {
   const card = $('usersCard');
   if (!card) return;
   const pua = perUserActive || {};
+  const ps = proxyStats || {};
 
   const meta = $('usersMeta');
   const note = $('usersNote');
@@ -474,9 +475,16 @@ function renderUsers(users, perUserActive) {
   const total = Number(users?.total || 0);
   const directTotal = Number(users?.direct_total || 0);
   const disabledTotal = Number(users?.disabled_total || 0);
+  const usersActiveTotal = Number(ps.users_active_total || Object.values(pua).reduce((acc, v) => acc + Number(v || 0), 0));
+  const activeTotal = Number(ps.active || 0);
+  const unassignedActive = Number(ps.unassigned_active || Math.max(activeTotal - usersActiveTotal, 0));
 
   let metaText = total + ' users · direct ' + directTotal;
   if (disabledTotal > 0) metaText += ' · disabled ' + disabledTotal;
+  if (activeTotal > 0 || usersActiveTotal > 0) {
+    metaText += ' · sessions ' + usersActiveTotal + '/' + activeTotal;
+    if (unassignedActive > 0) metaText += ' · unassigned ' + unassignedActive;
+  }
   meta.textContent = metaText;
 
   if (!users?.links_ready) {
@@ -991,7 +999,7 @@ async function poll() {
     $('maskTimer').textContent = timerState;
   }
 
-  renderUsers(d.users || null, (d.proxy || {}).per_user_active || {});
+  renderUsers(d.users || null, (d.proxy || {}).per_user_active || {}, d.proxy || {});
 }
 
 function setDataBadge(state, text) {
