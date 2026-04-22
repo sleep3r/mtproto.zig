@@ -307,6 +307,7 @@ async function copyText(text) {
 // ── User Management ──
 
 let pendingDeleteUser = null;
+let pendingToggleUser = null;
 
 function showToast(msg, type) {
   const el = document.createElement('div');
@@ -441,6 +442,17 @@ async function toggleDirect(name, newDirect) {
   }
 }
 
+async function toggleUserEnabled(name, newEnabled) {
+  try {
+    await apiCall('/api/users/toggle', { name, enabled: newEnabled });
+    showToast(`User "${name}" ${newEnabled ? 'enabled' : 'disabled'}. Proxy restarted.`, 'success');
+    _users_cache_bust();
+    await runPoll();
+  } catch (e) {
+    showToast('Failed: ' + e.message, 'error');
+  }
+}
+
 function _users_cache_bust() {
   // Force next poll to show fresh data
   if (lastData && lastData.users) {
@@ -448,9 +460,10 @@ function _users_cache_bust() {
   }
 }
 
-function renderUsers(users) {
+function renderUsers(users, perUserActive) {
   const card = $('usersCard');
   if (!card) return;
+  const pua = perUserActive || {};
 
   const meta = $('usersMeta');
   const note = $('usersNote');
@@ -460,8 +473,11 @@ function renderUsers(users) {
   const items = (users && Array.isArray(users.items)) ? users.items : [];
   const total = Number(users?.total || 0);
   const directTotal = Number(users?.direct_total || 0);
+  const disabledTotal = Number(users?.disabled_total || 0);
 
-  meta.textContent = total + ' users · direct ' + directTotal;
+  let metaText = total + ' users · direct ' + directTotal;
+  if (disabledTotal > 0) metaText += ' · disabled ' + disabledTotal;
+  meta.textContent = metaText;
 
   if (!users?.links_ready) {
     note.textContent = 'Public IP could not be detected. Set [server].public_ip in config.toml.';
@@ -475,25 +491,36 @@ function renderUsers(users) {
   }
 
   list.innerHTML = items.map((u) => {
+    const isEnabled = u.enabled !== false;
     const tg = u.tg_link || '';
     const tme = u.tme_link || '';
-    const preview = shortProxyLink(tg || tme);
-    const routeClass = u.direct ? 'direct' : 'default';
-    const routeLabel = u.direct ? 'direct' : 'default';
+    const preview = isEnabled ? shortProxyLink(tg || tme) : 'disabled';
     const tgData = encodeURIComponent(tg);
     const tmeData = encodeURIComponent(tme);
     const userName = esc(u.name || 'user');
-    const directToggle = u.direct
-      ? `<button class="ui-btn user-direct-toggle on" type="button" data-user="${userName}" data-direct="false" title="Switch to default route">direct</button>`
-      : `<button class="ui-btn user-direct-toggle" type="button" data-user="${userName}" data-direct="true" title="Switch to direct route">default</button>`;
+    const rowClass = isEnabled ? 'user-row' : 'user-row disabled';
+    const sessions = Number(pua[u.name] || 0);
+    const sessionsBadge = isEnabled
+      ? '<span class="user-sessions' + (sessions > 0 ? '' : ' zero') + '">' + sessions + '</span>'
+      : '';
 
-    return '<div class="user-row">' +
-      '<div class="user-name">' + userName + '</div>' +
+    // Enable/disable toggle switch
+    const toggleSwitch = '<label class="user-toggle-switch" title="' + (isEnabled ? 'Disable user' : 'Enable user') + '">' +
+      '<input type="checkbox" class="user-enabled-toggle" data-user="' + userName + '"' + (isEnabled ? ' checked' : '') + '>' +
+      '<span class="user-toggle-slider"></span>' +
+      '</label>';
+
+    const directToggle = !isEnabled ? '' : (u.direct
+      ? '<button class="ui-btn user-direct-toggle on" type="button" data-user="' + userName + '" data-direct="false" title="Switch to default route">direct</button>'
+      : '<button class="ui-btn user-direct-toggle" type="button" data-user="' + userName + '" data-direct="true" title="Switch to direct route">default</button>');
+
+    return '<div class="' + rowClass + '">' +
+      '<div class="user-name">' + toggleSwitch + userName + sessionsBadge + '</div>' +
       '<div class="user-route">' + directToggle + '</div>' +
-      '<div class="user-link" title="' + esc(tg || tme || 'link unavailable') + '">' + esc(preview) + '</div>' +
+      '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
-      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg ? '' : ' disabled') + '>Copy tg://</button>' +
-      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme ? '' : ' disabled') + '>Copy t.me</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + '>Copy tg://</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + '>Copy t.me</button>' +
       '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
       '</div>' +
       '</div>';
@@ -514,6 +541,14 @@ function renderUsers(users) {
         btn.textContent = original;
         btn.classList.remove('active');
       }, 1100);
+    });
+  });
+
+  // Enable/disable toggles
+  list.querySelectorAll('.user-enabled-toggle').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const name = cb.dataset.user;
+      toggleUserEnabled(name, cb.checked);
     });
   });
 
@@ -782,10 +817,15 @@ function renderRouting(routing) {
       proxyHostLabel.textContent = upstreamType + ' host';
       proxyHost.placeholder = upstreamType === 'socks5' ? '127.0.0.1' : '127.0.0.1';
       proxyPort.placeholder = upstreamType === 'socks5' ? '1080' : '8080';
-      proxyHost.value = host;
-      proxyPort.value = port > 0 ? String(port) : '';
-      proxyUser.value = username;
-      proxyPass.value = password;
+      // Don't overwrite inputs while user is typing (fix for field reset bug)
+      const proxyInputs = [proxyHost, proxyPort, proxyUser, proxyPass];
+      const anyFocused = proxyInputs.some(el => el === document.activeElement);
+      if (!anyFocused) {
+        proxyHost.value = host;
+        proxyPort.value = port > 0 ? String(port) : '';
+        proxyUser.value = username;
+        proxyPass.value = password;
+      }
     } else {
       proxyCtl.style.display = 'none';
     }
@@ -890,6 +930,7 @@ async function poll() {
   $('pxDrops').style.color = drp > 0 ? 'var(--amber)' : 'var(--text-muted)';
   $('pxDropLbl').textContent = 'rate +' + drp + ' · cap +' + (p.cap_drops || 0) + ' · hs_t +' + (p.hs_timeout || 0);
 
+
   // Version
   const vEl = $('dashboardVersion');
   if (vEl && d.proxy_version) {
@@ -950,7 +991,7 @@ async function poll() {
     $('maskTimer').textContent = timerState;
   }
 
-  renderUsers(d.users || null);
+  renderUsers(d.users || null, (d.proxy || {}).per_user_active || {});
 }
 
 function setDataBadge(state, text) {

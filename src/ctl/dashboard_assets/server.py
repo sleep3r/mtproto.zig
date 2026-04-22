@@ -217,6 +217,7 @@ def _proxy_stats() -> dict:
             sat_drops=0,
             hs_budget_drops=0,
             hs_timeout=0,
+            per_user_active={},
         )
         for line in reversed(out.strip().split("\n")):
             if "conn stats:" in line:
@@ -233,6 +234,16 @@ def _proxy_stats() -> dict:
                     m2 = re.search(p, line)
                     if m2:
                         s[k] = int(m2[1])
+                # Parse users{admin=5,regular=2} from same line
+                mu = re.search(r"users\{([^}]*)\}", line)
+                if mu and mu.group(1):
+                    for pair in mu.group(1).split(","):
+                        parts = pair.split("=", 1)
+                        if len(parts) == 2:
+                            try:
+                                s["per_user_active"][parts[0].strip()] = int(parts[1])
+                            except ValueError:
+                                pass
                 break
         for line in reversed(out.strip().split("\n")):
             if "drops:" in line:
@@ -340,6 +351,7 @@ def _load_proxy_runtime_config() -> dict:
         "upstream_http_password": "",
         "users": {},
         "direct_users": set(),
+        "disabled_users": {},
     }
 
     cfg_path = None
@@ -370,6 +382,7 @@ def _load_proxy_runtime_config() -> dict:
         "upstream_http_password": defaults["upstream_http_password"],
         "users": {},
         "direct_users": set(),
+        "disabled_users": {},
     }
 
     section = ""
@@ -463,6 +476,10 @@ def _load_proxy_runtime_config() -> dict:
                 elif section in ("[access.direct_users]", "[access.admins]"):
                     if key and _parse_bool(value, False):
                         result["direct_users"].add(key)
+
+                elif section == "[access.disabled_users]":
+                    if key and value:
+                        result["disabled_users"][key] = value
 
     except Exception:
         return defaults
@@ -983,13 +1000,34 @@ def _users_status() -> dict:
                 "name": name,
                 "secret": secret_raw,
                 "direct": name in direct_users,
+                "enabled": True,
                 "tg_link": tg_link,
                 "tme_link": tme_link,
             }
         )
 
+    # Include disabled users (shown in dashboard but not active in proxy)
+    disabled_users = cfg.get("disabled_users", {})
+    for name in sorted(disabled_users.keys()):
+        secret_raw = str(disabled_users[name]).strip().lower()
+        if not USER_SECRET_RE.fullmatch(secret_raw):
+            continue
+        items.append(
+            {
+                "name": name,
+                "secret": secret_raw,
+                "direct": False,
+                "enabled": False,
+                "tg_link": None,
+                "tme_link": None,
+            }
+        )
+
+    active_count = sum(1 for item in items if item["enabled"])
+
     result = {
-        "total": len(items),
+        "total": active_count,
+        "disabled_total": len(items) - active_count,
         "direct_total": sum(1 for item in items if item["direct"]),
         "links_ready": bool(server),
         "server": server,
@@ -1347,6 +1385,159 @@ def _set_user_direct(name: str, direct: bool) -> bool:
     return True
 
 
+def _disable_user_in_config(name: str) -> bool:
+    """Move user from [access.users] to [access.disabled_users]. Returns True on success."""
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    cfg = _load_proxy_runtime_config()
+    secret = cfg.get("users", {}).get(name)
+    if not secret:
+        return False  # user not found or already disabled
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    # Remove from [access.users] and [access.direct_users]
+    new_lines = []
+    in_users = False
+    in_direct = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "[access.users]":
+            in_users = True
+            in_direct = False
+            new_lines.append(line)
+            continue
+        elif stripped.lower() in ("[access.direct_users]", "[access.admins]"):
+            in_users = False
+            in_direct = True
+            new_lines.append(line)
+            continue
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            in_users = False
+            in_direct = False
+            new_lines.append(line)
+            continue
+
+        if (in_users or in_direct) and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key == name:
+                continue  # skip — removing this user
+
+        new_lines.append(line)
+
+    # Add to [access.disabled_users]
+    found_disabled = False
+    disabled_end = None
+    in_disabled = False
+    for i, line in enumerate(new_lines):
+        stripped = line.strip()
+        if stripped.lower() == "[access.disabled_users]":
+            found_disabled = True
+            in_disabled = True
+            continue
+        if in_disabled:
+            if stripped.startswith("[") and stripped.endswith("]"):
+                disabled_end = i
+                in_disabled = False
+            elif i == len(new_lines) - 1:
+                disabled_end = len(new_lines)
+
+    if found_disabled and disabled_end is not None:
+        new_lines.insert(disabled_end, f'{name} = "{secret}"\n')
+    elif found_disabled:
+        new_lines.append(f'{name} = "{secret}"\n')
+    else:
+        new_lines.append(f"\n[access.disabled_users]\n")
+        new_lines.append(f'{name} = "{secret}"\n')
+
+    cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    return True
+
+
+def _enable_user_in_config(name: str) -> bool:
+    """Move user from [access.disabled_users] back to [access.users]. Returns True on success."""
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    cfg = _load_proxy_runtime_config()
+    secret = cfg.get("disabled_users", {}).get(name)
+    if not secret:
+        return False  # not in disabled list
+
+    # Remove from [access.disabled_users]
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    new_lines = []
+    in_disabled = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == "[access.disabled_users]":
+            in_disabled = True
+            new_lines.append(line)
+            continue
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            in_disabled = False
+            new_lines.append(line)
+            continue
+
+        if in_disabled and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key == name:
+                continue  # skip — removing from disabled
+
+        new_lines.append(line)
+
+    # Add back to [access.users]
+    if not _add_user_to_config_lines(new_lines, name, secret):
+        # Fallback: just write the lines and use existing helper
+        cfg_path.write_text("".join(new_lines), encoding="utf-8")
+        return _add_user_to_config(name, secret)
+
+    cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    return True
+
+
+def _add_user_to_config_lines(lines: list[str], name: str, secret: str) -> bool:
+    """Insert a user into [access.users] section within an in-memory lines list."""
+    insert_idx = None
+    in_users = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.lower() == "[access.users]":
+            in_users = True
+            continue
+        if in_users:
+            if stripped.startswith("[") and stripped.endswith("]"):
+                insert_idx = i
+                break
+            if not stripped or stripped.startswith("#"):
+                continue
+        if in_users and i == len(lines) - 1:
+            insert_idx = len(lines)
+
+    if insert_idx is None:
+        if in_users:
+            insert_idx = len(lines)
+        else:
+            return False
+
+    lines.insert(insert_idx, f'{name} = "{secret}"\n')
+    return True
+
+
+
+
 @app.get("/api/stats")
 def api_stats():
     global _prev_net, _net_history, _cpu_history, _mem_history
@@ -1652,6 +1843,44 @@ async def api_user_direct(request: Request):
     _users_cache["ts"] = 0
     _restart_proxy()
     return JSONResponse({"ok": True, "name": name, "direct": direct, "restarted": True})
+
+
+@app.post("/api/users/toggle")
+async def api_user_toggle(request: Request):
+    """Enable or disable a user. Body: { name: str, enabled: bool }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "name is required"}, status_code=400)
+
+    enabled = body.get("enabled", None)
+    if not isinstance(enabled, bool):
+        return JSONResponse(
+            {"ok": False, "error": "enabled must be boolean"}, status_code=400
+        )
+
+    if enabled:
+        if not _enable_user_in_config(name):
+            return JSONResponse(
+                {"ok": False, "error": "user not found in disabled list"},
+                status_code=404,
+            )
+    else:
+        if not _disable_user_in_config(name):
+            return JSONResponse(
+                {"ok": False, "error": "user not found or already disabled"},
+                status_code=404,
+            )
+
+    _users_cache["ts"] = 0
+    _restart_proxy()
+    return JSONResponse(
+        {"ok": True, "name": name, "enabled": enabled, "restarted": True}
+    )
 
 
 @app.get("/api/logs")

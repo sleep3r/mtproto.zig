@@ -1880,7 +1880,22 @@ const EventLoop = struct {
 
         const has_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
 
-        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{}", .{
+        // Build per-user active connection counts for dashboard parsing
+        var user_buf: [1024]u8 = undefined;
+        var user_pos: usize = 0;
+        for (self.state.user_metrics) |*um| {
+            const uactive = um.connections_active.load(.monotonic);
+            const name = um.name;
+            if (user_pos > 0 and user_pos < user_buf.len) {
+                user_buf[user_pos] = ',';
+                user_pos += 1;
+            }
+            const written = std.fmt.bufPrint(user_buf[user_pos..], "{s}={d}", .{ name, uactive }) catch break;
+            user_pos += written.len;
+        }
+        const user_str = if (user_pos > 0) user_buf[0..user_pos] else "";
+
+        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{} users{{{s}}}", .{
             active,
             self.state.config.max_connections,
             hs,
@@ -1890,6 +1905,7 @@ const EventLoop = struct {
             accepted_total,
             self.accept_paused,
             self.saturation_paused,
+            user_str,
         });
 
         if (has_drops) {

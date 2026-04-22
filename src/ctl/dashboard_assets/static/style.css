@@ -372,6 +372,31 @@ body::after {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+.user-sessions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  margin-left: 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background: rgba(52,211,153,0.12);
+  border: 1px solid rgba(52,211,153,0.25);
+  color: var(--green);
+  flex-shrink: 0;
+}
+.user-sessions.zero {
+  background: rgba(124,134,152,0.08);
+  border-color: rgba(124,134,152,0.15);
+  color: var(--text-muted);
 }
 .user-route {
   display: flex;
@@ -440,6 +465,55 @@ body::after {
   padding: 16px 24px;
   color: var(--text-muted);
   font-size: 12px;
+}
+.user-row.disabled {
+  opacity: 0.45;
+}
+.user-row.disabled .user-link {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+/* ── Toggle Switch ── */
+.user-toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 30px;
+  height: 16px;
+  margin-right: 8px;
+  flex-shrink: 0;
+  vertical-align: middle;
+  cursor: pointer;
+}
+.user-toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.user-toggle-slider {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(248,113,113,0.25);
+  border-radius: 16px;
+  transition: background 0.25s;
+}
+.user-toggle-slider::before {
+  content: '';
+  position: absolute;
+  height: 12px;
+  width: 12px;
+  left: 2px;
+  bottom: 2px;
+  background: var(--red);
+  border-radius: 50%;
+  transition: transform 0.25s, background 0.25s;
+}
+.user-toggle-switch input:checked + .user-toggle-slider {
+  background: rgba(52,211,153,0.25);
+}
+.user-toggle-switch input:checked + .user-toggle-slider::before {
+  transform: translateX(14px);
+  background: var(--green);
 }
 
 /* ── Add User Button ── */
