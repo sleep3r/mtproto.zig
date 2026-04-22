@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/sleep3r/mtproto.zig/compare/v0.19.3...v0.20.0) (2026-04-22)
+
+
+### Features
+
+* **dashboard:** user toggle, per-user session tooltip, input fix ([#207](https://github.com/sleep3r/mtproto.zig/issues/207)) ([b5eb3dc](https://github.com/sleep3r/mtproto.zig/commit/b5eb3dc742d7270ea7d87c8513721da1c1ad0485))
+
 ## [0.19.3](https://github.com/sleep3r/mtproto.zig/compare/v0.19.2...v0.19.3) (2026-04-21)
 
 
