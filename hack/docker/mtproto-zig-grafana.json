@@ -1,0 +1,304 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Proxy Info",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "value_and_name", "colorMode": "value" },
+      "targets": [
+        { "expr": "mtproto_build_info", "legendFormat": "v{{version}}", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Uptime",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        { "expr": "mtproto_uptime_seconds", "legendFormat": "uptime", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Active Connections",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": null,
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 200 },
+            { "color": "red", "value": 450 }
+          ]}
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "mtproto_connections_active", "legendFormat": "active", "refId": "A" },
+        { "expr": "mtproto_connections_max", "legendFormat": "max", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Handshakes Inflight",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "mode": "absolute", "steps": [
+          { "color": "green", "value": null },
+          { "color": "yellow", "value": 10 },
+          { "color": "red", "value": 30 }
+        ]}},
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        { "expr": "mtproto_handshakes_inflight", "legendFormat": "inflight", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Connections Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10, "gradientMode": "scheme" } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "mtproto_connections_active", "legendFormat": "active", "refId": "A" },
+        { "expr": "mtproto_connections_max", "legendFormat": "max", "refId": "B" },
+        { "expr": "mtproto_handshakes_inflight", "legendFormat": "handshakes", "refId": "C" }
+      ]
+    },
+    {
+      "title": "Connection Rate (accepted / closed)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "custom": { "lineWidth": 2, "fillOpacity": 10, "gradientMode": "scheme" } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "rate(mtproto_connections_accepted_total[5m])", "legendFormat": "accepted/s", "refId": "A" },
+        { "expr": "rate(mtproto_connections_closed_total[5m])", "legendFormat": "closed/s", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Traffic Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "Bps", "custom": { "lineWidth": 2, "fillOpacity": 15, "gradientMode": "scheme" } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "rate(mtproto_client_to_upstream_bytes_total[5m])", "legendFormat": "client → upstream", "refId": "A" },
+        { "expr": "rate(mtproto_upstream_to_client_bytes_total[5m])", "legendFormat": "upstream → client", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Total Transferred",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "decbytes", "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        { "expr": "mtproto_client_to_upstream_bytes_total", "legendFormat": "C→S", "refId": "A" },
+        { "expr": "mtproto_upstream_to_client_bytes_total", "legendFormat": "S→C", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Total Connections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        { "expr": "mtproto_connections_total", "legendFormat": "total", "refId": "A" },
+        { "expr": "mtproto_connections_accepted_total", "legendFormat": "accepted", "refId": "B" },
+        { "expr": "mtproto_connections_closed_total", "legendFormat": "closed", "refId": "C" }
+      ]
+    },
+    {
+      "title": "Drops",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "custom": { "lineWidth": 2, "fillOpacity": 10, "drawStyle": "bars" } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "rate(mtproto_drops_capacity_total[5m])", "legendFormat": "capacity", "refId": "A" },
+        { "expr": "rate(mtproto_drops_saturation_total[5m])", "legendFormat": "saturation", "refId": "B" },
+        { "expr": "rate(mtproto_drops_rate_limit_total[5m])", "legendFormat": "rate limit", "refId": "C" },
+        { "expr": "rate(mtproto_drops_handshake_budget_total[5m])", "legendFormat": "hs budget", "refId": "D" },
+        { "expr": "rate(mtproto_handshake_timeouts_total[5m])", "legendFormat": "hs timeout", "refId": "E" },
+        { "expr": "rate(mtproto_middleproxy_fallback_total[5m])", "legendFormat": "mp fallback", "refId": "F" }
+      ]
+    },
+    {
+      "title": "Per-User Active Connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 20, "gradientMode": "scheme", "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "expr": "mtproto_user_connections_active", "legendFormat": "{{user}}", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Top Users by Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "Bps", "custom": { "lineWidth": 2, "fillOpacity": 10, "gradientMode": "scheme" } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "expr": "topk(10, rate(mtproto_user_client_to_upstream_bytes_total[5m]) + rate(mtproto_user_upstream_to_client_bytes_total[5m]))", "legendFormat": "{{user}}", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Top Users by Transferred Bytes",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "decbytes", "thresholds": { "mode": "absolute", "steps": [
+          { "color": "blue", "value": null },
+          { "color": "green", "value": 1073741824 },
+          { "color": "yellow", "value": 10737418240 }
+        ]}},
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal", "displayMode": "gradient" },
+      "targets": [
+        { "expr": "topk(10, mtproto_user_client_to_upstream_bytes_total + mtproto_user_upstream_to_client_bytes_total)", "legendFormat": "{{user}}", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Memory Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "decbytes", "custom": { "lineWidth": 2, "fillOpacity": 10, "gradientMode": "scheme" } },
+        "overrides": []
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "process_resident_memory_bytes", "legendFormat": "RSS", "refId": "A" },
+        { "expr": "process_virtual_memory_bytes", "legendFormat": "Virtual", "refId": "B" },
+        { "expr": "mtproto_cgroup_memory_usage_bytes", "legendFormat": "cgroup usage", "refId": "C" },
+        { "expr": "mtproto_cgroup_memory_limit_bytes", "legendFormat": "cgroup limit", "refId": "D" }
+      ]
+    },
+    {
+      "title": "Process Metrics",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "CPU" }, "properties": [{ "id": "unit", "value": "s" }] },
+          { "matcher": { "id": "byName", "options": "open FDs" }, "properties": [{ "id": "unit", "value": "short" }] }
+        ]
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        { "expr": "rate(process_cpu_seconds_total[5m])", "legendFormat": "CPU", "refId": "A" },
+        { "expr": "process_open_fds", "legendFormat": "open FDs", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Config Flags",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "OFF", "color": "red" }, "1": { "text": "ON", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "port" }, "properties": [{ "id": "mappings", "value": [] }] }
+        ]
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "value_and_name", "orientation": "horizontal" },
+      "targets": [
+        { "expr": "mtproto_middleproxy_enabled", "legendFormat": "middleproxy", "refId": "A" },
+        { "expr": "mtproto_fast_mode_enabled", "legendFormat": "fast_mode", "refId": "B" },
+        { "expr": "mtproto_mask_enabled", "legendFormat": "mask", "refId": "C" },
+        { "expr": "mtproto_desync_enabled", "legendFormat": "desync", "refId": "D" },
+        { "expr": "mtproto_drs_enabled", "legendFormat": "DRS", "refId": "E" },
+        { "expr": "mtproto_config_port", "legendFormat": "port", "refId": "F" },
+        { "expr": "mtproto_config_max_connections", "legendFormat": "max_conn", "refId": "G" },
+        { "expr": "mtproto_accept_paused", "legendFormat": "accept_paused", "refId": "H" },
+        { "expr": "mtproto_saturation_paused", "legendFormat": "saturation", "refId": "I" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["mtproto", "proxy", "telegram"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "MTProto Proxy",
+  "uid": "mtproto-zig",
+  "version": 1
+}

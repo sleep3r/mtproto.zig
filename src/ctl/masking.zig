@@ -16,7 +16,7 @@ const SummaryLine = tui_mod.SummaryLine;
 
 const INSTALL_DIR = "/opt/mtproto-proxy";
 const CERT_DIR = "/etc/nginx/ssl";
-const NGINX_PORT = "8443";
+pub const NGINX_PORT = "8443";
 
 pub const MaskingOpts = struct {
     tls_domain: []const u8 = "wb.ru",

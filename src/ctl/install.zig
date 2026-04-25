@@ -280,6 +280,17 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         return;
     }
 
+    // ── Check port / masking collision ──
+    // The masking Nginx binds to 127.0.0.1:8443. If the proxy listens on
+    // the same port, its 0.0.0.0 bind will collide with Nginx and the
+    // service won't start.
+    const masking_port: u16 = std.fmt.parseInt(u16, masking.NGINX_PORT, 10) catch 8443;
+    if (opts.enable_masking and opts.port == masking_port) {
+        ui.fail("Port conflict: proxy port and masking port are both " ++ masking.NGINX_PORT ++ ".");
+        ui.info("Choose a different proxy port (e.g. 443) or disable masking (--no-masking).");
+        return;
+    }
+
     ui.writeRaw("\n");
     ui.rule();
 

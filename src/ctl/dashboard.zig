@@ -1,7 +1,7 @@
 //! Setup dashboard command for mtbuddy.
 //!
 //! Embeds the Python FastAPI dashboard and its static files directly into the
-//! mtbuddy binary using @embedFile. Uses `uv` (astral.sh) to manage an
+//! mtbuddy binary using @embedFile. Uses `uv` (installed from GitHub) to manage an
 //! isolated virtualenv with all Python dependencies, avoiding PEP 668 breakage
 //! on modern Debian/Ubuntu systems.
 
@@ -59,46 +59,39 @@ fn uvExists() bool {
     return sys.commandExists("uv");
 }
 
-/// Install `uv` via the official astral.sh installer.
+/// Install `uv` from GitHub releases (astral.sh is blocked in some regions).
 fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
-    ui.step("Installing uv package manager...");
+    ui.step("Installing uv package manager from GitHub...");
 
-    // Download and run the official installer (installs to ~/.local/bin or /usr/local/bin)
+    // Download the latest release tarball from GitHub and extract `uv` binary.
+    // GitHub is reliably accessible even when astral.sh is blocked.
     const result = sys.exec(allocator, &.{
-        "sh", "-c", "curl -fsSL https://astral.sh/uv/install.sh | sh",
+        "sh", "-c",
+        \\set -e
+        \\UV_URL="https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz"
+        \\TMP_DIR=$(mktemp -d)
+        \\trap 'rm -rf "$TMP_DIR"' EXIT
+        \\curl -fsSL "$UV_URL" -o "$TMP_DIR/uv.tar.gz"
+        \\tar -xzf "$TMP_DIR/uv.tar.gz" -C "$TMP_DIR" --strip-components=1
+        \\install -m 0755 "$TMP_DIR/uv" /usr/local/bin/uv
+        \\if [ -f "$TMP_DIR/uvx" ]; then install -m 0755 "$TMP_DIR/uvx" /usr/local/bin/uvx; fi
     }) catch {
-        ui.fail("Failed to download uv installer");
+        ui.fail("Failed to download uv from GitHub");
         return false;
     };
     defer result.deinit();
 
     if (result.exit_code != 0) {
-        ui.fail("uv installer exited with an error");
+        ui.fail("uv installation from GitHub failed");
         return false;
     }
 
-    // The installer puts uv in ~/.local/bin for root → /root/.local/bin
-    // Also check /usr/local/bin.  Symlink to /usr/local/bin for PATH stability.
     if (!sys.commandExists("uv")) {
-        const symlink_result = sys.exec(allocator, &.{
-            "sh", "-c",
-            \\if [ -f /root/.local/bin/uv ]; then
-            \\  ln -sf /root/.local/bin/uv /usr/local/bin/uv
-            \\  ln -sf /root/.local/bin/uvx /usr/local/bin/uvx 2>/dev/null
-            \\fi
-        }) catch {
-            ui.fail("uv installed but not found on PATH");
-            return false;
-        };
-        defer symlink_result.deinit();
-
-        if (!sys.commandExists("uv")) {
-            ui.fail("uv installed but not found on PATH");
-            return false;
-        }
+        ui.fail("uv binary installed but not found on PATH");
+        return false;
     }
 
-    ui.ok("uv installed successfully");
+    ui.ok("uv installed successfully (from GitHub)");
     return true;
 }
 

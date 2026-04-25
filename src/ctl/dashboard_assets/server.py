@@ -38,25 +38,48 @@ def _proxy_config_candidates():
 
 
 def _load_dashboard_config() -> dict:
-    """Load [monitor] section from config.toml (host, port)."""
+    """Load [monitor] section from config.toml (host, port).
+
+    Uses the same line-by-line parser as _load_proxy_runtime_config() to avoid
+    silent failures when tomllib rejects slightly non-standard config files.
+    """
     defaults = {"host": "127.0.0.1", "port": 61208}
-    if tomllib is None:
-        return defaults
-    # Look for config.toml relative to the install directory
     for p in _proxy_config_candidates():
-        if p.is_file():
-            try:
-                with open(p, "rb") as f:
-                    cfg = tomllib.load(f)
-                mon = cfg.get("monitor", {})
-                return {
-                    "host": str(mon.get("host", defaults["host"])),
-                    "port": int(mon.get("port", defaults["port"])),
-                }
-            except Exception as exc:
-                print(
-                    f"[dashboard] warning: failed to parse {p}: {exc}", file=sys.stderr
-                )
+        if not p.is_file():
+            continue
+        try:
+            section = ""
+            result = dict(defaults)
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("[") and line.endswith("]"):
+                        section = line.lower()
+                        continue
+                    if section != "[monitor]":
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if "#" in value:
+                        value = value.split("#", 1)[0].strip()
+                    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                        value = value[1:-1]
+                    if key == "host":
+                        result["host"] = value
+                    elif key == "port":
+                        digits = "".join(ch for ch in value if ch.isdigit())
+                        if digits:
+                            result["port"] = int(digits)
+            return result
+        except Exception as exc:
+            print(
+                f"[dashboard] warning: failed to parse {p}: {exc}", file=sys.stderr
+            )
     return defaults
 
 

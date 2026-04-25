@@ -162,6 +162,15 @@ pub const Config = struct {
 
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
+        if (self.mask and self.port == self.mask_port) {
+            const log = std.log.scoped(.config);
+            log.err(
+                "proxy port ({d}) equals mask_port ({d}). The proxy listen socket " ++
+                    "will collide with the local masking server (Nginx). " ++
+                    "Change [server].port or [censorship].mask_port so they differ.",
+                .{ self.port, self.mask_port },
+            );
+        }
         if (self.use_middle_proxy and self.middleproxy_buffer_kb < 1024) {
             const log = std.log.scoped(.config);
             log.warn(
