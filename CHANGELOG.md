@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.1](https://github.com/sleep3r/mtproto.zig/compare/v0.20.0...v0.20.1) (2026-04-25)
+
+
+### Bug Fixes
+
+* resolve dashboard config parsing, UV installation, port conflicts, and Grafana dashboard ([#215](https://github.com/sleep3r/mtproto.zig/issues/215)) ([e5f77e6](https://github.com/sleep3r/mtproto.zig/commit/e5f77e669a1ceb6a81564a4fd1abe180e7832faf))
+
 ## [0.20.0](https://github.com/sleep3r/mtproto.zig/compare/v0.19.3...v0.20.0) (2026-04-22)
 
 
