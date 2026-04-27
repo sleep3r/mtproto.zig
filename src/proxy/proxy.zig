@@ -3330,8 +3330,7 @@ const EventLoop = struct {
                     tg_ip_v4_opt = tg_ip_v4;
 
                     if (self.state.middle_proxy_nat_ip4) |nat_ip| {
-                        const my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
-                        my_ip_v4_opt = my_ip_v4;
+                        my_ip_v4_opt = nat_ip;
                         middle_local_addr = net.Address.initIp4(nat_ip, local_port);
                     }
 
@@ -4466,10 +4465,6 @@ fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
 
 fn formatIpv4Bytes(ip: [4]u8, buf: *[16]u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?.?.?.?";
-}
-
-fn ipv4NetworkToHostBytes(ip: [4]u8) [4]u8 {
-    return .{ ip[3], ip[2], ip[1], ip[0] };
 }
 
 fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
