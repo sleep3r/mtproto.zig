@@ -233,9 +233,9 @@ const en_strings = [_][]const u8{
 
     // ── Tunnel ──
     // tunnel_conf_prompt
-    "VPN config file path",
+    "VPN config or share link",
     // tunnel_conf_help
-    "Path to your .conf file from VPN app or provider.",
+    "Path to a .conf file, or an Amnezia vpn:// share link.",
 
     // ── Install ──
     // install_header
@@ -464,9 +464,9 @@ const ru_strings = [_][]const u8{
 
     // ── Tunnel ──
     // tunnel_conf_prompt
-    "Путь к конфигурации VPN",
+    "Конфигурация VPN или ссылка",
     // tunnel_conf_help
-    "Путь к .conf файлу от VPN-приложения или провайдера.",
+    "Путь к .conf файлу или ссылка vpn:// из Amnezia.",
 
     // ── Install ──
     // install_header

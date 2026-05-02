@@ -22,7 +22,7 @@ const TUNNEL_MARK: u32 = 200;
 const TUNNEL_TABLE: u32 = 200;
 
 pub const TunnelOpts = struct {
-    awg_conf: []const u8 = "",
+    awg_source: []const u8 = "",
 };
 
 const AwgConfigKind = enum {
@@ -42,12 +42,12 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
         }
 
         if (arg.len > 0 and arg[0] != '-') {
-            opts.awg_conf = arg;
+            opts.awg_source = arg;
         }
     }
 
-    if (opts.awg_conf.len == 0) {
-        ui.fail("Usage: mtbuddy setup tunnel <vpn-config.conf>");
+    if (opts.awg_source.len == 0) {
+        ui.fail("Usage: mtbuddy setup tunnel <conf-path-or-vpn-link>");
         return;
     }
 
@@ -58,8 +58,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterato
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     ui.section(i18n.get(ui.lang, .menu_setup_tunnel));
 
-    var conf_buf: [512]u8 = undefined;
-    const conf_path = try ui.input(
+    var conf_buf: [16 * 1024]u8 = undefined;
+    const conf_source = try ui.input(
         i18n.get(ui.lang, .tunnel_conf_prompt),
         i18n.get(ui.lang, .tunnel_conf_help),
         null,
@@ -71,7 +71,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         return;
     }
 
-    try execute(ui, allocator, .{ .awg_conf = conf_path });
+    try execute(ui, allocator, .{ .awg_source = conf_source });
 }
 
 fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
@@ -80,8 +80,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         return;
     }
 
-    if (!sys.fileExists(opts.awg_conf)) {
-        ui.fail("Config file not found");
+    const awg_source = std.mem.trim(u8, opts.awg_source, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (awg_source.len == 0) {
+        ui.fail("VPN config source is empty");
         return;
     }
     if (!sys.fileExists(INSTALL_DIR ++ "/mtproto-proxy")) {
@@ -106,12 +107,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     ui.step("Installing AmneziaWG config...");
     _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/amnezia" }) catch {};
     _ = sys.exec(allocator, &.{ "mkdir", "-p", AWG_CONF_DIR }) catch {};
-    _ = sys.execForward(&.{ "cp", opts.awg_conf, AWG_CONFIG_PATH }) catch {};
-    _ = sys.exec(allocator, &.{ "chmod", "600", AWG_CONFIG_PATH }) catch {};
-    _ = sys.execForward(&.{ "ln", "-sfn", AWG_CONFIG_PATH, AWG_IFACE_CONF_PATH }) catch {};
 
-    const config_kind = normalizeAwgConfig(allocator, AWG_CONFIG_PATH) catch |err| {
+    const config_kind = installAwgConfigSource(allocator, awg_source, AWG_CONFIG_PATH) catch |err| {
         switch (err) {
+            error.ConfigSourceNotFound => ui.fail("Config file not found"),
             error.UnsupportedConfigFormat => ui.fail("Unsupported VPN config format. Use a WireGuard/AmneziaWG .conf file, or an Amnezia vpn:// share link."),
             error.InvalidAmneziaVpnLink => ui.fail("Invalid Amnezia vpn:// link. Export/share an AmneziaWG configuration again and retry."),
             error.AwgConfigNotFound => ui.fail("Amnezia vpn:// link does not contain an AmneziaWG configuration."),
@@ -122,6 +121,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     if (config_kind == .amnezia_vpn_link) {
         ui.warn("Converted Amnezia vpn:// link to AmneziaWG config");
     }
+    _ = sys.execForward(&.{ "ln", "-sfn", AWG_CONFIG_PATH, AWG_IFACE_CONF_PATH }) catch {};
 
     const dns_removed = stripAwgDnsLines(allocator, AWG_CONFIG_PATH) catch false;
     if (dns_removed) {
@@ -331,6 +331,33 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         .{ .label = "Tunnel routing is socket-level and explicit", .style = .success },
         .{ .label = "SOCKS5/HTTP upstream stay orthogonal", .style = .success },
     });
+}
+
+fn isAmneziaVpnLinkSource(source: []const u8) bool {
+    const trimmed = std.mem.trim(u8, source, &[_]u8{ ' ', '\t', '\r', '\n' });
+    return std.mem.startsWith(u8, trimmed, "vpn://");
+}
+
+fn installAwgConfigSource(allocator: std.mem.Allocator, source: []const u8, dest_path: []const u8) !AwgConfigKind {
+    const trimmed = std.mem.trim(u8, source, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) return error.ConfigSourceNotFound;
+
+    if (isAmneziaVpnLinkSource(trimmed)) {
+        try sys.writeFileMode(dest_path, trimmed, 0o600);
+    } else {
+        const src_file = std.fs.cwd().openFile(trimmed, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.ConfigSourceNotFound,
+            else => return err,
+        };
+        defer src_file.close();
+
+        const content = try src_file.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        try sys.writeFileMode(dest_path, content, 0o600);
+    }
+
+    return normalizeAwgConfig(allocator, dest_path);
 }
 
 fn normalizeAwgConfig(allocator: std.mem.Allocator, path: []const u8) !AwgConfigKind {
@@ -816,11 +843,11 @@ pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
     return .none;
 }
 
-test "tunnel - converts Amnezia vpn link to AWG config" {
-    const link =
-        "vpn://AAABPXicLY9Ra8IwFIX_Srn4WGoSHZSCD6I-lDEX9Gm0IrG5jkKbliSdG6X_fTdWTiA53wn3JCNo4zhkwJOnIA5AEEiTpwhUnfGqNmgdZMUI6vEN2QiNcv5K0b0mC2MJ87mELCqhyI1He1cVXsrSbLW26Fy0iThLgsRyJYhLW_8oj-_4R1FPhtj-eCazkKf8Y3v6upKNo8X5sPs87l-eLuUi2tBGq5CINnTI4dbU1WvUcAutTdM9UOcyFM-9bMkoOBjdd7XxhPFXtX2DSdW12Xq9CjMhpve3fpg_wkXKZtR31gf2xlPBJpimy_QPWglhtw";
+const test_amnezia_vpn_link =
+    "vpn://AAABPXicLY9Ra8IwFIX_Srn4WGoSHZSCD6I-lDEX9Gm0IrG5jkKbliSdG6X_fTdWTiA53wn3JCNo4zhkwJOnIA5AEEiTpwhUnfGqNmgdZMUI6vEN2QiNcv5K0b0mC2MJ87mELCqhyI1He1cVXsrSbLW26Fy0iThLgsRyJYhLW_8oj-_4R1FPhtj-eCazkKf8Y3v6upKNo8X5sPs87l-eLuUi2tBGq5CINnTI4dbU1WvUcAutTdM9UOcyFM-9bMkoOBjdd7XxhPFXtX2DSdW12Xq9CjMhpve3fpg_wkXKZtR31gf2xlPBJpimy_QPWglhtw";
 
-    const conf = try convertAmneziaVpnLink(std.testing.allocator, link);
+test "tunnel - converts Amnezia vpn link to AWG config" {
+    const conf = try convertAmneziaVpnLink(std.testing.allocator, test_amnezia_vpn_link);
     defer std.testing.allocator.free(conf);
 
     try std.testing.expect(std.mem.indexOf(u8, conf, "[Interface]") != null);
@@ -828,6 +855,24 @@ test "tunnel - converts Amnezia vpn link to AWG config" {
     try std.testing.expect(std.mem.indexOf(u8, conf, "DNS = 1.1.1.1, 8.8.8.8") != null);
     try std.testing.expect(std.mem.indexOf(u8, conf, "MTU = 1280") != null);
     try std.testing.expect(std.mem.indexOf(u8, conf, "ListenPort = 51820") != null);
+}
+
+test "tunnel - installs Amnezia vpn link source directly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dest_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/awg0.conf", .{tmp.sub_path});
+
+    const kind = try installAwgConfigSource(std.testing.allocator, " \n" ++ test_amnezia_vpn_link ++ "\n", dest_path);
+    try std.testing.expectEqual(AwgConfigKind.amnezia_vpn_link, kind);
+
+    const installed = try std.fs.cwd().readFileAlloc(std.testing.allocator, dest_path, 4096);
+    defer std.testing.allocator.free(installed);
+
+    try std.testing.expect(std.mem.indexOf(u8, installed, "vpn://") == null);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "[Interface]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "[Peer]") != null);
 }
 
 test "tunnel - strips empty AWG assignments" {

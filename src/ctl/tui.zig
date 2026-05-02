@@ -165,7 +165,7 @@ pub const Tui = struct {
     in: std.fs.File,
     lang: i18n.Lang,
     is_tty: bool,
-    line_buf: [1024]u8 = undefined,
+    line_buf: [16 * 1024]u8 = undefined,
     orig_termios: ?std.posix.termios = null,
 
     const Self = @This();

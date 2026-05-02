@@ -163,6 +163,7 @@ sudo mtbuddy setup dashboard
 
 # VPN tunnel (for servers where Telegram DCs are blocked)
 sudo mtbuddy setup tunnel /path/to/awg0.conf
+sudo mtbuddy setup tunnel 'vpn://...'
 
 # IPv6 hopping
 sudo mtbuddy ipv6-hop --check
@@ -223,6 +224,8 @@ Client → mtproto-proxy (host namespace)
 
 ```bash
 sudo mtbuddy setup tunnel /path/to/awg0.conf
+# or paste an Amnezia share link directly
+sudo mtbuddy setup tunnel 'vpn://...'
 ```
 
 `mtbuddy` keeps `[general].use_middle_proxy` unchanged and only configures transport (`[upstream].type = "tunnel"`).
