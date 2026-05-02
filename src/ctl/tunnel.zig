@@ -25,6 +25,11 @@ pub const TunnelOpts = struct {
     awg_conf: []const u8 = "",
 };
 
+const AwgConfigKind = enum {
+    native_conf,
+    amnezia_vpn_link,
+};
+
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var opts = TunnelOpts{};
@@ -105,14 +110,37 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     _ = sys.exec(allocator, &.{ "chmod", "600", AWG_CONFIG_PATH }) catch {};
     _ = sys.execForward(&.{ "ln", "-sfn", AWG_CONFIG_PATH, AWG_IFACE_CONF_PATH }) catch {};
 
+    const config_kind = normalizeAwgConfig(allocator, AWG_CONFIG_PATH) catch |err| {
+        switch (err) {
+            error.UnsupportedConfigFormat => ui.fail("Unsupported VPN config format. Use a WireGuard/AmneziaWG .conf file, or an Amnezia vpn:// share link."),
+            error.InvalidAmneziaVpnLink => ui.fail("Invalid Amnezia vpn:// link. Export/share an AmneziaWG configuration again and retry."),
+            error.AwgConfigNotFound => ui.fail("Amnezia vpn:// link does not contain an AmneziaWG configuration."),
+            else => ui.fail("Failed to prepare AmneziaWG config"),
+        }
+        return;
+    };
+    if (config_kind == .amnezia_vpn_link) {
+        ui.warn("Converted Amnezia vpn:// link to AmneziaWG config");
+    }
+
     const dns_removed = stripAwgDnsLines(allocator, AWG_CONFIG_PATH) catch false;
     if (dns_removed) {
         ui.warn("Removed DNS from awg0.conf (host resolver will be used)");
     }
 
+    const empty_removed = stripAwgEmptyAssignments(allocator, AWG_CONFIG_PATH) catch false;
+    if (empty_removed) {
+        ui.warn("Removed empty AmneziaWG parameters from awg0.conf");
+    }
+
     const table_off_added = ensureAwgTableOff(allocator, AWG_CONFIG_PATH) catch false;
     if (table_off_added) {
         ui.warn("Added Table = off to [Interface] in awg0.conf");
+    }
+
+    if (!validateAwgQuickConfig(allocator)) {
+        ui.fail("AmneziaWG config is not accepted by awg-quick. Check that the input is an AWG/WG client config.");
+        return;
     }
 
     ui.ok("Config installed to " ++ AWG_CONFIG_PATH);
@@ -305,6 +333,257 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     });
 }
 
+fn normalizeAwgConfig(allocator: std.mem.Allocator, path: []const u8) !AwgConfigKind {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    const trimmed = std.mem.trim(u8, content, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (std.mem.startsWith(u8, trimmed, "vpn://")) {
+        const converted = convertAmneziaVpnLink(allocator, trimmed) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AwgConfigNotFound => return error.AwgConfigNotFound,
+            else => return error.InvalidAmneziaVpnLink,
+        };
+        defer allocator.free(converted);
+
+        try sys.writeFileMode(path, converted, 0o600);
+        return .amnezia_vpn_link;
+    }
+
+    if (!looksLikeAwgConfig(trimmed)) return error.UnsupportedConfigFormat;
+    return .native_conf;
+}
+
+fn convertAmneziaVpnLink(allocator: std.mem.Allocator, link: []const u8) ![]u8 {
+    const encoded = std.mem.trim(u8, link["vpn://".len..], &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (encoded.len == 0) return error.InvalidAmneziaVpnLink;
+
+    const decoded = decodeVpnBase64(allocator, encoded) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAmneziaVpnLink,
+    };
+    defer allocator.free(decoded);
+    if (decoded.len <= 4) return error.InvalidAmneziaVpnLink;
+
+    var compressed_reader: std.Io.Reader = .fixed(decoded[4..]);
+    var json_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer json_writer.deinit();
+
+    var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .zlib, &decompress_buffer);
+    _ = decompressor.reader.streamRemaining(&json_writer.writer) catch return error.InvalidAmneziaVpnLink;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_writer.written(), .{}) catch return error.InvalidAmneziaVpnLink;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidAmneziaVpnLink,
+    };
+
+    const containers_value = root.get("containers") orelse return error.AwgConfigNotFound;
+    const containers = switch (containers_value) {
+        .array => |array| array,
+        else => return error.AwgConfigNotFound,
+    };
+
+    const dns1 = jsonObjectString(root, "dns1") orelse "";
+    const dns2 = jsonObjectString(root, "dns2") orelse "";
+
+    for (containers.items) |container| {
+        const container_obj = switch (container) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const awg_value = container_obj.get("awg") orelse continue;
+        const awg_obj = switch (awg_value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+
+        const last_config = jsonObjectString(awg_obj, "last_config") orelse continue;
+        return convertAmneziaLastConfig(allocator, last_config, dns1, dns2);
+    }
+
+    return error.AwgConfigNotFound;
+}
+
+fn decodeVpnBase64(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const padding_len = (4 - (encoded.len % 4)) % 4;
+    const padded = try allocator.alloc(u8, encoded.len + padding_len);
+    defer allocator.free(padded);
+
+    @memcpy(padded[0..encoded.len], encoded);
+    @memset(padded[encoded.len..], '=');
+
+    const decoded_len = std.base64.url_safe.Decoder.calcSizeForSlice(padded) catch return error.InvalidAmneziaVpnLink;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+
+    std.base64.url_safe.Decoder.decode(decoded, padded) catch return error.InvalidAmneziaVpnLink;
+    return decoded;
+}
+
+fn convertAmneziaLastConfig(
+    allocator: std.mem.Allocator,
+    last_config_json: []const u8,
+    dns1: []const u8,
+    dns2: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, last_config_json, .{}) catch return error.InvalidAmneziaVpnLink;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidAmneziaVpnLink,
+    };
+
+    const config = jsonObjectString(root, "config") orelse return error.AwgConfigNotFound;
+
+    const primary_replaced = try std.mem.replaceOwned(u8, allocator, config, "$PRIMARY_DNS", dns1);
+    defer allocator.free(primary_replaced);
+
+    var prepared = try std.mem.replaceOwned(u8, allocator, primary_replaced, "$SECONDARY_DNS", dns2);
+    errdefer allocator.free(prepared);
+
+    var value_buf: [64]u8 = undefined;
+    if (jsonObjectText(root, "mtu", &value_buf)) |mtu| {
+        const updated = try setInterfaceKeyInContent(allocator, prepared, "MTU", mtu);
+        allocator.free(prepared);
+        prepared = updated;
+    }
+
+    var port_buf: [64]u8 = undefined;
+    if (jsonObjectText(root, "port", &port_buf)) |port| {
+        const updated = try setInterfaceKeyInContent(allocator, prepared, "ListenPort", port);
+        allocator.free(prepared);
+        prepared = updated;
+    }
+
+    return prepared;
+}
+
+fn jsonObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn jsonObjectText(object: std.json.ObjectMap, key: []const u8, buf: *[64]u8) ?[]const u8 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        .number_string => |s| s,
+        .integer => |i| std.fmt.bufPrint(buf, "{d}", .{i}) catch null,
+        .float => |f| std.fmt.bufPrint(buf, "{d}", .{f}) catch null,
+        else => null,
+    };
+}
+
+fn setInterfaceKeyInContent(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    key: []const u8,
+    value: []const u8,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var in_interface = false;
+    var saw_interface = false;
+    var key_written = false;
+    var wrote_any = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        const is_section = trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']';
+
+        if (is_section and in_interface and !key_written) {
+            try appendConfigLine(allocator, &output, &wrote_any, key, value);
+            key_written = true;
+        }
+
+        if (is_section) {
+            in_interface = std.ascii.eqlIgnoreCase(trimmed, "[Interface]");
+            if (in_interface) saw_interface = true;
+            try appendOriginalLine(allocator, &output, &wrote_any, line);
+            continue;
+        }
+
+        if (in_interface and trimmed.len > 0 and trimmed[0] != '#' and trimmed[0] != ';') {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+                const existing_key = std.mem.trim(u8, trimmed[0..eq_pos], &[_]u8{ ' ', '\t' });
+                if (std.ascii.eqlIgnoreCase(existing_key, key)) {
+                    try appendConfigLine(allocator, &output, &wrote_any, key, value);
+                    key_written = true;
+                    continue;
+                }
+            }
+        }
+
+        try appendOriginalLine(allocator, &output, &wrote_any, line);
+    }
+
+    if (!saw_interface) return error.UnsupportedConfigFormat;
+    if (in_interface and !key_written) {
+        try appendConfigLine(allocator, &output, &wrote_any, key, value);
+    }
+
+    return try output.toOwnedSlice(allocator);
+}
+
+fn appendOriginalLine(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    wrote_any: *bool,
+    line: []const u8,
+) !void {
+    if (wrote_any.*) try output.append(allocator, '\n');
+    try output.appendSlice(allocator, line);
+    wrote_any.* = true;
+}
+
+fn appendConfigLine(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    wrote_any: *bool,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (wrote_any.*) try output.append(allocator, '\n');
+    try output.writer(allocator).print("{s} = {s}", .{ key, value });
+    wrote_any.* = true;
+}
+
+fn looksLikeAwgConfig(content: []const u8) bool {
+    var has_interface = false;
+    var has_peer = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        if (std.ascii.eqlIgnoreCase(trimmed, "[Interface]")) {
+            has_interface = true;
+        } else if (std.ascii.eqlIgnoreCase(trimmed, "[Peer]")) {
+            has_peer = true;
+        }
+    }
+
+    return has_interface and has_peer;
+}
+
+fn validateAwgQuickConfig(allocator: std.mem.Allocator) bool {
+    const result = sys.exec(allocator, &.{ "awg-quick", "strip", AWG_CONFIG_PATH }) catch return false;
+    defer result.deinit();
+    return result.exit_code == 0;
+}
+
 fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
     defer doc.deinit();
@@ -341,6 +620,53 @@ fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
             if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
                 const key = std.mem.trim(u8, trimmed[0..eq_pos], &[_]u8{ ' ', '\t' });
                 if (std.ascii.eqlIgnoreCase(key, "DNS")) {
+                    skip = true;
+                }
+            }
+        }
+
+        if (skip) {
+            removed_any = true;
+            continue;
+        }
+
+        if (wrote_any) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, line);
+        wrote_any = true;
+    }
+
+    if (!removed_any) return false;
+
+    const sanitized = try output.toOwnedSlice(allocator);
+    defer allocator.free(sanitized);
+
+    try sys.writeFileMode(path, sanitized, 0o600);
+    return true;
+}
+
+fn stripAwgEmptyAssignments(allocator: std.mem.Allocator, path: []const u8) !bool {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var removed_any = false;
+    var wrote_any = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+
+        var skip = false;
+        if (trimmed.len > 0 and trimmed[0] != '#' and trimmed[0] != ';') {
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+                const key = std.mem.trim(u8, trimmed[0..eq_pos], &[_]u8{ ' ', '\t' });
+                const value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
+                if (key.len > 0 and value.len == 0) {
                     skip = true;
                 }
             }
@@ -488,4 +814,51 @@ pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
     }
 
     return .none;
+}
+
+test "tunnel - converts Amnezia vpn link to AWG config" {
+    const link =
+        "vpn://AAABPXicLY9Ra8IwFIX_Srn4WGoSHZSCD6I-lDEX9Gm0IrG5jkKbliSdG6X_fTdWTiA53wn3JCNo4zhkwJOnIA5AEEiTpwhUnfGqNmgdZMUI6vEN2QiNcv5K0b0mC2MJ87mELCqhyI1He1cVXsrSbLW26Fy0iThLgsRyJYhLW_8oj-_4R1FPhtj-eCazkKf8Y3v6upKNo8X5sPs87l-eLuUi2tBGq5CINnTI4dbU1WvUcAutTdM9UOcyFM-9bMkoOBjdd7XxhPFXtX2DSdW12Xq9CjMhpve3fpg_wkXKZtR31gf2xlPBJpimy_QPWglhtw";
+
+    const conf = try convertAmneziaVpnLink(std.testing.allocator, link);
+    defer std.testing.allocator.free(conf);
+
+    try std.testing.expect(std.mem.indexOf(u8, conf, "[Interface]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conf, "[Peer]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conf, "DNS = 1.1.1.1, 8.8.8.8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conf, "MTU = 1280") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conf, "ListenPort = 51820") != null);
+}
+
+test "tunnel - strips empty AWG assignments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const name = "awg0.conf";
+    try tmp.dir.writeFile(.{
+        .sub_path = name,
+        .data =
+        \\[Interface]
+        \\PrivateKey = key
+        \\I2 =
+        \\I3 =
+        \\Jc = 6
+        \\
+        \\[Peer]
+        \\PublicKey = peer
+        \\
+        ,
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+
+    try std.testing.expect(try stripAwgEmptyAssignments(std.testing.allocator, path));
+
+    const sanitized = try tmp.dir.readFileAlloc(std.testing.allocator, path, 4096);
+    defer std.testing.allocator.free(sanitized);
+
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "I2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "I3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "Jc = 6") != null);
 }

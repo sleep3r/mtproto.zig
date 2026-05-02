@@ -112,6 +112,14 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const ctl_tests = b.addTest(.{
+        .root_module = ctl_mod,
+    });
+
+    const run_ctl_tests = b.addRunArtifact(ctl_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_ctl_tests.step);
 }
