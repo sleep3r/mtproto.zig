@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.2](https://github.com/sleep3r/mtproto.zig/compare/v0.20.1...v0.20.2) (2026-05-02)
+
+
+### Bug Fixes
+
+* support Amnezia vpn links in tunnel setup ([#220](https://github.com/sleep3r/mtproto.zig/issues/220)) ([0017d2c](https://github.com/sleep3r/mtproto.zig/commit/0017d2cc9fbac2c3cfb3c566950425752e16cfbd))
+
 ## [0.20.1](https://github.com/sleep3r/mtproto.zig/compare/v0.20.0...v0.20.1) (2026-04-25)
 
 
