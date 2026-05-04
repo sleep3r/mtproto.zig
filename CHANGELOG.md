@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.4](https://github.com/sleep3r/mtproto.zig/compare/v0.20.3...v0.20.4) (2026-05-04)
+
+
+### Bug Fixes
+
+* **tunnel:** fail fast on AWG install errors and clarify PPA outages ([#226](https://github.com/sleep3r/mtproto.zig/issues/226)) ([a2ad347](https://github.com/sleep3r/mtproto.zig/commit/a2ad3478531bacb4e7cded8bd2dcc73422f57423))
+
 ## [0.20.3](https://github.com/sleep3r/mtproto.zig/compare/v0.20.2...v0.20.3) (2026-05-02)
 
 
