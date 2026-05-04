@@ -1,11 +1,13 @@
 //! Shared GitHub Releases helpers for install and update commands.
 //!
 //! Centralises tag resolution, artifact download with architecture-aware
-//! candidate selection, binary validation, and temp-directory cleanup.
+//! candidate selection, checksum verification, binary validation, and
+//! temp-directory cleanup.
 //! Used by both install.zig and update.zig to avoid duplication.
 
 const std = @import("std");
 const sys = @import("sys.zig");
+const build_options = @import("build_options");
 
 // ── Shared constants ────────────────────────────────────────────
 
@@ -16,6 +18,7 @@ pub const SERVICE_NAME = "mtproto-proxy";
 pub const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
 
 const RELEASES_API = "https://api.github.com/repos/" ++ REPO_OWNER ++ "/" ++ REPO_NAME ++ "/releases/latest";
+const MINISIGN_PUBKEY = build_options.minisign_pubkey;
 
 // ── Result types ────────────────────────────────────────────────
 
@@ -117,28 +120,25 @@ pub fn downloadProxyArtifact(
     artifact.extract_dir_len = extract_dir.len;
 
     _ = sys.exec(allocator, &.{ "rm", "-rf", extract_dir }) catch {};
-    _ = sys.exec(allocator, &.{ "mkdir", "-p", extract_dir }) catch {};
+    const mk = sys.exec(allocator, &.{ "mkdir", "-p", extract_dir }) catch return false;
+    defer mk.deinit();
+    if (mk.exit_code != 0) return false;
 
     // ── Try each candidate ──
     for (candidates) |candidate| {
-        var url_buf: [512]u8 = undefined;
-        const url = std.fmt.bufPrint(
-            &url_buf,
-            "https://github.com/{s}/{s}/releases/download/{s}/{s}.tar.gz",
-            .{ REPO_OWNER, REPO_NAME, tag, candidate },
-        ) catch continue;
+        var tar_name_buf: [192]u8 = undefined;
+        const tar_name = std.fmt.bufPrint(&tar_name_buf, "{s}.tar.gz", .{candidate}) catch continue;
 
         const dl_path = std.fmt.bufPrint(
             &artifact.dl_path_buf,
-            "/tmp/{s}.tar.gz",
-            .{candidate},
+            "{s}/{s}",
+            .{ extract_dir, tar_name },
         ) catch continue;
         artifact.dl_path_len = dl_path.len;
 
-        // Download
-        const dl = sys.exec(allocator, &.{ "curl", "-fsSL", url, "-o", dl_path }) catch continue;
-        defer dl.deinit();
-        if (dl.exit_code != 0) continue;
+        // Download + checksum verify
+        if (!downloadReleaseFile(allocator, tag, tar_name, dl_path)) continue;
+        if (!verifyReleaseChecksum(allocator, tag, tar_name, dl_path, extract_dir)) continue;
 
         // Extract
         const tar_exit = sys.execForward(&.{ "tar", "-xzf", dl_path, "-C", extract_dir }) catch continue;
@@ -191,18 +191,15 @@ pub fn downloadBuddyArtifact(
     var name_buf: [128]u8 = undefined;
     const buddy_name = std.fmt.bufPrint(&name_buf, "mtbuddy{s}", .{suffix}) catch return null;
 
-    var url_buf: [512]u8 = undefined;
-    const url = std.fmt.bufPrint(
-        &url_buf,
-        "https://github.com/{s}/{s}/releases/download/{s}/{s}.tar.gz",
-        .{ REPO_OWNER, REPO_NAME, tag, buddy_name },
-    ) catch return null;
+    var tar_name_buf: [192]u8 = undefined;
+    const tar_name = std.fmt.bufPrint(&tar_name_buf, "{s}.tar.gz", .{buddy_name}) catch return null;
 
-    const dl = sys.exec(allocator, &.{ "curl", "-fsSL", url, "-o", "/tmp/mtbuddy.tar.gz" }) catch return null;
-    defer dl.deinit();
-    if (dl.exit_code != 0) return null;
+    var dl_path_buf: [320]u8 = undefined;
+    const dl_path = std.fmt.bufPrint(&dl_path_buf, "{s}/{s}", .{ extract_dir, tar_name }) catch return null;
+    if (!downloadReleaseFile(allocator, tag, tar_name, dl_path)) return null;
+    if (!verifyReleaseChecksum(allocator, tag, tar_name, dl_path, extract_dir)) return null;
 
-    const tar_exit = sys.execForward(&.{ "tar", "-xzf", "/tmp/mtbuddy.tar.gz", "-C", extract_dir }) catch return null;
+    const tar_exit = sys.execForward(&.{ "tar", "-xzf", dl_path, "-C", extract_dir }) catch return null;
     if (tar_exit != 0) return null;
 
     const bin_path = std.fmt.bufPrint(out_buf, "{s}/{s}", .{ extract_dir, buddy_name }) catch return null;
@@ -261,8 +258,6 @@ pub fn cleanup(allocator: std.mem.Allocator, artifact: *const Artifact) void {
     if (artifact.dl_path_len > 0) {
         _ = sys.exec(allocator, &.{ "rm", "-f", artifact.dlPath() }) catch {};
     }
-    // Clean up buddy tarball if it was downloaded
-    _ = sys.exec(allocator, &.{ "rm", "-f", "/tmp/mtbuddy.tar.gz" }) catch {};
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -275,6 +270,124 @@ fn resolveLatest(allocator: std.mem.Allocator, tag: *Tag) bool {
     const n = @min(parsed.len, tag.buf.len);
     @memcpy(tag.buf[0..n], parsed[0..n]);
     tag.len = n;
+    return true;
+}
+
+fn downloadReleaseFile(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    file_name: []const u8,
+    out_path: []const u8,
+) bool {
+    var url_buf: [512]u8 = undefined;
+    const url = std.fmt.bufPrint(
+        &url_buf,
+        "https://github.com/{s}/{s}/releases/download/{s}/{s}",
+        .{ REPO_OWNER, REPO_NAME, tag, file_name },
+    ) catch return false;
+    const dl = sys.exec(allocator, &.{ "curl", "-fsSL", url, "-o", out_path }) catch return false;
+    defer dl.deinit();
+    return dl.exit_code == 0;
+}
+
+fn verifyReleaseChecksum(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    tar_name: []const u8,
+    tar_path: []const u8,
+    work_dir: []const u8,
+) bool {
+    var checksum_name_buf: [224]u8 = undefined;
+    const checksum_name = std.fmt.bufPrint(&checksum_name_buf, "{s}.sha256", .{tar_name}) catch return false;
+
+    var checksum_path_buf: [320]u8 = undefined;
+    const checksum_path = std.fmt.bufPrint(&checksum_path_buf, "{s}/{s}", .{ work_dir, checksum_name }) catch return false;
+    if (!downloadReleaseFile(allocator, tag, checksum_name, checksum_path)) return false;
+    if (minisignVerificationEnabled()) {
+        var sig_name_buf: [256]u8 = undefined;
+        const sig_name = std.fmt.bufPrint(&sig_name_buf, "{s}.minisig", .{checksum_name}) catch return false;
+
+        var sig_path_buf: [352]u8 = undefined;
+        const sig_path = std.fmt.bufPrint(&sig_path_buf, "{s}/{s}", .{ work_dir, sig_name }) catch return false;
+        if (!downloadReleaseFile(allocator, tag, sig_name, sig_path)) return false;
+        if (!verifyMinisignSignature(allocator, checksum_path, sig_path)) return false;
+    }
+
+    var expected_buf: [64]u8 = undefined;
+    if (!readExpectedSha256(allocator, checksum_path, &expected_buf)) return false;
+    var actual_buf: [64]u8 = undefined;
+    if (!computeSha256Hex(allocator, tar_path, &actual_buf)) return false;
+    return std.ascii.eqlIgnoreCase(expected_buf[0..], actual_buf[0..]);
+}
+
+fn minisignVerificationEnabled() bool {
+    return MINISIGN_PUBKEY.len > 0 and std.mem.startsWith(u8, MINISIGN_PUBKEY, "RW");
+}
+
+pub fn requiresSignatureVerification() bool {
+    return minisignVerificationEnabled();
+}
+
+fn verifyMinisignSignature(
+    allocator: std.mem.Allocator,
+    message_path: []const u8,
+    signature_path: []const u8,
+) bool {
+    if (!sys.commandExists("minisign")) return false;
+    const res = sys.exec(allocator, &.{
+        "minisign",
+        "-V",
+        "-q",
+        "-m",
+        message_path,
+        "-x",
+        signature_path,
+        "-P",
+        MINISIGN_PUBKEY,
+    }) catch return false;
+    defer res.deinit();
+    return res.exit_code == 0;
+}
+
+fn readExpectedSha256(allocator: std.mem.Allocator, checksum_path: []const u8, out: *[64]u8) bool {
+    const r = sys.exec(allocator, &.{ "cat", checksum_path }) catch return false;
+    defer r.deinit();
+    if (r.exit_code != 0) return false;
+
+    var lines = std.mem.splitScalar(u8, r.stdout, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        if (trimmed.len < 64) continue;
+        const hash = trimmed[0..64];
+        if (!isHexString(hash)) continue;
+        @memcpy(out[0..], hash);
+        return true;
+    }
+    return false;
+}
+
+fn computeSha256Hex(allocator: std.mem.Allocator, file_path: []const u8, out: *[64]u8) bool {
+    if (readShaOutput(allocator, &.{ "sha256sum", file_path }, out)) return true;
+    if (readShaOutput(allocator, &.{ "shasum", "-a", "256", file_path }, out)) return true;
+    return false;
+}
+
+fn readShaOutput(allocator: std.mem.Allocator, argv: []const []const u8, out: *[64]u8) bool {
+    const r = sys.exec(allocator, argv) catch return false;
+    defer r.deinit();
+    if (r.exit_code != 0) return false;
+
+    var tokens = std.mem.tokenizeAny(u8, r.stdout, " \t\r\n");
+    const first = tokens.next() orelse return false;
+    if (first.len != 64 or !isHexString(first)) return false;
+    @memcpy(out[0..], first[0..64]);
+    return true;
+}
+
+fn isHexString(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
     return true;
 }
 

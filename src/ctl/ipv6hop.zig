@@ -15,6 +15,22 @@ const Color = tui_mod.Color;
 const SummaryLine = tui_mod.SummaryLine;
 
 const PROXY_SERVICE = "mtproto-proxy";
+const CLOUDFLARE_ENV_PATH = "/opt/mtproto-proxy/.env";
+
+const CloudflareRecordType = enum {
+    a,
+    aaaa,
+};
+
+const CloudflareCredentials = struct {
+    token: []const u8,
+    zone: []const u8,
+
+    fn deinit(self: *const CloudflareCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.token);
+        allocator.free(self.zone);
+    }
+};
 
 fn sleepSeconds(seconds: u64) void {
     const req: std.posix.timespec = .{
@@ -215,55 +231,30 @@ fn addNewIpv6(allocator: std.mem.Allocator, prefix: []const u8, interface: []con
 
 fn countRecentTimeouts(allocator: std.mem.Allocator) u32 {
     const r = sys.exec(allocator, &.{
-        "bash",                                                                                                                             "-c",
-        "journalctl -u " ++ PROXY_SERVICE ++ " --since '60 seconds ago' --no-pager -q 2>/dev/null | grep -c 'Handshake timeout' || echo 0",
+        "journalctl",
+        "-u",
+        PROXY_SERVICE,
+        "--since",
+        "60 seconds ago",
+        "--no-pager",
+        "-q",
     }) catch return 0;
     defer r.deinit();
-    const trimmed = std.mem.trim(u8, r.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-    return std.fmt.parseInt(u32, trimmed, 10) catch 0;
+
+    var count: u32 = 0;
+    var lines = std.mem.splitScalar(u8, r.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "Handshake timeout") != null) {
+            count +|= 1;
+        }
+    }
+    return count;
 }
 
 fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_name: []const u8) void {
-    // Load CF credentials: check env first, then .env file
-    const cf_token = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_TOKEN") orelse {
-        ui.warn("CF_TOKEN not set — skipping DNS update");
-        return;
-    };
-    const cf_zone = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_ZONE") orelse {
-        ui.warn("CF_ZONE not set — skipping DNS update");
-        return;
-    };
-
-    if (cf_token.len == 0 or cf_zone.len == 0) {
-        ui.warn("CF_TOKEN or CF_ZONE empty — skipping DNS update");
-        return;
+    if (updateCloudflareRecord(ui, allocator, .aaaa, dns_name, new_ip, 30)) {
+        ui.ok("DNS AAAA record updated");
     }
-
-    // Get record ID
-    var get_cmd_buf: [512]u8 = undefined;
-    const get_cmd = std.fmt.bufPrint(&get_cmd_buf, "curl -s -X GET 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type=AAAA&name={s}' " ++
-        "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' | " ++
-        "grep -oE '\"id\":\"[^\"]+\"' | head -1 | cut -d'\"' -f4", .{ cf_zone, dns_name, cf_token }) catch return;
-
-    const id_result = sys.exec(allocator, &.{ "bash", "-c", get_cmd }) catch return;
-    defer id_result.deinit();
-    const record_id = std.mem.trim(u8, id_result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-
-    // Create or update
-    var dns_cmd_buf: [1024]u8 = undefined;
-    if (record_id.len == 0) {
-        const dns_cmd = std.fmt.bufPrint(&dns_cmd_buf, "curl -s -X POST 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records' " ++
-            "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"AAAA\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":30,\"proxied\":false}}' > /dev/null", .{ cf_zone, cf_token, dns_name, new_ip }) catch return;
-        _ = sys.exec(allocator, &.{ "bash", "-c", dns_cmd }) catch {};
-    } else {
-        const dns_cmd = std.fmt.bufPrint(&dns_cmd_buf, "curl -s -X PUT 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}' " ++
-            "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"AAAA\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":30,\"proxied\":false}}' > /dev/null", .{ cf_zone, record_id, cf_token, dns_name, new_ip }) catch return;
-        _ = sys.exec(allocator, &.{ "bash", "-c", dns_cmd }) catch {};
-    }
-
-    ui.ok("DNS AAAA record updated");
 }
 
 /// Update DNS A record (from update_dns.sh).
@@ -275,39 +266,249 @@ pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Arg
 
     const dns_name = "proxy.sleep3r.ru";
 
-    // Load .env natively (child shell env doesn't propagate to parent)
-    const cf_token = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_TOKEN") orelse {
-        ui.warn("CF_TOKEN not set — skipping DNS update");
-        return;
-    };
-    const cf_zone = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_ZONE") orelse {
-        ui.warn("CF_ZONE not set — skipping DNS update");
-        return;
-    };
-
     ui.step("Updating DNS A record...");
+    if (!updateCloudflareRecord(ui, allocator, .a, dns_name, new_ip, 60)) return;
+    ui.ok("DNS A record updated successfully");
+}
 
-    var get_buf: [512]u8 = undefined;
-    const get_cmd = std.fmt.bufPrint(&get_buf, "curl -s -X GET 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type=A&name={s}' " ++
-        "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' | " ++
-        "grep -oE '\"id\":\"[^\"]+\"' | head -1 | cut -d'\"' -f4", .{ cf_zone, dns_name, cf_token }) catch return;
+fn updateCloudflareRecord(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    record_type: CloudflareRecordType,
+    dns_name: []const u8,
+    new_ip: []const u8,
+    ttl: u16,
+) bool {
+    const creds = loadCloudflareCredentials(ui, allocator) orelse return false;
+    defer creds.deinit(allocator);
 
-    const id_r = sys.exec(allocator, &.{ "bash", "-c", get_cmd }) catch return;
-    defer id_r.deinit();
-    const record_id = std.mem.trim(u8, id_r.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    const header_file = createCloudflareHeaderFile(allocator, creds.token) catch {
+        ui.warn("Failed to prepare Cloudflare auth headers");
+        return false;
+    };
+    defer allocator.free(header_file);
+    defer deleteFileBestEffort(header_file);
 
-    var cmd_buf: [1024]u8 = undefined;
-    if (record_id.len == 0) {
-        const cmd = std.fmt.bufPrint(&cmd_buf, "curl -s -X POST 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records' " ++
-            "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"A\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":60,\"proxied\":false}}' > /dev/null", .{ cf_zone, cf_token, dns_name, new_ip }) catch return;
-        _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
-    } else {
-        const cmd = std.fmt.bufPrint(&cmd_buf, "curl -s -X PUT 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}' " ++
-            "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"A\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":60,\"proxied\":false}}' > /dev/null", .{ cf_zone, record_id, cf_token, dns_name, new_ip }) catch return;
-        _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
+    const maybe_record_id = findCloudflareRecordId(allocator, creds.zone, dns_name, record_type, header_file) catch {
+        ui.warn("Cloudflare DNS lookup failed");
+        return false;
+    };
+    defer if (maybe_record_id) |record_id| allocator.free(record_id);
+
+    const payload = std.json.Stringify.valueAlloc(allocator, .{
+        .type = cloudflareRecordTypeText(record_type),
+        .name = dns_name,
+        .content = new_ip,
+        .ttl = ttl,
+        .proxied = false,
+    }, .{}) catch {
+        ui.warn("Failed to prepare Cloudflare DNS request body");
+        return false;
+    };
+    defer allocator.free(payload);
+
+    const url = if (maybe_record_id) |record_id|
+        std.fmt.allocPrint(allocator, "https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}", .{ creds.zone, record_id }) catch {
+            ui.warn("Failed to prepare Cloudflare DNS request URL");
+            return false;
+        }
+    else
+        std.fmt.allocPrint(allocator, "https://api.cloudflare.com/client/v4/zones/{s}/dns_records", .{creds.zone}) catch {
+            ui.warn("Failed to prepare Cloudflare DNS request URL");
+            return false;
+        };
+    defer allocator.free(url);
+
+    const method = if (maybe_record_id != null) "PUT" else "POST";
+    var response = curlJsonRequest(allocator, method, url, header_file, payload) catch {
+        ui.warn("Cloudflare DNS update request failed");
+        return false;
+    };
+    defer response.deinit();
+
+    if (response.exit_code != 0) {
+        ui.warn("Cloudflare DNS update command exited with non-zero status");
+        return false;
+    }
+    if (!cloudflareResponseSuccess(allocator, response.stdout)) {
+        ui.warn("Cloudflare API returned an unsuccessful response");
+        return false;
+    }
+    return true;
+}
+
+fn loadCloudflareCredentials(ui: *Tui, allocator: std.mem.Allocator) ?CloudflareCredentials {
+    const token = sys.readEnvFile(allocator, CLOUDFLARE_ENV_PATH, "CF_TOKEN") orelse {
+        ui.warn("CF_TOKEN not set — skipping DNS update");
+        return null;
+    };
+    errdefer allocator.free(token);
+
+    const zone = sys.readEnvFile(allocator, CLOUDFLARE_ENV_PATH, "CF_ZONE") orelse {
+        ui.warn("CF_ZONE not set — skipping DNS update");
+        return null;
+    };
+    errdefer allocator.free(zone);
+
+    if (token.len == 0 or zone.len == 0) {
+        ui.warn("CF_TOKEN or CF_ZONE empty — skipping DNS update");
+        return null;
     }
 
-    ui.ok("DNS A record updated successfully");
+    return .{
+        .token = token,
+        .zone = zone,
+    };
+}
+
+fn createCloudflareHeaderFile(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    var rand_bytes: [8]u8 = undefined;
+    if (!fillRandom(&rand_bytes)) return error.RandomUnavailable;
+
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/mtbuddy-cf-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}.headers",
+        .{
+            rand_bytes[0],
+            rand_bytes[1],
+            rand_bytes[2],
+            rand_bytes[3],
+            rand_bytes[4],
+            rand_bytes[5],
+            rand_bytes[6],
+            rand_bytes[7],
+        },
+    );
+    errdefer allocator.free(path);
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "Authorization: Bearer {s}\nContent-Type: application/json\n",
+        .{token},
+    );
+    defer allocator.free(content);
+
+    try sys.writeFileMode(path, content, 0o600);
+    return path;
+}
+
+fn deleteFileBestEffort(path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+}
+
+fn curlJsonRequest(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    url: []const u8,
+    header_file: []const u8,
+    payload: []const u8,
+) !sys.ExecResult {
+    const header_arg = try std.fmt.allocPrint(allocator, "@{s}", .{header_file});
+    defer allocator.free(header_arg);
+    return sys.exec(allocator, &.{
+        "curl",
+        "-fsS",
+        "-X",
+        method,
+        url,
+        "-H",
+        header_arg,
+        "--data",
+        payload,
+    });
+}
+
+fn curlGetRequest(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    header_file: []const u8,
+) !sys.ExecResult {
+    const header_arg = try std.fmt.allocPrint(allocator, "@{s}", .{header_file});
+    defer allocator.free(header_arg);
+    return sys.exec(allocator, &.{
+        "curl",
+        "-fsS",
+        "-X",
+        "GET",
+        url,
+        "-H",
+        header_arg,
+    });
+}
+
+fn findCloudflareRecordId(
+    allocator: std.mem.Allocator,
+    zone: []const u8,
+    dns_name: []const u8,
+    record_type: CloudflareRecordType,
+    header_file: []const u8,
+) !?[]u8 {
+    const query_url = try std.fmt.allocPrint(
+        allocator,
+        "https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type={s}&name={s}",
+        .{ zone, cloudflareRecordTypeText(record_type), dns_name },
+    );
+    defer allocator.free(query_url);
+
+    var response = try curlGetRequest(allocator, query_url, header_file);
+    defer response.deinit();
+    if (response.exit_code != 0) return error.CloudflareRequestFailed;
+
+    return cloudflareExtractRecordId(allocator, response.stdout);
+}
+
+fn cloudflareRecordTypeText(record_type: CloudflareRecordType) []const u8 {
+    return switch (record_type) {
+        .a => "A",
+        .aaaa => "AAAA",
+    };
+}
+
+fn cloudflareExtractRecordId(allocator: std.mem.Allocator, response_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+    const result_value = root.get("result") orelse return null;
+
+    return switch (result_value) {
+        .array => |arr| blk: {
+            if (arr.items.len == 0) break :blk null;
+            const first = switch (arr.items[0]) {
+                .object => |obj| obj,
+                else => break :blk null,
+            };
+            const id_value = first.get("id") orelse break :blk null;
+            break :blk switch (id_value) {
+                .string => |id| allocator.dupe(u8, id) catch null,
+                else => null,
+            };
+        },
+        .object => |obj| blk: {
+            const id_value = obj.get("id") orelse break :blk null;
+            break :blk switch (id_value) {
+                .string => |id| allocator.dupe(u8, id) catch null,
+                else => null,
+            };
+        },
+        else => null,
+    };
+}
+
+fn cloudflareResponseSuccess(allocator: std.mem.Allocator, response_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_json, .{}) catch return false;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const success_value = root.get("success") orelse return false;
+    return switch (success_value) {
+        .bool => |ok| ok,
+        else => false,
+    };
 }

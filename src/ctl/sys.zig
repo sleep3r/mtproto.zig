@@ -201,7 +201,7 @@ pub fn execSilent(allocator: std.mem.Allocator, argv: []const []const u8) void {
     result.deinit();
 }
 
-/// Write content to a file atomically. Avoids shell injection from bash -c.
+/// Write content to a file path. Avoids shell injection from bash -c.
 pub fn writeFile(path: []const u8, content: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io(), .{
         .sub_path = path,

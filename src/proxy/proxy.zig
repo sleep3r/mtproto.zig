@@ -291,7 +291,7 @@ const ConnectionSlot = struct {
     mp_frame_first_decrypted: bool = false,
 
     // Non-blocking proxy handshake state (SOCKS5 / HTTP CONNECT)
-    proxy_handshake_buf: [1024]u8 = undefined,
+    proxy_handshake_buf: [http_connect.max_response_size]u8 = undefined,
     proxy_handshake_pos: u16 = 0,
     proxy_handshake_len: u16 = 0,
     proxy_target_addr: ?Address = null,
@@ -524,24 +524,30 @@ pub const ProxyState = struct {
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
+    middle_proxy_updater_shutdown: std.atomic.Value(bool),
+    middle_proxy_updater_thread: ?std.Thread,
     upstream: upstream_mod.Upstream,
     tunnel_info: tunnel_mod.Tunnel,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
+    pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
+        if (cfg.users.count() == 0) return error.NoUsersConfigured;
+
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
+        errdefer secrets.deinit(allocator);
         var user_metrics: std.ArrayList(UserMetrics) = .empty;
+        errdefer user_metrics.deinit(allocator);
         var it = @constCast(&cfg.users).iterator();
         while (it.next()) |entry| {
-            secrets.append(allocator, .{
+            try secrets.append(allocator, .{
                 .name = entry.key_ptr.*,
                 .secret = entry.value_ptr.*,
-            }) catch continue;
-            user_metrics.append(allocator, .{
+            });
+            try user_metrics.append(allocator, .{
                 .name = entry.key_ptr.*,
                 .connections_active = std.atomic.Value(u32).init(0),
                 .client_to_upstream_bytes_total = std.atomic.Value(u64).init(0),
                 .upstream_to_client_bytes_total = std.atomic.Value(u64).init(0),
-            }) catch continue;
+            });
         }
 
         var resolved_addr: ?Address = null;
@@ -607,11 +613,16 @@ pub const ProxyState = struct {
             }
         }
 
+        const user_secrets = try secrets.toOwnedSlice(allocator);
+        errdefer allocator.free(user_secrets);
+        const user_metrics_owned = try user_metrics.toOwnedSlice(allocator);
+        errdefer allocator.free(user_metrics_owned);
+
         return .{
             .allocator = allocator,
             .config = cfg,
-            .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
-            .user_metrics = user_metrics.toOwnedSlice(allocator) catch &.{},
+            .user_secrets = user_secrets,
+            .user_metrics = user_metrics_owned,
             .start_time_seconds = realtimeSeconds(),
             .connection_count = std.atomic.Value(u64).init(0),
             .closed_count = std.atomic.Value(u64).init(0),
@@ -642,6 +653,8 @@ pub const ProxyState = struct {
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
+            .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
+            .middle_proxy_updater_thread = null,
             .upstream = upblk: {
                 switch (cfg.upstream_mode) {
                     .tunnel => break :upblk upstream_mod.Upstream.initDirectWithMark(tunnel_socket_mark),
@@ -649,8 +662,11 @@ pub const ProxyState = struct {
                         if (cfg.upstream_proxy_host) |host| {
                             if (cfg.upstream_proxy_port > 0) {
                                 const proxy_list = getAddressList(allocator, host, cfg.upstream_proxy_port) catch |err| {
-                                    log.err("Failed to resolve SOCKS5 proxy host '{s}:{d}': {any}", .{ host, cfg.upstream_proxy_port, err });
-                                    break :upblk upstream_mod.Upstream.initDirect();
+                                    if (cfg.allow_direct_fallback) {
+                                        log.err("Failed to resolve SOCKS5 proxy host '{s}:{d}': {any}", .{ host, cfg.upstream_proxy_port, err });
+                                        break :upblk upstream_mod.Upstream.initDirect();
+                                    }
+                                    return error.InvalidSocks5UpstreamConfig;
                                 };
                                 defer proxy_list.deinit();
                                 if (proxy_list.addrs.len > 0) {
@@ -663,6 +679,7 @@ pub const ProxyState = struct {
                                 }
                             }
                         }
+                        if (!cfg.allow_direct_fallback) return error.InvalidSocks5UpstreamConfig;
                         log.warn("upstream.type=socks5 but proxy host/port not configured; falling back to direct", .{});
                         break :upblk upstream_mod.Upstream.initDirect();
                     },
@@ -670,8 +687,11 @@ pub const ProxyState = struct {
                         if (cfg.upstream_proxy_host) |host| {
                             if (cfg.upstream_proxy_port > 0) {
                                 const proxy_list = getAddressList(allocator, host, cfg.upstream_proxy_port) catch |err| {
-                                    log.err("Failed to resolve HTTP proxy host '{s}:{d}': {any}", .{ host, cfg.upstream_proxy_port, err });
-                                    break :upblk upstream_mod.Upstream.initDirect();
+                                    if (cfg.allow_direct_fallback) {
+                                        log.err("Failed to resolve HTTP proxy host '{s}:{d}': {any}", .{ host, cfg.upstream_proxy_port, err });
+                                        break :upblk upstream_mod.Upstream.initDirect();
+                                    }
+                                    return error.InvalidHttpUpstreamConfig;
                                 };
                                 defer proxy_list.deinit();
                                 if (proxy_list.addrs.len > 0) {
@@ -684,6 +704,7 @@ pub const ProxyState = struct {
                                 }
                             }
                         }
+                        if (!cfg.allow_direct_fallback) return error.InvalidHttpUpstreamConfig;
                         log.warn("upstream.type=http but proxy host/port not configured; falling back to direct", .{});
                         break :upblk upstream_mod.Upstream.initDirect();
                     },
@@ -719,6 +740,11 @@ pub const ProxyState = struct {
     }
 
     pub fn deinit(self: *ProxyState) void {
+        self.middle_proxy_updater_shutdown.store(true, .release);
+        if (self.middle_proxy_updater_thread) |thread| {
+            thread.join();
+            self.middle_proxy_updater_thread = null;
+        }
         self.allocator.free(self.user_secrets);
         self.allocator.free(self.user_metrics);
     }
@@ -824,8 +850,9 @@ pub const ProxyState = struct {
                 }
             };
 
+            self.middle_proxy_updater_shutdown.store(false, .release);
             if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
-                updater.detach();
+                self.middle_proxy_updater_thread = updater;
             } else |err| {
                 log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
             }
@@ -917,7 +944,7 @@ pub const ProxyState = struct {
         };
         var retry_idx: usize = 0;
         while (retry_idx < short_retries.len) : (retry_idx += 1) {
-            sleepNs(short_retries[retry_idx]);
+            if (self.waitForUpdaterDelay(short_retries[retry_idx])) return;
             if (self.refreshMiddleProxyInfo()) |_| {
                 break;
             } else |err| {
@@ -929,8 +956,8 @@ pub const ProxyState = struct {
             }
         }
 
-        while (true) {
-            sleepNs(middle_proxy_update_period_ns);
+        while (!self.middle_proxy_updater_shutdown.load(.acquire)) {
+            if (self.waitForUpdaterDelay(middle_proxy_update_period_ns)) return;
             self.refreshMiddleProxyInfo() catch |err| {
                 if (isMiddleProxyRefreshNetworkError(err)) {
                     log.info("Middle-proxy refresh unavailable ({s}), keeping current cache", .{@errorName(err)});
@@ -939,6 +966,18 @@ pub const ProxyState = struct {
                 }
             };
         }
+    }
+
+    fn waitForUpdaterDelay(self: *ProxyState, total_ns: u64) bool {
+        const step_ns: u64 = std.time.ns_per_s;
+        var remaining = total_ns;
+        while (remaining > 0) {
+            if (self.middle_proxy_updater_shutdown.load(.acquire)) return true;
+            const chunk = @min(remaining, step_ns);
+            sleepNs(chunk);
+            remaining -= chunk;
+        }
+        return self.middle_proxy_updater_shutdown.load(.acquire);
     }
 
     fn isMiddleProxyRefreshNetworkError(err: anyerror) bool {

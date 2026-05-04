@@ -14,6 +14,7 @@ REPO="sleep3r/mtproto.zig"
 INSTALL_TO="/usr/local/bin/mtbuddy"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+MINISIGN_PUBKEY="${MTPROTO_MINISIGN_PUBKEY:-}"
 
 # ── colour helpers ────────────────────────────────────────────────
 Y='\033[0;33m'; G='\033[0;32m'; R='\033[0;31m'; N='\033[0m'
@@ -73,10 +74,39 @@ ok "Latest release: $TAG"
 # ── download helper ───────────────────────────────────────────────
 download_artifact() {
   local artifact="$1"
-  local url="https://github.com/${REPO}/releases/download/${TAG}/${artifact}.tar.gz"
+  local tar_name="${artifact}.tar.gz"
+  local sha_name="${tar_name}.sha256"
+  local url="https://github.com/${REPO}/releases/download/${TAG}/${tar_name}"
+  local sha_url="https://github.com/${REPO}/releases/download/${TAG}/${sha_name}"
   step "Downloading $artifact"
-  curl -fsSL "$url" -o "$TMP/mtbuddy.tar.gz" || fail "Download failed: $url"
-  tar xzf "$TMP/mtbuddy.tar.gz" -C "$TMP"
+  curl -fsSL "$url" -o "$TMP/${tar_name}" || fail "Download failed: $url"
+  curl -fsSL "$sha_url" -o "$TMP/${sha_name}" || fail "Checksum download failed: $sha_url"
+  if [ -n "$MINISIGN_PUBKEY" ]; then
+    local sig_name="${sha_name}.minisig"
+    local sig_url="https://github.com/${REPO}/releases/download/${TAG}/${sig_name}"
+    curl -fsSL "$sig_url" -o "$TMP/${sig_name}" || fail "Signature download failed: $sig_url"
+    if ! command -v minisign >/dev/null 2>&1; then
+      fail "minisign is required for signature verification (install minisign or unset MTPROTO_MINISIGN_PUBKEY)"
+    fi
+    step "Verifying signature for $artifact"
+    minisign -V -q -m "$TMP/${sha_name}" -x "$TMP/${sig_name}" -P "$MINISIGN_PUBKEY" \
+      || fail "Signature verification failed: $sha_name"
+  fi
+
+  step "Verifying checksum for $artifact"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$TMP" && sha256sum -c "${sha_name}" >/dev/null) || fail "Checksum verification failed: $artifact"
+  elif command -v shasum >/dev/null 2>&1; then
+    local expected actual
+    expected="$(awk '{print $1}' "$TMP/${sha_name}" | head -n1)"
+    [ -n "$expected" ] || fail "Malformed checksum file: ${sha_name}"
+    actual="$(shasum -a 256 "$TMP/${tar_name}" | awk '{print $1}')"
+    [ "$expected" = "$actual" ] || fail "Checksum verification failed: $artifact"
+  else
+    fail "Neither sha256sum nor shasum is available for checksum verification"
+  fi
+
+  tar xzf "$TMP/${tar_name}" -C "$TMP"
   echo "$TMP/$artifact"
 }
 

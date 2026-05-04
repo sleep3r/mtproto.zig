@@ -43,7 +43,17 @@ fn lockFreeLog(
     const level_txt = comptime message_level.asText();
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, level_txt ++ prefix2 ++ format ++ "\n", args) catch return;
+    const msg = std.fmt.bufPrint(&buf, level_txt ++ prefix2 ++ format ++ "\n", args) catch |err| switch (err) {
+        error.NoSpaceLeft => blk: {
+            if (buf.len >= 2) {
+                buf[buf.len - 2] = '\n';
+                buf[buf.len - 1] = 0;
+                break :blk buf[0 .. buf.len - 1];
+            }
+            return;
+        },
+        else => return,
+    };
     linux_io.writeAllFd(std.posix.STDERR_FILENO, msg);
 }
 
@@ -65,13 +75,6 @@ fn writeStderr(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
     linux_io.writeAllFd(std.posix.STDERR_FILENO, slice);
-}
-
-/// Write a hex byte to stdout.
-fn writeHexByte(byte: u8) void {
-    const hex = "0123456789abcdef";
-    const out = [2]u8{ hex[byte >> 4], hex[byte & 0x0f] };
-    linux_io.writeAllFd(std.posix.STDOUT_FILENO, &out);
 }
 
 /// Write raw string to stdout.
@@ -165,34 +168,6 @@ fn detectPublicIpFromServices(
         allocator.free(stdout);
     }
     return null;
-}
-
-fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
-    var required_len: usize = 0;
-    for (server) |c| {
-        required_len += if (c == ':' or c == '[' or c == ']') 3 else 1;
-    }
-
-    // Keep original value if it does not fit to avoid silent truncation.
-    if (required_len > out.len) return server;
-
-    var pos: usize = 0;
-    for (server) |c| {
-        if (c == ':') {
-            @memcpy(out[pos..][0..3], "%3A");
-            pos += 3;
-        } else if (c == '[') {
-            @memcpy(out[pos..][0..3], "%5B");
-            pos += 3;
-        } else if (c == ']') {
-            @memcpy(out[pos..][0..3], "%5D");
-            pos += 3;
-        } else {
-            out[pos] = c;
-            pos += 1;
-        }
-    }
-    return out[0..pos];
 }
 
 const CapacityEstimate = struct {
@@ -325,7 +300,6 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     const cyan = "\x1b[36m";
     const green = "\x1b[32m";
     const yellow = "\x1b[33m";
-    const magenta = "\x1b[35m";
     const white = "\x1b[97m";
     const red = "\x1b[31m";
 
@@ -389,48 +363,17 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeStdout("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "USERS" ++ R ++ " ({d}) " ++ D ++ "────────────────────────────────────" ++ R ++ "\n", .{cfg.users.count()});
     var it = @constCast(&cfg.users).iterator();
     while (it.next()) |entry| {
-        writeStdout("      " ++ green ++ "●" ++ R ++ " " ++ B ++ "{s}" ++ R ++ "  " ++ D, .{entry.key_ptr.*});
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
+        writeStdout("      " ++ green ++ "●" ++ R ++ " " ++ B ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
     }
     writeRaw("\n");
 
-    // ─── LINKS ──────────────────────────────────────
-    writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "LINKS" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
+    // ─── SECURITY ───────────────────────────────────
+    writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SECURITY" ++ R ++ " " ++ D ++ "───────────────────────────────────" ++ R ++ "\n");
     if (!has_ip) {
-        writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
+        writeRaw("      " ++ red ++ "⚠  Could not detect public IP automatically." ++ R ++ "\n");
     }
-
-    var encoded_ip_buf: [768]u8 = undefined;
-    const safe_server_ip = encodeServerForProxyLink(server_ip, &encoded_ip_buf);
-
-    var it2 = @constCast(&cfg.users).iterator();
-    while (it2.next()) |entry| {
-        writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
-
-        // tg:// deep link
-        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ safe_server_ip, cfg.port });
-        writeRaw(green ++ "ee");
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
-        }
-        for (cfg.tls_domain) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
-
-        // t.me link
-        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ safe_server_ip, cfg.port });
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
-        }
-        for (cfg.tls_domain) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
-    }
+    writeRaw("      " ++ D ++ "User secrets and proxy links are hidden in runtime logs." ++ R ++ "\n");
+    writeRaw("      " ++ D ++ "Use mtbuddy install output or trusted local tooling to generate links." ++ R ++ "\n");
 
     // Footer
     writeRaw("\n  " ++ D ++ "──────────────────────────────────────────────────" ++ R ++ "\n");
@@ -504,7 +447,7 @@ pub fn main(init: std.process.Init) !void {
     cfg.emitWarnings();
 
     // Create shared state (DI — no globals)
-    var state = proxy.ProxyState.init(allocator, cfg);
+    var state = try proxy.ProxyState.init(allocator, cfg);
     defer state.deinit();
 
     // Run the proxy

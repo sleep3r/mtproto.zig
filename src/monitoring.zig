@@ -424,8 +424,9 @@ test "metrics output contains required metrics" {
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
     };
     defer cfg.deinit(std.testing.allocator);
+    try cfg.users.put(try std.testing.allocator.dupe(u8, "test"), [_]u8{0x11} ** 16);
 
-    var state = proxy.ProxyState.init(std.testing.allocator, cfg);
+    var state = try proxy.ProxyState.init(std.testing.allocator, cfg);
     defer state.deinit();
 
     var buf: [32 * 1024]u8 = undefined;
@@ -443,8 +444,9 @@ test "metrics rejects unknown path" {
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
     };
     defer cfg.deinit(std.testing.allocator);
+    try cfg.users.put(try std.testing.allocator.dupe(u8, "test"), [_]u8{0x22} ** 16);
 
-    var state = proxy.ProxyState.init(std.testing.allocator, cfg);
+    var state = try proxy.ProxyState.init(std.testing.allocator, cfg);
     defer state.deinit();
 
     try std.testing.expect(!isGetMetrics("GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n"));

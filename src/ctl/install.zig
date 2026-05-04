@@ -302,7 +302,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         _ = sys.exec(allocator, &.{
             "apt-get",  "install", "-y",
             "iptables", "xxd",     "curl",
-            "openssl",  "tar",
+            "openssl",  "tar",     "minisign",
         }) catch {};
         sp.stop(true, "");
     }

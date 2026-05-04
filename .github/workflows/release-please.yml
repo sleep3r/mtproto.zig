@@ -67,7 +67,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Verify AES-enabled x86_64_v3 profile
         if: contains(matrix.cpu, 'x86_64_v3')
@@ -86,10 +86,15 @@ jobs:
           zig build-exe -target "${{ matrix.target }}" -mcpu "${{ matrix.cpu }}" /tmp/check_aes_target.zig
 
       - name: Build release binary
+        env:
+          MINISIGN_PUBKEY_B64: ${{ secrets.MINISIGN_PUBKEY_B64 }}
         run: |
           BUILD_ARGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
           if [ -n "${{ matrix.cpu }}" ]; then
             BUILD_ARGS="$BUILD_ARGS -Dcpu=${{ matrix.cpu }}"
+          fi
+          if [ -n "${MINISIGN_PUBKEY_B64}" ]; then
+            BUILD_ARGS="$BUILD_ARGS -Dminisign_pubkey=${MINISIGN_PUBKEY_B64}"
           fi
           zig build $BUILD_ARGS
 
@@ -99,8 +104,46 @@ jobs:
           cp zig-out/bin/${{ matrix.binary }} dist/${{ matrix.artifact_name }}
           chmod +x dist/${{ matrix.artifact_name }}
           tar -C dist -czf dist/${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+          (
+            cd dist
+            sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+          )
+
+      - name: Sign checksum with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: |
+          if [ -z "${MINISIGN_SECRET_KEY}" ] || [ -z "${MINISIGN_PUBLIC_KEY}" ]; then
+            echo "Minisign secrets are not configured; skipping signature generation"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y minisign
+
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > /tmp/minisign.key
+          chmod 600 /tmp/minisign.key
+          printf '%s\n' "${MINISIGN_PUBLIC_KEY}" > dist/minisign.pub
+          minisign -S \
+            -s /tmp/minisign.key \
+            -m dist/${{ matrix.artifact_name }}.tar.gz.sha256 \
+            -x dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig \
+            -t "tag:${{ needs.release-please.outputs.tag_name }} artifact:${{ matrix.artifact_name }}"
 
       - name: Upload release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/${{ matrix.artifact_name }}.tar.gz --clobber
+        run: |
+          FILES=(
+            "dist/${{ matrix.artifact_name }}.tar.gz"
+            "dist/${{ matrix.artifact_name }}.tar.gz.sha256"
+          )
+          if [ -f "dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig" ]; then
+            FILES+=("dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig")
+          fi
+          if [ -f "dist/minisign.pub" ]; then
+            FILES+=("dist/minisign.pub")
+          fi
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" \
+            "${FILES[@]}" \
+            --clobber

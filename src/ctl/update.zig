@@ -78,6 +78,18 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         return;
     }
 
+    // ── Ensure signature verifier dependency ──
+    if (release.requiresSignatureVerification() and !sys.commandExists("minisign")) {
+        ui.step("Installing minisign for release signature verification...");
+        _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
+        _ = sys.exec(allocator, &.{ "apt-get", "install", "-y", "minisign" }) catch {};
+        if (!sys.commandExists("minisign")) {
+            ui.fail("minisign is required for release signature verification");
+            return;
+        }
+        ui.ok("minisign installed");
+    }
+
     // ── Resolve release tag ──
     var tag = release.Tag{};
     {

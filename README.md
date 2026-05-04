@@ -70,7 +70,12 @@ All installation, updates, and management are done through **mtbuddy** — a nat
 curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash
 ```
 
-This downloads the latest `mtbuddy` binary and runs `mtbuddy --help`. Then install the proxy:
+This downloads the latest `mtbuddy` binary, verifies its SHA-256 checksum from the GitHub Release, and runs `mtbuddy --help`. Then install the proxy:
+
+```bash
+# Optional: enforce minisign verification for bootstrap checksum files
+export MTPROTO_MINISIGN_PUBKEY="RW..."
+```
 
 ```bash
 # Minimal — auto-generates a secret, enables all DPI bypass modules
@@ -138,7 +143,7 @@ sudo mtbuddy --interactive
 ## Update
 
 ```bash
-# Update to latest release (checks CPU compat, auto-rollback on failure)
+# Update to latest release (verifies checksum, checks CPU compat, auto-rollback on failure)
 sudo mtbuddy update
 
 # Pin to a specific version
@@ -238,7 +243,7 @@ You can also explicitly configure the tunnel interface in `config.toml`:
 type = "tunnel"
 
 [upstream.tunnel]
-tunnel_interface = "awg0"
+interface = "awg0"
 ```
 
 ### SOCKS5 proxy
@@ -285,6 +290,7 @@ use_middle_proxy = true   # ME mode for promo-channel parity
 
 [upstream]
 type = "auto"            # auto | direct | tunnel | socks5 | http
+# allow_direct_fallback = false   # fail-closed by default for socks5/http misconfig
 
 [server]
 port = 443
@@ -317,7 +323,8 @@ alice = true   # bypass MiddleProxy for this user
 | Key | Default | Description |
 |-----|---------|-------------|
 | `[upstream].type` | `auto` | Egress mode: `auto` (direct), `direct`, `tunnel` (VPN via socket policy routing), `socks5`, or `http` |
-| `[upstream.tunnel] tunnel_interface` | `"awg0"` | Name of the VPN network interface for SO_MARK routing |
+| `[upstream] allow_direct_fallback` | `false` | If `true`, allows socks5/http modes to fall back to direct egress when upstream is unavailable |
+| `[upstream.tunnel] interface` | `"awg0"` | Name of the VPN network interface for SO_MARK routing |
 | `[upstream.socks5] host` | — | SOCKS5 proxy address |
 | `[upstream.socks5] port` | — | SOCKS5 proxy port |
 | `[upstream.socks5] username` | — | SOCKS5 username (empty = no auth) |
@@ -424,18 +431,23 @@ It exposes proxy counters plus process metrics such as RSS, virtual memory, CPU 
 
 ## Building locally
 
-Requires [Zig 0.15.2](https://ziglang.org/download/).
+Requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ```bash
 git clone https://github.com/sleep3r/mtproto.zig.git
 cd mtproto.zig
 
-make build     # debug
-make release   # optimized
-make run       # run with config.toml
-make test      # unit tests (78 tests)
-make bench     # C2S encapsulation microbenchmark
-make soak      # 30s multithreaded stability test
+make build      # cross-compile ReleaseFast binaries for Linux x86_64_v3+aes
+make test       # run Zig tests
+make fmt        # format Zig sources
+make deploy     # build + deploy to SERVER (see Makefile)
+make dashboard  # SSH tunnel for web dashboard (localhost:61208)
+```
+
+Release builders can embed a minisign public key into `mtbuddy`:
+
+```bash
+zig build -Dminisign_pubkey=RW... -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 ```
 
 Cross-compile for Linux from macOS:
