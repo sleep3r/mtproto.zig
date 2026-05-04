@@ -179,6 +179,12 @@ const CapacityEstimate = struct {
 fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
     if (builtin.os.tag != .linux) return null;
 
+    // Prefer sysinfo(2): no /proc dependency and works under stricter sandboxing.
+    if (detectTotalRamBytesSysinfo()) |total| {
+        return total;
+    }
+
+    // Fallback: parse /proc/meminfo.
     const io = std.Io.Threaded.global_single_threaded.io();
     const content = std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{}) catch return null;
     defer content.close(io);
@@ -204,6 +210,19 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
     }
 
     return null;
+}
+
+fn detectTotalRamBytesSysinfo() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+
+    var info: std.os.linux.Sysinfo = undefined;
+    const rc = std.os.linux.sysinfo(&info);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+
+    const mem_unit: u128 = if (info.mem_unit == 0) 1 else info.mem_unit;
+    const total_bytes: u128 = @as(u128, info.totalram) * mem_unit;
+    if (total_bytes == 0 or total_bytes > std.math.maxInt(u64)) return null;
+    return @intCast(total_bytes);
 }
 
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
@@ -246,7 +265,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
         if (builtin.os.tag == .linux and !cfg.unsafe_override_limits) {
             const log_main = std.log.scoped(.config);
             log_main.warn(
-                "could not read /proc/meminfo; skipping max_connections safety clamp. " ++
+                "could not detect total RAM; skipping max_connections safety clamp. " ++
                     "set a conservative [server].max_connections to avoid OOM.",
                 .{},
             );
