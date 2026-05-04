@@ -16,6 +16,30 @@ const SummaryLine = tui_mod.SummaryLine;
 
 const PROXY_SERVICE = "mtproto-proxy";
 
+fn sleepSeconds(seconds: u64) void {
+    const req: std.posix.timespec = .{
+        .sec = @intCast(seconds),
+        .nsec = 0,
+    };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
+fn fillRandom(bytes: []u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = std.os.linux.getrandom(bytes[off..].ptr, bytes.len - off, 0);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false;
+                off += rc;
+            },
+            .INTR => continue,
+            else => return false,
+        }
+    }
+    return true;
+}
+
 pub const Ipv6Opts = struct {
     mode: Mode = .manual,
     interface: []const u8 = "eth0",
@@ -27,7 +51,7 @@ pub const Ipv6Opts = struct {
 pub const Mode = enum { manual, check, auto };
 
 /// Run in CLI mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = Ipv6Opts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--check")) {
@@ -128,9 +152,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: Ipv6Opts) !void {
                         updateDns(ui, allocator, ip, opts.dns_name);
                         ui.stepOk("Hop complete, sleeping 60s", ip);
                     }
-                    std.Thread.sleep(60 * std.time.ns_per_s);
+                    sleepSeconds(60);
                 } else {
-                    std.Thread.sleep(15 * std.time.ns_per_s);
+                    sleepSeconds(15);
                 }
             }
         },
@@ -161,15 +185,19 @@ fn removeOldIpv6(allocator: std.mem.Allocator, interface: []const u8) void {
 fn addNewIpv6(allocator: std.mem.Allocator, prefix: []const u8, interface: []const u8) ?[]const u8 {
     // Generate random suffix
     var rand_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
+    if (!fillRandom(&rand_bytes)) return null;
 
     var ip_buf: [128]u8 = undefined;
     const ip = std.fmt.bufPrint(&ip_buf, "{s}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
         prefix,
-        rand_bytes[0], rand_bytes[1],
-        rand_bytes[2], rand_bytes[3],
-        rand_bytes[4], rand_bytes[5],
-        rand_bytes[6], rand_bytes[7],
+        rand_bytes[0],
+        rand_bytes[1],
+        rand_bytes[2],
+        rand_bytes[3],
+        rand_bytes[4],
+        rand_bytes[5],
+        rand_bytes[6],
+        rand_bytes[7],
     }) catch return null;
 
     var addr_buf: [192]u8 = undefined;
@@ -187,7 +215,7 @@ fn addNewIpv6(allocator: std.mem.Allocator, prefix: []const u8, interface: []con
 
 fn countRecentTimeouts(allocator: std.mem.Allocator) u32 {
     const r = sys.exec(allocator, &.{
-        "bash", "-c",
+        "bash",                                                                                                                             "-c",
         "journalctl -u " ++ PROXY_SERVICE ++ " --since '60 seconds ago' --no-pager -q 2>/dev/null | grep -c 'Handshake timeout' || echo 0",
     }) catch return 0;
     defer r.deinit();
@@ -197,13 +225,11 @@ fn countRecentTimeouts(allocator: std.mem.Allocator) u32 {
 
 fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_name: []const u8) void {
     // Load CF credentials: check env first, then .env file
-    const cf_token = std.posix.getenv("CF_TOKEN") orelse
-        sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_TOKEN") orelse {
+    const cf_token = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_TOKEN") orelse {
         ui.warn("CF_TOKEN not set — skipping DNS update");
         return;
     };
-    const cf_zone = std.posix.getenv("CF_ZONE") orelse
-        sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_ZONE") orelse {
+    const cf_zone = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_ZONE") orelse {
         ui.warn("CF_ZONE not set — skipping DNS update");
         return;
     };
@@ -215,11 +241,9 @@ fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_nam
 
     // Get record ID
     var get_cmd_buf: [512]u8 = undefined;
-    const get_cmd = std.fmt.bufPrint(&get_cmd_buf,
-        "curl -s -X GET 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type=AAAA&name={s}' " ++
+    const get_cmd = std.fmt.bufPrint(&get_cmd_buf, "curl -s -X GET 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type=AAAA&name={s}' " ++
         "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' | " ++
-        "grep -oE '\"id\":\"[^\"]+\"' | head -1 | cut -d'\"' -f4",
-    .{ cf_zone, dns_name, cf_token }) catch return;
+        "grep -oE '\"id\":\"[^\"]+\"' | head -1 | cut -d'\"' -f4", .{ cf_zone, dns_name, cf_token }) catch return;
 
     const id_result = sys.exec(allocator, &.{ "bash", "-c", get_cmd }) catch return;
     defer id_result.deinit();
@@ -228,18 +252,14 @@ fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_nam
     // Create or update
     var dns_cmd_buf: [1024]u8 = undefined;
     if (record_id.len == 0) {
-        const dns_cmd = std.fmt.bufPrint(&dns_cmd_buf,
-            "curl -s -X POST 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records' " ++
+        const dns_cmd = std.fmt.bufPrint(&dns_cmd_buf, "curl -s -X POST 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records' " ++
             "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"AAAA\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":30,\"proxied\":false}}' > /dev/null",
-        .{ cf_zone, cf_token, dns_name, new_ip }) catch return;
+            "--data '{{\"type\":\"AAAA\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":30,\"proxied\":false}}' > /dev/null", .{ cf_zone, cf_token, dns_name, new_ip }) catch return;
         _ = sys.exec(allocator, &.{ "bash", "-c", dns_cmd }) catch {};
     } else {
-        const dns_cmd = std.fmt.bufPrint(&dns_cmd_buf,
-            "curl -s -X PUT 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}' " ++
+        const dns_cmd = std.fmt.bufPrint(&dns_cmd_buf, "curl -s -X PUT 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}' " ++
             "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"AAAA\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":30,\"proxied\":false}}' > /dev/null",
-        .{ cf_zone, record_id, cf_token, dns_name, new_ip }) catch return;
+            "--data '{{\"type\":\"AAAA\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":30,\"proxied\":false}}' > /dev/null", .{ cf_zone, record_id, cf_token, dns_name, new_ip }) catch return;
         _ = sys.exec(allocator, &.{ "bash", "-c", dns_cmd }) catch {};
     }
 
@@ -247,7 +267,7 @@ fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_nam
 }
 
 /// Update DNS A record (from update_dns.sh).
-pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     const new_ip = args.next() orelse {
         ui.fail("Usage: mtbuddy update-dns <new_ip>");
         return;
@@ -256,13 +276,11 @@ pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Arg
     const dns_name = "proxy.sleep3r.ru";
 
     // Load .env natively (child shell env doesn't propagate to parent)
-    const cf_token = std.posix.getenv("CF_TOKEN") orelse
-        sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_TOKEN") orelse {
+    const cf_token = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_TOKEN") orelse {
         ui.warn("CF_TOKEN not set — skipping DNS update");
         return;
     };
-    const cf_zone = std.posix.getenv("CF_ZONE") orelse
-        sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_ZONE") orelse {
+    const cf_zone = sys.readEnvFile(allocator, "/opt/mtproto-proxy/.env", "CF_ZONE") orelse {
         ui.warn("CF_ZONE not set — skipping DNS update");
         return;
     };
@@ -270,11 +288,9 @@ pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Arg
     ui.step("Updating DNS A record...");
 
     var get_buf: [512]u8 = undefined;
-    const get_cmd = std.fmt.bufPrint(&get_buf,
-        "curl -s -X GET 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type=A&name={s}' " ++
+    const get_cmd = std.fmt.bufPrint(&get_buf, "curl -s -X GET 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records?type=A&name={s}' " ++
         "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' | " ++
-        "grep -oE '\"id\":\"[^\"]+\"' | head -1 | cut -d'\"' -f4",
-    .{ cf_zone, dns_name, cf_token }) catch return;
+        "grep -oE '\"id\":\"[^\"]+\"' | head -1 | cut -d'\"' -f4", .{ cf_zone, dns_name, cf_token }) catch return;
 
     const id_r = sys.exec(allocator, &.{ "bash", "-c", get_cmd }) catch return;
     defer id_r.deinit();
@@ -282,18 +298,14 @@ pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Arg
 
     var cmd_buf: [1024]u8 = undefined;
     if (record_id.len == 0) {
-        const cmd = std.fmt.bufPrint(&cmd_buf,
-            "curl -s -X POST 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records' " ++
+        const cmd = std.fmt.bufPrint(&cmd_buf, "curl -s -X POST 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records' " ++
             "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"A\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":60,\"proxied\":false}}' > /dev/null",
-        .{ cf_zone, cf_token, dns_name, new_ip }) catch return;
+            "--data '{{\"type\":\"A\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":60,\"proxied\":false}}' > /dev/null", .{ cf_zone, cf_token, dns_name, new_ip }) catch return;
         _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
     } else {
-        const cmd = std.fmt.bufPrint(&cmd_buf,
-            "curl -s -X PUT 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}' " ++
+        const cmd = std.fmt.bufPrint(&cmd_buf, "curl -s -X PUT 'https://api.cloudflare.com/client/v4/zones/{s}/dns_records/{s}' " ++
             "-H 'Authorization: Bearer {s}' -H 'Content-Type: application/json' " ++
-            "--data '{{\"type\":\"A\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":60,\"proxied\":false}}' > /dev/null",
-        .{ cf_zone, record_id, cf_token, dns_name, new_ip }) catch return;
+            "--data '{{\"type\":\"A\",\"name\":\"{s}\",\"content\":\"{s}\",\"ttl\":60,\"proxied\":false}}' > /dev/null", .{ cf_zone, record_id, cf_token, dns_name, new_ip }) catch return;
         _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
     }
 

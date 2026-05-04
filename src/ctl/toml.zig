@@ -7,15 +7,19 @@
 const std = @import("std");
 
 pub const TomlDoc = struct {
-    lines: std.ArrayListUnmanaged([]const u8) = .{},
+    lines: std.ArrayListUnmanaged([]const u8) = .empty,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Self {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const content = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(1024 * 1024),
+        );
         defer allocator.free(content);
 
         var doc = Self{
@@ -39,12 +43,13 @@ pub const TomlDoc = struct {
 
     /// Save the document back to a file.
     pub fn save(self: *Self, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
         for (self.lines.items) |line| {
-            try file.writeAll(line);
-            try file.writeAll("\n");
+            try file.writeStreamingAll(io, line);
+            try file.writeStreamingAll(io, "\n");
         }
     }
 

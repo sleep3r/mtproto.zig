@@ -11,6 +11,7 @@ const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
+const linux_io = @import("linux_io");
 const version_mod = @import("version");
 
 // Custom lock-free log function: formats into a stack buffer and writes
@@ -32,7 +33,7 @@ pub const std_options = std.Options{
 
 fn lockFreeLog(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -43,47 +44,48 @@ fn lockFreeLog(
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, level_txt ++ prefix2 ++ format ++ "\n", args) catch return;
-    _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch return;
+    linux_io.writeAllFd(std.posix.STDERR_FILENO, msg);
 }
 
 const log = std.log.scoped(.mtproto);
 
 pub const version = version_mod.version;
 
-// ============= Output Helpers (Zig 0.15 compatible) =============
+// ============= Output Helpers =============
 
 /// Write a formatted string to stdout via posix write.
 fn writeStdout(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch return;
+    linux_io.writeAllFd(std.posix.STDOUT_FILENO, slice);
 }
 
 /// Write a formatted string to stderr.
 fn writeStderr(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.posix.write(std.posix.STDERR_FILENO, slice) catch return;
+    linux_io.writeAllFd(std.posix.STDERR_FILENO, slice);
 }
 
 /// Write a hex byte to stdout.
 fn writeHexByte(byte: u8) void {
     const hex = "0123456789abcdef";
     const out = [2]u8{ hex[byte >> 4], hex[byte & 0x0f] };
-    _ = std.posix.write(std.posix.STDOUT_FILENO, &out) catch return;
+    linux_io.writeAllFd(std.posix.STDOUT_FILENO, &out);
 }
 
 /// Write raw string to stdout.
 fn writeRaw(s: []const u8) void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, s) catch return;
+    linux_io.writeAllFd(std.posix.STDOUT_FILENO, s);
 }
 
 // ============= Public IP Detection =============
 
 fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     const uri = try std.Uri.parse(url);
+    const io = std.Io.Threaded.global_single_threaded.io();
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var req = try client.request(.GET, uri, .{
@@ -202,14 +204,17 @@ const CapacityEstimate = struct {
 fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
     if (builtin.os.tag != .linux) return null;
 
-    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return null;
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 16 * 1024) catch return null;
-    defer allocator.free(content);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const content = std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{}) catch return null;
+    defer content.close(io);
+    var reader = content.reader(io, &.{});
+    const bytes = reader.interface.allocRemaining(allocator, .limited(16 * 1024)) catch return null;
+    const data = bytes;
+    defer allocator.free(data);
+    const content_bytes = data;
 
     const key = "MemTotal:";
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    var lines = std.mem.splitScalar(u8, content_bytes, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, key)) continue;
 
@@ -432,13 +437,10 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
     // Parse config path from args
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
     const first_arg = args.next();

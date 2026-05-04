@@ -1,8 +1,12 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 const crypto = @import("../crypto/crypto.zig");
 const constants = @import("constants.zig");
+
+fn ip4(bytes: [4]u8, port: u16) net.IpAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
 
 pub const proxy_secret = [128]u8{
     0xc4, 0xf9, 0xfa, 0xca, 0x96, 0x78, 0xe6, 0xbb, 0x48, 0xad, 0x6c, 0x7e, 0x2c, 0xe5, 0xc0, 0xd2,
@@ -130,8 +134,8 @@ pub const MiddleProxyContext = struct {
         decryptor: crypto.AesCbc,
         conn_id: [8]u8,
         initial_seq_no: i32,
-        remote_addr: net.Address,
-        our_addr: net.Address,
+        remote_addr: net.IpAddress,
+        our_addr: net.IpAddress,
         proto_tag: constants.ProtoTag,
         ad_tag: ?[16]u8,
     ) !MiddleProxyContext {
@@ -155,37 +159,43 @@ pub const MiddleProxyContext = struct {
         decryptor: crypto.AesCbc,
         conn_id: [8]u8,
         initial_seq_no: i32,
-        remote_addr: net.Address,
-        our_addr: net.Address,
+        remote_addr: net.IpAddress,
+        our_addr: net.IpAddress,
         proto_tag: constants.ProtoTag,
         ad_tag: ?[16]u8,
         buffer_size: usize,
     ) !MiddleProxyContext {
         var rip: [20]u8 = undefined;
         var rport: u16 = 0;
-        if (remote_addr.any.family == posix.AF.INET) {
-            const ipv4_mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-            @memcpy(rip[0..12], &ipv4_mapped);
-            @memcpy(rip[12..16], std.mem.asBytes(&remote_addr.in.sa.addr));
-            rport = remote_addr.in.sa.port;
-        } else if (remote_addr.any.family == posix.AF.INET6) {
-            @memcpy(rip[0..16], &remote_addr.in6.sa.addr);
-            rport = remote_addr.in6.sa.port;
-        } else return error.UnsupportedAddressType;
-        std.mem.writeInt(u32, rip[16..20], std.mem.bigToNative(u16, rport), .little);
+        switch (remote_addr) {
+            .ip4 => |addr| {
+                const ipv4_mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+                @memcpy(rip[0..12], &ipv4_mapped);
+                @memcpy(rip[12..16], &addr.bytes);
+                rport = addr.port;
+            },
+            .ip6 => |addr| {
+                @memcpy(rip[0..16], &addr.bytes);
+                rport = addr.port;
+            },
+        }
+        std.mem.writeInt(u32, rip[16..20], rport, .little);
 
         var oip: [20]u8 = undefined;
         var oport: u16 = 0;
-        if (our_addr.any.family == posix.AF.INET) {
-            const ipv4_mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-            @memcpy(oip[0..12], &ipv4_mapped);
-            @memcpy(oip[12..16], std.mem.asBytes(&our_addr.in.sa.addr));
-            oport = our_addr.in.sa.port;
-        } else if (our_addr.any.family == posix.AF.INET6) {
-            @memcpy(oip[0..16], &our_addr.in6.sa.addr);
-            oport = our_addr.in6.sa.port;
-        } else return error.UnsupportedAddressType;
-        std.mem.writeInt(u32, oip[16..20], std.mem.bigToNative(u16, oport), .little);
+        switch (our_addr) {
+            .ip4 => |addr| {
+                const ipv4_mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+                @memcpy(oip[0..12], &ipv4_mapped);
+                @memcpy(oip[12..16], &addr.bytes);
+                oport = addr.port;
+            },
+            .ip6 => |addr| {
+                @memcpy(oip[0..16], &addr.bytes);
+                oport = addr.port;
+            },
+        }
+        std.mem.writeInt(u32, oip[16..20], oport, .little);
 
         const s2c_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(s2c_buf);
@@ -451,9 +461,9 @@ pub const MiddleProxyContext = struct {
                 var pad_len: usize = 0;
                 var pad_buf: [15]u8 = undefined;
                 if (self.proto_tag == .secure) {
-                    pad_len = std.crypto.random.intRangeLessThan(usize, 0, 16);
+                    pad_len = crypto.randomRange(usize, 16);
                     if (pad_len > 0) {
-                        std.crypto.random.bytes(pad_buf[0..pad_len]);
+                        crypto.randomBytes(pad_buf[0..pad_len]);
                     }
                 }
 
@@ -527,8 +537,8 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -563,8 +573,8 @@ test "encapsulated c2s omits ad_tag block when absent" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -599,8 +609,8 @@ test "encapsulate c2s rejects unaligned payload length" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -628,8 +638,8 @@ test "encapsulated c2s includes ad_tag block when present" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         ad_tag,
     );
@@ -670,8 +680,8 @@ test "decapsulate s2c skips noop padding words" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -730,8 +740,8 @@ test "decapsulate s2c validates seq and checksum" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -786,8 +796,8 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );

@@ -25,7 +25,7 @@ pub const RecoveryOpts = struct {
 };
 
 /// Run in CLI mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = RecoveryOpts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--quiet")) {

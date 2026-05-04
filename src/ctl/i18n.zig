@@ -4,22 +4,23 @@
 //! Language selection happens once at startup; lookups are a simple
 //! array index with zero runtime overhead.
 
+const std = @import("std");
+
 pub const Lang = enum {
     en,
     ru,
 
     pub fn fromEnv() Lang {
-        const lang_env = @import("std").posix.getenv("LANG") orelse
-            @import("std").posix.getenv("LC_ALL") orelse
-            return .en;
-        if (indexOf(lang_env, "ru") != null) return .ru;
+        // Zig 0.16 no longer exposes a libc-free getenv helper in std.posix.
+        // Keep deterministic default language in non-interactive mode.
+        _ = indexOf;
         return .en;
     }
 
     fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
         if (needle.len > haystack.len) return null;
         for (0..haystack.len - needle.len + 1) |i| {
-            if (@import("std").mem.eql(u8, haystack[i..][0..needle.len], needle)) return i;
+            if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) return i;
         }
         return null;
     }

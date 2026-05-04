@@ -1,11 +1,26 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const crypto = @import("crypto/crypto.zig");
 const middleproxy = @import("protocol/middleproxy.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const constants = @import("protocol/constants.zig");
 const tls = @import("protocol/tls.zig");
 const proxy = @import("proxy/proxy.zig");
+
+fn ip4(bytes: [4]u8, port: u16) net.IpAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    if (std.os.linux.errno(rc) != .SUCCESS) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn nowMs() i64 {
+    return @as(i64, @intCast(nowNs() / std.time.ns_per_ms));
+}
 
 const Mode = enum {
     bench,
@@ -37,10 +52,10 @@ const WorkerArgs = struct {
     shared: *SoakShared,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
 
-    const opts = parseArgs(allocator) catch |err| {
+    const opts = parseArgs(init.minimal.args, allocator) catch |err| {
         if (err != error.ShowHelp) {
             std.debug.print("error: {any}\n\n", .{err});
         }
@@ -86,7 +101,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
             _ = try ctx.encapsulateSingleMessageC2S(payload, (w & 1) == 1, out_buf);
         }
 
-        var timer = try std.time.Timer.start();
+        const t0 = nowNs();
 
         var produced_out_bytes: u64 = 0;
         var i: usize = 0;
@@ -96,7 +111,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
             produced_out_bytes += @as(u64, @intCast(written));
         }
 
-        const elapsed_ns = timer.read();
+        const elapsed_ns = nowNs() - t0;
         const total_in_bytes = @as(u64, @intCast(payload_size)) * @as(u64, @intCast(iters));
         const ns_per_op = elapsedNsPerOp(elapsed_ns, iters);
 
@@ -136,7 +151,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
         if (ok == null) return error.BenchmarkValidationFailed;
     }
 
-    var timer = try std.time.Timer.start();
+    const t0 = nowNs();
     var matched: usize = 0;
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
@@ -144,7 +159,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
         if (ok != null) matched += 1;
     }
 
-    const elapsed_ns = timer.read();
+    const elapsed_ns = nowNs() - t0;
     const ns_per_op = elapsedNsPerOp(elapsed_ns, iterations);
     const ops_per_sec = if (elapsed_ns == 0)
         0
@@ -169,7 +184,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
         handshake.* = buildObfuscationHandshake(&bench_secret, .intermediate, dc_idx, nonce_seed);
     }
 
-    var candidates: [16]net.Address = undefined;
+    var candidates: [16]net.IpAddress = undefined;
     fillBenchmarkCandidates(&candidates);
     const windows = candidates.len - opts.candidate_count + 1;
 
@@ -189,7 +204,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
         _ = try candidate_state.apply(allocator, candidates[base .. base + opts.candidate_count]);
     }
 
-    var timer = try std.time.Timer.start();
+    const t0 = nowNs();
     var matched: usize = 0;
     var checksum: u64 = 0;
     var i: usize = 0;
@@ -206,10 +221,10 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
 
         checksum +%= @as(u64, @intCast(candidate_len));
         checksum +%= @as(u64, @intCast(@abs(parsed.params.dc_idx)));
-        checksum +%= std.mem.bigToNative(u16, candidate_slice[0].in.sa.port);
+        checksum +%= @as(u64, candidate_slice[0].getPort());
     }
 
-    const elapsed_ns = timer.read();
+    const elapsed_ns = nowNs() - t0;
     const ns_per_op = elapsedNsPerOp(elapsed_ns, opts.iterations);
     const ops_per_sec = if (elapsed_ns == 0)
         0
@@ -229,7 +244,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
 }
 
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = nowMs();
     const duration_ms = @as(i64, @intCast(opts.seconds)) * 1000;
 
     var shared = SoakShared{
@@ -259,7 +274,7 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
         thread.join();
     }
 
-    const end_ms = std.time.milliTimestamp();
+    const end_ms = nowMs();
     const elapsed_ms_i64 = @max(@as(i64, 1), end_ms - start_ms);
     const elapsed_ms: u64 = @intCast(elapsed_ms_i64);
 
@@ -305,7 +320,7 @@ fn soakWorker(args: WorkerArgs) void {
 
     var rng_state = makeSeed(args.worker_id);
 
-    while (std.time.milliTimestamp() < args.shared.deadline_ms) {
+    while (nowMs() < args.shared.deadline_ms) {
         const payload_len = nextPayloadLen(&rng_state, args.max_payload);
         payload_buf[0] +%= 1;
         const quickack = (nextRand(&rng_state) & 1) == 1;
@@ -331,8 +346,8 @@ fn initContext(allocator: std.mem.Allocator, proto_tag: constants.ProtoTag) !mid
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
         proto_tag,
         null,
     );
@@ -374,18 +389,18 @@ fn buildObfuscationHandshake(secret: *const [16]u8, proto_tag: constants.ProtoTa
     return handshake;
 }
 
-fn fillBenchmarkCandidates(out: *[16]net.Address) void {
+fn fillBenchmarkCandidates(out: *[16]net.IpAddress) void {
     for (out, 0..) |*addr, idx| {
         const octet: u8 = @intCast(100 + idx);
         const port = constants.tg_datacenter_port + @as(u16, @intCast(idx));
-        addr.* = net.Address.initIp4(.{ 149, 154, 167, octet }, port);
+        addr.* = ip4(.{ 149, 154, 167, octet }, port);
     }
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Options {
+fn parseArgs(args_source: std.process.Args, allocator: std.mem.Allocator) !Options {
     var opts = Options{};
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try args_source.iterateAllocator(allocator);
     defer args.deinit();
 
     _ = args.next();
@@ -503,7 +518,7 @@ fn bytesPerSecToMiBMs(bytes: u64, elapsed_ms: u64) u64 {
 }
 
 fn makeSeed(worker_id: usize) u64 {
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = nowMs();
     const base: u64 = if (now_ms >= 0)
         @intCast(now_ms)
     else

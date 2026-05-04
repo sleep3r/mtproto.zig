@@ -8,6 +8,21 @@
 
 const std = @import("std");
 const i18n = @import("i18n.zig");
+const linux_io = @import("linux_io");
+
+fn sleepMs(ms: u64) void {
+    const req: std.posix.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
+fn isTty(fd: std.posix.fd_t) bool {
+    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const rc = std.posix.system.ioctl(fd, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+    return std.posix.errno(rc) == .SUCCESS;
+}
 
 // ── Terminal geometry helpers (used by draw closures) ──────────────────────
 
@@ -78,7 +93,16 @@ pub const Color = struct {
 // ── Braille spinner frames ──────────────────────────────────────────────────
 
 const SPINNER_FRAMES = [_][]const u8{
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+    "⠋",
+    "⠙",
+    "⠹",
+    "⠸",
+    "⠼",
+    "⠴",
+    "⠦",
+    "⠧",
+    "⠇",
+    "⠏",
 };
 
 // ── Spinner state (thread-safe write via atomic, rendered in main thread) ──
@@ -155,14 +179,14 @@ pub const Spinner = struct {
             self.tui.print("\r  {s}{s}{s} {s}", .{
                 Color.bright_yellow, SPINNER_FRAMES[frame], Color.reset, self.label,
             });
-            std.Thread.sleep(80 * std.time.ns_per_ms);
+            sleepMs(80);
         }
     }
 };
 
 pub const Tui = struct {
-    out: std.fs.File,
-    in: std.fs.File,
+    out_fd: std.posix.fd_t,
+    in_fd: std.posix.fd_t,
     lang: i18n.Lang,
     is_tty: bool,
     line_buf: [16 * 1024]u8 = undefined,
@@ -171,13 +195,13 @@ pub const Tui = struct {
     const Self = @This();
 
     pub fn init(lang: i18n.Lang) Self {
-        const out = std.fs.File.stdout();
-        const in = std.fs.File.stdin();
+        const out_fd = std.posix.STDOUT_FILENO;
+        const in_fd = std.posix.STDIN_FILENO;
         return .{
-            .out = out,
-            .in = in,
+            .out_fd = out_fd,
+            .in_fd = in_fd,
             .lang = lang,
-            .is_tty = out.isTty(),
+            .is_tty = isTty(out_fd),
         };
     }
 
@@ -185,7 +209,7 @@ pub const Tui = struct {
 
     pub fn enterRawMode(self: *Self) void {
         if (!self.is_tty) return;
-        const current = std.posix.tcgetattr(self.in.handle) catch return;
+        const current = std.posix.tcgetattr(self.in_fd) catch return;
         self.orig_termios = current;
 
         var raw = current;
@@ -196,19 +220,19 @@ pub const Tui = struct {
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
 
-        std.posix.tcsetattr(self.in.handle, .FLUSH, raw) catch {};
+        std.posix.tcsetattr(self.in_fd, .FLUSH, raw) catch {};
     }
 
     pub fn exitRawMode(self: *Self) void {
         if (self.orig_termios) |orig| {
-            std.posix.tcsetattr(self.in.handle, .FLUSH, orig) catch {};
+            std.posix.tcsetattr(self.in_fd, .FLUSH, orig) catch {};
             self.orig_termios = null;
         }
     }
 
     pub fn readKey(self: *Self) !KeyEvent {
         var byte: [1]u8 = undefined;
-        const n = try self.in.read(&byte);
+        const n = try std.posix.read(self.in_fd, &byte);
         if (n == 0) return error.EndOfStream;
         const c = byte[0];
 
@@ -219,13 +243,13 @@ pub const Tui = struct {
 
         if (c == '\x1b') {
             var fds = [_]std.posix.pollfd{
-                .{ .fd = self.in.handle, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.in_fd, .events = std.posix.POLL.IN, .revents = 0 },
             };
             const p = std.posix.poll(&fds, 0) catch 0;
             if (p == 0) return .{ .key = .escape };
 
             var seq: [2]u8 = undefined;
-            const seq_n = self.in.read(&seq) catch 0;
+            const seq_n = std.posix.read(self.in_fd, &seq) catch 0;
             if (seq_n < 2) return .{ .key = .escape };
             if (seq[0] == '[') {
                 if (seq[1] == 'A') return .{ .key = .up };
@@ -250,7 +274,7 @@ pub const Tui = struct {
     pub fn getTermWidth(self: *Self) u16 {
         if (!self.is_tty) return 80;
         var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-        const rc = std.posix.system.ioctl(self.out.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        const rc = std.posix.system.ioctl(self.out_fd, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
         if (std.posix.errno(rc) == .SUCCESS and ws.col > 0) return ws.col;
         return 80;
     }
@@ -262,7 +286,7 @@ pub const Tui = struct {
 
     /// Write raw bytes to stdout.
     pub fn writeRaw(self: *Self, bytes: []const u8) void {
-        _ = self.out.write(bytes) catch {};
+        linux_io.writeAllFd(self.out_fd, bytes);
     }
 
     /// Write formatted output to stdout.
@@ -747,9 +771,9 @@ pub const Tui = struct {
 
         self.print("  {s}╭──────────────────────────────────────────────────────────────────╮{s}\n", .{ Color.gray, Color.reset });
         self.print("  {s}│{s} {s}⚙  {s}{s}{s}{s}{s}│{s}\n", .{
-            Color.gray,          Color.reset,
-            Color.bold,          Color.bright_yellow,
-            clean_title,         Color.reset,
+            Color.gray,                         Color.reset,
+            Color.bold,                         Color.bright_yellow,
+            clean_title,                        Color.reset,
             pad_buf[0..@min(pad, pad_buf.len)], Color.gray,
             Color.reset,
         });
@@ -781,7 +805,7 @@ pub const Tui = struct {
         var pos: usize = 0;
         while (pos < self.line_buf.len) {
             var byte: [1]u8 = undefined;
-            const n = self.in.read(&byte) catch return error.InputError;
+            const n = std.posix.read(self.in_fd, &byte) catch return error.InputError;
             if (n == 0) {
                 if (pos == 0) return error.EndOfStream;
                 return self.line_buf[0..pos];
@@ -795,7 +819,7 @@ pub const Tui = struct {
         // Buffer full — drain remaining input until newline
         while (true) {
             var byte: [1]u8 = undefined;
-            const n = self.in.read(&byte) catch break;
+            const n = std.posix.read(self.in_fd, &byte) catch break;
             if (n == 0 or byte[0] == '\n') break;
         }
         return self.line_buf[0..pos];

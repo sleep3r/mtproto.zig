@@ -14,6 +14,7 @@
 const std = @import("std");
 const i18n = @import("i18n.zig");
 const tui_mod = @import("tui.zig");
+const linux_io = @import("linux_io");
 const install = @import("install.zig");
 const update = @import("update.zig");
 const masking = @import("masking.zig");
@@ -30,12 +31,10 @@ const Color = tui_mod.Color;
 
 pub const version = version_mod.version;
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
 
@@ -402,5 +401,5 @@ fn printOpt(ui: *Tui, flag: []const u8, desc: []const u8) void {
 }
 
 fn printVersion() void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, "mtbuddy v" ++ version ++ "\n") catch {};
+    linux_io.writeAllFd(std.posix.STDOUT_FILENO, "mtbuddy v" ++ version ++ "\n");
 }

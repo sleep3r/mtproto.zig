@@ -21,6 +21,14 @@ const AWG_CONFIG_PATH = AWG_CONF_DIR ++ "/awg0.conf";
 const TUNNEL_MARK: u32 = 200;
 const TUNNEL_TABLE: u32 = 200;
 
+fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn readFileAllocCwd(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io(), path, allocator, .limited(limit));
+}
+
 pub const TunnelOpts = struct {
     awg_source: []const u8 = "",
 };
@@ -37,7 +45,7 @@ const AwgQuickValidation = enum {
 };
 
 /// Run in CLI mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = TunnelOpts{};
 
     while (args.next()) |arg| {
@@ -359,13 +367,10 @@ fn installAwgConfigSource(allocator: std.mem.Allocator, source: []const u8, dest
     if (isAmneziaVpnLinkSource(trimmed)) {
         try sys.writeFileMode(dest_path, trimmed, 0o600);
     } else {
-        const src_file = std.fs.cwd().openFile(trimmed, .{}) catch |err| switch (err) {
+        const content = readFileAllocCwd(allocator, trimmed, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return error.ConfigSourceNotFound,
             else => return err,
         };
-        defer src_file.close();
-
-        const content = try src_file.readToEndAlloc(allocator, 1024 * 1024);
         defer allocator.free(content);
 
         try sys.writeFileMode(dest_path, content, 0o600);
@@ -375,10 +380,7 @@ fn installAwgConfigSource(allocator: std.mem.Allocator, source: []const u8, dest
 }
 
 fn normalizeAwgConfig(allocator: std.mem.Allocator, path: []const u8) !AwgConfigKind {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try readFileAllocCwd(allocator, path, 1024 * 1024);
     defer allocator.free(content);
 
     const trimmed = std.mem.trim(u8, content, &[_]u8{ ' ', '\t', '\r', '\n' });
@@ -598,7 +600,9 @@ fn appendConfigLine(
     value: []const u8,
 ) !void {
     if (wrote_any.*) try output.append(allocator, '\n');
-    try output.writer(allocator).print("{s} = {s}", .{ key, value });
+    try output.appendSlice(allocator, key);
+    try output.appendSlice(allocator, " = ");
+    try output.appendSlice(allocator, value);
     wrote_any.* = true;
 }
 
@@ -749,10 +753,7 @@ fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
 }
 
 fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try readFileAllocCwd(allocator, path, 1024 * 1024);
     defer allocator.free(content);
 
     var output: std.ArrayList(u8) = .empty;
@@ -795,10 +796,7 @@ fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
 }
 
 fn stripAwgEmptyAssignments(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try readFileAllocCwd(allocator, path, 1024 * 1024);
     defer allocator.free(content);
 
     var output: std.ArrayList(u8) = .empty;
@@ -842,10 +840,7 @@ fn stripAwgEmptyAssignments(allocator: std.mem.Allocator, path: []const u8) !boo
 }
 
 fn ensureAwgTableOff(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const content = try readFileAllocCwd(allocator, path, 1024 * 1024);
     defer allocator.free(content);
 
     var in_interface = false;
@@ -909,10 +904,7 @@ const NGINX_MASKING_CONF = "/etc/nginx/sites-available/mtproto-masking";
 /// Strip legacy netns listen directives (e.g. `listen 10.200.200.1:8443 ssl;`)
 /// from the nginx masking config. Returns true if any lines were removed.
 fn cleanupNetnsNginxListen(allocator: std.mem.Allocator) bool {
-    const file = std.fs.cwd().openFile(NGINX_MASKING_CONF, .{}) catch return false;
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 256 * 1024) catch return false;
+    const content = readFileAllocCwd(allocator, NGINX_MASKING_CONF, 256 * 1024) catch return false;
     defer allocator.free(content);
 
     var output: std.ArrayList(u8) = .empty;
@@ -984,13 +976,13 @@ test "tunnel - installs Amnezia vpn link source directly" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dest_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/awg0.conf", .{tmp.sub_path});
 
     const kind = try installAwgConfigSource(std.testing.allocator, " \n" ++ test_amnezia_vpn_link ++ "\n", dest_path);
     try std.testing.expectEqual(AwgConfigKind.amnezia_vpn_link, kind);
 
-    const installed = try std.fs.cwd().readFileAlloc(std.testing.allocator, dest_path, 4096);
+    const installed = try std.Io.Dir.cwd().readFileAlloc(io(), dest_path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(installed);
 
     try std.testing.expect(std.mem.indexOf(u8, installed, "vpn://") == null);
@@ -1018,7 +1010,7 @@ test "tunnel - strips empty AWG assignments" {
         ,
     });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 
     try std.testing.expect(try stripAwgEmptyAssignments(std.testing.allocator, path));

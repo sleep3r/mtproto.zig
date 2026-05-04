@@ -24,7 +24,7 @@ pub const MaskingOpts = struct {
 };
 
 /// Run in CLI mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = MaskingOpts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--domain")) {
@@ -63,8 +63,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         ui.fail(i18n.get(ui.lang, .error_not_root));
         return;
     }
-
-
 
     // ── Install Nginx ──
     if (sys.commandExists("nginx")) {
@@ -124,8 +122,6 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     ui.step("Configuring Nginx...");
     sys.execSilent(allocator, &.{ "mkdir", "-p", "/var/www/masking" });
     sys.writeFile("/var/www/masking/index.html", "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>It works!</h1></body></html>\n") catch {};
-
-
 
     var nginx_cfg_buf: [2048]u8 = undefined;
     const nginx_cfg = std.fmt.bufPrint(&nginx_cfg_buf,

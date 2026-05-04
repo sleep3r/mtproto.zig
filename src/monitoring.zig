@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 const linux = std.os.linux;
 const proxy = @import("proxy/proxy.zig");
@@ -25,17 +25,14 @@ pub fn start(state: *proxy.ProxyState) !void {
 
     const host = state.config.metrics.effectiveHost();
     const port = state.config.metrics.port;
+    const io_ctx = std.Io.Threaded.global_single_threaded.io();
 
-    const addr_list = try net.getAddressList(std.heap.page_allocator, host, port);
-    defer addr_list.deinit();
-
-    if (addr_list.addrs.len == 0) return error.AddressNotAvailable;
-
-    var server = try addr_list.addrs[0].listen(.{
+    const listen_addr = try resolveFirstAddress(host, port);
+    var server = try listen_addr.listen(io_ctx, .{
         .reuse_address = true,
         .kernel_backlog = 64,
     });
-    errdefer server.deinit();
+    errdefer server.deinit(io_ctx);
 
     log.info("metrics endpoint listening on {s}:{d}", .{ host, port });
 
@@ -45,20 +42,59 @@ pub fn start(state: *proxy.ProxyState) !void {
 
 fn acceptLoop(state: *proxy.ProxyState, server: net.Server) void {
     var local_server = server;
-    defer local_server.deinit();
+    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    defer local_server.deinit(io_ctx);
 
     while (true) {
-        const conn = local_server.accept() catch |err| {
+        const conn = local_server.accept(io_ctx) catch |err| {
             log.warn("metrics accept failed: {any}", .{err});
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+            sleepNs(200 * std.time.ns_per_ms);
             continue;
         };
-        handleConnection(state, conn.stream.handle);
+        handleConnection(state, conn.socket.handle);
+    }
+}
+
+fn resolveFirstAddress(host: []const u8, port: u16) !net.IpAddress {
+    if (net.IpAddress.parse(host, port)) |literal| return literal else |_| {}
+
+    const host_name = try net.HostName.init(host);
+    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+
+    var results_buf: [8]net.HostName.LookupResult = undefined;
+    var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
+    try host_name.lookup(io_ctx, &results, .{ .port = port });
+
+    while (results.getOneUncancelable(io_ctx)) |entry| {
+        switch (entry) {
+            .address => |addr| return addr,
+            .canonical_name => {},
+        }
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+
+    return error.AddressNotAvailable;
+}
+
+fn sleepNs(ns: u64) void {
+    var req: posix.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (true) {
+        var rem: posix.timespec = undefined;
+        const rc = linux.nanosleep(&req, &rem);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => req = rem,
+            else => return,
+        }
     }
 }
 
 fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
-    defer posix.close(fd);
+    defer closeFd(fd);
 
     // Prevent slow clients from blocking the accept thread.
     if (builtin.os.tag == .linux) {
@@ -85,38 +121,54 @@ fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
     };
 }
 
+fn closeFd(fd: posix.fd_t) void {
+    while (true) {
+        switch (posix.errno(posix.system.close(fd))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
+
 fn writeMetricsResponse(fd: posix.fd_t, state: *proxy.ProxyState) !void {
     var body_buf: [32 * 1024]u8 = undefined;
-    var body_stream = std.io.fixedBufferStream(&body_buf);
-    try writeMetrics(body_stream.writer(), state, collectProcessMetrics());
-    const body = body_stream.getWritten();
+    var body_writer: std.Io.Writer = .fixed(&body_buf);
+    try writeMetrics(&body_writer, state, collectProcessMetrics());
+    const body = body_writer.buffered();
 
     var header_buf: [256]u8 = undefined;
-    var header_stream = std.io.fixedBufferStream(&header_buf);
-    const w = header_stream.writer();
-    try w.print(
+    var header_writer: std.Io.Writer = .fixed(&header_buf);
+    try header_writer.print(
         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n\r\n",
         .{ metrics_content_type, body.len },
     );
-    try writeAll(fd, header_stream.getWritten());
+    try writeAll(fd, header_writer.buffered());
     try writeAll(fd, body);
 }
 
 fn writeSimpleResponse(fd: posix.fd_t, status: []const u8, content_type: []const u8, body: []const u8) void {
     var buf: [512]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const w = stream.writer();
-    w.print(
+    var writer: std.Io.Writer = .fixed(&buf);
+    writer.print(
         "HTTP/1.1 {s}\r\nConnection: close\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n\r\n{s}",
         .{ status, content_type, body.len, body },
     ) catch return;
-    writeAll(fd, stream.getWritten()) catch {};
+    writeAll(fd, writer.buffered()) catch {};
 }
 
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
-        off += try posix.write(fd, bytes[off..]);
+        const rc = linux.write(fd, bytes[off..].ptr, bytes.len - off);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.WriteFailed;
+                off += rc;
+            },
+            .INTR => continue,
+            else => return error.WriteFailed,
+        }
     }
 }
 
@@ -332,12 +384,13 @@ fn readCpuSecondsTotal() ?f64 {
 }
 
 fn countOpenFds() ?u64 {
-    var dir = std.fs.openDirAbsolute("/proc/self/fd", .{ .iterate = true }) catch return null;
-    defer dir.close();
+    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.openDirAbsolute(io_ctx, "/proc/self/fd", .{ .iterate = true }) catch return null;
+    defer dir.close(io_ctx);
 
     var it = dir.iterate();
     var count: u64 = 0;
-    while (it.next() catch return null) |_| {
+    while (it.next(io_ctx) catch return null) |_| {
         count += 1;
     }
     return count;
@@ -355,10 +408,14 @@ fn readMaxFds() ?u64 {
 }
 
 fn readFileAbsolute(path: []const u8, buffer: []u8) ?[]const u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const len = file.readAll(buffer) catch return null;
-    return buffer[0..len];
+    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    var file = std.Io.Dir.openFileAbsolute(io_ctx, path, .{}) catch return null;
+    defer file.close(io_ctx);
+    var reader = file.reader(io_ctx, &.{});
+    const content = reader.interface.allocRemaining(std.heap.page_allocator, .limited(buffer.len)) catch return null;
+    defer std.heap.page_allocator.free(content);
+    @memcpy(buffer[0..content.len], content);
+    return buffer[0..content.len];
 }
 
 test "metrics output contains required metrics" {
@@ -372,9 +429,9 @@ test "metrics output contains required metrics" {
     defer state.deinit();
 
     var buf: [32 * 1024]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    try writeMetrics(stream.writer(), &state, .{});
-    const out = stream.getWritten();
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeMetrics(&writer, &state, .{});
+    const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_connections_active") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_build_info") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_client_to_upstream_bytes_total") != null);

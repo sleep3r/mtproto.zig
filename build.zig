@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const linux_io_mod = b.createModule(.{
+        .root_source_file = b.path("src/linux_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -15,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "version", .module = version_mod },
+            .{ .name = "linux_io", .module = linux_io_mod },
         },
     });
 
@@ -78,6 +84,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "tunnel", .module = tunnel_mod },
             .{ .name = "version", .module = version_mod },
+            .{ .name = "linux_io", .module = linux_io_mod },
         },
     });
 
@@ -104,6 +111,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "version", .module = version_mod },
+            .{ .name = "linux_io", .module = linux_io_mod },
         },
     });
 

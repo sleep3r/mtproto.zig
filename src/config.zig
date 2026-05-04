@@ -4,6 +4,7 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
+const net = std.Io.net;
 
 pub const UpstreamMode = enum {
     /// Automatic egress mode (default).
@@ -56,11 +57,11 @@ fn stripInlineComment(value: []const u8) []const u8 {
         }
 
         if (!in_quotes and (ch == '#' or ch == ';')) {
-            return std.mem.trimRight(u8, value[0..i], &[_]u8{ ' ', '\t' });
+            return std.mem.trim(u8, value[0..i], &[_]u8{ ' ', '\t' });
         }
     }
 
-    return std.mem.trimRight(u8, value, &[_]u8{ ' ', '\t' });
+    return std.mem.trim(u8, value, &[_]u8{ ' ', '\t' });
 }
 
 pub const Config = struct {
@@ -134,7 +135,7 @@ pub const Config = struct {
     /// Use only if you know your host has enough memory for the configured limits.
     unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally
-    datacenter_override: ?std.net.Address = null,
+    datacenter_override: ?net.IpAddress = null,
     /// Upstream egress mode. Parsed from [upstream].type.
     /// Supported values: auto | direct | tunnel | socks5 | http.
     upstream_mode: UpstreamMode = .auto,
@@ -206,9 +207,13 @@ pub const Config = struct {
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const content = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(1024 * 1024),
+        );
         defer allocator.free(content);
         return parse(allocator, content);
     }

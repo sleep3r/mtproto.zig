@@ -54,7 +54,7 @@ pub const InstallOpts = struct {
 };
 
 /// Run install in CLI (non-interactive) mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = InstallOpts{};
 
     // Parse CLI flags

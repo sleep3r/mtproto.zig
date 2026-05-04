@@ -5,7 +5,7 @@
 //! handshake through the non-blocking epoll event loop.
 
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -70,7 +70,7 @@ pub fn buildGreeting(buf: []u8, use_auth: bool) []u8 {
 pub fn parseGreetingResponse(data: []const u8) ?Method {
     if (data.len < 2) return null;
     if (data[0] != version) return null;
-    return std.meta.intToEnum(Method, data[1]) catch .no_acceptable;
+    return std.enums.fromInt(Method, data[1]) orelse .no_acceptable;
 }
 
 /// Minimum bytes needed for greeting response.
@@ -111,8 +111,9 @@ pub const auth_response_len: usize = 2;
 
 /// Build a SOCKS5 CONNECT request to the given target address.
 /// Returns the slice of `buf` that was written, or empty on overflow.
-pub fn buildConnectRequest(buf: []u8, addr: net.Address) []u8 {
-    if (addr.any.family == std.posix.AF.INET) {
+pub fn buildConnectRequest(buf: []u8, addr: net.IpAddress) []u8 {
+    switch (addr) {
+        .ip4 => |ip4| {
         // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv4(4) + PORT(2) = 10
         const total: usize = 10;
         if (buf.len < total) return buf[0..0];
@@ -122,16 +123,16 @@ pub fn buildConnectRequest(buf: []u8, addr: net.Address) []u8 {
         buf[2] = 0x00; // reserved
         buf[3] = @intFromEnum(AddressType.ipv4);
 
-        const ip_bytes = std.mem.asBytes(&addr.in.sa.addr);
-        @memcpy(buf[4..8], ip_bytes);
+            @memcpy(buf[4..8], &ip4.bytes);
 
-        const port = addr.in.sa.port; // network byte order already
+            const port = std.mem.nativeToBig(u16, ip4.port);
         const port_bytes = std.mem.asBytes(&port);
         buf[8] = port_bytes[0];
         buf[9] = port_bytes[1];
 
         return buf[0..total];
-    } else if (addr.any.family == std.posix.AF.INET6) {
+        },
+        .ip6 => |ip6| {
         // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv6(16) + PORT(2) = 22
         const total: usize = 22;
         if (buf.len < total) return buf[0..0];
@@ -141,16 +142,16 @@ pub fn buildConnectRequest(buf: []u8, addr: net.Address) []u8 {
         buf[2] = 0x00; // reserved
         buf[3] = @intFromEnum(AddressType.ipv6);
 
-        @memcpy(buf[4..20], &addr.in6.sa.addr);
+            @memcpy(buf[4..20], &ip6.bytes);
 
-        const port = addr.in6.sa.port;
+            const port = std.mem.nativeToBig(u16, ip6.port);
         const port_bytes = std.mem.asBytes(&port);
         buf[20] = port_bytes[0];
         buf[21] = port_bytes[1];
 
         return buf[0..total];
+        },
     }
-    return buf[0..0];
 }
 
 /// Parse a SOCKS5 CONNECT response.
@@ -249,7 +250,10 @@ test "socks5 - parse auth response" {
 test "socks5 - connect request ipv4" {
     var buf: [64]u8 = undefined;
     // Construct an IPv4 address: 149.154.167.51:443
-    const addr = net.Address.initIp4(.{ 149, 154, 167, 51 }, 443);
+    const addr: net.IpAddress = .{ .ip4 = .{
+        .bytes = .{ 149, 154, 167, 51 },
+        .port = 443,
+    } };
     const msg = buildConnectRequest(&buf, addr);
 
     try std.testing.expectEqual(@as(usize, 10), msg.len);

@@ -32,7 +32,7 @@ pub const DashboardOpts = struct {
 };
 
 /// Run in CLI mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = DashboardOpts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--quiet")) {
@@ -149,9 +149,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     ui.step("Installing Python dependencies (fastapi, uvicorn, psutil, websockets)...");
 
     const pip_res = sys.exec(allocator, &.{
-        "uv",     "pip",   "install",
-        "--python", VENV_PYTHON,
-        "fastapi", "uvicorn", "psutil", "websockets", "starlette",
+        "uv",        "pip",       "install",
+        "--python",  VENV_PYTHON, "fastapi",
+        "uvicorn",   "psutil",    "websockets",
+        "starlette",
     }) catch {
         ui.fail("Failed to install Python dependencies via uv");
         return;
@@ -211,8 +212,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     if (!opts.quiet) {
         ui.summaryBox("Monitoring Dashboard Installed", &.{
             .{ .label = "Status:", .value = "systemctl status " ++ SERVICE_NAME },
-            .{ .label = "Logs:",   .value = "journalctl -u " ++ SERVICE_NAME ++ " -f" },
-            .{ .label = "Port:",   .value = "61208 (default, see config.toml)" },
+            .{ .label = "Logs:", .value = "journalctl -u " ++ SERVICE_NAME ++ " -f" },
+            .{ .label = "Port:", .value = "61208 (default, see config.toml)" },
             .{ .label = "", .style = .blank },
             .{ .label = "Access via secure SSH Tunnel:", .style = .success },
             .{ .label = "  ssh -L 61208:localhost:61208 root@<server_ip>", .style = .success },

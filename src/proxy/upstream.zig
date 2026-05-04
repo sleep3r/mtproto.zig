@@ -18,11 +18,92 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 const tunnel_mod = @import("../tunnel.zig");
+const Address = net.IpAddress;
 
 pub const Tunnel = tunnel_mod.Tunnel;
+
+const SocketAddr = union(enum) {
+    ip4: posix.sockaddr.in,
+    ip6: posix.sockaddr.in6,
+};
+
+fn socketFamily(addr: Address) posix.sa_family_t {
+    return switch (addr) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+}
+
+fn toSocketAddr(addr: Address) SocketAddr {
+    return switch (addr) {
+        .ip4 => |ip4| .{ .ip4 = .{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ip4.port),
+            .addr = @bitCast(ip4.bytes),
+        } },
+        .ip6 => |ip6| .{ .ip6 = .{
+            .family = posix.AF.INET6,
+            .port = std.mem.nativeToBig(u16, ip6.port),
+            .flowinfo = ip6.flow,
+            .addr = ip6.bytes,
+            .scope_id = ip6.interface.index,
+        } },
+    };
+}
+
+fn connectSocket(fd: posix.fd_t, addr: Address) !void {
+    var sa = toSocketAddr(addr);
+    switch (sa) {
+        .ip4 => |*a| try connectSockaddr(fd, @ptrCast(&a.*), @sizeOf(posix.sockaddr.in)),
+        .ip6 => |*a| try connectSockaddr(fd, @ptrCast(&a.*), @sizeOf(posix.sockaddr.in6)),
+    }
+}
+
+fn createTcpSocket(family: posix.sa_family_t) !posix.fd_t {
+    const flags = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    while (true) {
+        const rc = posix.system.socket(family, flags, posix.IPPROTO.TCP);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+            .PROTOTYPE => return error.SocketModeUnsupported,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    while (true) switch (posix.errno(posix.system.close(fd))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
+}
+
+fn connectSockaddr(fd: posix.fd_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
+    while (true) switch (posix.errno(posix.system.connect(fd, addr, addr_len))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .AGAIN, .INPROGRESS => return error.WouldBlock,
+        .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.Timeout,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+}
 
 /// What proxy-level handshake (if any) must be completed after TCP connect.
 pub const ProxyHandshake = enum {
@@ -61,7 +142,7 @@ pub const Upstream = union(Tag) {
     }
 
     pub fn initSocks5(
-        proxy_addr: net.Address,
+        proxy_addr: Address,
         username: ?[]const u8,
         password: ?[]const u8,
     ) Upstream {
@@ -73,7 +154,7 @@ pub const Upstream = union(Tag) {
     }
 
     pub fn initHttpConnect(
-        proxy_addr: net.Address,
+        proxy_addr: Address,
         username: ?[]const u8,
         password: ?[]const u8,
     ) Upstream {
@@ -90,7 +171,7 @@ pub const Upstream = union(Tag) {
     /// For proxy variants, connects to the proxy server; the caller
     /// must check `proxy_handshake` and run the appropriate handshake
     /// before using the socket for DC traffic.
-    pub fn connect(self: *const Upstream, addr: net.Address) !ConnectResult {
+    pub fn connect(self: *const Upstream, addr: Address) !ConnectResult {
         return switch (self.*) {
             .direct => |connector| connector.connect(addr),
             .socks5 => |connector| connector.connect(),
@@ -99,7 +180,7 @@ pub const Upstream = union(Tag) {
     }
 
     /// Get the proxy server address (for logging), or null for direct.
-    pub fn proxyAddr(self: *const Upstream) ?net.Address {
+    pub fn proxyAddr(self: *const Upstream) ?Address {
         return switch (self.*) {
             .direct => null,
             .socks5 => |s| s.proxy_addr,
@@ -128,19 +209,15 @@ pub const Upstream = union(Tag) {
 pub const Direct = struct {
     socket_mark: ?u32 = null,
 
-    pub fn connect(self: Direct, addr: net.Address) !ConnectResult {
-        const fd = try posix.socket(
-            addr.any.family,
-            posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-            posix.IPPROTO.TCP,
-        );
-        errdefer posix.close(fd);
+    pub fn connect(self: Direct, addr: Address) !ConnectResult {
+        const fd = try createTcpSocket(socketFamily(addr));
+        errdefer closeFd(fd);
 
         if (self.socket_mark) |mark| {
             try applySocketMark(fd, mark);
         }
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        connectSocket(fd, addr) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
                 return .{ .fd = fd, .pending = true };
             },
@@ -152,7 +229,7 @@ pub const Direct = struct {
 };
 
 pub const Socks5 = struct {
-    proxy_addr: net.Address,
+    proxy_addr: Address,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
     socket_mark: ?u32 = null,
@@ -160,18 +237,14 @@ pub const Socks5 = struct {
     /// Connect to the SOCKS5 proxy server (not the target DC).
     /// Returns a result with `.proxy_handshake = .socks5`.
     pub fn connect(self: Socks5) !ConnectResult {
-        const fd = try posix.socket(
-            self.proxy_addr.any.family,
-            posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-            posix.IPPROTO.TCP,
-        );
-        errdefer posix.close(fd);
+        const fd = try createTcpSocket(socketFamily(self.proxy_addr));
+        errdefer closeFd(fd);
 
         if (self.socket_mark) |mark| {
             try applySocketMark(fd, mark);
         }
 
-        posix.connect(fd, &self.proxy_addr.any, self.proxy_addr.getOsSockLen()) catch |err| switch (err) {
+        connectSocket(fd, self.proxy_addr) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
                 return .{ .fd = fd, .pending = true, .proxy_handshake = .socks5 };
             },
@@ -189,7 +262,7 @@ pub const Socks5 = struct {
 };
 
 pub const HttpConnect = struct {
-    proxy_addr: net.Address,
+    proxy_addr: Address,
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
     socket_mark: ?u32 = null,
@@ -197,18 +270,14 @@ pub const HttpConnect = struct {
     /// Connect to the HTTP proxy server (not the target DC).
     /// Returns a result with `.proxy_handshake = .http_connect`.
     pub fn connect(self: HttpConnect) !ConnectResult {
-        const fd = try posix.socket(
-            self.proxy_addr.any.family,
-            posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
-            posix.IPPROTO.TCP,
-        );
-        errdefer posix.close(fd);
+        const fd = try createTcpSocket(socketFamily(self.proxy_addr));
+        errdefer closeFd(fd);
 
         if (self.socket_mark) |mark| {
             try applySocketMark(fd, mark);
         }
 
-        posix.connect(fd, &self.proxy_addr.any, self.proxy_addr.getOsSockLen()) catch |err| switch (err) {
+        connectSocket(fd, self.proxy_addr) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
                 return .{ .fd = fd, .pending = true, .proxy_handshake = .http_connect };
             },

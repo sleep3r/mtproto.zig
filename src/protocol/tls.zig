@@ -8,6 +8,13 @@ const constants = @import("constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("obfuscation.zig");
 
+fn realtimeSeconds() i64 {
+    var ts: std.posix.timespec = undefined;
+    const rc = std.posix.system.clock_gettime(.REALTIME, &ts);
+    if (std.posix.errno(rc) != .SUCCESS) return 0;
+    return @intCast(ts.sec);
+}
+
 /// Re-export for convenience
 pub const UserSecret = obfuscation.UserSecret;
 
@@ -58,10 +65,7 @@ pub fn validateTlsHandshake(
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
-    const now: i64 = if (!ignore_time_skew)
-        @intCast(std.time.timestamp())
-    else
-        0;
+    const now: i64 = if (!ignore_time_skew) realtimeSeconds() else 0;
 
     for (secrets) |entry| {
         var hmac = HmacSha256.init(&entry.secret);
@@ -217,7 +221,7 @@ const nginx_template: [nginx_template_len]u8 = blk: {
 };
 
 pub fn buildServerHelloTemplate(seed: ?u64) [nginx_template_len]u8 {
-    const actual_seed = seed orelse std.crypto.random.int(u64);
+    const actual_seed = seed orelse crypto.randomInt(u64);
     return buildNginxTemplate(actual_seed);
 }
 

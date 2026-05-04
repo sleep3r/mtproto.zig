@@ -1,37 +1,46 @@
 //! Protocol constants and datacenter addresses for MTProto proxy.
 
 const std = @import("std");
+const net = std.Io.net;
+
+fn ip4(bytes: [4]u8, port: u16) net.IpAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+fn ip6(bytes: [16]u8, port: u16) net.IpAddress {
+    return .{ .ip6 = .{ .bytes = bytes, .port = port } };
+}
 
 // ============= Telegram Datacenters =============
 
 pub const tg_datacenter_port: u16 = 443;
 
-pub const tg_datacenters_v4 = [5]std.net.Address{
-    std.net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_datacenter_port),
-    std.net.Address.initIp4(.{ 149, 154, 167, 51 }, tg_datacenter_port),
-    std.net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_datacenter_port),
-    std.net.Address.initIp4(.{ 149, 154, 167, 91 }, tg_datacenter_port),
-    std.net.Address.initIp4(.{ 149, 154, 171, 5 }, tg_datacenter_port),
+pub const tg_datacenters_v4 = [5]net.IpAddress{
+    ip4(.{ 149, 154, 175, 50 }, tg_datacenter_port),
+    ip4(.{ 149, 154, 167, 51 }, tg_datacenter_port),
+    ip4(.{ 149, 154, 175, 100 }, tg_datacenter_port),
+    ip4(.{ 149, 154, 167, 91 }, tg_datacenter_port),
+    ip4(.{ 149, 154, 171, 5 }, tg_datacenter_port),
 };
 
-pub const tg_datacenters_v6 = [5]std.net.Address{
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    std.net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
+pub const tg_datacenters_v6 = [5]net.IpAddress{
+    ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
+    ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
+    ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
+    ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
+    ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
 };
 
 pub const tg_middle_proxy_port: u16 = 8888;
 
 /// Default MiddleProxy endpoints per primary DC (1..5), regular (non-media) path.
 /// Refreshed at runtime from getProxyConfig when available.
-pub const tg_middle_proxies_v4 = [5]std.net.Address{
-    std.net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 149, 154, 161, 144 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 91, 108, 4, 169 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
+pub const tg_middle_proxies_v4 = [5]net.IpAddress{
+    ip4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
+    ip4(.{ 149, 154, 161, 144 }, tg_middle_proxy_port),
+    ip4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
+    ip4(.{ 91, 108, 4, 169 }, tg_middle_proxy_port),
+    ip4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
 };
 
 /// Default MiddleProxy endpoints per primary DC (1..5), media path (dc_idx < 0).
@@ -39,19 +48,19 @@ pub const tg_middle_proxies_v4 = [5]std.net.Address{
 /// client to a regular MP causes large file downloads to stall or silently
 /// drop. Keep these in sync with `proxy_for -N` lines in getProxyConfig.
 /// Refreshed at runtime from getProxyConfig when available.
-pub const tg_media_middle_proxies_v4 = [5]std.net.Address{
-    std.net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 149, 154, 161, 184 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 149, 154, 164, 250 }, tg_middle_proxy_port),
-    std.net.Address.initIp4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
+pub const tg_media_middle_proxies_v4 = [5]net.IpAddress{
+    ip4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
+    ip4(.{ 149, 154, 161, 184 }, tg_middle_proxy_port),
+    ip4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
+    ip4(.{ 149, 154, 164, 250 }, tg_middle_proxy_port),
+    ip4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
 };
 
 /// Resolves physical Datacenter IP by its index, handling special media DCs.
-pub fn getDcAddressV4(abs_dc: usize) std.net.Address {
+pub fn getDcAddressV4(abs_dc: usize) net.IpAddress {
     if (abs_dc == 203) {
         // Media DC 203 has a dedicated network, resolving to MiddleProxy IP
-        return std.net.Address.initIp4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
+        return ip4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
     }
     if (abs_dc >= 1 and abs_dc <= tg_datacenters_v4.len) {
         return tg_datacenters_v4[abs_dc - 1];
@@ -70,7 +79,7 @@ pub const ProtoTag = enum(u32) {
 
     pub fn fromBytes(bytes: [4]u8) ?ProtoTag {
         const val = std.mem.readInt(u32, &bytes, .little);
-        return std.meta.intToEnum(ProtoTag, val) catch null;
+        return std.enums.fromInt(ProtoTag, val);
     }
 
     pub fn toBytes(self: ProtoTag) [4]u8 {

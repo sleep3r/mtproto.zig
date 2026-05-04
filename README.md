@@ -9,7 +9,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 **177 KB binary · Sub-1 MB RAM · Boots in <10 ms · Zero dependencies**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
 
 </div>

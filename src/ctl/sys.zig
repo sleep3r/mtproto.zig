@@ -7,6 +7,24 @@
 const std = @import("std");
 const tui_mod = @import("tui.zig");
 
+fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
+    var file = std.Io.Dir.openFileAbsolute(io(), path, .{}) catch return null;
+    defer file.close(io());
+    var reader = file.reader(io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(limit)) catch null;
+}
+
+fn readFileAllocCwd(allocator: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
+    var file = std.Io.Dir.cwd().openFile(io(), path, .{}) catch return null;
+    defer file.close(io());
+    var reader = file.reader(io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(limit)) catch null;
+}
+
 pub const ExecResult = struct {
     exit_code: u8,
     stdout: []const u8,
@@ -33,17 +51,20 @@ pub const Arch = enum {
 
 /// Run a command, capture stdout/stderr, return result.
 pub fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !ExecResult {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+
+    const result = try std.process.run(allocator, io_instance.io(), .{
         .argv = argv,
-        .max_output_bytes = 1024 * 1024,
+        .stdout_limit = std.Io.Limit.limited(1024 * 1024),
+        .stderr_limit = std.Io.Limit.limited(1024 * 1024),
     });
 
     const exit_code: u8 = switch (result.term) {
-        .Exited => |code| code,
-        .Signal => |sig| @as(u8, 128) +| @as(u8, @intCast(@min(sig, 127))),
-        .Stopped => 1,
-        .Unknown => 1,
+        .exited => |code| code,
+        .signal => |sig| @as(u8, 128) +| @as(u8, @intCast(@min(@intFromEnum(sig), 127))),
+        .stopped => 1,
+        .unknown => 1,
     };
 
     return .{
@@ -56,18 +77,24 @@ pub fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !ExecResult 
 
 /// Run a command with output forwarded directly to the terminal (no capture).
 pub fn execForward(argv: []const []const u8) !u8 {
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
 
-    try child.spawn();
-    const term = try child.wait();
+    const io_ctx = io_instance.io();
+    var child = try std.process.spawn(io_ctx, .{
+        .argv = argv,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io_ctx);
+
+    const term = try child.wait(io_ctx);
 
     return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| @as(u8, 128) +| @as(u8, @intCast(@min(sig, 127))),
-        .Stopped => 1,
-        .Unknown => 1,
+        .exited => |code| code,
+        .signal => |sig| @as(u8, 128) +| @as(u8, @intCast(@min(@intFromEnum(sig), 127))),
+        .stopped => 1,
+        .unknown => 1,
     };
 }
 
@@ -106,10 +133,7 @@ pub fn getArch() !Arch {
 pub fn supportsV3(allocator: std.mem.Allocator) bool {
     if (@import("builtin").os.tag != .linux) return false;
 
-    const cpuinfo = std.fs.openFileAbsolute("/proc/cpuinfo", .{}) catch return false;
-    defer cpuinfo.close();
-
-    const content = cpuinfo.readToEndAlloc(allocator, 256 * 1024) catch return false;
+    const content = readFileAllocAbsolute(allocator, "/proc/cpuinfo", 256 * 1024) orelse return false;
     defer allocator.free(content);
 
     // Find "flags" line
@@ -167,7 +191,7 @@ pub fn isServiceActive(service: []const u8) bool {
 
 /// Check if a file exists.
 pub fn fileExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(io(), path, .{}) catch return false;
     return true;
 }
 
@@ -179,23 +203,26 @@ pub fn execSilent(allocator: std.mem.Allocator, argv: []const []const u8) void {
 
 /// Write content to a file atomically. Avoids shell injection from bash -c.
 pub fn writeFile(path: []const u8, content: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    try std.Io.Dir.cwd().writeFile(io(), .{
+        .sub_path = path,
+        .data = content,
+    });
 }
 
 /// Write content and set permissions.
 pub fn writeFileMode(path: []const u8, content: []const u8, mode: u9) !void {
-    const file = try std.fs.cwd().createFile(path, .{ .mode = mode });
-    defer file.close();
-    try file.writeAll(content);
+    try std.Io.Dir.cwd().writeFile(io(), .{
+        .sub_path = path,
+        .data = content,
+        .flags = .{
+            .permissions = std.Io.File.Permissions.fromMode(mode),
+        },
+    });
 }
 
 /// Parse a simple KEY=VALUE .env file, return value for given key.
 pub fn readEnvFile(allocator: std.mem.Allocator, path: []const u8, key: []const u8) ?[]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return null;
+    const content = readFileAllocCwd(allocator, path, 64 * 1024) orelse return null;
     defer allocator.free(content);
 
     var lines_iter = std.mem.splitScalar(u8, content, '\n');
@@ -219,7 +246,18 @@ pub fn readEnvFile(allocator: std.mem.Allocator, path: []const u8, key: []const 
 /// Generate 16 random bytes as a hex string (32 chars).
 pub fn generateSecret(buf: *[32]u8) void {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = std.os.linux.getrandom(bytes[off..].ptr, bytes.len - off, 0);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) break;
+                off += rc;
+            },
+            .INTR => continue,
+            else => break,
+        }
+    }
     const hex = "0123456789abcdef";
     for (bytes, 0..) |byte, idx| {
         buf[idx * 2] = hex[byte >> 4];

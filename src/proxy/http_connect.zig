@@ -5,7 +5,11 @@
 //! handshake through the non-blocking epoll event loop.
 
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
+
+fn ip4(bytes: [4]u8, port: u16) net.IpAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
 
 // ─── Request Building ────────────────────────────────────────
 
@@ -20,7 +24,7 @@ const net = std.net;
 /// Returns the slice of `buf` used, or empty on overflow.
 pub fn buildConnectRequest(
     buf: []u8,
-    addr: net.Address,
+    addr: net.IpAddress,
     username: ?[]const u8,
     password: ?[]const u8,
 ) []u8 {
@@ -145,46 +149,39 @@ fn copyInto(dst: []u8, src: []const u8) ?usize {
     return src.len;
 }
 
-fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
-    if (addr.any.family == std.posix.AF.INET) {
-        const ip = std.mem.asBytes(&addr.in.sa.addr);
-        const port = std.mem.bigToNative(u16, addr.in.sa.port);
-        const str = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
-            ip[0], ip[1], ip[2], ip[3], port,
-        }) catch return "";
-        return str;
-    } else if (addr.any.family == std.posix.AF.INET6) {
-        const port = std.mem.bigToNative(u16, addr.in6.sa.port);
-        // For IPv6, use bracket notation
-        var ip_buf: [46]u8 = undefined;
-        var ip_len: usize = 0;
-        const ip6 = &addr.in6.sa.addr;
+fn formatAddress(addr: net.IpAddress, buf: []u8) []const u8 {
+    return switch (addr) {
+        .ip4 => |a| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+            a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3], a.port,
+        }) catch "",
+        .ip6 => |a| blk: {
+            var ip_buf: [46]u8 = undefined;
+            var ip_len: usize = 0;
+            const ip6_bytes = &a.bytes;
 
-        // Simple hex format for IPv6
-        var i: usize = 0;
-        while (i < 16) : (i += 2) {
-            if (i > 0) {
-                ip_buf[ip_len] = ':';
-                ip_len += 1;
+            var i: usize = 0;
+            while (i < 16) : (i += 2) {
+                if (i > 0) {
+                    ip_buf[ip_len] = ':';
+                    ip_len += 1;
+                }
+                const word = @as(u16, ip6_bytes[i]) << 8 | @as(u16, ip6_bytes[i + 1]);
+                const hex = std.fmt.bufPrint(ip_buf[ip_len..], "{x}", .{word}) catch return "";
+                ip_len += hex.len;
             }
-            const word = @as(u16, ip6[i]) << 8 | @as(u16, ip6[i + 1]);
-            const hex = std.fmt.bufPrint(ip_buf[ip_len..], "{x}", .{word}) catch return "";
-            ip_len += hex.len;
-        }
 
-        const str = std.fmt.bufPrint(buf, "[{s}]:{d}", .{
-            ip_buf[0..ip_len], port,
-        }) catch return "";
-        return str;
-    }
-    return "";
+            break :blk std.fmt.bufPrint(buf, "[{s}]:{d}", .{
+                ip_buf[0..ip_len], a.port,
+            }) catch "";
+        },
+    };
 }
 
 // ─── Tests ───────────────────────────────────────────────────
 
 test "http_connect - build request without auth" {
     var buf: [1024]u8 = undefined;
-    const addr = net.Address.initIp4(.{ 149, 154, 167, 51 }, 443);
+    const addr = ip4(.{ 149, 154, 167, 51 }, 443);
     const msg = buildConnectRequest(&buf, addr, null, null);
 
     try std.testing.expect(msg.len > 0);
@@ -196,7 +193,7 @@ test "http_connect - build request without auth" {
 
 test "http_connect - build request with auth" {
     var buf: [1024]u8 = undefined;
-    const addr = net.Address.initIp4(.{ 149, 154, 167, 51 }, 443);
+    const addr = ip4(.{ 149, 154, 167, 51 }, 443);
     const msg = buildConnectRequest(&buf, addr, "admin", "fr6CgjUvxFEAn5vs");
 
     try std.testing.expect(msg.len > 0);
@@ -207,7 +204,7 @@ test "http_connect - build request with auth" {
 
 test "http_connect - build request with empty username skips auth" {
     var buf: [1024]u8 = undefined;
-    const addr = net.Address.initIp4(.{ 149, 154, 167, 51 }, 443);
+    const addr = ip4(.{ 149, 154, 167, 51 }, 443);
     const msg = buildConnectRequest(&buf, addr, "", "");
 
     try std.testing.expect(std.mem.indexOf(u8, msg, "Proxy-Authorization") == null);
@@ -250,7 +247,7 @@ test "http_connect - parse response with pipelined payload" {
 
 test "http_connect - address formatting ipv4" {
     var buf: [64]u8 = undefined;
-    const addr = net.Address.initIp4(.{ 10, 0, 0, 1 }, 8080);
+    const addr = ip4(.{ 10, 0, 0, 1 }, 8080);
     const str = formatAddress(addr, &buf);
     try std.testing.expectEqualStrings("10.0.0.1:8080", str);
 }

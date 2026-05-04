@@ -214,13 +214,27 @@ pub fn md5(data: []const u8) [16]u8 {
 
 /// Fill buffer with cryptographically secure random bytes.
 pub fn randomBytes(buf: []u8) void {
-    std.crypto.random.bytes(buf);
+    var source: std.Random.IoSource = .{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
+    source.interface().bytes(buf);
 }
 
 /// Generate a random integer in [0, max).
 pub fn randomRange(comptime T: type, max: T) T {
     if (max == 0) return 0;
-    return std.crypto.random.intRangeLessThan(T, 0, max);
+    var source: std.Random.IoSource = .{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
+    return source.interface().uintLessThan(T, max);
+}
+
+/// Generate a random integer in the full range of T.
+pub fn randomInt(comptime T: type) T {
+    var source: std.Random.IoSource = .{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
+    return source.interface().int(T);
 }
 
 // ============= Tests =============

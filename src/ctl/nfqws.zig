@@ -24,7 +24,7 @@ pub const NfqwsOpts = struct {
 };
 
 /// Run in CLI mode.
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = NfqwsOpts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--ttl")) {
@@ -93,8 +93,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     ui.step("Installing build dependencies...");
     _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
     _ = sys.execForward(&.{
-        "apt-get", "install", "-y", "build-essential", "git",
-        "libnetfilter-queue-dev", "libcap-dev", "iptables", "libmnl-dev", "zlib1g-dev",
+        "apt-get",                "install",    "-y",       "build-essential", "git",
+        "libnetfilter-queue-dev", "libcap-dev", "iptables", "libmnl-dev",      "zlib1g-dev",
     }) catch {};
     ui.ok("Dependencies installed");
 
@@ -125,14 +125,14 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     removeNfqwsRules(allocator, "ip6tables");
 
     _ = sys.exec(allocator, &.{
-        "iptables", "-t", "mangle", "-A", "OUTPUT",
-        "-p", "tcp", "--sport", port,
-        "-j", "NFQUEUE", "--queue-num", NFQUEUE_NUM,
+        "iptables", "-t",          "mangle",    "-A", "OUTPUT",
+        "-p",       "tcp",         "--sport",   port, "-j",
+        "NFQUEUE",  "--queue-num", NFQUEUE_NUM,
     }) catch {};
     _ = sys.exec(allocator, &.{
-        "ip6tables", "-t", "mangle", "-A", "OUTPUT",
-        "-p", "tcp", "--sport", port,
-        "-j", "NFQUEUE", "--queue-num", NFQUEUE_NUM,
+        "ip6tables", "-t",          "mangle",    "-A", "OUTPUT",
+        "-p",        "tcp",         "--sport",   port, "-j",
+        "NFQUEUE",   "--queue-num", NFQUEUE_NUM,
     }) catch {};
 
     _ = sys.exec(allocator, &.{ "bash", "-c", "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ip6tables-save > /etc/iptables/rules.v6" }) catch {};
@@ -202,7 +202,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 fn removeNfqwsRules(allocator: std.mem.Allocator, ipt: []const u8) void {
     // Remove any existing NFQUEUE rules for our queue number
     var cmd_buf: [512]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf,
+    const cmd = std.fmt.bufPrint(
+        &cmd_buf,
         "{s} -t mangle -S OUTPUT 2>/dev/null | grep 'NFQUEUE --queue-num {s}' | while read -r line; do rule=$(echo \"$line\" | sed 's/-A /-D /'); {s} -t mangle $rule 2>/dev/null || true; done",
         .{ ipt, NFQUEUE_NUM, ipt },
     ) catch return;
