@@ -30,6 +30,12 @@ const AwgConfigKind = enum {
     amnezia_vpn_link,
 };
 
+const AwgQuickValidation = enum {
+    ok,
+    missing_binary,
+    invalid_config,
+};
+
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var opts = TunnelOpts{};
@@ -91,15 +97,16 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     }
 
     // ── Install AmneziaWG ──
-    if (sys.commandExists("awg")) {
+    if (sys.commandExists("awg") and sys.commandExists("awg-quick")) {
         ui.ok("AmneziaWG already installed");
     } else {
+        if (sys.commandExists("awg") != sys.commandExists("awg-quick")) {
+            ui.warn("Detected partial AmneziaWG installation; repairing package setup");
+        }
         ui.step("Installing AmneziaWG...");
-        _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
-        _ = sys.execForward(&.{ "apt-get", "install", "-y", "software-properties-common" }) catch {};
-        _ = sys.execForward(&.{ "add-apt-repository", "-y", "ppa:amnezia/ppa" }) catch {};
-        _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
-        _ = sys.execForward(&.{ "apt-get", "install", "-y", "amneziawg-tools" }) catch {};
+        if (!ensureAmneziaWgInstalled(ui, allocator)) {
+            return;
+        }
         ui.ok("AmneziaWG installed");
     }
 
@@ -138,9 +145,16 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         ui.warn("Added Table = off to [Interface] in awg0.conf");
     }
 
-    if (!validateAwgQuickConfig(allocator)) {
-        ui.fail("AmneziaWG config is not accepted by awg-quick. Check that the input is an AWG/WG client config.");
-        return;
+    switch (validateAwgQuickConfig(allocator)) {
+        .ok => {},
+        .missing_binary => {
+            ui.fail("AmneziaWG tools are not available (`awg-quick` was not found). Install amneziawg-tools and retry.");
+            return;
+        },
+        .invalid_config => {
+            ui.fail("AmneziaWG config is not accepted by awg-quick. Check that the input is an AWG/WG client config.");
+            return;
+        },
     }
 
     ui.ok("Config installed to " ++ AWG_CONFIG_PATH);
@@ -605,10 +619,119 @@ fn looksLikeAwgConfig(content: []const u8) bool {
     return has_interface and has_peer;
 }
 
-fn validateAwgQuickConfig(allocator: std.mem.Allocator) bool {
-    const result = sys.exec(allocator, &.{ "awg-quick", "strip", AWG_CONFIG_PATH }) catch return false;
+fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
+    if (!runCommandChecked(
+        ui,
+        allocator,
+        &.{ "apt-get", "-o", "APT::Update::Error-Mode=any", "update", "-qq" },
+        "Failed to refresh apt package index",
+    )) return false;
+
+    if (!runCommandChecked(
+        ui,
+        allocator,
+        &.{ "apt-get", "install", "-y", "software-properties-common" },
+        "Failed to install software-properties-common",
+    )) return false;
+
+    if (!runCommandChecked(
+        ui,
+        allocator,
+        &.{ "add-apt-repository", "-y", "ppa:amnezia/ppa" },
+        "Failed to add Amnezia PPA",
+    )) return false;
+
+    if (!runCommandChecked(
+        ui,
+        allocator,
+        &.{ "apt-get", "-o", "APT::Update::Error-Mode=any", "update", "-qq" },
+        "Failed to refresh apt index after adding Amnezia PPA",
+    )) return false;
+
+    if (!runCommandChecked(
+        ui,
+        allocator,
+        &.{ "apt-get", "install", "-y", "amneziawg-tools" },
+        "Failed to install amneziawg-tools",
+    )) return false;
+
+    if (!sys.commandExists("awg") or !sys.commandExists("awg-quick")) {
+        ui.fail("amneziawg-tools installation finished but awg/awg-quick were not found in PATH");
+        ui.warn("Run `apt-cache policy amneziawg-tools` and verify package availability for your distro.");
+        return false;
+    }
+
+    return true;
+}
+
+fn runCommandChecked(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    fail_summary: []const u8,
+) bool {
+    const result = sys.exec(allocator, argv) catch {
+        ui.fail(fail_summary);
+        ui.warn("Failed to execute system command.");
+        return false;
+    };
     defer result.deinit();
-    return result.exit_code == 0;
+
+    if (result.exit_code != 0) {
+        ui.fail(fail_summary);
+
+        if (firstDiagnosticLine(result.stderr)) |line| {
+            ui.warn(line);
+        } else if (firstDiagnosticLine(result.stdout)) |line| {
+            ui.warn(line);
+        }
+
+        if (looksLikeLaunchpadPpaIssue(result.stdout) or looksLikeLaunchpadPpaIssue(result.stderr)) {
+            ui.warn("Detected Launchpad PPA outage/block (ppa.launchpadcontent.net). This is usually temporary.");
+            ui.warn("Retry later or install `amneziawg-tools` from a reachable mirror, then rerun `mtbuddy setup tunnel`.");
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+fn looksLikeLaunchpadPpaIssue(output: []const u8) bool {
+    if (std.mem.indexOf(u8, output, "ppa.launchpadcontent.net") == null) return false;
+
+    return std.mem.indexOf(u8, output, "Failed to fetch") != null or
+        std.mem.indexOf(u8, output, "Could not resolve") != null or
+        std.mem.indexOf(u8, output, "Temporary failure") != null or
+        std.mem.indexOf(u8, output, "Connection timed out") != null or
+        std.mem.indexOf(u8, output, "Network is unreachable") != null;
+}
+
+fn firstDiagnosticLine(output: []const u8) ?[]const u8 {
+    var first_non_empty: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        if (trimmed.len == 0) continue;
+        if (first_non_empty == null) first_non_empty = trimmed;
+
+        if (std.mem.startsWith(u8, trimmed, "E:") or
+            std.mem.startsWith(u8, trimmed, "Err:") or
+            std.mem.startsWith(u8, trimmed, "W:"))
+        {
+            return trimmed;
+        }
+    }
+
+    return first_non_empty;
+}
+
+fn validateAwgQuickConfig(allocator: std.mem.Allocator) AwgQuickValidation {
+    if (!sys.commandExists("awg-quick")) return .missing_binary;
+
+    const result = sys.exec(allocator, &.{ "awg-quick", "strip", AWG_CONFIG_PATH }) catch return .missing_binary;
+    defer result.deinit();
+    return if (result.exit_code == 0) .ok else .invalid_config;
 }
 
 fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
@@ -900,7 +1023,7 @@ test "tunnel - strips empty AWG assignments" {
 
     try std.testing.expect(try stripAwgEmptyAssignments(std.testing.allocator, path));
 
-    const sanitized = try tmp.dir.readFileAlloc(std.testing.allocator, path, 4096);
+    const sanitized = try tmp.dir.readFileAlloc(std.testing.allocator, name, 4096);
     defer std.testing.allocator.free(sanitized);
 
     try std.testing.expect(std.mem.indexOf(u8, sanitized, "I2") == null);
