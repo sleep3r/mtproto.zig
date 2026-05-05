@@ -56,10 +56,15 @@ pub fn main(init: std.process.Init) !void {
     var encrypted = plain;
     enc.apply(&encrypted);
 
+    // Obfuscated MTProto handshake wire format keeps the first 56 bytes
+    // as-is and carries encrypted proto_tag/dc_idx in the last 8 bytes.
+    var wire = plain;
+    @memcpy(wire[constants.proto_tag_pos..], encrypted[constants.proto_tag_pos..]);
+
     var stdout_buffer: [256]u8 = undefined;
     var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    const out_buf = std.fmt.bytesToHex(encrypted, .lower);
+    const out_buf = std.fmt.bytesToHex(wire, .lower);
     try stdout.writeAll(out_buf[0..]);
     try stdout.writeAll("\n");
     try stdout.flush();
