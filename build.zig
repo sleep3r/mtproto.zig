@@ -141,4 +141,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_ctl_tests.step);
+
+    // E2E / integration harness (process-level scenarios).
+    const e2e_cmd = b.addSystemCommand(&.{ "python3", "test/e2e/run.py" });
+    e2e_cmd.step.dependOn(&exe.step);
+    e2e_cmd.addArg("--proxy-bin");
+    e2e_cmd.addFileArg(exe.getEmittedBin());
+    if (b.args) |args| {
+        e2e_cmd.addArgs(args);
+    }
+
+    const e2e_step = b.step("e2e", "Run E2E/integration tests");
+    e2e_step.dependOn(&e2e_cmd.step);
 }

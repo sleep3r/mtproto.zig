@@ -1,4 +1,4 @@
-.PHONY: help build fmt test deploy
+.PHONY: help build fmt test e2e deploy
 
 SERVER ?= mtproto.sleep3r.ru
 CONFIG ?= config.toml
@@ -18,6 +18,9 @@ fmt: ## Format all Zig source files
 
 test: ## Run unit tests
 	zig build test
+
+e2e: ## Run E2E/integration harness
+	zig build e2e
 
 # ── server ops ────────────────────────────────────────────────────────────────
 

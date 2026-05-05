@@ -6,6 +6,44 @@ This folder contains practical tools to validate **capacity**, **stability**, an
 
 - `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.
 - `connection_stability_check.py` — churn + idle-pool stability harness (leak/regression detector).
+- `e2e/run.py` — process-level integration harness (`make e2e` / `zig build e2e`).
+
+## E2E Harness
+
+Run all integration scenarios in one command:
+
+```bash
+make e2e
+# or
+zig build e2e
+```
+
+Note: the runtime harness requires Linux (it launches the real epoll-based proxy binary).
+
+Run a single scenario:
+
+```bash
+zig build e2e -- --scenario replay_attack_rejected
+```
+
+List scenarios:
+
+```bash
+zig build e2e -- --list
+```
+
+Current scenarios include:
+
+- fake Telegram DC via SOCKS5 tunnel
+- fake MiddleProxy path with fallback-to-direct
+- SOCKS5 upstream success/failure
+- HTTP CONNECT upstream success/failure
+- mask fallback to local `mask_port` target
+- invalid TLS / invalid MTProto handshake rejection
+- replay attack rejection
+- slowloris / partial ClientHello timeout
+- connection churn 10k+
+- SIGTERM during active relay
 
 ## What We Measure
 
