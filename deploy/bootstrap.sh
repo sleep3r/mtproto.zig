@@ -39,6 +39,30 @@ step() { printf "  ${Y}●${N} %s...\n" "$*" >&2; }
 
 [ "$(id -u)" = "0" ] || fail "Run as root: sudo bash bootstrap.sh"
 
+curl_try_download() {
+  local out="$1"
+  shift
+  rm -f "$out"
+  if curl "$@" -o "$out" && [ -s "$out" ]; then
+    return 0
+  fi
+  rm -f "$out"
+  return 1
+}
+
+curl_download() {
+  local url="$1"
+  local out="$2"
+  local common=(-fsSL --connect-timeout 8 --max-time 120 --retry 1 --retry-delay 1 --speed-time 30 --speed-limit 1)
+
+  curl_try_download "$out" "${common[@]}" "$url" && return 0
+  curl_try_download "$out" -4 "${common[@]}" "$url" && return 0
+  curl_try_download "$out" --http1.1 "${common[@]}" "$url" && return 0
+  curl_try_download "$out" -4 --http1.1 "${common[@]}" "$url" && return 0
+
+  return 1
+}
+
 # ── detect arch ───────────────────────────────────────────────────
 cpu_supports_x86_64_v3() {
   local flags
@@ -81,8 +105,10 @@ esac
 
 # ── resolve latest tag ────────────────────────────────────────────
 step "Fetching latest release"
-TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "\(.*\)".*/\1/')"
+LATEST_JSON="$TMP/latest-release.json"
+curl_download "https://api.github.com/repos/${REPO}/releases/latest" "$LATEST_JSON" \
+  || fail "Could not fetch latest release metadata"
+TAG="$(grep '"tag_name"' "$LATEST_JSON" | head -1 | sed 's/.*"tag_name": "\(.*\)".*/\1/')"
 [ -n "$TAG" ] || fail "Could not resolve latest release tag"
 ok "Latest release: $TAG"
 
@@ -94,12 +120,12 @@ download_artifact() {
   local url="https://github.com/${REPO}/releases/download/${TAG}/${tar_name}"
   local sha_url="https://github.com/${REPO}/releases/download/${TAG}/${sha_name}"
   step "Downloading $artifact"
-  curl -fsSL "$url" -o "$TMP/${tar_name}" || fail "Download failed: $url"
-  curl -fsSL "$sha_url" -o "$TMP/${sha_name}" || fail "Checksum download failed: $sha_url"
+  curl_download "$url" "$TMP/${tar_name}" || fail "Download failed: $url"
+  curl_download "$sha_url" "$TMP/${sha_name}" || fail "Checksum download failed: $sha_url"
   if [ "$INSECURE_MODE" != "1" ]; then
     local sig_name="${sha_name}.minisig"
     local sig_url="https://github.com/${REPO}/releases/download/${TAG}/${sig_name}"
-    curl -fsSL "$sig_url" -o "$TMP/${sig_name}" || fail "Signature download failed: $sig_url"
+    curl_download "$sig_url" "$TMP/${sig_name}" || fail "Signature download failed: $sig_url"
     if ! command -v minisign >/dev/null 2>&1; then
       fail "minisign is required for signature verification (use --insecure or MTPROTO_INSECURE=1 to bypass)"
     fi

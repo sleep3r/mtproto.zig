@@ -290,23 +290,78 @@ fn downloadReleaseFile(
         "https://github.com/{s}/{s}/releases/download/{s}/{s}",
         .{ REPO_OWNER, REPO_NAME, tag, file_name },
     ) catch return false;
-    const dl = sys.exec(allocator, &.{
-        "curl",
+
+    const modes = [_]CurlMode{
+        .{},
+        .{ .force_ipv4 = true },
+        .{ .http1 = true },
+        .{ .force_ipv4 = true, .http1 = true },
+    };
+    for (modes) |mode| {
+        _ = sys.exec(allocator, &.{ "rm", "-f", out_path }) catch {};
+        if (curlDownloadToPath(allocator, url, out_path, mode)) return true;
+    }
+    _ = sys.exec(allocator, &.{ "rm", "-f", out_path }) catch {};
+    return false;
+}
+
+const CurlMode = struct {
+    force_ipv4: bool = false,
+    http1: bool = false,
+};
+
+fn curlDownloadToPath(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    out_path: []const u8,
+    mode: CurlMode,
+) bool {
+    var argv: [32][]const u8 = undefined;
+    var n: usize = 0;
+
+    argv[n] = "curl";
+    n += 1;
+    if (mode.force_ipv4) {
+        argv[n] = "-4";
+        n += 1;
+    }
+    if (mode.http1) {
+        argv[n] = "--http1.1";
+        n += 1;
+    }
+
+    const common = [_][]const u8{
         "-fsSL",
         "--connect-timeout",
-        "10",
+        "8",
         "--max-time",
         "120",
         "--retry",
-        "2",
+        "1",
         "--retry-delay",
+        "1",
+        "--speed-time",
+        "30",
+        "--speed-limit",
         "1",
         url,
         "-o",
         out_path,
-    }) catch return false;
+    };
+    for (common) |arg| {
+        argv[n] = arg;
+        n += 1;
+    }
+
+    const dl = sys.exec(allocator, argv[0..n]) catch return false;
     defer dl.deinit();
-    return dl.exit_code == 0;
+    return dl.exit_code == 0 and fileIsNonEmpty(allocator, out_path);
+}
+
+fn fileIsNonEmpty(allocator: std.mem.Allocator, path: []const u8) bool {
+    const r = sys.exec(allocator, &.{ "test", "-s", path }) catch return false;
+    defer r.deinit();
+    return r.exit_code == 0;
 }
 
 fn verifyReleaseChecksum(
