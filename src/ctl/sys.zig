@@ -243,6 +243,20 @@ pub fn readEnvFile(allocator: std.mem.Allocator, path: []const u8, key: []const 
     return null;
 }
 
+/// Read a boolean-like env flag from the current process environment.
+/// Returns true for: 1, true, yes, on (case-insensitive).
+pub fn envFlagSet(name: []const u8) bool {
+    const result = exec(std.heap.page_allocator, &.{ "printenv", name }) catch return false;
+    defer result.deinit();
+    if (result.exit_code != 0) return false;
+
+    const trimmed = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    return std.ascii.eqlIgnoreCase(trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes") or
+        std.ascii.eqlIgnoreCase(trimmed, "on");
+}
+
 /// Generate 16 random bytes as a hex string (32 chars).
 pub fn generateSecret(buf: *[32]u8) void {
     var bytes: [16]u8 = undefined;

@@ -22,6 +22,7 @@ const SERVICE_FILE = release.SERVICE_FILE;
 pub const UpdateOpts = struct {
     version: ?[]const u8 = null,
     force_service_update: bool = false,
+    insecure: bool = false,
 };
 
 /// Run update in CLI (non-interactive) mode.
@@ -33,6 +34,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.version = args.next();
         } else if (std.mem.eql(u8, arg, "--force-service")) {
             opts.force_service_update = true;
+        } else if (std.mem.eql(u8, arg, "--insecure")) {
+            opts.insecure = true;
         }
     }
 
@@ -78,8 +81,19 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         return;
     }
 
+    const insecure_mode = opts.insecure or sys.envFlagSet("MTPROTO_INSECURE");
+    const signature_available = release.signatureVerificationAvailable();
+    if (!signature_available and !insecure_mode) {
+        ui.fail("This mtbuddy build has no embedded minisign public key.");
+        ui.info("Rebuild with -Dminisign_pubkey=<RW...> or use --insecure (or MTPROTO_INSECURE=1).");
+        return;
+    }
+    if (insecure_mode) {
+        ui.warn("INSECURE mode enabled: release signature verification is disabled.");
+    }
+
     // ── Ensure signature verifier dependency ──
-    if (release.requiresSignatureVerification() and !sys.commandExists("minisign")) {
+    if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
         ui.step("Installing minisign for release signature verification...");
         _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
         _ = sys.exec(allocator, &.{ "apt-get", "install", "-y", "minisign" }) catch {};
@@ -106,7 +120,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     defer release.cleanup(allocator, &artifact);
     {
         ui.step(ui.str(.update_downloading));
-        if (!release.downloadProxyArtifact(allocator, tag.slice(), "update", &artifact)) {
+        if (!release.downloadProxyArtifact(allocator, tag.slice(), "update", !insecure_mode, &artifact)) {
             ui.fail(ui.str(.error_download_failed));
             return;
         }
@@ -122,6 +136,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         tag.slice(),
         artifact.asset_name,
         artifact.extractDir(),
+        !insecure_mode,
         &buddy_buf,
     );
 

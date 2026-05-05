@@ -68,14 +68,13 @@ All installation, updates, and management are done through **mtbuddy** — a nat
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash
+
+# Explicitly allow unsigned bootstrap mode (not recommended)
+curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash -s -- --insecure
+# or: MTPROTO_INSECURE=1
 ```
 
-This downloads the latest `mtbuddy` binary, verifies its SHA-256 checksum from the GitHub Release, and runs `mtbuddy --help`. Then install the proxy:
-
-```bash
-# Optional: enforce minisign verification for bootstrap checksum files
-export MTPROTO_MINISIGN_PUBKEY="RW..."
-```
+This downloads the latest `mtbuddy` binary, verifies minisign signature + SHA-256 checksum from the GitHub Release, and runs `mtbuddy --help`. Then install the proxy:
 
 ```bash
 # Minimal — auto-generates a secret, enables all DPI bypass modules
@@ -89,6 +88,9 @@ sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
 
 # Install using an existing config file (auto-maps port and domain)
 sudo mtbuddy install --config /path/to/config.toml --yes
+
+# Explicitly allow unsigned mode (not recommended)
+sudo mtbuddy install --insecure --port 443 --domain wb.ru --yes
 ```
 
 At the end, mtbuddy prints a ready-to-use `tg://` connection link.
@@ -143,11 +145,14 @@ sudo mtbuddy --interactive
 ## Update
 
 ```bash
-# Update to latest release (verifies checksum, checks CPU compat, auto-rollback on failure)
+# Update to latest release (verifies minisign + checksum, checks CPU compat, auto-rollback on failure)
 sudo mtbuddy update
 
 # Pin to a specific version
 sudo mtbuddy update --version v0.11.1
+
+# Explicitly allow unsigned mode (not recommended)
+sudo mtbuddy update --insecure
 ```
 
 ---
@@ -444,7 +449,7 @@ make deploy     # build + deploy to SERVER (see Makefile)
 make dashboard  # SSH tunnel for web dashboard (localhost:61208)
 ```
 
-Release builders can embed a minisign public key into `mtbuddy`:
+Release builders can override the default pinned minisign key if needed:
 
 ```bash
 zig build -Dminisign_pubkey=RW... -Doptimize=ReleaseFast -Dtarget=x86_64-linux

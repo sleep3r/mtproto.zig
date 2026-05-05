@@ -3,11 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const pinned_minisign_pubkey = "RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO";
     const minisign_pubkey = b.option(
         []const u8,
         "minisign_pubkey",
         "Minisign public key (base64) for release signature verification",
-    ) orelse "";
+    ) orelse pinned_minisign_pubkey;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "minisign_pubkey", minisign_pubkey);

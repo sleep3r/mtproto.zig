@@ -14,7 +14,22 @@ REPO="sleep3r/mtproto.zig"
 INSTALL_TO="/usr/local/bin/mtbuddy"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-MINISIGN_PUBKEY="${MTPROTO_MINISIGN_PUBKEY:-}"
+PINNED_MINISIGN_PUBKEY="RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO"
+MINISIGN_PUBKEY="${MTPROTO_MINISIGN_PUBKEY:-$PINNED_MINISIGN_PUBKEY}"
+INSECURE_MODE="${MTPROTO_INSECURE:-0}"
+
+FORWARD_ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--insecure" ]; then
+    INSECURE_MODE=1
+  fi
+  FORWARD_ARGS+=("$arg")
+done
+
+case "${INSECURE_MODE,,}" in
+  1|true|yes|on) INSECURE_MODE=1 ;;
+  *) INSECURE_MODE=0 ;;
+esac
 
 # ── colour helpers ────────────────────────────────────────────────
 Y='\033[0;33m'; G='\033[0;32m'; R='\033[0;31m'; N='\033[0m'
@@ -81,16 +96,18 @@ download_artifact() {
   step "Downloading $artifact"
   curl -fsSL "$url" -o "$TMP/${tar_name}" || fail "Download failed: $url"
   curl -fsSL "$sha_url" -o "$TMP/${sha_name}" || fail "Checksum download failed: $sha_url"
-  if [ -n "$MINISIGN_PUBKEY" ]; then
+  if [ "$INSECURE_MODE" != "1" ]; then
     local sig_name="${sha_name}.minisig"
     local sig_url="https://github.com/${REPO}/releases/download/${TAG}/${sig_name}"
     curl -fsSL "$sig_url" -o "$TMP/${sig_name}" || fail "Signature download failed: $sig_url"
     if ! command -v minisign >/dev/null 2>&1; then
-      fail "minisign is required for signature verification (install minisign or unset MTPROTO_MINISIGN_PUBKEY)"
+      fail "minisign is required for signature verification (use --insecure or MTPROTO_INSECURE=1 to bypass)"
     fi
     step "Verifying signature for $artifact"
     minisign -V -q -m "$TMP/${sha_name}" -x "$TMP/${sig_name}" -P "$MINISIGN_PUBKEY" \
       || fail "Signature verification failed: $sha_name"
+  else
+    step "INSECURE mode: skipping minisign signature verification"
   fi
 
   step "Verifying checksum for $artifact"
@@ -132,8 +149,8 @@ install -m 0755 "$BUDDY_BIN" "$INSTALL_TO"
 ok "mtbuddy installed → $INSTALL_TO"
 
 # ── run with forwarded args ───────────────────────────────────────
-if [ $# -gt 0 ]; then
-  exec mtbuddy "$@"
+if [ "${#FORWARD_ARGS[@]}" -gt 0 ]; then
+  exec mtbuddy "${FORWARD_ARGS[@]}"
 else
   mtbuddy --help
 fi

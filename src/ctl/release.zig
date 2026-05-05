@@ -97,6 +97,7 @@ pub fn downloadProxyArtifact(
     allocator: std.mem.Allocator,
     tag: []const u8,
     label: []const u8,
+    verify_signatures: bool,
     artifact: *Artifact,
 ) bool {
     // ── Detect architecture ──
@@ -138,7 +139,7 @@ pub fn downloadProxyArtifact(
 
         // Download + checksum verify
         if (!downloadReleaseFile(allocator, tag, tar_name, dl_path)) continue;
-        if (!verifyReleaseChecksum(allocator, tag, tar_name, dl_path, extract_dir)) continue;
+        if (!verifyReleaseChecksum(allocator, tag, tar_name, dl_path, extract_dir, verify_signatures)) continue;
 
         // Extract
         const tar_exit = sys.execForward(&.{ "tar", "-xzf", dl_path, "-C", extract_dir }) catch continue;
@@ -181,6 +182,7 @@ pub fn downloadBuddyArtifact(
     tag: []const u8,
     proxy_asset: []const u8,
     extract_dir: []const u8,
+    verify_signatures: bool,
     out_buf: *[256]u8,
 ) ?[]const u8 {
     // Derive buddy name: "mtproto-proxy-linux-x86_64_v3" → "mtbuddy-linux-x86_64_v3"
@@ -197,7 +199,7 @@ pub fn downloadBuddyArtifact(
     var dl_path_buf: [320]u8 = undefined;
     const dl_path = std.fmt.bufPrint(&dl_path_buf, "{s}/{s}", .{ extract_dir, tar_name }) catch return null;
     if (!downloadReleaseFile(allocator, tag, tar_name, dl_path)) return null;
-    if (!verifyReleaseChecksum(allocator, tag, tar_name, dl_path, extract_dir)) return null;
+    if (!verifyReleaseChecksum(allocator, tag, tar_name, dl_path, extract_dir, verify_signatures)) return null;
 
     const tar_exit = sys.execForward(&.{ "tar", "-xzf", dl_path, "-C", extract_dir }) catch return null;
     if (tar_exit != 0) return null;
@@ -296,14 +298,17 @@ fn verifyReleaseChecksum(
     tar_name: []const u8,
     tar_path: []const u8,
     work_dir: []const u8,
+    verify_signatures: bool,
 ) bool {
+    if (verify_signatures and !hasEmbeddedMinisignPubkey()) return false;
+
     var checksum_name_buf: [224]u8 = undefined;
     const checksum_name = std.fmt.bufPrint(&checksum_name_buf, "{s}.sha256", .{tar_name}) catch return false;
 
     var checksum_path_buf: [320]u8 = undefined;
     const checksum_path = std.fmt.bufPrint(&checksum_path_buf, "{s}/{s}", .{ work_dir, checksum_name }) catch return false;
     if (!downloadReleaseFile(allocator, tag, checksum_name, checksum_path)) return false;
-    if (minisignVerificationEnabled()) {
+    if (verify_signatures) {
         var sig_name_buf: [256]u8 = undefined;
         const sig_name = std.fmt.bufPrint(&sig_name_buf, "{s}.minisig", .{checksum_name}) catch return false;
 
@@ -320,12 +325,12 @@ fn verifyReleaseChecksum(
     return std.ascii.eqlIgnoreCase(expected_buf[0..], actual_buf[0..]);
 }
 
-fn minisignVerificationEnabled() bool {
+fn hasEmbeddedMinisignPubkey() bool {
     return MINISIGN_PUBKEY.len > 0 and std.mem.startsWith(u8, MINISIGN_PUBKEY, "RW");
 }
 
-pub fn requiresSignatureVerification() bool {
-    return minisignVerificationEnabled();
+pub fn signatureVerificationAvailable() bool {
+    return hasEmbeddedMinisignPubkey();
 }
 
 fn verifyMinisignSignature(

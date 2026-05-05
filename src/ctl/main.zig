@@ -344,12 +344,14 @@ fn printHelp() void {
     printOpt(&ui, "--middle-proxy", "Enable Telegram MiddleProxy relay");
     printOpt(&ui, "--ipv6-hop", "Enable IPv6 auto-hopping");
     printOpt(&ui, "--version, -v <tag>", "Release version to install (default: latest)");
+    printOpt(&ui, "--insecure", "Allow unsigned assets (disables minisign verification)");
     ui.writeRaw("\n");
 
     // ── Update options ──
     ui.print("  {s}Update options:{s}\n\n", .{ Color.accent, Color.reset });
     printOpt(&ui, "--version, -v <tag>", "Pin to specific release tag");
     printOpt(&ui, "--force-service", "Force systemd unit update");
+    printOpt(&ui, "--insecure", "Allow unsigned assets (disables minisign verification)");
     ui.writeRaw("\n");
 
     // ── Setup options ──

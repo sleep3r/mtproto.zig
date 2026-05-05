@@ -86,16 +86,13 @@ jobs:
           zig build-exe -target "${{ matrix.target }}" -mcpu "${{ matrix.cpu }}" /tmp/check_aes_target.zig
 
       - name: Build release binary
-        env:
-          MINISIGN_PUBKEY_B64: ${{ secrets.MINISIGN_PUBKEY_B64 }}
         run: |
+          PINNED_MINISIGN_PUBKEY="RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO"
           BUILD_ARGS="-Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}"
           if [ -n "${{ matrix.cpu }}" ]; then
             BUILD_ARGS="$BUILD_ARGS -Dcpu=${{ matrix.cpu }}"
           fi
-          if [ -n "${MINISIGN_PUBKEY_B64}" ]; then
-            BUILD_ARGS="$BUILD_ARGS -Dminisign_pubkey=${MINISIGN_PUBKEY_B64}"
-          fi
+          BUILD_ARGS="$BUILD_ARGS -Dminisign_pubkey=${PINNED_MINISIGN_PUBKEY}"
           zig build $BUILD_ARGS
 
       - name: Package artifact
@@ -112,23 +109,29 @@ jobs:
       - name: Sign checksum with minisign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
         run: |
-          if [ -z "${MINISIGN_SECRET_KEY}" ] || [ -z "${MINISIGN_PUBLIC_KEY}" ]; then
-            echo "Minisign secrets are not configured; skipping signature generation"
-            exit 0
+          PINNED_MINISIGN_PUBKEY="RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO"
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "MINISIGN_SECRET_KEY is required for release signing"
+            exit 1
           fi
           sudo apt-get update -qq
           sudo apt-get install -y minisign
 
           printf '%s\n' "${MINISIGN_SECRET_KEY}" > /tmp/minisign.key
           chmod 600 /tmp/minisign.key
-          printf '%s\n' "${MINISIGN_PUBLIC_KEY}" > dist/minisign.pub
+          printf '%s\n' "untrusted comment: mtproto.zig minisign public key" > dist/minisign.pub
+          printf '%s\n' "${PINNED_MINISIGN_PUBKEY}" >> dist/minisign.pub
           minisign -S \
             -s /tmp/minisign.key \
             -m dist/${{ matrix.artifact_name }}.tar.gz.sha256 \
             -x dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig \
             -t "tag:${{ needs.release-please.outputs.tag_name }} artifact:${{ matrix.artifact_name }}"
+          minisign -V \
+            -q \
+            -m dist/${{ matrix.artifact_name }}.tar.gz.sha256 \
+            -x dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig \
+            -P "${PINNED_MINISIGN_PUBKEY}"
 
       - name: Upload release asset
         env:
@@ -137,13 +140,9 @@ jobs:
           FILES=(
             "dist/${{ matrix.artifact_name }}.tar.gz"
             "dist/${{ matrix.artifact_name }}.tar.gz.sha256"
+            "dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig"
+            "dist/minisign.pub"
           )
-          if [ -f "dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig" ]; then
-            FILES+=("dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig")
-          fi
-          if [ -f "dist/minisign.pub" ]; then
-            FILES+=("dist/minisign.pub")
-          fi
           gh release upload "${{ needs.release-please.outputs.tag_name }}" \
             "${FILES[@]}" \
             --clobber

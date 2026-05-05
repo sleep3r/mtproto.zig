@@ -46,6 +46,8 @@ pub const InstallOpts = struct {
     yes: bool = false,
     /// Release version to install (e.g. "v0.12.0"). If null, uses latest.
     version: ?[]const u8 = null,
+    /// Allow unsigned release assets (disables minisign verification).
+    insecure: bool = false,
     /// Path to an existing config.toml to use.
     config_path: ?[]const u8 = null,
     /// Internal flags to track if user explicitly provided a value.
@@ -106,6 +108,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.enable_middle_proxy = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             opts.version = args.next();
+        } else if (std.mem.eql(u8, arg, "--insecure")) {
+            opts.insecure = true;
         }
     }
 
@@ -291,6 +295,17 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         return;
     }
 
+    const insecure_mode = opts.insecure or sys.envFlagSet("MTPROTO_INSECURE");
+    const signature_available = release.signatureVerificationAvailable();
+    if (!signature_available and !insecure_mode) {
+        ui.fail("This mtbuddy build has no embedded minisign public key.");
+        ui.info("Rebuild with -Dminisign_pubkey=<RW...> or use --insecure (or MTPROTO_INSECURE=1).");
+        return;
+    }
+    if (insecure_mode) {
+        ui.warn("INSECURE mode enabled: release signature verification is disabled.");
+    }
+
     ui.writeRaw("\n");
     ui.rule();
 
@@ -299,11 +314,24 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         var sp = ui.spinner(ui.str(.install_checking_deps));
         sp.start();
         _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
-        _ = sys.exec(allocator, &.{
-            "apt-get",  "install", "-y",
-            "iptables", "xxd",     "curl",
-            "openssl",  "tar",     "minisign",
-        }) catch {};
+        const base_packages: []const []const u8 = if (signature_available and !insecure_mode)
+            &.{
+                "apt-get",  "install", "-y",
+                "iptables", "xxd",     "curl",
+                "openssl",  "tar",     "minisign",
+            }
+        else
+            &.{
+                "apt-get",  "install", "-y",
+                "iptables", "xxd",     "curl",
+                "openssl",  "tar",
+            };
+        _ = sys.exec(allocator, base_packages) catch {};
+        if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
+            sp.stop(false, "");
+            ui.fail("minisign is required for release signature verification");
+            return;
+        }
         sp.stop(true, "");
     }
 
@@ -326,7 +354,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     {
         var sp = ui.spinner(ui.str(.install_downloading));
         sp.start();
-        if (!release.downloadProxyArtifact(allocator, tag.slice(), "install", &artifact)) {
+        if (!release.downloadProxyArtifact(allocator, tag.slice(), "install", !insecure_mode, &artifact)) {
             sp.stop(false, "");
             ui.fail(ui.str(.error_download_failed));
             return;
