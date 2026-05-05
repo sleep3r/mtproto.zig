@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 
+const crypto = @import("../crypto/crypto.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 
 const log = std.log.scoped(.proxy);
@@ -196,5 +197,199 @@ pub fn tryReadFrame(
 
         readReset(slot, encrypted);
         return payload;
+    }
+}
+
+const TestStep = enum {
+    fuzz,
+};
+
+const TestSlot = struct {
+    conn_id: u64 = 1,
+    mp_step: TestStep = .fuzz,
+    upstream_fd: posix.fd_t = -1,
+
+    mp_frame_have: usize = 0,
+    mp_frame_total_len: usize = 0,
+    mp_frame_padded_len: usize = 0,
+    mp_frame_encrypted: bool = false,
+    mp_frame_first_decrypted: bool = false,
+    mp_frame_need: usize = 0,
+    mp_frame_buf: ?[]u8 = null,
+
+    mp_read_seq_no: i32 = -2,
+    mp_write_seq_no: i32 = -2,
+
+    mp_enc: ?crypto.AesCbc = null,
+    mp_dec: ?crypto.AesCbc = null,
+};
+
+fn makePipe() ![2]posix.fd_t {
+    return try std.Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    while (true) switch (posix.errno(posix.system.close(fd))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        else => return,
+    };
+}
+
+fn writeAll(fd: posix.fd_t, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const rc = posix.system.write(fd, data[off..].ptr, data.len - off);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.Unexpected;
+                off += @intCast(rc);
+            },
+            .INTR => continue,
+            .AGAIN => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn buildPlainFrame(seq: i32, payload: []const u8, out: []u8) []const u8 {
+    const total_len = payload.len + 12;
+    std.mem.writeInt(u32, out[0..4], @intCast(total_len), .little);
+    std.mem.writeInt(i32, out[4..8], seq, .little);
+    @memcpy(out[8 .. 8 + payload.len], payload);
+    const checksum = middleproxy.crc32(out[0 .. 8 + payload.len]);
+    std.mem.writeInt(u32, out[8 + payload.len ..][0..4], checksum, .little);
+    return out[0..total_len];
+}
+
+fn buildEncryptedFrame(
+    seq: i32,
+    payload: []const u8,
+    out: []u8,
+    key: *const [32]u8,
+    iv: *const [16]u8,
+) ![]const u8 {
+    const plain = buildPlainFrame(seq, payload, out);
+    var frame_len = plain.len;
+    const pad = (16 - (frame_len % 16)) % 16;
+    var i: usize = 0;
+    while (i < pad) : (i += 4) {
+        std.mem.writeInt(u32, out[frame_len + i ..][0..4], 4, .little);
+    }
+    frame_len += pad;
+
+    var enc = crypto.AesCbc.init(key, iv);
+    try enc.encryptInPlace(out[0..frame_len]);
+    return out[0..frame_len];
+}
+
+test "middle proxy frame parser - fragmented plain frame" {
+    const fds = try makePipe();
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    var slot = TestSlot{ .upstream_fd = fds[0] };
+    readReset(&slot, false);
+
+    var frame_buf: [128]u8 = undefined;
+    const payload = "hello-middle-proxy";
+    const frame = buildPlainFrame(-2, payload, &frame_buf);
+
+    try writeAll(fds[1], frame[0..4]);
+    try std.testing.expect(try tryReadFrame(&slot, std.testing.allocator, false, 512) == null);
+
+    try writeAll(fds[1], frame[4..]);
+    closeFd(fds[1]);
+
+    var parsed: ?[]const u8 = null;
+    var got_error = false;
+    for (0..8) |_| {
+        parsed = tryReadFrame(&slot, std.testing.allocator, false, 512) catch |err| {
+            if (err == error.EndOfStream) {
+                got_error = true;
+                break;
+            }
+            return err;
+        };
+        if (parsed != null) break;
+    }
+
+    try std.testing.expect(!got_error);
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualSlices(u8, payload, parsed.?);
+    try std.testing.expectEqual(@as(i32, -1), slot.mp_read_seq_no);
+
+    if (slot.mp_frame_buf) |buf| std.testing.allocator.free(buf);
+}
+
+test "middle proxy frame parser - encrypted frame and fuzz malformed input" {
+    const key = [_]u8{0x11} ** 32;
+    const iv = [_]u8{0x22} ** 16;
+
+    // Deterministic encrypted roundtrip.
+    {
+        const fds = try makePipe();
+        defer closeFd(fds[0]);
+        defer closeFd(fds[1]);
+
+        var slot = TestSlot{
+            .upstream_fd = fds[0],
+            .mp_dec = crypto.AesCbc.init(&key, &iv),
+        };
+        readReset(&slot, true);
+
+        var wire: [256]u8 = undefined;
+        const encrypted = try buildEncryptedFrame(-2, "abc12345", &wire, &key, &iv);
+        try writeAll(fds[1], encrypted);
+        closeFd(fds[1]);
+
+        var parsed: ?[]const u8 = null;
+        for (0..8) |_| {
+            parsed = tryReadFrame(&slot, std.testing.allocator, true, 512) catch |err| {
+                if (err == error.EndOfStream) break;
+                return err;
+            };
+            if (parsed != null) break;
+        }
+        try std.testing.expect(parsed != null);
+        try std.testing.expectEqualSlices(u8, "abc12345", parsed.?);
+        if (slot.mp_frame_buf) |buf| std.testing.allocator.free(buf);
+    }
+
+    // Fuzz malformed encrypted/plain wire bytes (no panics, only controlled errors/null).
+    var prng = std.Random.DefaultPrng.init(0xFACE1234);
+    const random = prng.random();
+    var fuzz_buf: [192]u8 = undefined;
+
+    for (0..1500) |i| {
+        const fds = try makePipe();
+        defer closeFd(fds[0]);
+        defer closeFd(fds[1]);
+
+        const wire_len: usize = @as(usize, random.int(u8)) % fuzz_buf.len;
+        random.bytes(fuzz_buf[0..wire_len]);
+        try writeAll(fds[1], fuzz_buf[0..wire_len]);
+        closeFd(fds[1]);
+
+        var slot = TestSlot{
+            .upstream_fd = fds[0],
+            .mp_dec = crypto.AesCbc.init(&key, &iv),
+        };
+        const encrypted = (i % 2) == 0;
+        readReset(&slot, encrypted);
+
+        for (0..6) |_| {
+            const maybe_payload = tryReadFrame(&slot, std.testing.allocator, encrypted, 512) catch |err| switch (err) {
+                error.EndOfStream,
+                error.BadMiddleProxyFrameSize,
+                error.BadMiddleProxyChecksum,
+                error.BadMiddleProxySeqNo,
+                => break,
+                else => return err,
+            };
+            if (maybe_payload != null) break;
+        }
+
+        if (slot.mp_frame_buf) |buf| std.testing.allocator.free(buf);
     }
 }

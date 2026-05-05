@@ -114,42 +114,42 @@ pub const auth_response_len: usize = 2;
 pub fn buildConnectRequest(buf: []u8, addr: net.IpAddress) []u8 {
     switch (addr) {
         .ip4 => |ip4| {
-        // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv4(4) + PORT(2) = 10
-        const total: usize = 10;
-        if (buf.len < total) return buf[0..0];
+            // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv4(4) + PORT(2) = 10
+            const total: usize = 10;
+            if (buf.len < total) return buf[0..0];
 
-        buf[0] = version;
-        buf[1] = @intFromEnum(Command.connect);
-        buf[2] = 0x00; // reserved
-        buf[3] = @intFromEnum(AddressType.ipv4);
+            buf[0] = version;
+            buf[1] = @intFromEnum(Command.connect);
+            buf[2] = 0x00; // reserved
+            buf[3] = @intFromEnum(AddressType.ipv4);
 
             @memcpy(buf[4..8], &ip4.bytes);
 
             const port = std.mem.nativeToBig(u16, ip4.port);
-        const port_bytes = std.mem.asBytes(&port);
-        buf[8] = port_bytes[0];
-        buf[9] = port_bytes[1];
+            const port_bytes = std.mem.asBytes(&port);
+            buf[8] = port_bytes[0];
+            buf[9] = port_bytes[1];
 
-        return buf[0..total];
+            return buf[0..total];
         },
         .ip6 => |ip6| {
-        // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv6(16) + PORT(2) = 22
-        const total: usize = 22;
-        if (buf.len < total) return buf[0..0];
+            // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv6(16) + PORT(2) = 22
+            const total: usize = 22;
+            if (buf.len < total) return buf[0..0];
 
-        buf[0] = version;
-        buf[1] = @intFromEnum(Command.connect);
-        buf[2] = 0x00; // reserved
-        buf[3] = @intFromEnum(AddressType.ipv6);
+            buf[0] = version;
+            buf[1] = @intFromEnum(Command.connect);
+            buf[2] = 0x00; // reserved
+            buf[3] = @intFromEnum(AddressType.ipv6);
 
             @memcpy(buf[4..20], &ip6.bytes);
 
             const port = std.mem.nativeToBig(u16, ip6.port);
-        const port_bytes = std.mem.asBytes(&port);
-        buf[20] = port_bytes[0];
-        buf[21] = port_bytes[1];
+            const port_bytes = std.mem.asBytes(&port);
+            buf[20] = port_bytes[0];
+            buf[21] = port_bytes[1];
 
-        return buf[0..total];
+            return buf[0..total];
         },
     }
 }
@@ -297,4 +297,33 @@ test "socks5 - parse connect response too short" {
     const resp = [_]u8{ 0x05, 0x00, 0x00 };
     const result = parseConnectResponse(&resp);
     try std.testing.expect(result == null);
+}
+
+test "socks5 - parser fuzz random malformed bytes" {
+    var prng = std.Random.DefaultPrng.init(0x50C55F22);
+    const random = prng.random();
+
+    var buf: [96]u8 = undefined;
+    for (0..2000) |_| {
+        const len: usize = @as(usize, random.int(u8)) % buf.len;
+        random.bytes(buf[0..len]);
+
+        _ = parseGreetingResponse(buf[0..len]);
+        _ = parseAuthResponse(buf[0..len]);
+        _ = parseConnectResponse(buf[0..len]);
+    }
+}
+
+test "socks5 - connect response fragmented prefixes" {
+    const full = [_]u8{ 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xBB };
+
+    for (0..full.len) |prefix_len| {
+        const partial = parseConnectResponse(full[0..prefix_len]);
+        try std.testing.expect(partial == null);
+    }
+
+    const result = parseConnectResponse(&full);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(Reply.succeeded, result.?.reply);
+    try std.testing.expectEqual(full.len, result.?.consumed);
 }

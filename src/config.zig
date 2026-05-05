@@ -1267,3 +1267,30 @@ test "parse config - duplicate upstream proxy fields" {
     try std.testing.expectEqualStrings("second", cfg.upstream_proxy_username.?);
     try std.testing.expectEqualStrings("two", cfg.upstream_proxy_password.?);
 }
+
+test "parse config - fuzz malformed/random content" {
+    var prng = std.Random.DefaultPrng.init(0xC01F16F2);
+    const random = prng.random();
+
+    var buf: [1400]u8 = undefined;
+    for (0..1200) |_| {
+        const len: usize = @as(usize, random.int(u16)) % buf.len;
+        random.bytes(buf[0..len]);
+
+        // Keep bytes text-like to exercise parser state transitions rather than UTF noise only.
+        for (buf[0..len]) |*b| {
+            const v = b.*;
+            b.* = switch (v % 7) {
+                0 => '\n',
+                1 => '=',
+                2 => '[',
+                3 => ']',
+                4 => '#',
+                else => 32 + (v % 95),
+            };
+        }
+
+        var parsed = Config.parse(std.testing.allocator, buf[0..len]) catch continue;
+        parsed.deinit(std.testing.allocator);
+    }
+}

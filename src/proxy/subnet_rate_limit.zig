@@ -241,3 +241,33 @@ test "subnet rate limit - different subnets are independent" {
     // Subnet B should still work
     try std.testing.expect(limiter.check(addr_b, 1));
 }
+
+test "subnet rate limit - property fuzz for malformed/state transitions" {
+    var limiter = SubnetRateLimit.init();
+    var prng = std.Random.DefaultPrng.init(0x5AB7E7F2);
+    const random = prng.random();
+
+    for (0..5000) |_| {
+        const a = ip4(
+            .{
+                random.int(u8),
+                random.int(u8),
+                random.int(u8),
+                random.int(u8),
+            },
+            443,
+        );
+        const max_per_sec: u8 = @intCast((@as(u16, random.int(u8)) % 8));
+        const allowed = limiter.check(a, max_per_sec);
+        if (max_per_sec == 0) try std.testing.expect(allowed);
+
+        const key = SubnetRateLimit.subnetKey(a);
+        const entry = limiter.findEntry(key) orelse continue;
+        // Force deterministic "no refill" window and exhausted tokens.
+        entry.tokens = 0;
+        entry.last_refill_s = std.math.maxInt(i64);
+        if (max_per_sec > 0) {
+            try std.testing.expect(!limiter.check(a, max_per_sec));
+        }
+    }
+}

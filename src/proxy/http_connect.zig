@@ -251,3 +251,31 @@ test "http_connect - address formatting ipv4" {
     const str = formatAddress(addr, &buf);
     try std.testing.expectEqualStrings("10.0.0.1:8080", str);
 }
+
+test "http_connect - parser fuzz random malformed bytes" {
+    var prng = std.Random.DefaultPrng.init(0x04770C0D);
+    const random = prng.random();
+
+    var buf: [512]u8 = undefined;
+    for (0..2000) |_| {
+        const len: usize = @as(usize, random.int(u16)) % buf.len;
+        random.bytes(buf[0..len]);
+
+        if (parseResponse(buf[0..len])) |parsed| {
+            try std.testing.expect(parsed.header_end <= len);
+            try std.testing.expect(parsed.status <= 999);
+        }
+    }
+}
+
+test "http_connect - fragmented response prefixes" {
+    const full = "HTTP/1.1 200 Connection Established\r\nX-Test: 1\r\n\r\n";
+    for (0..full.len) |prefix_len| {
+        try std.testing.expect(parseResponse(full[0..prefix_len]) == null);
+    }
+
+    const parsed = parseResponse(full);
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqual(@as(u16, 200), parsed.?.status);
+    try std.testing.expectEqual(full.len, parsed.?.header_end);
+}

@@ -206,7 +206,7 @@ test "generateNonce produces valid nonces" {
 test "prepareTgNonce - intermediate tag" {
     var nonce: [64]u8 = [_]u8{0x00} ** 64;
     prepareTgNonce(&nonce, constants.ProtoTag.intermediate, null);
-    
+
     // Check that bytes 56-59 are the intermediate tag (eeeeeeee)
     const expected_tag = constants.ProtoTag.intermediate.toBytes();
     try std.testing.expectEqualStrings(&expected_tag, nonce[56..60]);
@@ -214,21 +214,92 @@ test "prepareTgNonce - intermediate tag" {
 
 test "prepareTgNonce - fast mode key inversion" {
     var nonce: [64]u8 = [_]u8{0x00} ** 64;
-    
+
     // 32-byte key + 16-byte IV = 48 bytes
     var client_key_iv: [48]u8 = undefined;
     for (0..48) |i| client_key_iv[i] = @intCast(i);
-    
+
     prepareTgNonce(&nonce, constants.ProtoTag.abridged, &client_key_iv);
-    
+
     // Check proto tag
     const expected_tag = constants.ProtoTag.abridged.toBytes();
     try std.testing.expectEqualStrings(&expected_tag, nonce[56..60]);
-    
+
     // Check key inversion at offset 8 (skip_len)
     // The key_iv should be written entirely in reverse
     for (0..48) |i| {
         const expected_byte = client_key_iv[48 - 1 - i];
         try std.testing.expectEqual(expected_byte, nonce[8 + i]);
+    }
+}
+
+fn buildClientObfuscatedHandshake(
+    secret: [16]u8,
+    proto_tag: constants.ProtoTag,
+    dc_idx: i16,
+) [constants.handshake_len]u8 {
+    var plain = generateNonce();
+    const tag = proto_tag.toBytes();
+    @memcpy(plain[constants.proto_tag_pos..][0..4], &tag);
+    std.mem.writeInt(i16, plain[constants.dc_idx_pos..][0..2], dc_idx, .little);
+
+    const dec_prekey = plain[constants.skip_len .. constants.skip_len + constants.prekey_len];
+    const dec_iv_bytes = plain[constants.skip_len + constants.prekey_len .. constants.skip_len + constants.prekey_len + constants.iv_len];
+    const dec_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
+
+    var key_input: [constants.prekey_len + 16]u8 = undefined;
+    @memcpy(key_input[0..constants.prekey_len], dec_prekey);
+    @memcpy(key_input[constants.prekey_len..], &secret);
+    const decrypt_key = crypto.sha256(&key_input);
+
+    var enc = crypto.AesCtr.init(&decrypt_key, dec_iv);
+    defer enc.wipe();
+    var encrypted = plain;
+    enc.apply(&encrypted);
+
+    var wire = plain;
+    @memcpy(wire[constants.proto_tag_pos..], encrypted[constants.proto_tag_pos..]);
+    return wire;
+}
+
+test "fromHandshake - valid roundtrip and wrong secret rejection" {
+    const secret = [_]u8{0x42} ** 16;
+    const hs = buildClientObfuscatedHandshake(secret, .intermediate, 2);
+
+    const ok = [_]UserSecret{.{ .name = "alice", .secret = secret }};
+    const parsed = ObfuscationParams.fromHandshake(&hs, &ok);
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqual(constants.ProtoTag.intermediate, parsed.?.params.proto_tag);
+    try std.testing.expectEqual(@as(i16, 2), parsed.?.params.dc_idx);
+    try std.testing.expectEqualStrings("alice", parsed.?.user);
+
+    const wrong = [_]UserSecret{.{ .name = "bob", .secret = [_]u8{0x11} ** 16 }};
+    try std.testing.expect(ObfuscationParams.fromHandshake(&hs, &wrong) == null);
+}
+
+test "fromHandshake - fuzz malformed/random handshakes" {
+    var prng = std.Random.DefaultPrng.init(0x0BF016A);
+    const random = prng.random();
+
+    var hs: [constants.handshake_len]u8 = undefined;
+    const secrets = [_]UserSecret{
+        .{ .name = "alice", .secret = [_]u8{0x1A} ** 16 },
+        .{ .name = "bob", .secret = [_]u8{0x2B} ** 16 },
+    };
+
+    for (0..3000) |i| {
+        random.bytes(&hs);
+        if ((i % 5) == 0) {
+            hs = buildClientObfuscatedHandshake(secrets[0].secret, .abridged, -3);
+            // Corrupt one random byte to exercise near-valid malformed cases.
+            const idx: usize = @as(usize, random.int(u8)) % hs.len;
+            hs[idx] ^=
+                0x01;
+        }
+
+        if (ObfuscationParams.fromHandshake(&hs, &secrets)) |parsed| {
+            try std.testing.expect(parsed.user.len > 0);
+            try std.testing.expect(parsed.params.dc_idx != 0);
+        }
     }
 }

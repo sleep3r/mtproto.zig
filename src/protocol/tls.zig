@@ -652,3 +652,175 @@ test "validateTlsHandshake returns canonical_hmac" {
     try std.testing.expect(result != null);
     try std.testing.expectEqualSlices(u8, &computed_mac, &result.?.canonical_hmac);
 }
+
+fn buildTlsAuthClientHello(
+    out: *[512]u8,
+    secret: [16]u8,
+    host: []const u8,
+) ![]const u8 {
+    if (host.len == 0 or host.len > 200) return error.BadHostLen;
+
+    const sni_list_len: usize = 1 + 2 + host.len;
+    const sni_ext_len: usize = 2 + sni_list_len;
+    const supported_versions_ext_len: usize = 3;
+    const ext_total_len: usize = 4 + sni_ext_len + 4 + supported_versions_ext_len;
+
+    const body_len: usize = 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2 + ext_total_len;
+    const record_payload_len: usize = 4 + body_len;
+    const total_len: usize = 5 + record_payload_len;
+    if (total_len > out.len) return error.OutOfSpace;
+
+    var p: usize = 0;
+    out[p] = constants.tls_record_handshake;
+    p += 1;
+    out[p] = 0x03;
+    out[p + 1] = 0x01;
+    p += 2;
+    std.mem.writeInt(u16, out[p..][0..2], @intCast(record_payload_len), .big);
+    p += 2;
+
+    out[p] = 0x01; // ClientHello
+    p += 1;
+    out[p] = @intCast((body_len >> 16) & 0xFF);
+    out[p + 1] = @intCast((body_len >> 8) & 0xFF);
+    out[p + 2] = @intCast(body_len & 0xFF);
+    p += 3;
+
+    out[p] = 0x03;
+    out[p + 1] = 0x03;
+    p += 2;
+
+    const digest_pos = p;
+    @memset(out[p .. p + 32], 0);
+    p += 32;
+
+    out[p] = 32;
+    p += 1;
+    @memset(out[p .. p + 32], 0xAA);
+    p += 32;
+
+    std.mem.writeInt(u16, out[p..][0..2], 2, .big);
+    p += 2;
+    out[p] = 0x13;
+    out[p + 1] = 0x01;
+    p += 2;
+
+    out[p] = 1;
+    p += 1;
+    out[p] = 0;
+    p += 1;
+
+    std.mem.writeInt(u16, out[p..][0..2], @intCast(ext_total_len), .big);
+    p += 2;
+
+    // SNI extension
+    out[p] = 0x00;
+    out[p + 1] = 0x00;
+    p += 2;
+    std.mem.writeInt(u16, out[p..][0..2], @intCast(sni_ext_len), .big);
+    p += 2;
+    std.mem.writeInt(u16, out[p..][0..2], @intCast(sni_list_len), .big);
+    p += 2;
+    out[p] = 0; // host_name
+    p += 1;
+    std.mem.writeInt(u16, out[p..][0..2], @intCast(host.len), .big);
+    p += 2;
+    @memcpy(out[p .. p + host.len], host);
+    p += host.len;
+
+    // supported_versions extension (TLS 1.3)
+    out[p] = 0x00;
+    out[p + 1] = 0x2B;
+    p += 2;
+    std.mem.writeInt(u16, out[p..][0..2], supported_versions_ext_len, .big);
+    p += 2;
+    out[p] = 2;
+    p += 1;
+    out[p] = 0x03;
+    out[p + 1] = 0x04;
+    p += 2;
+
+    if (p != total_len) return error.BuildMismatch;
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    const zero_digest = [_]u8{0} ** constants.tls_digest_len;
+    var hmac = HmacSha256.init(&secret);
+    hmac.update(out[0..constants.tls_digest_pos]);
+    hmac.update(&zero_digest);
+    hmac.update(out[constants.tls_digest_pos + constants.tls_digest_len .. total_len]);
+    var computed: [32]u8 = undefined;
+    hmac.final(&computed);
+
+    @memcpy(out[digest_pos..][0..28], computed[0..28]);
+    const ts: u32 = 0x1234_5678;
+    const ts_bytes = std.mem.toBytes(ts);
+    out[digest_pos + 28] = computed[28] ^ ts_bytes[0];
+    out[digest_pos + 29] = computed[29] ^ ts_bytes[1];
+    out[digest_pos + 30] = computed[30] ^ ts_bytes[2];
+    out[digest_pos + 31] = computed[31] ^ ts_bytes[3];
+
+    return out[0..total_len];
+}
+
+test "extractSni - fragmented and overlong records" {
+    var hello_buf: [512]u8 = undefined;
+    const hello = try buildTlsAuthClientHello(&hello_buf, [_]u8{0x19} ** 16, "google.com");
+
+    const sni = extractSni(hello);
+    try std.testing.expect(sni != null);
+    try std.testing.expectEqualStrings("google.com", sni.?);
+
+    for (0..hello.len) |prefix_len| {
+        try std.testing.expect(extractSni(hello[0..prefix_len]) == null);
+    }
+
+    var malformed = hello_buf;
+    malformed[3] = 0xFF;
+    malformed[4] = 0xFF;
+    try std.testing.expect(extractSni(malformed[0..hello.len]) == null);
+}
+
+test "extractSni - fuzz malformed input" {
+    var prng = std.Random.DefaultPrng.init(0x7155100);
+    const random = prng.random();
+
+    var buf: [640]u8 = undefined;
+    for (0..2500) |_| {
+        const len: usize = @as(usize, random.int(u16)) % buf.len;
+        random.bytes(buf[0..len]);
+        if (extractSni(buf[0..len])) |name| {
+            try std.testing.expect(name.len > 0);
+            try std.testing.expect(name.len <= len);
+        }
+    }
+}
+
+test "validateTlsHandshake - fuzz random and replayed input" {
+    const allocator = std.testing.allocator;
+    const secrets = [_]UserSecret{
+        .{ .name = "alice", .secret = [_]u8{0x1A} ** 16 },
+        .{ .name = "bob", .secret = [_]u8{0x2B} ** 16 },
+    };
+
+    var prng = std.Random.DefaultPrng.init(0xDA7A5EED);
+    const random = prng.random();
+    var random_buf: [768]u8 = undefined;
+
+    for (0..3000) |_| {
+        const len: usize = @as(usize, random.int(u16)) % random_buf.len;
+        random.bytes(random_buf[0..len]);
+        const parsed = try validateTlsHandshake(allocator, random_buf[0..len], &secrets, true);
+        if (parsed) |v| {
+            try std.testing.expect(v.session_id.len == 32);
+            try std.testing.expect(v.user.len > 0);
+        }
+    }
+
+    // Replayed bytes produce identical canonical HMAC.
+    var hello_buf: [512]u8 = undefined;
+    const hello = try buildTlsAuthClientHello(&hello_buf, secrets[0].secret, "google.com");
+    const first = try validateTlsHandshake(allocator, hello, &secrets, true);
+    const second = try validateTlsHandshake(allocator, hello, &secrets, true);
+    try std.testing.expect(first != null and second != null);
+    try std.testing.expectEqualSlices(u8, &first.?.canonical_hmac, &second.?.canonical_hmac);
+}

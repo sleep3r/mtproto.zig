@@ -101,3 +101,28 @@ test "replay cache accepts distinct digests" {
     try std.testing.expect(!cache.checkAndInsert(&digest_a));
     try std.testing.expect(!cache.checkAndInsert(&digest_b));
 }
+
+test "replay cache - property fuzz and replay invariants" {
+    var cache = ReplayCache.init();
+    var prng = std.Random.DefaultPrng.init(0xA11CECA6E);
+    const random = prng.random();
+
+    var digest: [32]u8 = undefined;
+    for (0..6000) |i| {
+        random.bytes(&digest);
+
+        if ((i % 11) == 0) {
+            // Force explicit replay path.
+            digest = [_]u8{0xAB} ** 32;
+        }
+
+        const first = cache.checkAndInsert(&digest);
+        const second = cache.checkAndInsert(&digest);
+        try std.testing.expect(second);
+        if (!first) {
+            // First observation can be either new(false) or existing(true) under collisions;
+            // second call must still be treated as replay.
+            try std.testing.expect(cache.checkAndInsert(&digest));
+        }
+    }
+}
