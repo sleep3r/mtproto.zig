@@ -227,6 +227,9 @@ pub fn writeServiceFile() void {
         \\Group=mtproto
         \\WorkingDirectory=/opt/mtproto-proxy
         \\ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+        \\ExecReload=/bin/kill -HUP $MAINPID
+        \\KillSignal=SIGTERM
+        \\TimeoutStopSec=25
         \\Restart=always
         \\RestartSec=3
         \\

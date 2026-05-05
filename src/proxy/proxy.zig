@@ -40,6 +40,7 @@ const proxy_upstream_handshake = @import("proxy_upstream_handshake.zig");
 const middle_proxy_fallback = @import("middle_proxy_fallback.zig");
 const dc_nonce = @import("dc_nonce.zig");
 const upstream_failover = @import("upstream_failover.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 test {
     // Keep extracted proxy submodule tests in the default `zig build test` run.
@@ -85,6 +86,7 @@ const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 32 * 1024;
 const max_pipelined_handshake_bytes: usize = 128 * 1024;
+const graceful_shutdown_check_ms: i32 = 100;
 
 const upstream_candidates_inline_cap: usize = 4;
 
@@ -445,6 +447,34 @@ pub const BenchCandidatePath = struct {
 
 const ConnectionPool = connection_pool_mod.ConnectionPool(ConnectionSlot);
 
+const SignalController = struct {
+    fd: posix.fd_t,
+    old_mask: posix.sigset_t,
+
+    fn init() !SignalController {
+        var mask = posix.sigemptyset();
+        posix.sigaddset(&mask, .TERM);
+        posix.sigaddset(&mask, .INT);
+        posix.sigaddset(&mask, .HUP);
+        posix.sigaddset(&mask, .USR1);
+
+        var old_mask: posix.sigset_t = undefined;
+        posix.sigprocmask(posix.SIG.BLOCK, &mask, &old_mask);
+        errdefer posix.sigprocmask(posix.SIG.SETMASK, &old_mask, null);
+
+        const fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+        return .{
+            .fd = fd,
+            .old_mask = old_mask,
+        };
+    }
+
+    fn deinit(self: *SignalController) void {
+        closeFd(self.fd);
+        posix.sigprocmask(posix.SIG.SETMASK, &self.old_mask, null);
+    }
+};
+
 pub const ProxyState = struct {
     pub const UserMetrics = struct {
         name: []const u8,
@@ -482,6 +512,7 @@ pub const ProxyState = struct {
     };
 
     allocator: std.mem.Allocator,
+    config_path: []const u8,
     config: Config,
     user_secrets: []const obfuscation.UserSecret,
     user_metrics: []UserMetrics,
@@ -529,7 +560,7 @@ pub const ProxyState = struct {
     upstream: upstream_mod.Upstream,
     tunnel_info: tunnel_mod.Tunnel,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
+    pub fn init(allocator: std.mem.Allocator, cfg: Config, config_path: []const u8) !ProxyState {
         if (cfg.users.count() == 0) return error.NoUsersConfigured;
 
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -618,8 +649,12 @@ pub const ProxyState = struct {
         const user_metrics_owned = try user_metrics.toOwnedSlice(allocator);
         errdefer allocator.free(user_metrics_owned);
 
+        const owned_config_path = try allocator.dupe(u8, config_path);
+        errdefer allocator.free(owned_config_path);
+
         return .{
             .allocator = allocator,
+            .config_path = owned_config_path,
             .config = cfg,
             .user_secrets = user_secrets,
             .user_metrics = user_metrics_owned,
@@ -745,6 +780,7 @@ pub const ProxyState = struct {
             thread.join();
             self.middle_proxy_updater_thread = null;
         }
+        self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         self.allocator.free(self.user_metrics);
     }
@@ -791,6 +827,8 @@ pub const ProxyState = struct {
     pub fn run(self: *ProxyState) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
         const io_ctx = std.Io.Threaded.global_single_threaded.io();
+        var signal_controller = try SignalController.init();
+        defer signal_controller.deinit();
 
         var ipv6_ok = true;
         var server: net.Server = undefined;
@@ -881,7 +919,7 @@ pub const ProxyState = struct {
             try @import("../monitoring.zig").start(self);
         }
 
-        var loop = try EventLoop.init(self, server.socket.handle);
+        var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
         defer loop.deinit();
         try loop.run();
     }
@@ -1149,10 +1187,13 @@ const EventLoop = struct {
     state: *ProxyState,
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
+    signal_fd: posix.fd_t,
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
     saturation_paused: bool,
+    shutting_down: bool,
+    shutdown_deadline_ns: i128,
     timer_scan_cursor: u32,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
@@ -1170,7 +1211,7 @@ const EventLoop = struct {
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
+    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
 
@@ -1178,10 +1219,13 @@ const EventLoop = struct {
             .state = state,
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
+            .signal_fd = signal_fd,
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
             .accept_paused = false,
             .accept_resume_ns = 0,
             .saturation_paused = false,
+            .shutting_down = false,
+            .shutdown_deadline_ns = 0,
             .timer_scan_cursor = 0,
             .stats_next_log_ns = nowNs() + stats_log_interval_ns,
             .accepted_since_log = 0,
@@ -1201,6 +1245,7 @@ const EventLoop = struct {
         errdefer loop.pool.deinit();
 
         try loop.addFd(listen_fd, true, false);
+        try loop.addFd(signal_fd, true, false);
         return loop;
     }
 
@@ -1231,6 +1276,9 @@ const EventLoop = struct {
             if (self.desync_wait_slots.items.len > 0) {
                 current_wait_ms = @min(current_wait_ms, desync_wait_poll_ms);
             }
+            if (self.shutting_down) {
+                current_wait_ms = @min(current_wait_ms, graceful_shutdown_check_ms);
+            }
 
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), current_wait_ms);
             switch (posix.errno(rc)) {
@@ -1243,10 +1291,16 @@ const EventLoop = struct {
             for (events[0..n]) |ev| {
                 const fd = ev.data.fd;
                 const ev_flags = ev.events;
+                if (fd == self.signal_fd) {
+                    self.processSignalFd();
+                    continue;
+                }
                 if (fd == self.listen_fd) {
-                    self.acceptNewConnections() catch |err| {
-                        log.err("accept loop error: {any}", .{err});
-                    };
+                    if (!self.shutting_down) {
+                        self.acceptNewConnections() catch |err| {
+                            log.err("accept loop error: {any}", .{err});
+                        };
+                    }
                     continue;
                 }
 
@@ -1257,11 +1311,11 @@ const EventLoop = struct {
             self.processDesyncWaits();
 
             const now_ns = nowNs();
-            if (self.accept_paused and now_ns >= self.accept_resume_ns) {
+            if (!self.shutting_down and self.accept_paused and now_ns >= self.accept_resume_ns) {
                 self.resumeAccepting();
             }
             // Saturation hysteresis: resume accepting when active drops below 80%
-            if (self.saturation_paused) {
+            if (!self.shutting_down and self.saturation_paused) {
                 const active = self.state.active_connections.load(.monotonic);
                 const resume_threshold = (self.state.config.max_connections * 8) / 10;
                 if (active <= resume_threshold) {
@@ -1274,6 +1328,9 @@ const EventLoop = struct {
             }
             if (now_ns >= self.stats_next_log_ns) {
                 self.logPeriodicStats(now_ns);
+            }
+            if (self.shutting_down and self.maybeCompleteShutdown(now_ns)) {
+                return;
             }
         }
     }
@@ -1560,6 +1617,236 @@ const EventLoop = struct {
         self.state.saturation_paused.store(false, .monotonic);
         const active = self.state.active_connections.load(.monotonic);
         log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
+    }
+
+    fn processSignalFd(self: *EventLoop) void {
+        while (true) {
+            var info: linux.signalfd_siginfo = undefined;
+            const buf = std.mem.asBytes(&info);
+            const n = posix.read(self.signal_fd, buf) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    log.warn("signalfd read failed: {any}", .{err});
+                    return;
+                },
+            };
+            if (n == 0) return;
+            if (n != buf.len) {
+                log.warn("short signalfd read: got {d} bytes, expected {d}", .{ n, buf.len });
+                continue;
+            }
+            self.onSignal(@enumFromInt(info.signo));
+        }
+    }
+
+    fn onSignal(self: *EventLoop, sig: posix.SIG) void {
+        switch (sig) {
+            .TERM => self.beginGracefulShutdown("SIGTERM"),
+            .INT => self.beginGracefulShutdown("SIGINT"),
+            .HUP => self.reloadConfigFromDisk(),
+            .USR1 => self.dumpSignalStats(),
+            else => {},
+        }
+    }
+
+    fn beginGracefulShutdown(self: *EventLoop, signal_name: []const u8) void {
+        const now_ns = nowNs();
+        if (self.shutting_down) {
+            self.shutdown_deadline_ns = now_ns;
+            log.warn("{s} received during graceful drain; forcing immediate shutdown", .{signal_name});
+            return;
+        }
+
+        self.shutting_down = true;
+        self.shutdown_deadline_ns = now_ns + (@as(i128, @intCast(self.state.config.graceful_shutdown_timeout_sec)) * std.time.ns_per_s);
+
+        self.modFd(self.listen_fd, false, false) catch |err| {
+            log.warn("failed to disable listen socket during shutdown: {any}", .{err});
+        };
+        self.accept_paused = true;
+        self.saturation_paused = true;
+        self.state.accept_paused.store(true, .monotonic);
+        self.state.saturation_paused.store(true, .monotonic);
+
+        const active = self.state.active_connections.load(.monotonic);
+        log.warn(
+            "{s} received: graceful shutdown started, active={d}, timeout={d}s",
+            .{ signal_name, active, self.state.config.graceful_shutdown_timeout_sec },
+        );
+    }
+
+    fn maybeCompleteShutdown(self: *EventLoop, now_ns: i128) bool {
+        const active = self.state.active_connections.load(.monotonic);
+        if (active == 0) {
+            log.info("graceful shutdown complete: all connections drained", .{});
+            return true;
+        }
+        if (now_ns < self.shutdown_deadline_ns) return false;
+
+        log.warn("graceful shutdown timeout reached; forcing close of {d} active connections", .{active});
+        self.forceCloseActiveSlots("shutdown timeout");
+        return true;
+    }
+
+    fn forceCloseActiveSlots(self: *EventLoop, reason: []const u8) void {
+        for (self.pool.slots) |slot_opt| {
+            if (slot_opt) |slot| {
+                if (slot.phase != .idle) {
+                    self.closeSlot(slot, reason);
+                }
+            }
+        }
+    }
+
+    fn dumpSignalStats(self: *EventLoop) void {
+        const snapshot = self.state.getMetricsSnapshot();
+        log.info(
+            "SIGUSR1 stats: active={d}/{d} hs={d} total={d} closed={d} c2s={d} s2c={d} paused={}/{} drops(cap/sat/rate/hs)={d}/{d}/{d}/{d}",
+            .{
+                snapshot.connections_active,
+                snapshot.connections_max,
+                snapshot.handshakes_inflight,
+                snapshot.connections_accepted_total,
+                snapshot.connections_closed_total,
+                snapshot.client_to_upstream_bytes_total,
+                snapshot.upstream_to_client_bytes_total,
+                snapshot.accept_paused,
+                snapshot.saturation_paused,
+                snapshot.drops_capacity_total,
+                snapshot.drops_saturation_total,
+                snapshot.drops_rate_limit_total,
+                snapshot.drops_handshake_budget_total,
+            },
+        );
+    }
+
+    fn reloadConfigFromDisk(self: *EventLoop) void {
+        var next = Config.loadFromFile(self.state.allocator, self.state.config_path) catch |err| {
+            log.err("SIGHUP: failed to reload config '{s}': {any}", .{ self.state.config_path, err });
+            return;
+        };
+        defer next.deinit(self.state.allocator);
+
+        if (next.users.count() == 0) {
+            log.err("SIGHUP: reload rejected (no users configured)", .{});
+            return;
+        }
+
+        var applied: usize = 0;
+        var static_changes: usize = 0;
+
+        if (next.port != self.state.config.port) static_changes += 1;
+        const bind_address_changed = blk: {
+            if (next.bind_address == null and self.state.config.bind_address == null) break :blk false;
+            if (next.bind_address) |new_bind| {
+                if (self.state.config.bind_address) |old_bind| {
+                    break :blk !std.mem.eql(u8, new_bind, old_bind);
+                }
+            }
+            break :blk true;
+        };
+        if (bind_address_changed) static_changes += 1;
+        if (next.backlog != self.state.config.backlog) static_changes += 1;
+        if (next.use_middle_proxy != self.state.config.use_middle_proxy) static_changes += 1;
+        if (next.force_media_middle_proxy != self.state.config.force_media_middle_proxy) static_changes += 1;
+        if (next.middleproxy_buffer_kb != self.state.config.middleproxy_buffer_kb) static_changes += 1;
+        if (next.upstream_mode != self.state.config.upstream_mode) static_changes += 1;
+        if (next.allow_direct_fallback != self.state.config.allow_direct_fallback) static_changes += 1;
+
+        if (next.idle_timeout_sec != self.state.config.idle_timeout_sec) {
+            self.state.config.idle_timeout_sec = next.idle_timeout_sec;
+            applied += 1;
+        }
+        if (next.handshake_timeout_sec != self.state.config.handshake_timeout_sec) {
+            self.state.config.handshake_timeout_sec = next.handshake_timeout_sec;
+            applied += 1;
+        }
+        if (next.graceful_shutdown_timeout_sec != self.state.config.graceful_shutdown_timeout_sec) {
+            self.state.config.graceful_shutdown_timeout_sec = next.graceful_shutdown_timeout_sec;
+            applied += 1;
+        }
+        if (next.rate_limit_per_subnet != self.state.config.rate_limit_per_subnet) {
+            self.state.config.rate_limit_per_subnet = next.rate_limit_per_subnet;
+            applied += 1;
+        }
+        if (next.log_level != self.state.config.log_level) {
+            self.state.config.log_level = next.log_level;
+            runtime_log.level = next.log_level;
+            applied += 1;
+        }
+        const tls_domain_changed = !std.mem.eql(u8, next.tls_domain, self.state.config.tls_domain);
+        if (next.mask != self.state.config.mask or next.mask_port != self.state.config.mask_port or tls_domain_changed) {
+            const resolved_mask_addr = self.resolveMaskAddress(&next);
+            if (next.mask) {
+                if (resolved_mask_addr) |addr| {
+                    self.state.mask_addr = addr;
+                } else {
+                    log.warn("SIGHUP: failed to resolve new mask target, keeping previous mask address", .{});
+                }
+            } else {
+                self.state.mask_addr = null;
+            }
+            self.state.config.mask = next.mask;
+            self.state.config.mask_port = next.mask_port;
+            if (tls_domain_changed) {
+                if (self.state.allocator.dupe(u8, next.tls_domain)) |owned_tls_domain| {
+                    if (self.state.config.ownsTlsDomain()) {
+                        self.state.allocator.free(self.state.config.tls_domain);
+                    }
+                    self.state.config.tls_domain = owned_tls_domain;
+                } else |_| {
+                    log.warn("SIGHUP: failed to apply new tls_domain due to allocation error", .{});
+                }
+            }
+            applied += 1;
+        }
+        if (next.desync != self.state.config.desync) {
+            self.state.config.desync = next.desync;
+            applied += 1;
+        }
+        if (next.drs != self.state.config.drs) {
+            self.state.config.drs = next.drs;
+            applied += 1;
+        }
+        if (next.fast_mode != self.state.config.fast_mode) {
+            self.state.config.fast_mode = next.fast_mode;
+            applied += 1;
+        }
+
+        const pool_capacity: u32 = @intCast(self.pool.slots.len);
+        if (next.max_connections != self.state.config.max_connections) {
+            if (next.max_connections <= pool_capacity) {
+                self.state.config.max_connections = next.max_connections;
+                applied += 1;
+            } else {
+                log.warn(
+                    "SIGHUP: requested max_connections={d} exceeds startup pool capacity={d}; restart required",
+                    .{ next.max_connections, pool_capacity },
+                );
+                static_changes += 1;
+            }
+        }
+
+        if (static_changes > 0) {
+            log.warn("SIGHUP: {d} non-reloadable settings changed; restart required for full apply", .{static_changes});
+        }
+        if (applied == 0) {
+            log.info("SIGHUP: config reloaded, no hot-reloadable changes detected", .{});
+            return;
+        }
+        log.info("SIGHUP: applied {d} hot-reloadable setting(s)", .{applied});
+    }
+
+    fn resolveMaskAddress(self: *EventLoop, cfg: *const Config) ?Address {
+        if (!cfg.mask) return null;
+        const mask_target = if (cfg.mask_port == 443) cfg.tls_domain else "127.0.0.1";
+        const list = getAddressList(self.state.allocator, mask_target, cfg.mask_port) catch |err| {
+            log.warn("SIGHUP: mask target resolve failed for '{s}:{d}': {any}", .{ mask_target, cfg.mask_port, err });
+            return null;
+        };
+        defer list.deinit();
+        if (list.addrs.len == 0) return null;
+        return list.addrs[0];
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {

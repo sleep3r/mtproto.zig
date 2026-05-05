@@ -104,6 +104,10 @@ pub const Config = struct {
     idle_timeout_sec: u32 = 120,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
+    /// Graceful shutdown drain timeout on SIGTERM.
+    /// The proxy stops accepting new clients and drains active relays
+    /// for this many seconds before forced close.
+    graceful_shutdown_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = default_tls_domain,
     users: std.StringHashMap([16]u8),
@@ -161,13 +165,23 @@ pub const Config = struct {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
     }
 
+    pub fn ownsTlsDomain(self: *const Config) bool {
+        return self.tls_domain.ptr != default_tls_domain.ptr;
+    }
+
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
         return self.direct_users.contains(user_name);
     }
 
+    /// Port collision exists only when masking points to a local endpoint.
+    /// With mask_port=443, masking targets tls_domain:443 (remote), so no local bind clash.
+    pub fn hasLocalMaskPortCollision(self: *const Config) bool {
+        return self.mask and self.mask_port != 443 and self.port == self.mask_port;
+    }
+
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
-        if (self.mask and self.port == self.mask_port) {
+        if (self.hasLocalMaskPortCollision()) {
             const log = std.log.scoped(.config);
             log.err(
                 "proxy port ({d}) equals mask_port ({d}). The proxy listen socket " ++
@@ -328,6 +342,9 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.handshake_timeout_sec;
                         cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
+                    } else if (std.mem.eql(u8, key, "graceful_shutdown_timeout_sec")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.graceful_shutdown_timeout_sec;
+                        cfg.graceful_shutdown_timeout_sec = @max(@as(u32, 1), parsed);
                     } else if (std.mem.eql(u8, key, "tag")) {
                         if (value.len == 32) {
                             var tag: [16]u8 = undefined;
@@ -532,6 +549,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 15), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
@@ -564,6 +582,30 @@ test "parse config - metrics section" {
     try std.testing.expect(cfg.metrics.enabled);
     try std.testing.expectEqualStrings("0.0.0.0", cfg.metrics.host.?);
     try std.testing.expectEqual(@as(u16, 9200), cfg.metrics.port);
+}
+
+test "local mask collision check ignores default remote masking port" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = true,
+        .port = 443,
+        .mask_port = 443,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(!cfg.hasLocalMaskPortCollision());
+}
+
+test "local mask collision check detects local nginx clash" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = true,
+        .port = 8443,
+        .mask_port = 8443,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.hasLocalMaskPortCollision());
 }
 
 test "parse config - direct users allowlist" {
@@ -675,6 +717,7 @@ test "parse config - server runtime tunables lower bounds" {
         \\max_connections = 1
         \\idle_timeout_sec = 1
         \\handshake_timeout_sec = 1
+        \\graceful_shutdown_timeout_sec = 0
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
     ;
@@ -685,6 +728,7 @@ test "parse config - server runtime tunables lower bounds" {
     try std.testing.expectEqual(@as(u32, 32), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 5), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 5), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 1), cfg.graceful_shutdown_timeout_sec);
 }
 
 test "parse config - spaces and tabs" {

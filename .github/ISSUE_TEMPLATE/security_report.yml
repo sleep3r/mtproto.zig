@@ -1,0 +1,32 @@
+name: "🔐 Security Report (Public placeholder)"
+description: "Use this only if GitHub private vulnerability reporting is unavailable."
+title: "[Security]: "
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Do not post exploit details here
+
+        For real vulnerabilities, use private reporting:
+        https://github.com/sleep3r/mtproto.zig/security/advisories/new
+
+        This template is only a placeholder to request a private channel if advisories are unavailable.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Short summary (no exploit details)
+      description: "Describe the affected area at a high level."
+      placeholder: "Example: updater signature verification path"
+    validations:
+      required: true
+
+  - type: textarea
+    id: contact
+    attributes:
+      label: Contact preference
+      description: "How maintainers should reach you privately."
+      placeholder: "GitHub handle / email"
+    validations:
+      required: true

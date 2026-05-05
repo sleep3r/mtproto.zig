@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: "🔐 Security report (private)"
+    url: https://github.com/sleep3r/mtproto.zig/security/advisories/new
+    about: "Report vulnerabilities privately. Do not publish exploit details in public issues."
   - name: "❓ General question"
     url: https://github.com/sleep3r/mtproto.zig/discussions
     about: "For questions about usage, configuration, or troubleshooting — please use Discussions instead of Issues."

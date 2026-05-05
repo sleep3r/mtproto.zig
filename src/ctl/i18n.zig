@@ -10,19 +10,31 @@ pub const Lang = enum {
     en,
     ru,
 
-    pub fn fromEnv() Lang {
-        // Zig 0.16 no longer exposes a libc-free getenv helper in std.posix.
-        // Keep deterministic default language in non-interactive mode.
-        _ = indexOf;
+    /// Resolve language from environment map.
+    /// Priority: LC_ALL -> LANG.
+    pub fn fromEnvMap(env_map: *const std.process.Environ.Map) Lang {
+        if (env_map.get("LC_ALL")) |value| {
+            if (fromLocale(value)) |lang| return lang;
+        }
+        if (env_map.get("LANG")) |value| {
+            if (fromLocale(value)) |lang| return lang;
+        }
         return .en;
     }
 
-    fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
-        if (needle.len > haystack.len) return null;
-        for (0..haystack.len - needle.len + 1) |i| {
-            if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) return i;
-        }
+    fn fromLocale(raw: []const u8) ?Lang {
+        const locale = std.mem.trim(u8, raw, " \t\r\n");
+        if (locale.len == 0) return null;
+        if (std.ascii.eqlIgnoreCase(locale, "C") or std.ascii.eqlIgnoreCase(locale, "POSIX")) return null;
+
+        if (startsWithIgnoreCase(locale, "ru")) return .ru;
+        if (startsWithIgnoreCase(locale, "en")) return .en;
         return null;
+    }
+
+    fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+        if (prefix.len > haystack.len) return false;
+        return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
     }
 };
 
@@ -632,4 +644,36 @@ comptime {
     if (ru_strings.len != num_keys) {
         @compileError("ru_strings length mismatch with S enum");
     }
+}
+
+test "Lang.fromEnvMap prefers LC_ALL over LANG" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("LANG", "en_US.UTF-8");
+    try env.put("LC_ALL", "ru_RU.UTF-8");
+
+    try std.testing.expectEqual(Lang.ru, Lang.fromEnvMap(&env));
+}
+
+test "Lang.fromEnvMap detects LANG ru locale" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("LANG", "ru_RU.UTF-8");
+
+    try std.testing.expectEqual(Lang.ru, Lang.fromEnvMap(&env));
+}
+
+test "Lang.fromEnvMap falls back to en for C/POSIX and empty" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    try env.put("LANG", "C");
+    try std.testing.expectEqual(Lang.en, Lang.fromEnvMap(&env));
+
+    const removed = env.swapRemove("LANG");
+    try std.testing.expect(removed);
+    try env.put("LC_ALL", "POSIX");
+    try std.testing.expectEqual(Lang.en, Lang.fromEnvMap(&env));
 }

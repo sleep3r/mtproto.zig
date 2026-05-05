@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const proxy_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -95,6 +100,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tunnel", .module = tunnel_mod },
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
+            .{ .name = "proxy_config", .module = proxy_config_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
@@ -141,6 +147,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_ctl_tests.step);
+
+    // CLI localization smoke test (Linux hosts only).
+    if (target.query.isNative() and target.result.os.tag == .linux) {
+        const run_mtbuddy_help_ru = b.addRunArtifact(ctl_exe);
+        run_mtbuddy_help_ru.addArgs(&.{ "--lang", "ru", "--help" });
+        test_step.dependOn(&run_mtbuddy_help_ru.step);
+    }
 
     // E2E / integration harness (process-level scenarios).
     const e2e_cmd = b.addSystemCommand(&.{ "python3", "test/e2e/run.py" });

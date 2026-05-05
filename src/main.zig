@@ -13,6 +13,7 @@ const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
 const linux_io = @import("linux_io");
 const version_mod = @import("version");
+const runtime_log = @import("runtime_log.zig");
 
 // Custom lock-free log function: formats into a stack buffer and writes
 // to stderr in a single write() syscall. On Linux, write() is atomic for
@@ -20,13 +21,9 @@ const version_mod = @import("version");
 // don't interleave. This avoids the global stderr_mutex that Zig's
 // default logger uses, which causes catastrophic contention under
 // hundreds of concurrent threads.
-// Runtime log level, set from config.toml at startup.
-// Checked by lockFreeLog to filter messages without recompilation.
-pub var runtime_log_level: std.log.Level = .info;
-
 pub const std_options = std.Options{
     // Set comptime level to .debug so all log calls are compiled in.
-    // Runtime filtering is done in lockFreeLog via runtime_log_level.
+    // Runtime filtering is done in lockFreeLog via runtime_log.level.
     .log_level = .debug,
     .logFn = lockFreeLog,
 };
@@ -38,7 +35,7 @@ fn lockFreeLog(
     args: anytype,
 ) void {
     // Runtime filter: skip messages below configured level
-    if (@intFromEnum(message_level) > @intFromEnum(runtime_log_level)) return;
+    if (@intFromEnum(message_level) > @intFromEnum(runtime_log.level)) return;
 
     const level_txt = comptime message_level.asText();
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
@@ -441,7 +438,7 @@ pub fn main(init: std.process.Init) !void {
     defer cfg.deinit(allocator);
 
     // Apply runtime log level from config
-    runtime_log_level = cfg.log_level;
+    runtime_log.level = cfg.log_level;
 
     if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
         const log_main = std.log.scoped(.config);
@@ -466,7 +463,7 @@ pub fn main(init: std.process.Init) !void {
     cfg.emitWarnings();
 
     // Create shared state (DI — no globals)
-    var state = try proxy.ProxyState.init(allocator, cfg);
+    var state = try proxy.ProxyState.init(allocator, cfg, config_path);
     defer state.deinit();
 
     // Run the proxy

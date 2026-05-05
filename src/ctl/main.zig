@@ -25,6 +25,7 @@ const dashboard = @import("dashboard.zig");
 const ipv6hop = @import("ipv6hop.zig");
 const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
+const config_cmd = @import("config_cmd.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -48,11 +49,19 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "-i")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--lang")) {
-            if (args.next()) |lang_val| {
-                lang = if (std.mem.eql(u8, lang_val, "ru")) .ru else .en;
-            }
+            const lang_val = args.next() orelse {
+                printLangFlagError("Missing value for --lang (expected: en|ru)\n");
+                return;
+            };
+            lang = parseLangFlag(lang_val) orelse {
+                var buf: [96]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Unsupported language '{s}' (expected: en|ru)\n", .{lang_val}) catch "Unsupported language (expected: en|ru)\n";
+                printLangFlagError(msg);
+                return;
+            };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printHelp();
+            const help_lang = lang orelse i18n.Lang.fromEnvMap(init.environ_map);
+            printHelp(help_lang);
             return;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             printVersion();
@@ -64,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const resolved_lang = lang orelse i18n.Lang.fromEnv();
+    const resolved_lang = lang orelse i18n.Lang.fromEnvMap(init.environ_map);
     var ui = Tui.init(resolved_lang);
 
     // ── Interactive mode ──
@@ -107,12 +116,17 @@ pub fn main(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, sub, "dashboard")) {
                     return dashboard.run(&ui, allocator, &remaining_args);
                 } else {
-                    ui.print("\n  {s}Unknown setup subcommand:{s} {s}\n", .{ Color.err, Color.reset, sub });
-                    ui.hint("Available: masking, nfqws, tunnel, recovery, dashboard");
+                    ui.print("\n  {s}{s}:{s} {s}\n", .{
+                        Color.err,
+                        tr(ui.lang, "Unknown setup subcommand", "Неизвестная подкоманда setup"),
+                        Color.reset,
+                        sub,
+                    });
+                    ui.hint(tr(ui.lang, "Available: masking, nfqws, tunnel, recovery, dashboard", "Доступно: masking, nfqws, tunnel, recovery, dashboard"));
                     return;
                 }
             } else {
-                ui.fail("Usage: mtbuddy setup <masking|nfqws|tunnel|recovery|dashboard>");
+                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|tunnel|recovery|dashboard>", "Использование: mtbuddy setup <masking|nfqws|tunnel|recovery|dashboard>"));
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
@@ -122,15 +136,25 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "status")) {
             showStatus(&ui, allocator);
             return;
+        } else if (std.mem.eql(u8, cmd, "config")) {
+            return config_cmd.run(&ui, allocator, &remaining_args);
+        } else if (std.mem.eql(u8, cmd, "reload")) {
+            reloadProxy(&ui, allocator);
+            return;
         } else {
-            ui.print("\n  {s}Unknown command:{s} {s}\n\n", .{ Color.err, Color.reset, cmd });
-            printHelp();
+            ui.print("\n  {s}{s}:{s} {s}\n\n", .{
+                Color.err,
+                tr(ui.lang, "Unknown command", "Неизвестная команда"),
+                Color.reset,
+                cmd,
+            });
+            printHelp(ui.lang);
             return;
         }
     }
 
     // No command — show help
-    printHelp();
+    printHelp(ui.lang);
 }
 
 const Action = enum {
@@ -214,11 +238,35 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
 }
 
 fn restartProxy(ui: *Tui, allocator: std.mem.Allocator) void {
-    var sp = ui.spinner("Restarting...");
+    var sp = ui.spinner(tr(ui.lang, "Restarting", "Перезапуск"));
     sp.start();
     _ = @import("sys.zig").exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
     _ = @import("sys.zig").exec(allocator, &.{ "systemctl", "restart", "nfqws-mtproto" }) catch {};
     sp.stop(true, i18n.get(ui.lang, .restart_success));
+}
+
+fn reloadProxy(ui: *Tui, allocator: std.mem.Allocator) void {
+    var sp = ui.spinner(tr(ui.lang, "Reloading", "Перезагрузка"));
+    sp.start();
+    const sys = @import("sys.zig");
+    const reload_rc = sys.exec(allocator, &.{ "systemctl", "reload", "mtproto-proxy" }) catch null;
+    if (reload_rc) |res| {
+        defer res.deinit();
+        if (res.exit_code == 0) {
+            sp.stop(true, tr(ui.lang, "Config reloaded (SIGHUP)", "Конфигурация перезагружена (SIGHUP)"));
+            return;
+        }
+    }
+
+    const restart_rc = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch null;
+    if (restart_rc) |res| {
+        defer res.deinit();
+        if (res.exit_code == 0) {
+            sp.stop(true, tr(ui.lang, "Reload unsupported by unit; restarted service", "Reload не поддерживается unit'ом; выполнен restart"));
+            return;
+        }
+    }
+    sp.stop(false, tr(ui.lang, "Failed to reload mtproto-proxy", "Не удалось перезагрузить mtproto-proxy"));
 }
 
 fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
@@ -228,46 +276,46 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
 
     const svc_active = sys.isServiceActive("mtproto-proxy");
     if (svc_active) {
-        ui.ok("mtproto-proxy is running");
+        ui.ok(tr(ui.lang, "mtproto-proxy is running", "mtproto-proxy запущен"));
     } else {
-        ui.fail("mtproto-proxy is not running");
+        ui.fail(tr(ui.lang, "mtproto-proxy is not running", "mtproto-proxy не запущен"));
     }
 
     const nginx_active = sys.isServiceActive("nginx");
     if (nginx_active) {
-        ui.ok("nginx is running");
+        ui.ok(tr(ui.lang, "nginx is running", "nginx запущен"));
     } else {
-        ui.info("nginx is not running (masking may be disabled)");
+        ui.info(tr(ui.lang, "nginx is not running (masking may be disabled)", "nginx не запущен (маскировка может быть выключена)"));
     }
 
     const nfqws_active = sys.isServiceActive("nfqws-mtproto");
     if (nfqws_active) {
-        ui.ok("nfqws-mtproto is running");
+        ui.ok(tr(ui.lang, "nfqws-mtproto is running", "nfqws-mtproto запущен"));
     } else {
-        ui.info("nfqws-mtproto is not running (TCP desync disabled)");
+        ui.info(tr(ui.lang, "nfqws-mtproto is not running (TCP desync disabled)", "nfqws-mtproto не запущен (TCP desync выключен)"));
     }
 
     const timer_active = sys.isServiceActive("mtproto-mask-health.timer");
     if (timer_active) {
-        ui.ok("DPI auto-recovery is active");
+        ui.ok(tr(ui.lang, "DPI auto-recovery is active", "Автовосстановление DPI активно"));
     } else {
-        ui.info("DPI auto-recovery is not installed");
+        ui.info(tr(ui.lang, "DPI auto-recovery is not installed", "Автовосстановление DPI не установлено"));
     }
 
     const dashboard_active = sys.isServiceActive("proxy-monitor");
     if (dashboard_active) {
-        ui.ok("monitoring dashboard is running");
-        ui.summaryBox("Dashboard", &.{
-            .{ .label = "Status:", .value = "active", .style = .label_value },
-            .{ .label = "Port:", .value = "61208", .style = .label_value },
-            .{ .label = "Service:", .value = "systemctl status proxy-monitor", .style = .label_value },
+        ui.ok(tr(ui.lang, "monitoring dashboard is running", "дашборд мониторинга запущен"));
+        ui.summaryBox(tr(ui.lang, "Dashboard", "Дашборд"), &.{
+            .{ .label = tr(ui.lang, "Status:", "Статус:"), .value = tr(ui.lang, "active", "активен"), .style = .label_value },
+            .{ .label = tr(ui.lang, "Port:", "Порт:"), .value = "61208", .style = .label_value },
+            .{ .label = tr(ui.lang, "Service:", "Сервис:"), .value = "systemctl status proxy-monitor", .style = .label_value },
             .{ .label = "", .value = "", .style = .blank },
-            .{ .label = "Access via SSH tunnel:", .value = "", .style = .highlight },
-            .{ .label = "Command:", .value = "ssh -L 61208:localhost:61208 root@<ip>", .style = .label_value },
-            .{ .label = "Open:", .value = "http://localhost:61208", .style = .label_value },
+            .{ .label = tr(ui.lang, "Access via SSH tunnel:", "Доступ через SSH-туннель:"), .value = "", .style = .highlight },
+            .{ .label = tr(ui.lang, "Command:", "Команда:"), .value = "ssh -L 61208:localhost:61208 root@<ip>", .style = .label_value },
+            .{ .label = tr(ui.lang, "Open:", "Открыть:"), .value = "http://localhost:61208", .style = .label_value },
         });
     } else {
-        ui.info("monitoring dashboard is not installed (mtbuddy setup dashboard)");
+        ui.info(tr(ui.lang, "monitoring dashboard is not installed (mtbuddy setup dashboard)", "дашборд мониторинга не установлен (mtbuddy setup dashboard)"));
     }
 
     const result = @import("sys.zig").exec(allocator, &.{
@@ -289,92 +337,96 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     }
 }
 
-fn printHelp() void {
-    var ui = Tui.init(i18n.Lang.fromEnv());
+fn printHelp(lang: i18n.Lang) void {
+    var ui = Tui.init(lang);
 
     ui.writeRaw("\n");
-    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  MTProto Proxy installer & control panel\n\n", .{
+    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  {s}\n\n", .{
         Color.header, Color.reset,
         Color.dim,    version,
         Color.reset,
+        tr(lang, "MTProto Proxy installer & control panel", "Установщик и панель управления MTProto Proxy"),
     });
 
     // ── One-liner examples ──
-    ui.print("  {s}Quick install (one-liner):{s}\n\n", .{ Color.accent, Color.reset });
-    ui.print("    {s}# Minimal — auto-generates secret:{s}\n", .{ Color.gray, Color.reset });
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Quick install (one-liner)", "Быстрая установка (one-liner)"), Color.reset });
+    ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "Minimal — auto-generates secret", "Минимум — секрет сгенерируется автоматически"), Color.reset });
     ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
-    ui.print("    {s}# Full control — bring your own secret and username:{s}\n", .{ Color.gray, Color.reset });
+    ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "Full control — bring your own secret and username", "Полный контроль — свой секрет и имя пользователя"), Color.reset });
     ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru \\\n", .{Color.bright_yellow});
     ui.print("    {s}  --secret <32-hex> --user alice --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
-    ui.print("    {s}# No DPI bypass (bare install):{s}\n", .{ Color.gray, Color.reset });
+    ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "No DPI bypass (bare install)", "Без обхода DPI (чистая установка)"), Color.reset });
     ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
 
-    ui.print("  {s}Interactive wizard:{s}\n\n", .{ Color.accent, Color.reset });
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Interactive wizard", "Интерактивный мастер"), Color.reset });
     ui.print("    {s}sudo mtbuddy --interactive{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}mtbuddy --lang ru --help{s}\n\n", .{ Color.bright_yellow, Color.reset });
 
     // ── Commands ──
-    ui.print("  {s}Commands:{s}\n\n", .{ Color.accent, Color.reset });
-    printCmd(&ui, "install", "Install mtproto-proxy from release");
-    printCmd(&ui, "uninstall", "Uninstall mtproto-proxy completely");
-    printCmd(&ui, "update", "Update to latest GitHub release");
-    printCmd(&ui, "setup masking", "Setup local Nginx DPI masking");
-    printCmd(&ui, "setup nfqws", "Setup nfqws TCP desync (Zapret)");
-    printCmd(&ui, "setup tunnel <conf|vpn://>", "Setup VPN tunnel (AmneziaWG, WireGuard, ...)");
-    printCmd(&ui, "setup dashboard", "Install web monitoring dashboard");
-    printCmd(&ui, "setup recovery", "Install DPI auto-recovery");
-    printCmd(&ui, "ipv6-hop", "IPv6 address rotation");
-    printCmd(&ui, "update-dns <ip>", "Update Cloudflare DNS A record");
-    printCmd(&ui, "status", "Show service status");
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Commands", "Команды"), Color.reset });
+    printCmd(&ui, "install", tr(lang, "Install mtproto-proxy from release", "Установить mtproto-proxy из релиза"));
+    printCmd(&ui, "uninstall", tr(lang, "Uninstall mtproto-proxy completely", "Полностью удалить mtproto-proxy"));
+    printCmd(&ui, "update", tr(lang, "Update to latest GitHub release", "Обновить до последнего GitHub релиза"));
+    printCmd(&ui, "setup masking", tr(lang, "Setup local Nginx DPI masking", "Настроить локальную DPI-маскировку через Nginx"));
+    printCmd(&ui, "setup nfqws", tr(lang, "Setup nfqws TCP desync (Zapret)", "Настроить nfqws TCP desync (Zapret)"));
+    printCmd(&ui, "setup tunnel <conf|vpn://>", tr(lang, "Setup VPN tunnel (AmneziaWG, WireGuard, ...)", "Настроить VPN-туннель (AmneziaWG, WireGuard, ...)"));
+    printCmd(&ui, "setup dashboard", tr(lang, "Install web monitoring dashboard", "Установить веб-дашборд мониторинга"));
+    printCmd(&ui, "setup recovery", tr(lang, "Install DPI auto-recovery", "Установить авто-восстановление DPI"));
+    printCmd(&ui, "ipv6-hop", tr(lang, "IPv6 address rotation", "Ротация IPv6 адреса"));
+    printCmd(&ui, "update-dns <ip>", tr(lang, "Update Cloudflare DNS A record", "Обновить A-запись Cloudflare DNS"));
+    printCmd(&ui, "config <validate|doctor|print-effective>", tr(lang, "Config diagnostics and effective values", "Диагностика и эффективные значения конфига"));
+    printCmd(&ui, "status", tr(lang, "Show service status", "Показать статус сервисов"));
+    printCmd(&ui, "reload", tr(lang, "Reload config (SIGHUP)", "Перезагрузить конфиг (SIGHUP)"));
     ui.writeRaw("\n");
 
     // ── Install options ──
-    ui.print("  {s}Install options:{s}\n\n", .{ Color.accent, Color.reset });
-    printOpt(&ui, "--port,   -p <port>", "Proxy port (default: 443)");
-    printOpt(&ui, "--domain, -d <domain>", "TLS masking domain (default: wb.ru)");
-    printOpt(&ui, "--secret, -s <hex32>", "User secret (32 hex chars, auto-generated if omitted)");
-    printOpt(&ui, "--user,   -u <name>", "Username in config.toml (default: user)");
-    printOpt(&ui, "--config, -c <path>", "Use existing config.toml file");
-    printOpt(&ui, "--yes,    -y", "Skip confirmation prompt (non-interactive)");
-    printOpt(&ui, "--max-connections <N>", "Max proxy connections (default: 512)");
-    printOpt(&ui, "--no-masking", "Disable Nginx DPI masking");
-    printOpt(&ui, "--no-nfqws", "Disable nfqws TCP desync");
-    printOpt(&ui, "--no-tcpmss", "Disable TCPMSS=88 clamping");
-    printOpt(&ui, "--no-dpi", "Disable all DPI bypass modules");
-    printOpt(&ui, "--bind,   -b <ip>", "Bind to specific IP (default: all interfaces)");
-    printOpt(&ui, "--middle-proxy", "Enable Telegram MiddleProxy relay");
-    printOpt(&ui, "--ipv6-hop", "Enable IPv6 auto-hopping");
-    printOpt(&ui, "--version, -v <tag>", "Release version to install (default: latest)");
-    printOpt(&ui, "--insecure", "Allow unsigned assets (disables minisign verification)");
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Install options", "Опции установки"), Color.reset });
+    printOpt(&ui, "--port,   -p <port>", tr(lang, "Proxy port (default: 443)", "Порт прокси (по умолчанию: 443)"));
+    printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: wb.ru)", "TLS-домен маскировки (по умолчанию: wb.ru)"));
+    printOpt(&ui, "--secret, -s <hex32>", tr(lang, "User secret (32 hex chars, auto-generated if omitted)", "Секрет пользователя (32 hex, если не задан — генерируется)"));
+    printOpt(&ui, "--user,   -u <name>", tr(lang, "Username in config.toml (default: user)", "Имя пользователя в config.toml (по умолчанию: user)"));
+    printOpt(&ui, "--config, -c <path>", tr(lang, "Use existing config.toml file", "Использовать существующий config.toml"));
+    printOpt(&ui, "--yes,    -y", tr(lang, "Skip confirmation prompt (non-interactive)", "Пропустить подтверждение (non-interactive)"));
+    printOpt(&ui, "--max-connections <N>", tr(lang, "Max proxy connections (default: 512)", "Максимум подключений (по умолчанию: 512)"));
+    printOpt(&ui, "--no-masking", tr(lang, "Disable Nginx DPI masking", "Отключить DPI-маскировку через Nginx"));
+    printOpt(&ui, "--no-nfqws", tr(lang, "Disable nfqws TCP desync", "Отключить nfqws TCP desync"));
+    printOpt(&ui, "--no-tcpmss", tr(lang, "Disable TCPMSS=88 clamping", "Отключить TCPMSS=88"));
+    printOpt(&ui, "--no-dpi", tr(lang, "Disable all DPI bypass modules", "Отключить все DPI-модули"));
+    printOpt(&ui, "--bind,   -b <ip>", tr(lang, "Bind to specific IP (default: all interfaces)", "Слушать конкретный IP (по умолчанию: все интерфейсы)"));
+    printOpt(&ui, "--middle-proxy", tr(lang, "Enable Telegram MiddleProxy relay", "Включить Telegram MiddleProxy relay"));
+    printOpt(&ui, "--ipv6-hop", tr(lang, "Enable IPv6 auto-hopping", "Включить автоматическую ротацию IPv6"));
+    printOpt(&ui, "--version, -v <tag>", tr(lang, "Release version to install (default: latest)", "Версия релиза для установки (по умолчанию: latest)"));
+    printOpt(&ui, "--insecure", tr(lang, "Allow unsigned assets (disables minisign verification)", "Разрешить неподписанные артефакты (отключает minisign verification)"));
     ui.writeRaw("\n");
 
     // ── Update options ──
-    ui.print("  {s}Update options:{s}\n\n", .{ Color.accent, Color.reset });
-    printOpt(&ui, "--version, -v <tag>", "Pin to specific release tag");
-    printOpt(&ui, "--force-service", "Force systemd unit update");
-    printOpt(&ui, "--insecure", "Allow unsigned assets (disables minisign verification)");
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Update options", "Опции обновления"), Color.reset });
+    printOpt(&ui, "--version, -v <tag>", tr(lang, "Pin to specific release tag", "Зафиксировать конкретный тег релиза"));
+    printOpt(&ui, "--force-service", tr(lang, "Force systemd unit update", "Принудительно обновить systemd unit"));
+    printOpt(&ui, "--insecure", tr(lang, "Allow unsigned assets (disables minisign verification)", "Разрешить неподписанные артефакты (отключает minisign verification)"));
     ui.writeRaw("\n");
 
     // ── Setup options ──
-    ui.print("  {s}Setup options:{s}\n\n", .{ Color.accent, Color.reset });
-    printOpt(&ui, "--domain <domain>", "TLS masking domain");
-    printOpt(&ui, "--ttl <N>", "nfqws fake packet TTL (default: 6)");
-    printOpt(&ui, "--remove", "Remove nfqws installation");
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Setup options", "Опции setup"), Color.reset });
+    printOpt(&ui, "--domain <domain>", tr(lang, "TLS masking domain", "TLS-домен маскировки"));
+    printOpt(&ui, "--ttl <N>", tr(lang, "nfqws fake packet TTL (default: 6)", "TTL фейковых пакетов nfqws (по умолчанию: 6)"));
+    printOpt(&ui, "--remove", tr(lang, "Remove nfqws installation", "Удалить установленный nfqws"));
     ui.writeRaw("\n");
 
     // ── IPv6 options ──
-    ui.print("  {s}IPv6 options:{s}\n\n", .{ Color.accent, Color.reset });
-    printOpt(&ui, "--check", "Show current IPv6 rotation status");
-    printOpt(&ui, "--auto", "Auto-rotate on ban detection");
-    printOpt(&ui, "--prefix <prefix>", "IPv6 /64 prefix");
-    printOpt(&ui, "--threshold <N>", "Ban detection threshold (default: 10)");
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "IPv6 options", "Опции IPv6"), Color.reset });
+    printOpt(&ui, "--check", tr(lang, "Show current IPv6 rotation status", "Показать текущий статус ротации IPv6"));
+    printOpt(&ui, "--auto", tr(lang, "Auto-rotate on ban detection", "Авто-ротация при обнаружении блокировки"));
+    printOpt(&ui, "--prefix <prefix>", tr(lang, "IPv6 /64 prefix", "IPv6 /64 префикс"));
+    printOpt(&ui, "--threshold <N>", tr(lang, "Ban detection threshold (default: 10)", "Порог обнаружения блокировки (по умолчанию: 10)"));
     ui.writeRaw("\n");
 
     // ── Global options ──
-    ui.print("  {s}Global options:{s}\n\n", .{ Color.accent, Color.reset });
-    printOpt(&ui, "-i, --interactive", "Interactive TUI wizard");
-    printOpt(&ui, "--lang <en|ru>", "Language (default: auto-detect)");
-    printOpt(&ui, "-h, --help", "Show this help");
-    printOpt(&ui, "--version", "Show version");
+    ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Global options", "Глобальные опции"), Color.reset });
+    printOpt(&ui, "-i, --interactive", tr(lang, "Interactive TUI wizard", "Интерактивный TUI-мастер"));
+    printOpt(&ui, "--lang <en|ru>", tr(lang, "Language (default: auto-detect)", "Язык (по умолчанию: auto-detect)"));
+    printOpt(&ui, "-h, --help", tr(lang, "Show this help", "Показать эту справку"));
+    printOpt(&ui, "--version", tr(lang, "Show version", "Показать версию"));
     ui.writeRaw("\n");
 }
 
@@ -404,4 +456,18 @@ fn printOpt(ui: *Tui, flag: []const u8, desc: []const u8) void {
 
 fn printVersion() void {
     linux_io.writeAllFd(std.posix.STDOUT_FILENO, "mtbuddy v" ++ version ++ "\n");
+}
+
+fn parseLangFlag(raw: []const u8) ?i18n.Lang {
+    if (std.ascii.eqlIgnoreCase(raw, "en")) return .en;
+    if (std.ascii.eqlIgnoreCase(raw, "ru")) return .ru;
+    return null;
+}
+
+fn printLangFlagError(msg: []const u8) void {
+    linux_io.writeAllFd(std.posix.STDERR_FILENO, msg);
+}
+
+fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
+    return if (lang == .ru) ru else en;
 }

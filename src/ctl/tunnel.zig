@@ -213,6 +213,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\Type=simple
         \\ExecStartPre=/usr/local/bin/setup_tunnel.sh
         \\ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+        \\ExecReload=/bin/kill -HUP $MAINPID
+        \\KillSignal=SIGTERM
+        \\TimeoutStopSec=25
         \\Restart=on-failure
         \\RestartSec=5
         \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
