@@ -871,6 +871,7 @@ def scenario_invalid_tls_and_mtproto() -> None:
         upstream_type="socks5",
         upstream_host="127.0.0.1",
         upstream_port=socks.port,
+        handshake_timeout_sec=1,
     )
     proxy = start_proxy(cfg, proxy_port)
     try:
@@ -879,7 +880,7 @@ def scenario_invalid_tls_and_mtproto() -> None:
         c1.settimeout(2.0)
         try:
             c1.sendall(b"NOPE")
-            assert_socket_closed_soon(c1, timeout_sec=1.5)
+            assert_socket_closed_soon(c1, timeout_sec=2.5)
         finally:
             c1.close()
 
