@@ -73,6 +73,15 @@ def wait_for_listen(host: str, port: int, timeout_sec: float) -> bool:
     return False
 
 
+def wait_for_condition(predicate: Callable[[], bool], timeout_sec: float, interval_sec: float = 0.02) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval_sec)
+    return predicate()
+
+
 def recv_exact(sock: socket.socket, n: int) -> bytes:
     out = bytearray()
     while len(out) < n:
@@ -698,9 +707,14 @@ def scenario_fake_telegram_dc_via_socks5() -> None:
         with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
             c.settimeout(2.0)
             perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            # First payload triggers upstream connect path.
             c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x11" * 64))
-            time.sleep(0.25)
-        time.sleep(0.3)
+            connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=2.0)
+            assert connected, "SOCKS5 CONNECT was not attempted in time"
+            # Send one more record after connect to reduce scheduling flakiness in CI.
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x12" * 128))
+            forwarded = wait_for_condition(lambda: socks.tunnel_bytes > 0, timeout_sec=2.0)
+            assert forwarded, "no C2S bytes reached fake DC tunnel"
         assert socks.tunnel_bytes > 0, "no C2S bytes reached fake DC tunnel"
         assert any(p == 443 for _, p in socks.connect_targets), f"no DC connect in {socks.connect_targets}"
     finally:
@@ -750,8 +764,11 @@ def scenario_http_connect_success() -> None:
             c.settimeout(2.0)
             perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
             c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x33" * 64))
-            time.sleep(0.25)
-        time.sleep(0.3)
+            connected = wait_for_condition(lambda: len(http.connect_targets) > 0, timeout_sec=2.0)
+            assert connected, "HTTP CONNECT was not attempted in time"
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x34" * 128))
+            forwarded = wait_for_condition(lambda: http.tunnel_bytes > 0, timeout_sec=2.0)
+            assert forwarded, "no tunneled bytes through HTTP CONNECT"
         assert http.tunnel_bytes > 0, "no tunneled bytes through HTTP CONNECT"
         assert any(p == 443 for _, p in http.connect_targets), f"no DC connect in {http.connect_targets}"
     finally:
