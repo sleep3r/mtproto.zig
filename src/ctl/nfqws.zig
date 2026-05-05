@@ -91,11 +91,12 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 
     // ── Install dependencies ──
     ui.step("Installing build dependencies...");
-    _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
-    _ = sys.execForward(&.{
-        "apt-get",                "install",    "-y",       "build-essential", "git",
-        "libnetfilter-queue-dev", "libcap-dev", "iptables", "libmnl-dev",      "zlib1g-dev",
-    }) catch {};
+    if (!runLogged(ui, allocator, &.{ "apt-get", "update", "-qq" }, "apt-get update failed")) return;
+    if (!runLogged(ui, allocator, &.{
+        "apt-get",                "install",          "-y",         "build-essential", "git",
+        "libnetfilter-queue-dev", "libnfnetlink-dev", "libcap-dev", "iptables",        "libmnl-dev",
+        "zlib1g-dev",
+    }, "Failed to install nfqws build dependencies")) return;
     ui.ok("Dependencies installed");
 
     // ── Clone and build zapret ──
@@ -104,16 +105,17 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     } else {
         ui.step("Cloning and building zapret...");
         _ = sys.exec(allocator, &.{ "rm", "-rf", ZAPRET_DIR }) catch {};
-        const build_result = sys.execForward(&.{
-            "bash", "-c",
-            "git clone --depth 1 https://github.com/bol-van/zapret.git " ++ ZAPRET_DIR ++
-                " && cd " ++ ZAPRET_DIR ++ "/nfq && make clean >/dev/null 2>&1 || true && make >/dev/null 2>&1",
-        }) catch {
-            ui.fail("nfqws build failed");
-            return;
-        };
-        if (build_result != 0 or !sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws")) {
-            ui.fail("nfqws build failed");
+        if (!runLogged(ui, allocator, &.{
+            "git", "clone", "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
+        }, "Failed to clone zapret")) return;
+
+        _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
+        if (!runLogged(ui, allocator, &.{
+            "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make",
+        }, "nfqws build failed")) return;
+
+        if (!sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws")) {
+            ui.fail("nfqws build finished but /opt/zapret/nfq/nfqws was not created");
             return;
         }
         ui.ok("nfqws built successfully");
@@ -208,4 +210,36 @@ fn removeNfqwsRules(allocator: std.mem.Allocator, ipt: []const u8) void {
         .{ ipt, NFQUEUE_NUM, ipt },
     ) catch return;
     _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
+}
+
+fn runLogged(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {
+    const result = sys.exec(allocator, argv) catch {
+        ui.fail(failure_msg);
+        ui.info("Failed to spawn command");
+        return false;
+    };
+    defer result.deinit();
+
+    if (result.exit_code == 0) return true;
+
+    ui.fail(failure_msg);
+    printCommandOutput(ui, &result);
+    return false;
+}
+
+fn printCommandOutput(ui: *Tui, result: *const sys.ExecResult) void {
+    const stderr = std.mem.trim(u8, result.stderr, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (stderr.len > 0) {
+        ui.print("  stderr:\n{s}\n", .{tailBytes(stderr, 4096)});
+    }
+
+    const stdout = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (stdout.len > 0) {
+        ui.print("  stdout:\n{s}\n", .{tailBytes(stdout, 4096)});
+    }
+}
+
+fn tailBytes(bytes: []const u8, max_len: usize) []const u8 {
+    if (bytes.len <= max_len) return bytes;
+    return bytes[bytes.len - max_len ..];
 }

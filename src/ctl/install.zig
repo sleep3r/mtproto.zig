@@ -426,27 +426,23 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.ok(ui.str(.install_config_exists));
     }
 
-    // ── Create system user ──
-    if (!blk: {
-        const r = sys.exec(allocator, &.{ "id", "-u", "mtproto" }) catch break :blk false;
-        defer r.deinit();
-        break :blk r.exit_code == 0;
-    }) {
-        _ = sys.exec(allocator, &.{
-            "useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "mtproto",
-        }) catch {};
-        ui.ok(ui.str(.install_user_created));
-    }
-
-    _ = sys.exec(allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
+    // ── Create system user/group ──
+    if (!ensureServiceUser(ui, allocator)) return;
+    if (!runRequired(ui, allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }, "Failed to chown install directory")) return;
 
     // ── Systemd service ──
     {
         var sp = ui.spinner(ui.str(.install_service_installed));
         sp.start();
-        _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
-        _ = sys.exec(allocator, &.{ "systemctl", "enable", SERVICE_NAME }) catch {};
-        _ = sys.exec(allocator, &.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+        if (!runRequiredWhileSpinning(ui, allocator, &.{ "systemctl", "daemon-reload" }, "systemctl daemon-reload failed", &sp)) return;
+        if (!runRequiredWhileSpinning(ui, allocator, &.{ "systemctl", "enable", SERVICE_NAME }, "Failed to enable mtproto-proxy service", &sp)) return;
+        if (!runRequiredWhileSpinning(ui, allocator, &.{ "systemctl", "restart", SERVICE_NAME }, "Failed to start mtproto-proxy service", &sp)) return;
+        if (!sys.isServiceActive(SERVICE_NAME)) {
+            sp.stop(false, "");
+            ui.fail("mtproto-proxy service is not active after restart");
+            printServiceStatus(ui, allocator);
+            return;
+        }
         sp.stop(true, "");
     }
 
@@ -498,8 +494,13 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     }
 
     // ── Final restart ──
-    _ = sys.exec(allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
-    _ = sys.exec(allocator, &.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+    if (!runRequired(ui, allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }, "Failed to chown install directory")) return;
+    if (!runRequired(ui, allocator, &.{ "systemctl", "restart", SERVICE_NAME }, "Failed to restart mtproto-proxy after setup")) return;
+    if (!sys.isServiceActive(SERVICE_NAME)) {
+        ui.fail("mtproto-proxy service is not active after setup");
+        printServiceStatus(ui, allocator);
+        return;
+    }
 
     ui.rule();
 
@@ -779,4 +780,109 @@ fn printSummary(
     }
 
     ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
+}
+
+fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
+    if (!groupExists(allocator, "mtproto")) {
+        if (!runRequired(ui, allocator, &.{ "groupadd", "--system", "mtproto" }, "Failed to create system group 'mtproto'")) return false;
+    }
+
+    if (!userExists(allocator, "mtproto")) {
+        if (!runRequired(ui, allocator, &.{
+            "useradd",
+            "--system",
+            "--no-create-home",
+            "--home-dir",
+            INSTALL_DIR,
+            "--shell",
+            "/usr/sbin/nologin",
+            "--gid",
+            "mtproto",
+            "mtproto",
+        }, "Failed to create system user 'mtproto'")) return false;
+        ui.ok(ui.str(.install_user_created));
+    }
+
+    if (!groupExists(allocator, "mtproto")) {
+        ui.fail("System group 'mtproto' is missing");
+        return false;
+    }
+    if (!userExists(allocator, "mtproto")) {
+        ui.fail("System user 'mtproto' is missing");
+        return false;
+    }
+    return true;
+}
+
+fn userExists(allocator: std.mem.Allocator, name: []const u8) bool {
+    const result = sys.exec(allocator, &.{ "id", "-u", name }) catch return false;
+    defer result.deinit();
+    return result.exit_code == 0;
+}
+
+fn groupExists(allocator: std.mem.Allocator, name: []const u8) bool {
+    const result = sys.exec(allocator, &.{ "getent", "group", name }) catch return false;
+    defer result.deinit();
+    return result.exit_code == 0;
+}
+
+fn runRequired(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {
+    const result = sys.exec(allocator, argv) catch {
+        ui.fail(failure_msg);
+        ui.info("Failed to spawn command");
+        return false;
+    };
+    defer result.deinit();
+
+    if (result.exit_code == 0) return true;
+
+    ui.fail(failure_msg);
+    printCommandOutput(ui, &result);
+    return false;
+}
+
+fn runRequiredWhileSpinning(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    failure_msg: []const u8,
+    sp: *tui_mod.Spinner,
+) bool {
+    const result = sys.exec(allocator, argv) catch {
+        sp.stop(false, "");
+        ui.fail(failure_msg);
+        ui.info("Failed to spawn command");
+        return false;
+    };
+    defer result.deinit();
+
+    if (result.exit_code == 0) return true;
+
+    sp.stop(false, "");
+    ui.fail(failure_msg);
+    printCommandOutput(ui, &result);
+    return false;
+}
+
+fn printServiceStatus(ui: *Tui, allocator: std.mem.Allocator) void {
+    const status = sys.exec(allocator, &.{ "systemctl", "status", SERVICE_NAME, "--no-pager", "-l" }) catch return;
+    defer status.deinit();
+    printCommandOutput(ui, &status);
+}
+
+fn printCommandOutput(ui: *Tui, result: *const sys.ExecResult) void {
+    const stderr = std.mem.trim(u8, result.stderr, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (stderr.len > 0) {
+        ui.print("  stderr:\n{s}\n", .{tailBytes(stderr, 4096)});
+    }
+
+    const stdout = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (stdout.len > 0) {
+        ui.print("  stdout:\n{s}\n", .{tailBytes(stdout, 4096)});
+    }
+}
+
+fn tailBytes(bytes: []const u8, max_len: usize) []const u8 {
+    if (bytes.len <= max_len) return bytes;
+    return bytes[bytes.len - max_len ..];
 }
