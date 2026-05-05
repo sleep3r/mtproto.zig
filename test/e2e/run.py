@@ -969,7 +969,8 @@ def scenario_slowloris_partial_clienthello() -> None:
     cfg = base_config(
         port=proxy_port,
         mask=False,
-        handshake_timeout_sec=1,
+        # Config clamps handshake_timeout_sec to a minimum of 5 seconds.
+        handshake_timeout_sec=5,
         idle_timeout_sec=10,
         upstream_type="auto",
     )
@@ -979,7 +980,7 @@ def scenario_slowloris_partial_clienthello() -> None:
         c.settimeout(2.0)
         try:
             c.sendall(b"\x16\x03\x01")
-            assert wait_socket_closed(c, timeout_sec=4.0), (
+            assert wait_socket_closed(c, timeout_sec=8.0), (
                 "slowloris connection did not close after handshake timeout\n"
                 + proxy.read_log_tail()
             )
