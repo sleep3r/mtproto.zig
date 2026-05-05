@@ -820,8 +820,14 @@ def scenario_middleproxy_fallback_to_direct() -> None:
             c.settimeout(2.0)
             perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
             c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x44" * 64))
-            time.sleep(0.5)
-        time.sleep(0.4)
+            connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=3.0)
+            assert connected, "middle-proxy SOCKS5 CONNECT was not attempted in time\n" + proxy.read_log_tail()
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x45" * 128))
+            fallback = wait_for_condition(
+                lambda: socks.middleproxy_disconnects >= 1 and any(p == 443 for _, p in socks.connect_targets),
+                timeout_sec=3.0,
+            )
+            assert fallback, "middle-proxy fallback did not complete in time\n" + proxy.read_log_tail()
         ports = [p for _, p in socks.connect_targets]
         assert 8888 in ports, f"middle-proxy connect was not attempted: {ports}"
         assert 443 in ports, f"direct fallback connect was not attempted: {ports}"
