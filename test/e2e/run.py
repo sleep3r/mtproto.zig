@@ -585,7 +585,12 @@ class FakeMaskServer:
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self.received = bytearray()
+
+    def received_bytes(self) -> bytes:
+        with self._lock:
+            return bytes(self.received)
 
     def start(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -616,18 +621,27 @@ class FakeMaskServer:
             except OSError:
                 break
             with conn:
-                conn.settimeout(1.5)
-                try:
-                    data = conn.recv(4096)
-                except OSError:
-                    continue
-                if data:
-                    self.received.extend(data)
-                    # Keep the relay path alive just enough for confirmation.
+                conn.settimeout(0.2)
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not self._stop.is_set():
                     try:
-                        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                        data = conn.recv(4096)
+                    except socket.timeout:
+                        continue
                     except OSError:
-                        pass
+                        break
+                    if not data:
+                        break
+                    with self._lock:
+                        self.received.extend(data)
+                        complete = b"\r\n\r\n" in self.received
+                    if complete:
+                        # Keep the relay path alive just enough for confirmation.
+                        try:
+                            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                        except OSError:
+                            pass
+                        break
 
 
 def base_config(
@@ -854,8 +868,8 @@ def scenario_mask_fallback_local_nginx() -> None:
             c.settimeout(2.0)
             c.sendall(payload)
             _ = c.recv(1024)
-        time.sleep(0.4)
-        assert bytes(mask.received).startswith(payload), "mask target did not receive original bad client bytes"
+        received = wait_for_condition(lambda: mask.received_bytes().startswith(payload), timeout_sec=2.0)
+        assert received, f"mask target did not receive original bad client bytes: {mask.received_bytes()!r}"
     finally:
         proxy.stop()
         mask.stop()
