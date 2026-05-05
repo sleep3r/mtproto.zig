@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.3](https://github.com/sleep3r/mtproto.zig/compare/v0.21.2...v0.21.3) (2026-05-05)
+
+
+### Bug Fixes
+
+* harden nfqws install diagnostics ([#237](https://github.com/sleep3r/mtproto.zig/issues/237)) ([33c769c](https://github.com/sleep3r/mtproto.zig/commit/33c769cfc1221df35c76f4c5b2b28c7b4b2e3536))
+
 ## [0.21.2](https://github.com/sleep3r/mtproto.zig/compare/v0.21.1...v0.21.2) (2026-05-05)
 
 
