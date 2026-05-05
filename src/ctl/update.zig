@@ -131,6 +131,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Download mtbuddy (optional) ──
     var buddy_buf: [256]u8 = undefined;
+    ui.step(localized(
+        ui,
+        "Downloading mtbuddy updater...",
+        "Скачивание обновления mtbuddy...",
+    ));
     const buddy_path = release.downloadBuddyArtifact(
         allocator,
         tag.slice(),
@@ -139,6 +144,18 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         !insecure_mode,
         &buddy_buf,
     );
+    if (buddy_path) |_| {
+        ui.stepOk(
+            localized(ui, "mtbuddy updater downloaded", "Обновление mtbuddy скачано"),
+            "mtbuddy",
+        );
+    } else {
+        ui.warn(localized(
+            ui,
+            "mtbuddy artifact unavailable; updating proxy binary only",
+            "Артефакт mtbuddy недоступен; обновляем только бинарник прокси",
+        ));
+    }
 
     // ── Backup current binary ──
     ui.step(ui.str(.update_backing_up));
@@ -235,4 +252,11 @@ fn isTunnelServiceUnit() bool {
     }) catch return false;
     defer result.deinit();
     return result.exit_code == 0;
+}
+
+fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
+    return switch (ui.lang) {
+        .en => en,
+        .ru => ru,
+    };
 }

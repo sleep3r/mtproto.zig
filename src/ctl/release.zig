@@ -290,7 +290,21 @@ fn downloadReleaseFile(
         "https://github.com/{s}/{s}/releases/download/{s}/{s}",
         .{ REPO_OWNER, REPO_NAME, tag, file_name },
     ) catch return false;
-    const dl = sys.exec(allocator, &.{ "curl", "-fsSL", url, "-o", out_path }) catch return false;
+    const dl = sys.exec(allocator, &.{
+        "curl",
+        "-fsSL",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "120",
+        "--retry",
+        "2",
+        "--retry-delay",
+        "1",
+        url,
+        "-o",
+        out_path,
+    }) catch return false;
     defer dl.deinit();
     return dl.exit_code == 0;
 }
