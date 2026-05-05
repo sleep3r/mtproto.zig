@@ -889,12 +889,13 @@ def scenario_invalid_tls_and_mtproto() -> None:
     )
     proxy = start_proxy(cfg, proxy_port)
     try:
-        # Part 1: invalid TLS preface -> close
+        # Part 1: invalid full TLS header -> close. Use 5 bytes so the proxy
+        # does not need to wait for the partial-header handshake timeout.
         c1 = socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0)
         c1.settimeout(2.0)
         try:
-            c1.sendall(b"NOPE")
-            assert_socket_closed_soon(c1, timeout_sec=2.5)
+            c1.sendall(b"NOPE!")
+            assert_socket_closed_soon(c1, timeout_sec=1.5)
         finally:
             c1.close()
 
