@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/sleep3r/mtproto.zig/compare/v0.21.3...v0.22.0) (2026-05-05)
+
+
+### Features
+
+* add mtbuddy link helpers ([#240](https://github.com/sleep3r/mtproto.zig/issues/240)) ([34bf5e3](https://github.com/sleep3r/mtproto.zig/commit/34bf5e314a84ea259ade86e6d6d8563c42793756))
+
 ## [0.21.3](https://github.com/sleep3r/mtproto.zig/compare/v0.21.2...v0.21.3) (2026-05-05)
 
 
