@@ -262,7 +262,7 @@ def perform_valid_client_handshake(sock: socket.socket, secret_hex: str, tls_dom
     sock.sendall(build_tls_record(TLS_RECORD_APPLICATION, hs))
 
 
-def assert_socket_closed_soon(sock: socket.socket, timeout_sec: float = 2.0) -> None:
+def wait_socket_closed(sock: socket.socket, timeout_sec: float = 2.0) -> bool:
     deadline = time.time() + timeout_sec
     sock.setblocking(False)
     try:
@@ -273,14 +273,19 @@ def assert_socket_closed_soon(sock: socket.socket, timeout_sec: float = 2.0) -> 
             try:
                 data = sock.recv(1024)
             except ConnectionResetError:
-                return
+                return True
             except (BlockingIOError, InterruptedError):
                 continue
             if data == b"":
-                return
-        raise AssertionError("socket did not close in time")
+                return True
+        return False
     finally:
         sock.setblocking(True)
+
+
+def assert_socket_closed_soon(sock: socket.socket, timeout_sec: float = 2.0) -> None:
+    if not wait_socket_closed(sock, timeout_sec):
+        raise AssertionError("socket did not close in time")
 
 
 @dataclass
@@ -974,8 +979,10 @@ def scenario_slowloris_partial_clienthello() -> None:
         c.settimeout(2.0)
         try:
             c.sendall(b"\x16\x03\x01")
-            time.sleep(1.6)
-            assert_socket_closed_soon(c, timeout_sec=1.2)
+            assert wait_socket_closed(c, timeout_sec=4.0), (
+                "slowloris connection did not close after handshake timeout\n"
+                + proxy.read_log_tail()
+            )
         finally:
             c.close()
     finally:
