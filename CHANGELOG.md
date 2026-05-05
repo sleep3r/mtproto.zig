@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.21.0](https://github.com/sleep3r/mtproto.zig/compare/v0.20.4...v0.21.0) (2026-05-05)
+
+
+### Features
+
+* migrate the project and build workflows to Zig 0.16.0 ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+* add `mtbuddy config validate`, `mtbuddy config doctor`, and `mtbuddy config print-effective` for config diagnostics ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* add Linux e2e integration harness covering fake Telegram DC, SOCKS5/HTTP CONNECT, MiddleProxy fallback, masking, replay rejection, slowloris, churn, and SIGTERM drain scenarios ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* add parser and state-machine fuzz/property coverage for TLS, MTProto obfuscation, MiddleProxy frames, SOCKS5, HTTP CONNECT, config, replay cache, and subnet limiter ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* add SIGTERM graceful drain, SIGHUP config reload for supported runtime settings, SIGUSR1 stats dump, and `mtbuddy reload` ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+
+
+### Security
+
+* embed the official minisign public key in release builds and enforce signed release verification by default in `mtbuddy install`, `mtbuddy update`, and `deploy/bootstrap.sh` ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* require explicit `--insecure` or `MTPROTO_INSECURE=1` for unsigned release mode ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* publish and verify per-asset SHA-256 checksums and minisign signatures before extraction or execution ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+* remove shell-based Cloudflare DNS update execution from `ipv6hop` and use argv-safe curl plus JSON parsing instead ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+* hide runtime user secrets and proxy links from proxy startup logs ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+
+
+### Refactoring
+
+* split the proxy core into focused modules for connection pool/state, queue I/O, relay steps, MiddleProxy routing/frames/handshake/fallback, upstream failover, fd limits, network detection, and socket helpers ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+* make `ProxyState.init` fallible and fail fast on invalid or empty user configuration instead of silently dropping users ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+* replace the detached MiddleProxy updater with a joined lifecycle and shutdown flag ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+
+
+### Documentation
+
+* add `SECURITY.md`, `THREAT_MODEL.md`, `CONTRIBUTING.md`, CODEOWNERS, issue templates, and updated README trust/install guidance ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* document Zig 0.16.0 support, current Make targets, e2e/fuzz commands, kernel/OS compatibility, known limitations, and Telegram compatibility caveats ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+
+
+### Fixes
+
+* support ARM64 dashboard uv installation instead of hard-coding the x86_64 uv archive ([#228](https://github.com/sleep3r/mtproto.zig/pull/228)) ([ea0c927](https://github.com/sleep3r/mtproto.zig/commit/ea0c9279ea9d99e1b86d5b5ae7af6d0ce60fbec6))
+* align MiddleProxy memory capacity warnings with effective MiddleProxy usage and unsafe limit handling ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* fix false-positive masking port collision warning for the default `tls_domain:443` path ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+* localize `mtbuddy` language selection from `LANG`/`LC_ALL` and expose `--lang` in help ([#229](https://github.com/sleep3r/mtproto.zig/pull/229)) ([0fea3fc](https://github.com/sleep3r/mtproto.zig/commit/0fea3fc45ed5bd32853a1877dbd96b7c0c229fbb))
+
 ## [0.20.4](https://github.com/sleep3r/mtproto.zig/compare/v0.20.3...v0.20.4) (2026-05-04)
 
 
