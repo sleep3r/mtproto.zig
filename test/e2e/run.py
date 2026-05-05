@@ -41,7 +41,7 @@ from typing import Callable, Optional
 ROOT = Path(__file__).resolve().parents[2]
 PROXY_BIN = ROOT / "zig-out/bin/mtproto-proxy"
 ACTIVE_PROXY_BIN = PROXY_BIN
-OBF_GEN = ROOT / "test/e2e/obf_handshake_gen.zig"
+OBF_GEN = ROOT / "src/e2e_obf_handshake_gen.zig"
 DEFAULT_SECRET_HEX = "00112233445566778899aabbccddeeff"
 DEFAULT_TLS_DOMAIN = "google.com"
 
