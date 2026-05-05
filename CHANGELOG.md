@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.1](https://github.com/sleep3r/mtproto.zig/compare/v0.22.0...v0.22.1) (2026-05-05)
+
+
+### Bug Fixes
+
+* add release asset download fallbacks ([#243](https://github.com/sleep3r/mtproto.zig/issues/243)) ([813dc8d](https://github.com/sleep3r/mtproto.zig/commit/813dc8d3a0785930badd06f7ba59a37d790be7d4))
+
 ## [0.22.0](https://github.com/sleep3r/mtproto.zig/compare/v0.21.3...v0.22.0) (2026-05-05)
 
 
