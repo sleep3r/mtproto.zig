@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.2](https://github.com/sleep3r/mtproto.zig/compare/v0.21.1...v0.21.2) (2026-05-05)
+
+
+### Bug Fixes
+
+* bound release download timeouts ([#234](https://github.com/sleep3r/mtproto.zig/issues/234)) ([fa62cd8](https://github.com/sleep3r/mtproto.zig/commit/fa62cd8e94dee2c705fb2a8d4228aeb5f3cb4994))
+
 ## [0.21.1](https://github.com/sleep3r/mtproto.zig/compare/v0.21.0...v0.21.1) (2026-05-05)
 
 
