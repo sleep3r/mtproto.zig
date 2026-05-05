@@ -780,6 +780,15 @@ fn printSummary(
     }
 
     ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
+    ui.hint(localized(ui, "Run `sudo mtbuddy links` later to print these links again.", "Позже выполните `sudo mtbuddy links`, чтобы снова показать эти ссылки."));
+    ui.hint(localized(ui, "Runtime proxy logs intentionally hide secrets and links.", "Runtime-логи прокси намеренно скрывают секреты и ссылки."));
+}
+
+fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
+    return switch (ui.lang) {
+        .en => en,
+        .ru => ru,
+    };
 }
 
 fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {

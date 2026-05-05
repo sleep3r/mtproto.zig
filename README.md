@@ -172,6 +172,13 @@ sudo mtbuddy config validate
 sudo mtbuddy config doctor
 sudo mtbuddy config print-effective
 
+# Print Telegram proxy links from config.toml (sensitive output)
+sudo mtbuddy links
+sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config.toml
+
+# Generate a fresh 32-hex user secret
+mtbuddy secret
+
 # Hot-reload config (SIGHUP, reloadable settings only)
 sudo mtbuddy reload
 
@@ -384,7 +391,9 @@ alice = true   # bypass MiddleProxy for this user
 
 </details>
 
-> Generate a secret: `openssl rand -hex 16`
+> Generate a secret: `mtbuddy secret` or `openssl rand -hex 16`
+>
+> Print client links explicitly: `sudo mtbuddy links`. Runtime proxy logs intentionally hide secrets and proxy links.
 
 ---
 

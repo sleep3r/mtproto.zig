@@ -26,6 +26,7 @@ const ipv6hop = @import("ipv6hop.zig");
 const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
 const config_cmd = @import("config_cmd.zig");
+const links = @import("links.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -138,6 +139,11 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, cmd, "config")) {
             return config_cmd.run(&ui, allocator, &remaining_args);
+        } else if (std.mem.eql(u8, cmd, "links")) {
+            return links.run(&ui, allocator, &remaining_args);
+        } else if (std.mem.eql(u8, cmd, "secret")) {
+            links.runSecret(&ui);
+            return;
         } else if (std.mem.eql(u8, cmd, "reload")) {
             reloadProxy(&ui, allocator);
             return;
@@ -375,6 +381,8 @@ fn printHelp(lang: i18n.Lang) void {
     printCmd(&ui, "ipv6-hop", tr(lang, "IPv6 address rotation", "Ротация IPv6 адреса"));
     printCmd(&ui, "update-dns <ip>", tr(lang, "Update Cloudflare DNS A record", "Обновить A-запись Cloudflare DNS"));
     printCmd(&ui, "config <validate|doctor|print-effective>", tr(lang, "Config diagnostics and effective values", "Диагностика и эффективные значения конфига"));
+    printCmd(&ui, "links", tr(lang, "Print tg:// links from config (sensitive)", "Показать tg:// ссылки из конфига (секретно)"));
+    printCmd(&ui, "secret", tr(lang, "Generate a fresh 32-hex secret", "Сгенерировать новый 32-hex секрет"));
     printCmd(&ui, "status", tr(lang, "Show service status", "Показать статус сервисов"));
     printCmd(&ui, "reload", tr(lang, "Reload config (SIGHUP)", "Перезагрузить конфиг (SIGHUP)"));
     ui.writeRaw("\n");
