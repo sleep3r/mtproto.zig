@@ -5,7 +5,7 @@
 
 ### Fixes
 
-* **docker:** build images with Zig 0.16.0 by default
+* **docker:** build images with Zig 0.16.0 by default ([#232](https://github.com/sleep3r/mtproto.zig/pull/232))
 
 ## [0.21.0](https://github.com/sleep3r/mtproto.zig/compare/v0.20.4...v0.21.0) (2026-05-05)
 
