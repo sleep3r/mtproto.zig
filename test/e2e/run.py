@@ -272,6 +272,8 @@ def assert_socket_closed_soon(sock: socket.socket, timeout_sec: float = 2.0) -> 
                 continue
             try:
                 data = sock.recv(1024)
+            except ConnectionResetError:
+                return
             except (BlockingIOError, InterruptedError):
                 continue
             if data == b"":
