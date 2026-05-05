@@ -2,7 +2,7 @@
 #
 # Build (see README "Docker image" for --platform and build-args):
 #   docker build -t mtproto-zig .
-#   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig .
+#   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
 #
 # Run (default config from image listens on 443; override with a volume for production):
 #   docker run --rm -p 443:443 mtproto-zig
@@ -10,7 +10,7 @@
 # To use 8443, set server.port = 8443 in config.toml and run with -p 8443:8443 or manipulate the port mapping like
 # -p 48443:8443
 
-ARG ZIG_VERSION=0.15.2
+ARG ZIG_VERSION=0.16.0
 ARG ZIG_SHA256=
 
 FROM debian:bookworm-slim AS builder

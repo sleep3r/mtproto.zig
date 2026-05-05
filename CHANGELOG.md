@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.1](https://github.com/sleep3r/mtproto.zig/compare/v0.21.0...v0.21.1) (2026-05-05)
+
+
+### Fixes
+
+* **docker:** build images with Zig 0.16.0 by default
+
 ## [0.21.0](https://github.com/sleep3r/mtproto.zig/compare/v0.20.4...v0.21.0) (2026-05-05)
 
 
