@@ -662,6 +662,7 @@ def base_config(
     upstream_port: Optional[int] = None,
     handshake_timeout_sec: int = 5,
     idle_timeout_sec: int = 30,
+    graceful_shutdown_timeout_sec: int = 15,
     max_connections: int = 4096,
 ) -> str:
     lines: list[str] = []
@@ -675,6 +676,7 @@ def base_config(
     lines.append(f"max_connections = {max_connections}")
     lines.append(f"idle_timeout_sec = {idle_timeout_sec}")
     lines.append(f"handshake_timeout_sec = {handshake_timeout_sec}")
+    lines.append(f"graceful_shutdown_timeout_sec = {graceful_shutdown_timeout_sec}")
     lines.append('log_level = "warn"')
     lines.append("unsafe_override_limits = true")
     lines.append('middle_proxy_nat_ip = "127.0.0.1"')
@@ -1048,6 +1050,7 @@ def scenario_sigterm_during_active_relay() -> None:
         upstream_host="127.0.0.1",
         upstream_port=socks.port,
         mask=False,
+        graceful_shutdown_timeout_sec=1,
     )
     proxy = start_proxy(cfg, proxy_port)
     try:
