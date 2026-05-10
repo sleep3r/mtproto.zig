@@ -13,8 +13,10 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
 
 <p align="center">
-  <a href="README.md"><kbd>English</kbd></a>
-  <a href="README.ru.md"><kbd>Русский</kbd></a>
+  <strong>🌐 Language</strong><br>
+  <kbd><strong>🇬🇧 English</strong></kbd>
+  ·
+  <a href="README.ru.md"><kbd>🇷🇺 Русский</kbd></a>
 </p>
 
 </div>

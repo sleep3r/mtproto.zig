@@ -13,8 +13,10 @@
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#установка)
 
 <p align="center">
-  <a href="README.md"><kbd>English</kbd></a>
-  <a href="README.ru.md"><kbd>Русский</kbd></a>
+  <strong>🌐 Язык</strong><br>
+  <a href="README.md"><kbd>🇬🇧 English</kbd></a>
+  ·
+  <kbd><strong>🇷🇺 Русский</strong></kbd>
 </p>
 
 </div>
