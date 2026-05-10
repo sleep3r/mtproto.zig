@@ -1,6 +1,11 @@
 [general]
 # Route regular DC traffic via Telegram MiddleProxy transport.
-# Required when using a promotion tag from @MTProxybot.
+# Required when using a promotion tag from @MTProxybot and for media
+# loading on non-Premium accounts. Without MiddleProxy, photos, videos,
+# stories, and other media on non-Premium accounts will not load.
+# Telegram calls are not supported by this MTProto proxy: Telegram only
+# handles calls through SOCKS-style paths, which cannot be masked cleanly
+# as normal HTTPS by this project.
 use_middle_proxy = true
 
 # Telemt-compatible alias for promotion tag (alternative to [server].tag).
@@ -94,10 +99,14 @@ port = 443
 
 # ── VPN tunnel configuration ──
 # Activate with: type = "tunnel"
-# Interface metadata for mtbuddy tooling/status.
 # Runtime proxy routing uses SO_MARK=200 and Linux policy routing.
+# `interfaces` is an ordered tunnel pool: mtbuddy routes through the first
+# healthy interface and automatically falls back to the next one. The legacy
+# `interface` key is kept for compatibility and as the single-tunnel fallback.
 # [upstream.tunnel]
 # interface = "awg0"
+# interfaces = ["awg0", "awg1"]
+# pinned_interface = ""  # optional manual preference; empty = priority auto
 
 # ── SOCKS5 upstream proxy configuration ──
 # Activate with: type = "socks5"
@@ -148,6 +157,9 @@ user2 = "ffeeddccbbaa99887766554433221100"
 [access.direct_users]
 # Optional: users that always bypass MiddleProxy (direct DC path).
 # Useful for admin/service accounts that should always use fast mode.
+# Do not put non-Premium users here if they need media loading; bypassing
+# MiddleProxy means their photos, videos, stories, and other media will not load.
+# Telegram calls remain unsupported in both direct and MiddleProxy modes.
 # Names here must match keys from [access.users].
 # Value must be true/1/yes to enable.
 # user1 = true

@@ -57,6 +57,8 @@ Secondary assets:
 - Some mitigations depend on host networking setup (iptables/nftables, kernel routing, NIC offload behavior).
 - Dashboard and metrics endpoints are plain HTTP; exposing them publicly is unsafe unless protected by a reverse proxy and auth.
 - Proxy behavior depends on Telegram DC availability and protocol expectations that can change.
+- Telegram calls are out of scope and do not work through this proxy. Calls use Telegram's SOCKS-style call path, which is outside the MTProto/TLS-masking model and cannot be disguised cleanly as normal HTTPS here.
+- Media for non-Premium accounts requires MiddleProxy (`[general].use_middle_proxy = true`). Without it, photos, videos, stories, and other media on non-Premium accounts should be considered unavailable.
 
 ## Region-Specific Caveats
 
@@ -74,6 +76,8 @@ Secondary assets:
 | Official Telegram iOS | expected to work | IPv6/AAAA issues are a common deployment pitfall |
 | Telegram Desktop | expected to work | verify with your selected masking domain |
 | Third-party Telegram clients | best effort | protocol edge cases may differ |
+
+Compatibility here covers chat and media transport. Telegram calls are unsupported in both direct and MiddleProxy modes.
 
 ### OS / kernel
 

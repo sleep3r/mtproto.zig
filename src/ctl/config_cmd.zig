@@ -223,6 +223,17 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     if (cfg.upstream_tunnel_interface) |iface| {
         ui.print("tunnel_interface = \"{s}\"\n", .{iface});
     }
+    if (cfg.upstream_tunnel_interfaces.len > 0) {
+        ui.writeRaw("tunnel_interfaces = [");
+        for (cfg.upstream_tunnel_interfaces, 0..) |iface, idx| {
+            if (idx > 0) ui.writeRaw(", ");
+            ui.print("\"{s}\"", .{iface});
+        }
+        ui.writeRaw("]\n");
+    }
+    if (cfg.upstream_tunnel_pinned_interface) |iface| {
+        ui.print("tunnel_pinned_interface = \"{s}\"\n", .{iface});
+    }
     ui.writeRaw("\n");
 
     ui.writeRaw("[censorship]\n");

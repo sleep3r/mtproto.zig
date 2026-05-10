@@ -81,6 +81,8 @@ const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
 const tunnel_socket_mark: u32 = 200;
+const tunnel_route_table: u32 = 200;
+const tunnel_pool_state_path = "/run/mtproto-proxy/tunnel-pool.state";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
@@ -175,6 +177,79 @@ const getAddressList = net_helpers.getAddressList;
 
 fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
     return network_detect.detectPublicIpv4(allocator, fetchUrlBytes);
+}
+
+fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+
+    const result = std.process.run(allocator, io_instance.io(), .{
+        .argv = argv,
+        .stdout_limit = std.Io.Limit.limited(512),
+        .stderr_limit = std.Io.Limit.limited(512),
+    }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) return null;
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
+fn detectActiveTunnelInterface(allocator: std.mem.Allocator) ?[]u8 {
+    var table_buf: [16]u8 = undefined;
+    const table = std.fmt.bufPrint(&table_buf, "{d}", .{tunnel_route_table}) catch "200";
+    const argv = [_][]const u8{
+        "sh",
+        "-c",
+        "ip -4 route show table \"$1\" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i==\"dev\") { print $(i+1); exit } }'",
+        "sh",
+        table,
+    };
+    return runSmallCommand(allocator, &argv);
+}
+
+fn readTunnelPoolStateValue(allocator: std.mem.Allocator, key: []const u8) ?[]u8 {
+    const io_instance = std.Io.Threaded.global_single_threaded.io();
+    const content = std.Io.Dir.cwd().readFileAlloc(
+        io_instance,
+        tunnel_pool_state_path,
+        allocator,
+        .limited(4096),
+    ) catch return null;
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const raw_key = std.mem.trim(u8, line[0..eq], &[_]u8{ ' ', '\t', '\r' });
+        if (!std.mem.eql(u8, raw_key, key)) continue;
+        const value = std.mem.trim(u8, line[eq + 1 ..], &[_]u8{ ' ', '\t', '\r' });
+        if (value.len == 0) return null;
+        return allocator.dupe(u8, value) catch null;
+    }
+
+    return null;
+}
+
+fn tryFetchMiddleProxyViaInterface(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    iface: []const u8,
+    direct_err: anyerror,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, iface, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) return error.UnexpectedConnectFailure;
+    log.info(
+        "Middle-proxy asset {s} unreachable directly ({s}); retrying via tunnel '{s}'",
+        .{ url, @errorName(direct_err), trimmed },
+    );
+    return fetchUrlBytesViaInterface(allocator, url, trimmed);
 }
 
 const ConnectionSlot = struct {
@@ -946,25 +1021,54 @@ pub const ProxyState = struct {
     }
 
     /// Refresh helper. Tries the default route first; on any network-class
-    /// failure AND when the config selects tunnel upstream, retries via
-    /// `curl --interface <tunnel>`. This is what makes the media MP cache
-    /// warm up correctly on censored hosts where `core.telegram.org` is
-    /// unreachable directly but reachable through the tunnel.
+    /// failure AND when the config selects tunnel upstream, retries via the
+    /// active tunnel route (`table 200`), pool state, then configured tunnel
+    /// candidates. This keeps the media MP cache warm after tunnel failover.
     fn fetchMiddleProxyAsset(self: *ProxyState, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
         if (fetchUrlBytes(allocator, url)) |bytes| {
             return bytes;
         } else |direct_err| {
-            const tunnel_iface = blk: {
-                if (self.config.upstream_mode != .tunnel) break :blk null;
-                break :blk self.config.upstream_tunnel_interface;
-            };
-            const iface = tunnel_iface orelse return direct_err;
-            log.info(
-                "Middle-proxy asset {s} unreachable directly ({s}); retrying via tunnel '{s}'",
-                .{ url, @errorName(direct_err), iface },
-            );
-            return fetchUrlBytesViaInterface(allocator, url, iface);
+            if (self.config.upstream_mode != .tunnel) return direct_err;
+            return self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, direct_err);
         }
+    }
+
+    fn fetchMiddleProxyAssetViaTunnelPool(
+        self: *ProxyState,
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        direct_err: anyerror,
+    ) ![]u8 {
+        var last_err: anyerror = direct_err;
+
+        if (detectActiveTunnelInterface(allocator)) |iface| {
+            defer allocator.free(iface);
+            if (tryFetchMiddleProxyViaInterface(allocator, url, iface, direct_err)) |bytes| {
+                return bytes;
+            } else |err| {
+                last_err = err;
+            }
+        }
+
+        if (readTunnelPoolStateValue(allocator, "active")) |iface| {
+            defer allocator.free(iface);
+            if (tryFetchMiddleProxyViaInterface(allocator, url, iface, direct_err)) |bytes| {
+                return bytes;
+            } else |err| {
+                last_err = err;
+            }
+        }
+
+        var idx: usize = 0;
+        while (self.config.tunnelCandidateAt(idx)) |iface| : (idx += 1) {
+            if (tryFetchMiddleProxyViaInterface(allocator, url, iface, direct_err)) |bytes| {
+                return bytes;
+            } else |err| {
+                last_err = err;
+            }
+        }
+
+        return last_err;
     }
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {

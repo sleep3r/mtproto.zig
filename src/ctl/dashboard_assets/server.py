@@ -362,6 +362,39 @@ def _parse_bool(value, default: bool) -> bool:
     return default
 
 
+def _parse_toml_string_array(value) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw.startswith("[") or not raw.endswith("]"):
+        return []
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(v).strip() for v in parsed if str(v).strip()]
+    except Exception:
+        pass
+
+    raw = raw[1:-1]
+    out: list[str] = []
+    for item in raw.split(","):
+        item = item.strip().strip('"').strip("'").strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        v = str(value or "").strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
 def _load_proxy_runtime_config() -> dict:
     defaults = {
         "public_ip": "",
@@ -372,6 +405,8 @@ def _load_proxy_runtime_config() -> dict:
         "use_middle_proxy": False,
         "upstream_type": "auto",
         "upstream_tunnel_interface": "awg0",
+        "upstream_tunnel_interfaces": [],
+        "upstream_tunnel_pinned_interface": "",
         "upstream_socks5_host": "",
         "upstream_socks5_port": 0,
         "upstream_socks5_username": "",
@@ -403,6 +438,8 @@ def _load_proxy_runtime_config() -> dict:
         "use_middle_proxy": defaults["use_middle_proxy"],
         "upstream_type": defaults["upstream_type"],
         "upstream_tunnel_interface": defaults["upstream_tunnel_interface"],
+        "upstream_tunnel_interfaces": [],
+        "upstream_tunnel_pinned_interface": "",
         "upstream_socks5_host": defaults["upstream_socks5_host"],
         "upstream_socks5_port": defaults["upstream_socks5_port"],
         "upstream_socks5_username": defaults["upstream_socks5_username"],
@@ -464,6 +501,10 @@ def _load_proxy_runtime_config() -> dict:
                 elif section == "[upstream.tunnel]":
                     if key == "interface" and value:
                         result["upstream_tunnel_interface"] = value
+                    elif key == "interfaces":
+                        result["upstream_tunnel_interfaces"] = _parse_toml_string_array(value)
+                    elif key == "pinned_interface":
+                        result["upstream_tunnel_pinned_interface"] = value
 
                 elif section == "[upstream.socks5]":
                     if key == "host":
@@ -515,6 +556,10 @@ def _load_proxy_runtime_config() -> dict:
     except Exception:
         return defaults
 
+    if not result["upstream_tunnel_interfaces"]:
+        iface = str(result.get("upstream_tunnel_interface") or "awg0").strip()
+        result["upstream_tunnel_interfaces"] = [iface] if iface else ["awg0"]
+
     return result
 
 
@@ -529,6 +574,9 @@ def _load_censorship_config() -> dict:
 
 _routing_cache = {"ts": 0, "data": None}
 ROUTING_CACHE_TTL = 8  # seconds
+TUNNEL_POOL_STATE = Path("/run/mtproto-proxy/tunnel-pool.state")
+TUNNEL_POOL_SCRIPT = Path("/usr/local/bin/setup_tunnel.sh")
+TUNNEL_PROBE_URL = "https://core.telegram.org/getProxyConfig"
 
 
 def _parse_transfer_bytes(value: str | None) -> float:
@@ -555,6 +603,79 @@ def _has_valid_handshake(handshake: str | None) -> bool:
     return hs not in ("", "0", "none", "none (idle)")
 
 
+def _tunnel_tool_hint(interface: str) -> str | None:
+    if interface.startswith("awg"):
+        return "awg"
+    if interface.startswith("wg"):
+        return "wg"
+    return None
+
+
+def _effective_tunnel_pool(cfg: dict) -> list[str]:
+    pool = _dedupe([str(v) for v in cfg.get("upstream_tunnel_interfaces", [])])
+    if pool:
+        return pool
+    iface = str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip()
+    return [iface] if iface else ["awg0"]
+
+
+def _tunnel_candidates(cfg: dict) -> list[str]:
+    pinned = str(cfg.get("upstream_tunnel_pinned_interface", "") or "").strip()
+    return _dedupe(([pinned] if pinned else []) + _effective_tunnel_pool(cfg))
+
+
+def _read_tunnel_pool_state() -> dict:
+    result = {
+        "active": "",
+        "status": "",
+        "reason": "",
+        "pinned": "",
+        "pool": "",
+        "last_switch": "",
+        "checked_at": "",
+    }
+    try:
+        text = TUNNEL_POOL_STATE.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return result
+
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in result:
+            result[key] = value.strip()
+    return result
+
+
+def _probe_tunnel_interface(interface: str) -> dict:
+    if not shutil.which("curl"):
+        return {"ok": None, "reason": "curl unavailable"}
+    try:
+        r = subprocess.run(
+            [
+                "curl",
+                "--interface",
+                interface,
+                "-fsS",
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "4",
+                TUNNEL_PROBE_URL,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        return {"ok": False, "reason": "probe failed to run"}
+    if r.returncode == 0:
+        return {"ok": True, "reason": "Telegram probe ok"}
+    return {"ok": False, "reason": "Telegram probe failed"}
+
+
 def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> dict:
     result = {
         "interface": interface,
@@ -564,6 +685,9 @@ def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> di
         "endpoint": None,
         "handshake": None,
         "handshake_ok": False,
+        "healthy": False,
+        "probe_ok": None,
+        "probe": None,
         "rx": None,
         "tx": None,
         "reason": None,
@@ -642,12 +766,22 @@ def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> di
         else:
             result["reason"] = "interface down"
 
+        probe = _probe_tunnel_interface(interface) if result["link_up"] and hs_ok else {"ok": False, "reason": result["reason"] or "handshake missing"}
+        result["probe_ok"] = probe.get("ok")
+        result["probe"] = probe.get("reason")
+        result["healthy"] = bool(result["link_up"] and hs_ok and probe.get("ok") is True)
+        if not result["healthy"] and probe.get("reason"):
+            result["reason"] = str(probe.get("reason"))
+
         return result
 
     if result["link_up"]:
         result["reason"] = "interface up, tool output unavailable"
     else:
         result["reason"] = "interface down"
+    result["probe_ok"] = False
+    result["probe"] = result["reason"]
+    result["healthy"] = False
     return result
 
 
@@ -739,11 +873,11 @@ def _upstream_target_from_cfg(cfg: dict, policy: dict) -> str:
         return f"{host}:{port}" if host and port > 0 else "proxy host/port not set"
 
     if upstream_type == "tunnel":
-        iface = str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip()
         route_dev = policy.get("route_dev")
         if route_dev:
             return f"mark 200 -> table 200 -> dev {route_dev}"
-        return f"mark 200 -> table 200 (iface {iface})"
+        pool = _effective_tunnel_pool(cfg)
+        return f"mark 200 -> table 200 (pool {', '.join(pool)})"
 
     if upstream_type == "direct":
         return "direct host routing"
@@ -758,7 +892,9 @@ def _routing_status() -> dict:
 
     cfg = _load_proxy_runtime_config()
     upstream_type = str(cfg.get("upstream_type", "auto") or "auto").lower().strip()
-    selected_iface = str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip()
+    pool = _effective_tunnel_pool(cfg)
+    pinned_iface = str(cfg.get("upstream_tunnel_pinned_interface", "") or "").strip()
+    selected_iface = pinned_iface or (pool[0] if pool else str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip())
 
     if not selected_iface:
         selected_iface = "awg0"
@@ -767,27 +903,25 @@ def _routing_status() -> dict:
     available_tunnel_ifaces: list[str] = []
     for iface in system_ifaces:
         low = iface.lower()
-        if not (low.startswith(("awg", "wg", "tun", "tap")) or iface == selected_iface):
+        if not (low.startswith(("awg", "wg", "tun", "tap")) or iface in pool or iface == selected_iface):
             continue
         if iface and iface not in available_tunnel_ifaces:
             available_tunnel_ifaces.append(iface)
 
-    interfaces = list(available_tunnel_ifaces)
+    candidates = _tunnel_candidates(cfg)
+    interfaces = _dedupe(candidates + list(available_tunnel_ifaces))
     for iface in ("awg0", "wg0"):
         if iface not in interfaces:
             interfaces.append(iface)
 
     tunnels = []
     for iface in interfaces:
-        hint = None
-        if iface.startswith("awg"):
-            hint = "awg"
-        elif iface.startswith("wg"):
-            hint = "wg"
-
-        tunnel = _detect_tunnel_interface(iface, hint)
+        tunnel = _detect_tunnel_interface(iface, _tunnel_tool_hint(iface))
+        tunnel["in_pool"] = iface in pool
+        tunnel["pinned"] = bool(pinned_iface and iface == pinned_iface)
         if (
             iface == selected_iface
+            or iface in pool
             or tunnel.get("link_up")
             or tunnel.get("active")
             or tunnel.get("endpoint")
@@ -795,6 +929,7 @@ def _routing_status() -> dict:
             tunnels.append(tunnel)
 
     policy = _policy_routing_status()
+    pool_state = _read_tunnel_pool_state()
     target = _upstream_target_from_cfg(cfg, policy)
 
     primary_tunnel = None
@@ -809,6 +944,7 @@ def _routing_status() -> dict:
         primary_tunnel = tunnels[0]
 
     active_tunnels = sum(1 for t in tunnels if t.get("active"))
+    healthy_tunnels = sum(1 for t in tunnels if t.get("healthy"))
 
     if upstream_type == "tunnel":
         healthy = bool(
@@ -816,8 +952,7 @@ def _routing_status() -> dict:
             and policy.get("route_ok")
             and primary_tunnel
             and primary_tunnel.get("link_up")
-            and primary_tunnel.get("active")
-            and primary_tunnel.get("handshake_ok")
+            and primary_tunnel.get("healthy")
         )
     elif upstream_type == "socks5":
         healthy = bool(
@@ -837,10 +972,19 @@ def _routing_status() -> dict:
         "upstream_type": upstream_type,
         "upstream_target": target,
         "selected_tunnel_interface": selected_iface,
+        "active_tunnel_interface": route_dev or pool_state.get("active") or "",
+        "pinned_tunnel_interface": pinned_iface,
+        "tunnel_pool": pool,
+        "tunnel_candidates": candidates,
+        "last_switch": pool_state.get("last_switch") or "",
+        "pool_status": pool_state.get("status") or "",
+        "pool_reason": pool_state.get("reason") or "",
+        "pool_checked_at": pool_state.get("checked_at") or "",
         "available_tunnel_interfaces": available_tunnel_ifaces,
         "policy": policy,
         "tunnels": tunnels,
         "active_tunnels": active_tunnels,
+        "healthy_tunnels": healthy_tunnels,
         "detected_tunnels": len(tunnels),
         "primary_tunnel": primary_tunnel,
         "upstream_socks5": {
@@ -1190,9 +1334,6 @@ def _set_upstream_type(upstream_type: str) -> bool:
         lines, "[upstream]", "type", _toml_string_literal(upstream_type)
     )
 
-    if upstream_type == "tunnel":
-        lines = _set_toml_key(lines, "[upstream.tunnel]", "interface", '"awg0"')
-
     cfg_path.write_text("".join(lines), encoding="utf-8")
     return True
 
@@ -1203,20 +1344,34 @@ def _set_upstream_tunnel_interface(interface: str) -> bool:
         return False
 
     iface = str(interface or "").strip()
-    if not iface:
-        return False
-
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", iface):
+    if iface and not re.fullmatch(r"[A-Za-z0-9_.:-]+", iface):
         return False
 
     lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
         keepends=True
     )
     lines = _set_toml_key(
-        lines, "[upstream.tunnel]", "interface", _toml_string_literal(iface)
+        lines, "[upstream.tunnel]", "pinned_interface", _toml_string_literal(iface)
     )
     cfg_path.write_text("".join(lines), encoding="utf-8")
     return True
+
+
+def _run_tunnel_pool_once() -> bool:
+    if not TUNNEL_POOL_SCRIPT.is_file():
+        return False
+    try:
+        r = subprocess.run(
+            [str(TUNNEL_POOL_SCRIPT)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=12,
+        )
+        _routing_cache["ts"] = 0
+        return r.returncode == 0
+    except Exception:
+        _routing_cache["ts"] = 0
+        return False
 
 
 def _set_upstream_proxy_target(
@@ -1697,22 +1852,20 @@ async def api_routing_upstream(request: Request):
 
 @app.post("/api/routing/tunnel-interface")
 async def api_routing_tunnel_interface(request: Request):
-    """Set [upstream.tunnel].interface. Body: { interface: str }"""
+    """Set [upstream.tunnel].pinned_interface. Body: { interface: str }"""
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
-    iface = str(body.get("interface", "")).strip()
-    if not iface:
-        return JSONResponse(
-            {"ok": False, "error": "interface is required"}, status_code=400
-        )
+    clear = bool(body.get("clear", False))
+    iface = "" if clear else str(body.get("interface", "")).strip()
 
-    available = _list_system_interfaces()
-    if available and iface not in available:
+    cfg = _load_proxy_runtime_config()
+    pool = _effective_tunnel_pool(cfg)
+    if iface and iface not in pool:
         return JSONResponse(
-            {"ok": False, "error": "interface is not present on host"},
+            {"ok": False, "error": "interface is not in configured tunnel pool"},
             status_code=400,
         )
 
@@ -1721,8 +1874,16 @@ async def api_routing_tunnel_interface(request: Request):
             {"ok": False, "error": "failed to update config"}, status_code=500
         )
 
-    _restart_proxy()
-    return JSONResponse({"ok": True, "interface": iface, "restarted": True})
+    controller_ok = _run_tunnel_pool_once()
+    return JSONResponse(
+        {
+            "ok": True,
+            "interface": iface,
+            "pinned_interface": iface,
+            "controller_ok": controller_ok,
+            "restarted": False,
+        }
+    )
 
 
 @app.post("/api/routing/proxy-target")

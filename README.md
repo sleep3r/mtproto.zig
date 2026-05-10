@@ -12,6 +12,11 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
 
+<p align="center">
+  <a href="README.md"><kbd>English</kbd></a>
+  <a href="README.ru.md"><kbd>Русский</kbd></a>
+</p>
+
 </div>
 
 ---
@@ -57,6 +62,8 @@ It also ships more evasion techniques than any of the above:
 | **Anti-replay** | Rejects replayed handshakes + detects ТСПУ Revisor active probes |
 | **Multi-user** | Independent per-user secrets |
 | **MiddleProxy** | ME transport with auto-refreshed Telegram metadata |
+
+MiddleProxy is required for promotion tags and for media on non-Premium accounts. Without it, photos, videos, stories, and other media on non-Premium accounts should be treated as unavailable rather than flaky. Telegram calls are not supported by this proxy: Telegram only routes calls through SOCKS-style paths, and exposing SOCKS traffic cannot be masked by mtproto.zig as normal HTTPS.
 
 ---
 
@@ -229,13 +236,13 @@ The proxy supports multiple ways to route outgoing connections to Telegram DC se
 |---|---|---|
 | `auto` (default) | Direct egress without tunnel policy marks | Most deployments |
 | `direct` | Connect to Telegram DCs directly from the host | DCs reachable from the server |
-| `tunnel` | Direct connect with `SO_MARK=200` policy-routed via VPN interface | DCs blocked by the ISP |
+| `tunnel` | Direct connect with `SO_MARK=200` policy-routed via a VPN tunnel pool | DCs blocked by the ISP |
 | `socks5` | Route through an external SOCKS5 proxy with optional auth | Existing proxy infrastructure |
 | `http` | Route through an HTTP CONNECT proxy with optional auth | Corporate proxy environments |
 
 ### VPN tunnel
 
-If your VPS is in a region where Telegram DCs are blocked at the network level, you can route proxy traffic through a VPN tunnel with explicit socket policy routing. The proxy runs in the host namespace; only sockets marked by the proxy (`SO_MARK=200`) are routed through the tunnel table.
+If your VPS is in a region where Telegram DCs are blocked at the network level, you can route proxy traffic through a VPN tunnel pool with explicit socket policy routing. The proxy runs in the host namespace; only sockets marked by the proxy (`SO_MARK=200`) are routed through table 200. `mtbuddy` keeps that table pointed at the first healthy tunnel in the configured order.
 
 Currently supported VPN types:
 - **AmneziaWG** — DPI-resistant WireGuard fork (recommended for Russia/Iran)
@@ -248,7 +255,7 @@ Client → mtproto-proxy (host namespace)
                      │
         Linux policy routing table 200
                      │
-                 awg0 (tunnel)
+          awg0 / awg1 / ... (pool)
                      │
              Telegram DC servers
 ```
@@ -257,10 +264,13 @@ Client → mtproto-proxy (host namespace)
 sudo mtbuddy setup tunnel /path/to/awg0.conf
 # or paste an Amnezia share link directly
 sudo mtbuddy setup tunnel 'vpn://...'
+
+# Add or replace a specific pool member
+sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 ```
 
 `mtbuddy` keeps `[general].use_middle_proxy` unchanged and only configures transport (`[upstream].type = "tunnel"`).
-After setup, it validates policy routes (`mark 200`) to Telegram DC ranges and prints operational commands.
+After setup, it installs `mtproto-tunnel-pool.timer`, validates policy routes (`mark 200`) to Telegram DC ranges, and prints operational commands. The pool controller probes Telegram through each tunnel and rewrites table 200 with `ip route replace`; automatic failover does not restart `mtproto-proxy`.
 
 You can also explicitly configure the tunnel interface in `config.toml`:
 
@@ -270,6 +280,8 @@ type = "tunnel"
 
 [upstream.tunnel]
 interface = "awg0"
+interfaces = ["awg0", "awg1"]
+pinned_interface = ""   # optional; empty means priority auto-failback
 ```
 
 ### SOCKS5 proxy
@@ -351,7 +363,9 @@ alice = true   # bypass MiddleProxy for this user
 |-----|---------|-------------|
 | `[upstream].type` | `auto` | Egress mode: `auto` (direct), `direct`, `tunnel` (VPN via socket policy routing), `socks5`, or `http` |
 | `[upstream] allow_direct_fallback` | `false` | If `true`, allows socks5/http modes to fall back to direct egress when upstream is unavailable |
-| `[upstream.tunnel] interface` | `"awg0"` | Name of the VPN network interface for SO_MARK routing |
+| `[upstream.tunnel] interface` | `"awg0"` | Legacy single tunnel interface / fallback for SO_MARK routing |
+| `[upstream.tunnel] interfaces` | `["awg0"]` | Ordered tunnel pool; first healthy interface wins |
+| `[upstream.tunnel] pinned_interface` | — | Optional manual preference used before the ordered pool when healthy |
 | `[upstream.socks5] host` | — | SOCKS5 proxy address |
 | `[upstream.socks5] port` | — | SOCKS5 proxy port |
 | `[upstream.socks5] username` | — | SOCKS5 username (empty = no auth) |
@@ -399,7 +413,7 @@ alice = true   # bypass MiddleProxy for this user
 
 ## Monitoring dashboard
 
-A lightweight web dashboard (~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, tunnel metrics, user management, and streaming logs.
+A lightweight web dashboard (~30 MB RAM) shows live connections, CPU/memory, network throughput, proxy stats, tunnel pool health/failover state, user management, and streaming logs.
 
 The dashboard is **embedded directly into the `mtbuddy` binary** — no extra files needed.
 
@@ -496,6 +510,8 @@ scp zig-out/bin/mtproto-proxy root@<SERVER>:/opt/mtproto-proxy/
 
 ## Docker
 
+Docker support is provided for testing, packaging experiments, and simple deployments where only the proxy binary is needed. The project is primarily designed for a native Linux host managed by `mtbuddy`: DPI modules, tunnel pool failover, policy routing, Nginx masking, nfqws, and recovery timers are host-level integrations and are not fully represented by the container.
+
 ```bash
 docker pull ghcr.io/sleep3r/mtproto.zig:latest
 
@@ -515,7 +531,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t your-registry/mtproto-
 
 Published `linux/amd64` images are built with a portable CPU profile (`-Dcpu=x86_64`) to avoid `Illegal instruction` crashes on older VPS CPUs.
 
-> OS-level mitigations (iptables TCPMSS, nfqws, etc.) are not applied inside the container; only the proxy binary runs there.
+> For production censorship-bypass deployments, prefer the native `mtbuddy install` flow. OS-level mitigations (iptables TCPMSS, nfqws, tunnel policy routing, masking/recovery units) are not applied inside the container; only the proxy binary runs there.
 
 ---
 
@@ -541,6 +557,8 @@ For a full model see [THREAT_MODEL.md](THREAT_MODEL.md). Quick operational summa
   - This is a transport-hardening proxy, not an anonymity network.
   - Bypass quality can degrade as DPI strategies evolve.
   - Dashboard/metrics are plaintext by default; do not expose publicly without auth/TLS.
+  - Telegram calls do not work through this proxy. Calls require Telegram's SOCKS-style call path, which is outside the MTProto/TLS-masking model and cannot be disguised cleanly as normal HTTPS here.
+  - Without MiddleProxy (`[general].use_middle_proxy = true`), media on non-Premium accounts will not load. MiddleProxy is required for photos, videos, stories, and promotion tags.
 - **Region-specific caveats**
   - ISP behavior differs by country/region; configs are not universally portable.
   - IPv6 and AAAA handling vary heavily across providers and can impact iOS/Desktop connection latency.

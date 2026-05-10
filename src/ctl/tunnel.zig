@@ -16,8 +16,9 @@ const INSTALL_DIR = "/opt/mtproto-proxy";
 const AWG_CONF_DIR = "/etc/amnezia/amneziawg";
 const AWG_IFACE_CONF_PATH = "/etc/amnezia/awg0.conf";
 const TUNNEL_SCRIPT = "/usr/local/bin/setup_tunnel.sh";
+const TUNNEL_POOL_SERVICE = "/etc/systemd/system/mtproto-tunnel-pool.service";
+const TUNNEL_POOL_TIMER = "/etc/systemd/system/mtproto-tunnel-pool.timer";
 const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
-const AWG_CONFIG_PATH = AWG_CONF_DIR ++ "/awg0.conf";
 const TUNNEL_MARK: u32 = 200;
 const TUNNEL_TABLE: u32 = 200;
 
@@ -31,6 +32,7 @@ fn readFileAllocCwd(allocator: std.mem.Allocator, path: []const u8, limit: usize
 
 pub const TunnelOpts = struct {
     awg_source: []const u8 = "",
+    iface: []const u8 = "",
 };
 
 const AwgConfigKind = enum {
@@ -55,13 +57,18 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--iface")) {
+            opts.iface = args.next() orelse "";
+            continue;
+        }
+
         if (arg.len > 0 and arg[0] != '-') {
             opts.awg_source = arg;
         }
     }
 
     if (opts.awg_source.len == 0) {
-        ui.fail("Usage: mtbuddy setup tunnel <conf-path-or-vpn-link>");
+        ui.fail("Usage: mtbuddy setup tunnel [--iface awgN] <conf-path-or-vpn-link>");
         return;
     }
 
@@ -118,12 +125,28 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         ui.ok("AmneziaWG installed");
     }
 
+    const iface = selectTunnelInterface(allocator, opts.iface) catch |err| {
+        switch (err) {
+            error.InvalidInterfaceName => ui.fail("Invalid tunnel interface name. Use names like awg0, awg1, wg0."),
+            error.NoFreeInterface => ui.fail("No free awgN interface name found"),
+            else => ui.fail("Failed to select tunnel interface"),
+        }
+        return;
+    };
+    defer allocator.free(iface);
+
+    var config_path_buf: [256]u8 = undefined;
+    const awg_config_path = awgConfigPath(&config_path_buf, iface) catch {
+        ui.fail("Tunnel interface name is too long");
+        return;
+    };
+
     // ── Copy AWG config ──
     ui.step("Installing AmneziaWG config...");
     _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/amnezia" }) catch {};
     _ = sys.exec(allocator, &.{ "mkdir", "-p", AWG_CONF_DIR }) catch {};
 
-    const config_kind = installAwgConfigSource(allocator, awg_source, AWG_CONFIG_PATH) catch |err| {
+    const config_kind = installAwgConfigSource(allocator, awg_source, awg_config_path) catch |err| {
         switch (err) {
             error.ConfigSourceNotFound => ui.fail("Config file not found"),
             error.UnsupportedConfigFormat => ui.fail("Unsupported VPN config format. Use a WireGuard/AmneziaWG .conf file, or an Amnezia vpn:// share link."),
@@ -136,24 +159,26 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     if (config_kind == .amnezia_vpn_link) {
         ui.warn("Converted Amnezia vpn:// link to AmneziaWG config");
     }
-    _ = sys.execForward(&.{ "ln", "-sfn", AWG_CONFIG_PATH, AWG_IFACE_CONF_PATH }) catch {};
+    if (std.mem.eql(u8, iface, "awg0")) {
+        _ = sys.execForward(&.{ "ln", "-sfn", awg_config_path, AWG_IFACE_CONF_PATH }) catch {};
+    }
 
-    const dns_removed = stripAwgDnsLines(allocator, AWG_CONFIG_PATH) catch false;
+    const dns_removed = stripAwgDnsLines(allocator, awg_config_path) catch false;
     if (dns_removed) {
-        ui.warn("Removed DNS from awg0.conf (host resolver will be used)");
+        ui.warn("Removed DNS from tunnel config (host resolver will be used)");
     }
 
-    const empty_removed = stripAwgEmptyAssignments(allocator, AWG_CONFIG_PATH) catch false;
+    const empty_removed = stripAwgEmptyAssignments(allocator, awg_config_path) catch false;
     if (empty_removed) {
-        ui.warn("Removed empty AmneziaWG parameters from awg0.conf");
+        ui.warn("Removed empty AmneziaWG parameters from tunnel config");
     }
 
-    const table_off_added = ensureAwgTableOff(allocator, AWG_CONFIG_PATH) catch false;
+    const table_off_added = ensureAwgTableOff(allocator, awg_config_path) catch false;
     if (table_off_added) {
-        ui.warn("Added Table = off to [Interface] in awg0.conf");
+        ui.warn("Added Table = off to [Interface] in tunnel config");
     }
 
-    switch (validateAwgQuickConfig(allocator)) {
+    switch (validateAwgQuickConfig(allocator, awg_config_path)) {
         .ok => {},
         .missing_binary => {
             ui.fail("AmneziaWG tools are not available (`awg-quick` was not found). Install amneziawg-tools and retry.");
@@ -165,34 +190,16 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         },
     }
 
-    ui.ok("Config installed to " ++ AWG_CONFIG_PATH);
+    ui.stepOk("Config installed", awg_config_path);
 
     // ── Create tunnel policy script ──
     ui.step("Creating tunnel policy routing script...");
 
-    var tunnel_script_buf: [2048]u8 = undefined;
-    const tunnel_script = std.fmt.bufPrint(&tunnel_script_buf,
-        \\#!/bin/bash
-        \\set -euo pipefail
-        \\IFACE="awg0"
-        \\MARK={[mark]d}
-        \\TABLE={[table]d}
-        \\
-        \\awg-quick down "$IFACE" 2>/dev/null || true
-        \\awg-quick up "$IFACE"
-        \\
-        \\ip -4 route flush table "$TABLE" 2>/dev/null || true
-        \\ip -4 route add default dev "$IFACE" table "$TABLE"
-        \\ip -4 rule del fwmark "$MARK" table "$TABLE" 2>/dev/null || true
-        \\ip -4 rule add fwmark "$MARK" table "$TABLE" priority 1200
-        \\
-        \\echo "Tunnel routing ready: fwmark=$MARK -> table $TABLE via $IFACE"
-    , .{ .mark = TUNNEL_MARK, .table = TUNNEL_TABLE }) catch "";
-
-    if (tunnel_script.len == 0) {
+    const tunnel_script = renderTunnelPoolScript(allocator) catch {
         ui.fail("Failed to render tunnel setup script");
         return;
-    }
+    };
+    defer allocator.free(tunnel_script);
 
     sys.writeFileMode(TUNNEL_SCRIPT, tunnel_script, 0o755) catch {
         ui.fail("Failed to write tunnel setup script");
@@ -234,10 +241,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
     ui.ok("Systemd service patched for tunnel policy routing");
 
+    installTunnelPoolUnits(ui, allocator);
+
     // ── Configure proxy egress mode ──
-    setUpstreamType(allocator, "tunnel");
+    setTunnelPoolConfig(allocator, iface);
     ui.stepOk("Set [upstream].type", "tunnel");
-    ui.stepOk("Set [upstream.tunnel].interface", "awg0");
+    ui.stepOk("Added tunnel pool interface", iface);
     ui.stepOk("Preserved [general].use_middle_proxy", "unchanged");
 
     // ── Inject public IP (preserve existing custom value) ──
@@ -312,13 +321,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     // ── Validate tunnel routing ──
     ui.step("Validating policy routing to Telegram DCs...");
 
-    const awg_status = sys.exec(allocator, &.{ "awg", "show", "awg0" }) catch null;
+    _ = sys.execForward(&.{TUNNEL_SCRIPT}) catch {};
+
+    const awg_status = sys.exec(allocator, &.{ "awg", "show", iface }) catch null;
     if (awg_status) |result| {
         defer result.deinit();
         if (result.exit_code == 0) {
-            ui.stepOk("Tunnel interface active", "awg0");
+            ui.stepOk("Tunnel interface active", iface);
         } else {
-            ui.warn("awg0 is not active (check AWG config and endpoint)");
+            ui.warn("Tunnel interface is not active (check AWG config and endpoint)");
         }
     }
 
@@ -334,8 +345,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
 
         if (r) |route_result| {
             defer route_result.deinit();
-            if (route_result.exit_code == 0 and std.mem.indexOf(u8, route_result.stdout, "dev awg0") != null) {
-                ui.stepOk("Policy route via awg0", dc_ip);
+            if (route_result.exit_code == 0 and std.mem.indexOf(u8, route_result.stdout, "dev ") != null) {
+                ui.stepOk("Policy route via tunnel pool", dc_ip);
             } else {
                 var warn_buf: [96]u8 = undefined;
                 const warn_msg = std.fmt.bufPrint(&warn_buf, "Policy route check failed for {s}", .{dc_ip}) catch "Policy route check failed";
@@ -348,12 +359,13 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     ui.summaryBox("VPN Tunnel Configured", &.{
         .{ .label = "Status:", .value = "systemctl status mtproto-proxy" },
         .{ .label = "Logs:", .value = "journalctl -u mtproto-proxy -f" },
-        .{ .label = "Tunnel:", .value = "awg show awg0" },
+        .{ .label = "Tunnel:", .value = "awg show <iface>" },
+        .{ .label = "Pool:", .value = "systemctl status mtproto-tunnel-pool.timer" },
         .{ .label = "Policy:", .value = "ip -4 rule show | grep fwmark" },
         .{ .label = "Mark:", .value = "SO_MARK=200 -> table 200" },
         .{ .label = "", .style = .blank },
         .{ .label = "Proxy runs in host network namespace", .style = .success },
-        .{ .label = "Tunnel routing is socket-level and explicit", .style = .success },
+        .{ .label = "Tunnel pool failover is socket-level and explicit", .style = .success },
         .{ .label = "SOCKS5/HTTP upstream stay orthogonal", .style = .success },
     });
 }
@@ -733,26 +745,448 @@ fn firstDiagnosticLine(output: []const u8) ?[]const u8 {
     return first_non_empty;
 }
 
-fn validateAwgQuickConfig(allocator: std.mem.Allocator) AwgQuickValidation {
+fn validateAwgQuickConfig(allocator: std.mem.Allocator, path: []const u8) AwgQuickValidation {
     if (!sys.commandExists("awg-quick")) return .missing_binary;
 
-    const result = sys.exec(allocator, &.{ "awg-quick", "strip", AWG_CONFIG_PATH }) catch return .missing_binary;
+    const result = sys.exec(allocator, &.{ "awg-quick", "strip", path }) catch return .missing_binary;
     defer result.deinit();
     return if (result.exit_code == 0) .ok else .invalid_config;
 }
 
-fn setUpstreamType(allocator: std.mem.Allocator, value: []const u8) void {
+fn awgConfigPath(buf: []u8, iface: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "{s}/{s}.conf", .{ AWG_CONF_DIR, iface });
+}
+
+fn isValidTunnelInterfaceName(iface: []const u8) bool {
+    if (iface.len == 0 or iface.len > 32) return false;
+    for (iface) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
+    if (values.len == 0) return;
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
+fn parseTunnelInterfaceArray(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    const trimmed = std.mem.trim(u8, value, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') {
+        return error.InvalidInterfaceArray;
+    }
+
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
+    var i: usize = 1;
+    while (i + 1 < trimmed.len) {
+        while (i + 1 < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t' or trimmed[i] == ',')) : (i += 1) {}
+        if (i + 1 >= trimmed.len or trimmed[i] == ']') break;
+
+        const quoted = trimmed[i] == '"';
+        const start: usize = if (quoted) blk: {
+            i += 1;
+            break :blk i;
+        } else i;
+        while (i < trimmed.len and ((quoted and trimmed[i] != '"') or (!quoted and trimmed[i] != ',' and trimmed[i] != ']'))) : (i += 1) {}
+        const item = std.mem.trim(u8, trimmed[start..i], &[_]u8{ ' ', '\t', '\r', '\n' });
+        if (quoted and i < trimmed.len and trimmed[i] == '"') i += 1;
+        if (item.len > 0 and isValidTunnelInterfaceName(item)) {
+            try list.append(allocator, try allocator.dupe(u8, item));
+        }
+    }
+
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return &.{};
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn loadTunnelPoolFromDoc(allocator: std.mem.Allocator, doc: *toml.TomlDoc) ![]const []const u8 {
+    if (doc.get("upstream.tunnel", "interfaces")) |raw_interfaces| {
+        const parsed = parseTunnelInterfaceArray(allocator, raw_interfaces) catch &.{};
+        if (parsed.len > 0) return parsed;
+    }
+
+    if (doc.get("upstream.tunnel", "interface")) |legacy_iface| {
+        const trimmed = std.mem.trim(u8, legacy_iface, &[_]u8{ ' ', '\t', '\r', '\n' });
+        if (isValidTunnelInterfaceName(trimmed)) {
+            const values = try allocator.alloc([]const u8, 1);
+            values[0] = try allocator.dupe(u8, trimmed);
+            return values;
+        }
+    }
+
+    return &.{};
+}
+
+fn containsInterface(values: []const []const u8, iface: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, iface)) return true;
+    }
+    return false;
+}
+
+fn appendInterfaceIfMissing(allocator: std.mem.Allocator, values: []const []const u8, iface: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |value| allocator.free(value);
+        out.deinit(allocator);
+    }
+
+    for (values) |value| {
+        try out.append(allocator, try allocator.dupe(u8, value));
+    }
+    if (!containsInterface(values, iface)) {
+        try out.append(allocator, try allocator.dupe(u8, iface));
+    }
+    if (out.items.len == 0) {
+        out.deinit(allocator);
+        return &.{};
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn nextAwgInterfaceNameFromPool(allocator: std.mem.Allocator, used: []const []const u8) ![]const u8 {
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var buf: [16]u8 = undefined;
+        const candidate = try std.fmt.bufPrint(&buf, "awg{d}", .{i});
+        if (!containsInterface(used, candidate)) return try allocator.dupe(u8, candidate);
+    }
+    return error.NoFreeInterface;
+}
+
+fn selectTunnelInterface(allocator: std.mem.Allocator, requested: []const u8) ![]u8 {
+    const trimmed_requested = std.mem.trim(u8, requested, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed_requested.len > 0) {
+        if (!isValidTunnelInterfaceName(trimmed_requested)) return error.InvalidInterfaceName;
+        return try allocator.dupe(u8, trimmed_requested);
+    }
+
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch {
+        return try allocator.dupe(u8, "awg0");
+    };
+    defer doc.deinit();
+
+    const pool = try loadTunnelPoolFromDoc(allocator, &doc);
+    defer freeOwnedStringSlice(allocator, pool);
+
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const candidate = try std.fmt.bufPrint(&name_buf, "awg{d}", .{i});
+        var path_buf: [256]u8 = undefined;
+        const path = awgConfigPath(&path_buf, candidate) catch continue;
+        if (!containsInterface(pool, candidate) and !sys.fileExists(path)) {
+            return try allocator.dupe(u8, candidate);
+        }
+    }
+
+    return error.NoFreeInterface;
+}
+
+fn formatInterfaceArrayLiteral(allocator: std.mem.Allocator, values: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.append(allocator, '[');
+    for (values, 0..) |value, idx| {
+        if (idx > 0) try out.appendSlice(allocator, ", ");
+        try out.append(allocator, '"');
+        try out.appendSlice(allocator, value);
+        try out.append(allocator, '"');
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn setTunnelPoolConfig(allocator: std.mem.Allocator, iface: []const u8) void {
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
     defer doc.deinit();
 
-    var quoted_buf: [64]u8 = undefined;
-    const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{value}) catch return;
-    doc.set("upstream", "type", quoted) catch return;
+    doc.set("upstream", "type", "\"tunnel\"") catch return;
 
-    // Default to AmneziaWG interface when setting up tunnel via this script
-    doc.set("upstream.tunnel", "interface", "\"awg0\"") catch return;
+    const existing = loadTunnelPoolFromDoc(allocator, &doc) catch &.{};
+    defer freeOwnedStringSlice(allocator, existing);
+
+    const pool = appendInterfaceIfMissing(allocator, existing, iface) catch return;
+    defer freeOwnedStringSlice(allocator, pool);
+
+    if (pool.len > 0) {
+        var first_buf: [64]u8 = undefined;
+        const first = std.fmt.bufPrint(&first_buf, "\"{s}\"", .{pool[0]}) catch return;
+        doc.set("upstream.tunnel", "interface", first) catch return;
+    }
+
+    const array_literal = formatInterfaceArrayLiteral(allocator, pool) catch return;
+    defer allocator.free(array_literal);
+    doc.set("upstream.tunnel", "interfaces", array_literal) catch return;
 
     doc.save(INSTALL_DIR ++ "/config.toml") catch {};
+}
+
+fn installTunnelPoolUnits(ui: *Tui, allocator: std.mem.Allocator) void {
+    const service =
+        \\[Unit]
+        \\Description=MTProto tunnel pool failover
+        \\Documentation=https://github.com/sleep3r/mtproto.zig
+        \\After=network-online.target
+        \\Wants=network-online.target
+        \\
+        \\[Service]
+        \\Type=oneshot
+        \\ExecStart=/usr/local/bin/setup_tunnel.sh
+        \\AmbientCapabilities=CAP_NET_ADMIN
+    ;
+
+    const timer =
+        \\[Unit]
+        \\Description=Run MTProto tunnel pool failover checks
+        \\
+        \\[Timer]
+        \\OnBootSec=30s
+        \\OnUnitActiveSec=30s
+        \\RandomizedDelaySec=5s
+        \\Persistent=true
+        \\
+        \\[Install]
+        \\WantedBy=timers.target
+    ;
+
+    sys.writeFile(TUNNEL_POOL_SERVICE, service) catch {
+        ui.warn("Failed to write mtproto-tunnel-pool.service");
+        return;
+    };
+    sys.writeFile(TUNNEL_POOL_TIMER, timer) catch {
+        ui.warn("Failed to write mtproto-tunnel-pool.timer");
+        return;
+    };
+
+    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+    _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", "mtproto-tunnel-pool.timer" }) catch {};
+    ui.ok("Tunnel pool failover timer installed");
+}
+
+fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
+    return try allocator.dupe(u8,
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\
+        \\CONFIG_FILE="/opt/mtproto-proxy/config.toml"
+        \\CONF_DIR="/etc/amnezia/amneziawg"
+        \\STATE_DIR="/run/mtproto-proxy"
+        \\STATE_FILE="$STATE_DIR/tunnel-pool.state"
+        \\MARK=200
+        \\TABLE=200
+        \\PROBE_URL="https://core.telegram.org/getProxyConfig"
+        \\
+        \\mkdir -p "$STATE_DIR"
+        \\
+        \\log() {
+        \\    logger -t mtproto-tunnel-pool "$*" 2>/dev/null || true
+        \\}
+        \\
+        \\read_tunnel_key() {
+        \\    local want_key="$1"
+        \\    [[ -f "$CONFIG_FILE" ]] || return 1
+        \\    awk -v want_key="$want_key" '
+        \\        BEGIN { in_section=0; value="" }
+        \\        /^[[:space:]]*\[upstream\.tunnel\][[:space:]]*$/ { in_section=1; next }
+        \\        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { in_section=0; next }
+        \\        in_section {
+        \\            line=$0
+        \\            sub(/[;#].*/, "", line)
+        \\            if (line ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+        \\                sub(/^[^=]*=/, "", line)
+        \\                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+        \\                gsub(/^"|"$/, "", line)
+        \\                value=line
+        \\            }
+        \\        }
+        \\        END { if (value != "") print value }
+        \\    ' "$CONFIG_FILE"
+        \\}
+        \\
+        \\trim() {
+        \\    local v="$1"
+        \\    v="${v#"${v%%[![:space:]]*}"}"
+        \\    v="${v%"${v##*[![:space:]]}"}"
+        \\    printf '%s\n' "$v"
+        \\}
+        \\
+        \\parse_interfaces() {
+        \\    local raw="$1"
+        \\    raw="${raw#[}"
+        \\    raw="${raw%]}"
+        \\    raw="${raw//\"/}"
+        \\    local old_ifs="$IFS"
+        \\    IFS=','
+        \\    read -r -a parts <<< "$raw"
+        \\    IFS="$old_ifs"
+        \\    for item in "${parts[@]}"; do
+        \\        item="$(trim "$item")"
+        \\        [[ -n "$item" ]] && printf '%s\n' "$item"
+        \\    done
+        \\}
+        \\
+        \\add_unique() {
+        \\    local item="$1"
+        \\    [[ -n "$item" ]] || return 0
+        \\    local existing
+        \\    for existing in "${candidates[@]}"; do
+        \\        [[ "$existing" == "$item" ]] && return 0
+        \\    done
+        \\    candidates+=("$item")
+        \\}
+        \\
+        \\conf_path_for() {
+        \\    local iface="$1"
+        \\    if [[ -f "$CONF_DIR/${iface}.conf" ]]; then
+        \\        printf '%s/%s.conf\n' "$CONF_DIR" "$iface"
+        \\    elif [[ -f "/etc/wireguard/${iface}.conf" ]]; then
+        \\        printf '/etc/wireguard/%s.conf\n' "$iface"
+        \\    else
+        \\        printf '%s/%s.conf\n' "$CONF_DIR" "$iface"
+        \\    fi
+        \\}
+        \\
+        \\quick_tool_for() {
+        \\    local iface="$1"
+        \\    if [[ "$iface" == wg* ]] && command -v wg-quick >/dev/null 2>&1; then
+        \\        printf 'wg-quick\n'
+        \\        return
+        \\    fi
+        \\    if command -v awg-quick >/dev/null 2>&1; then
+        \\        printf 'awg-quick\n'
+        \\        return
+        \\    fi
+        \\    if command -v wg-quick >/dev/null 2>&1; then
+        \\        printf 'wg-quick\n'
+        \\        return
+        \\    fi
+        \\    return 1
+        \\}
+        \\
+        \\show_tool_for() {
+        \\    local iface="$1"
+        \\    if [[ "$iface" == wg* ]] && command -v wg >/dev/null 2>&1; then
+        \\        printf 'wg\n'
+        \\        return
+        \\    fi
+        \\    if command -v awg >/dev/null 2>&1; then
+        \\        printf 'awg\n'
+        \\        return
+        \\    fi
+        \\    if command -v wg >/dev/null 2>&1; then
+        \\        printf 'wg\n'
+        \\        return
+        \\    fi
+        \\    return 1
+        \\}
+        \\
+        \\ensure_iface_up() {
+        \\    local iface="$1"
+        \\    ip link show dev "$iface" >/dev/null 2>&1 && return 0
+        \\    local quick conf
+        \\    quick="$(quick_tool_for "$iface")" || return 1
+        \\    conf="$(conf_path_for "$iface")"
+        \\    [[ -f "$conf" ]] || return 1
+        \\    "$quick" up "$conf" >/dev/null 2>&1
+        \\}
+        \\
+        \\probe_iface() {
+        \\    local iface="$1"
+        \\    reason=""
+        \\    ensure_iface_up "$iface" || { reason="failed to bring interface up"; return 1; }
+        \\    ip link show dev "$iface" >/dev/null 2>&1 || { reason="interface missing"; return 1; }
+        \\    local show_tool
+        \\    show_tool="$(show_tool_for "$iface")" || { reason="awg/wg show tool missing"; return 1; }
+        \\    "$show_tool" show "$iface" >/dev/null 2>&1 || { reason="tunnel show failed"; return 1; }
+        \\    curl --interface "$iface" -fsS --connect-timeout 3 --max-time 5 "$PROBE_URL" >/dev/null 2>&1 || { reason="Telegram probe failed"; return 1; }
+        \\    reason="healthy"
+        \\    return 0
+        \\}
+        \\
+        \\state_value() {
+        \\    local key="$1"
+        \\    [[ -f "$STATE_FILE" ]] || return 0
+        \\    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$STATE_FILE"
+        \\}
+        \\
+        \\write_state() {
+        \\    local active="$1" status="$2" reason="$3"
+        \\    local prev_active prev_last now last_switch
+        \\    prev_active="$(state_value active || true)"
+        \\    prev_last="$(state_value last_switch || true)"
+        \\    now="$(date -Is)"
+        \\    last_switch="${prev_last:-$now}"
+        \\    [[ "$active" != "$prev_active" ]] && last_switch="$now"
+        \\    {
+        \\        printf 'active=%s\n' "$active"
+        \\        printf 'status=%s\n' "$status"
+        \\        printf 'reason=%s\n' "$reason"
+        \\        printf 'pinned=%s\n' "$pinned"
+        \\        printf 'pool=%s\n' "${pool[*]}"
+        \\        printf 'last_switch=%s\n' "$last_switch"
+        \\        printf 'checked_at=%s\n' "$now"
+        \\    } > "$STATE_FILE"
+        \\}
+        \\
+        \\mapfile -t pool < <(
+        \\    raw_interfaces="$(read_tunnel_key interfaces || true)"
+        \\    if [[ -n "${raw_interfaces:-}" ]]; then
+        \\        parse_interfaces "$raw_interfaces"
+        \\    else
+        \\        legacy="$(read_tunnel_key interface || true)"
+        \\        printf '%s\n' "${legacy:-awg0}"
+        \\    fi
+        \\)
+        \\
+        \\pinned="$(read_tunnel_key pinned_interface || true)"
+        \\candidates=()
+        \\add_unique "$pinned"
+        \\for iface in "${pool[@]}"; do
+        \\    add_unique "$iface"
+        \\done
+        \\
+        \\ip -4 rule del fwmark "$MARK" table "$TABLE" 2>/dev/null || true
+        \\ip -4 rule add fwmark "$MARK" table "$TABLE" priority 1200
+        \\
+        \\selected=""
+        \\selected_reason=""
+        \\for iface in "${candidates[@]}"; do
+        \\    if probe_iface "$iface"; then
+        \\        selected="$iface"
+        \\        selected_reason="$reason"
+        \\        break
+        \\    fi
+        \\    log "tunnel $iface unhealthy: $reason"
+        \\done
+        \\
+        \\if [[ -z "$selected" ]]; then
+        \\    write_state "" "degraded" "no healthy tunnel"
+        \\    echo "No healthy tunnel in pool: ${candidates[*]}" >&2
+        \\    exit 1
+        \\fi
+        \\
+        \\previous="$(ip -4 route show table "$TABLE" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }')"
+        \\ip -4 route flush table "$TABLE" 2>/dev/null || true
+        \\ip -4 route replace default dev "$selected" table "$TABLE"
+        \\write_state "$selected" "healthy" "$selected_reason"
+        \\
+        \\if [[ "$previous" != "$selected" ]]; then
+        \\    log "selected tunnel $selected (previous: ${previous:-none})"
+        \\fi
+        \\echo "Tunnel routing ready: fwmark=$MARK -> table $TABLE via $selected"
+    );
 }
 
 fn stripAwgDnsLines(allocator: std.mem.Allocator, path: []const u8) !bool {
@@ -946,6 +1380,12 @@ fn cleanupNetnsNginxListen(allocator: std.mem.Allocator) bool {
 /// Returns the `Tunnel.Tag` corresponding to the detected tunnel,
 /// or `.none` if no known tunnel is active.
 pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
+    const route_result = sys.exec(allocator, &.{ "ip", "-4", "route", "show", "table", "200", "default" }) catch null;
+    if (route_result) |r| {
+        defer r.deinit();
+        if (r.exit_code == 0 and std.mem.indexOf(u8, r.stdout, " dev ") != null) return .tunnel;
+    }
+
     const awg_result = sys.exec(allocator, &.{ "awg", "show", "awg0" }) catch null;
     if (awg_result) |r| {
         defer r.deinit();
@@ -963,6 +1403,46 @@ pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
 
 const test_amnezia_vpn_link =
     "vpn://AAABPXicLY9Ra8IwFIX_Srn4WGoSHZSCD6I-lDEX9Gm0IrG5jkKbliSdG6X_fTdWTiA53wn3JCNo4zhkwJOnIA5AEEiTpwhUnfGqNmgdZMUI6vEN2QiNcv5K0b0mC2MJ87mELCqhyI1He1cVXsrSbLW26Fy0iThLgsRyJYhLW_8oj-_4R1FPhtj-eCazkKf8Y3v6upKNo8X5sPs87l-eLuUi2tBGq5CINnTI4dbU1WvUcAutTdM9UOcyFM-9bMkoOBjdd7XxhPFXtX2DSdW12Xq9CjMhpve3fpg_wkXKZtR31gf2xlPBJpimy_QPWglhtw";
+
+test "tunnel pool - next awg interface skips used names" {
+    const used = [_][]const u8{ "awg0", "awg1" };
+    const next = try nextAwgInterfaceNameFromPool(std.testing.allocator, &used);
+    defer std.testing.allocator.free(next);
+    try std.testing.expectEqualStrings("awg2", next);
+}
+
+test "tunnel pool - append interface avoids duplicates" {
+    const existing = [_][]const u8{ "awg0", "awg1" };
+
+    const same = try appendInterfaceIfMissing(std.testing.allocator, &existing, "awg1");
+    defer freeOwnedStringSlice(std.testing.allocator, same);
+    try std.testing.expectEqual(@as(usize, 2), same.len);
+    try std.testing.expectEqualStrings("awg0", same[0]);
+    try std.testing.expectEqualStrings("awg1", same[1]);
+
+    const added = try appendInterfaceIfMissing(std.testing.allocator, &existing, "awg2");
+    defer freeOwnedStringSlice(std.testing.allocator, added);
+    try std.testing.expectEqual(@as(usize, 3), added.len);
+    try std.testing.expectEqualStrings("awg2", added[2]);
+}
+
+test "tunnel pool - script renders route replacement and Telegram probe" {
+    const script = try renderTunnelPoolScript(std.testing.allocator);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "ip -4 route replace default dev \"$selected\" table \"$TABLE\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "https://core.telegram.org/getProxyConfig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "pinned_interface") != null);
+}
+
+test "tunnel pool - parses interface array" {
+    const pool = try parseTunnelInterfaceArray(std.testing.allocator, "[\"awg0\", \"awg1\"]");
+    defer freeOwnedStringSlice(std.testing.allocator, pool);
+
+    try std.testing.expectEqual(@as(usize, 2), pool.len);
+    try std.testing.expectEqualStrings("awg0", pool[0]);
+    try std.testing.expectEqualStrings("awg1", pool[1]);
+}
 
 test "tunnel - converts Amnezia vpn link to AWG config" {
     const conf = try convertAmneziaVpnLink(std.testing.allocator, test_amnezia_vpn_link);

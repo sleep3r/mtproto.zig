@@ -296,9 +296,9 @@ const en_strings = [_][]const u8{
     // install_middle_proxy_prompt
     "Enable MiddleProxy (Telegram relay)?",
     // install_middle_proxy_help
-    "Routes traffic through Telegram's relay servers.\nUses more RAM (~2 MB per connection) but is required for:\n  • Promo tag / sponsored messages (ad_tag)\n  • Media loading (photos, video, stories) on non-Premium accounts",
+    "Routes traffic through Telegram's relay servers.\nUses more RAM (~2 MB per connection) but is required for:\n  • Promo tag / sponsored messages (ad_tag)\n  • Media loading (photos, video, stories) on non-Premium accounts\n\nTelegram calls are not supported: they require SOCKS-style paths that cannot be masked cleanly as HTTPS.",
     // install_middle_proxy_warn
-    "Without MiddleProxy: promo tags will not work, and non-Premium users may fail to load media.",
+    "Without MiddleProxy: promo tags will not work, and media on non-Premium accounts will not load. Telegram calls are unsupported.",
     // install_checking_deps
     "Installing system dependencies...",
     // install_resolving_tag
@@ -527,9 +527,9 @@ const ru_strings = [_][]const u8{
     // install_middle_proxy_prompt
     "Включить MiddleProxy (релей Telegram)?",
     // install_middle_proxy_help
-    "Маршрутизирует трафик через релей-серверы Telegram.\nПотребляет больше RAM (~2 МБ на подключение), но необходим для:\n  • Промо-тега / спонсорских сообщений (ad_tag)\n  • Загрузки медиа (фото, видео, истории) на аккаунтах без Premium",
+    "Маршрутизирует трафик через релей-серверы Telegram.\nПотребляет больше RAM (~2 МБ на подключение), но необходим для:\n  • Промо-тега / спонсорских сообщений (ad_tag)\n  • Загрузки медиа (фото, видео, истории) на аккаунтах без Premium\n\nЗвонки не поддерживаются: Telegram проводит их только через SOCKS-пути, которые нельзя нормально замаскировать под HTTPS.",
     // install_middle_proxy_warn
-    "Без MiddleProxy: промо-тег не будет работать, а у пользователей без Premium могут не загружаться медиа.",
+    "Без MiddleProxy: промо-тег не будет работать, а медиа на аккаунтах без Premium не будут загружаться. Звонки не поддерживаются.",
     // install_checking_deps
     "Установка системных зависимостей...",
     // install_resolving_tag

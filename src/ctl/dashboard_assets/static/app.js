@@ -652,24 +652,23 @@ function setupRoutingControls() {
       if (!currentRouting) return;
 
       const iface = String(tunnelIfaceSelect.value || '').trim();
-      if (!iface) {
-        setRoutingAction('Select tunnel interface first.', 'error');
-        return;
-      }
-
-      if (iface === String(currentRouting.selected_tunnel_interface || '')) {
-        setRoutingAction('Tunnel interface is already set to ' + iface + '.');
+      const currentPinned = String(currentRouting.pinned_tunnel_interface || '');
+      if (iface === currentPinned) {
+        setRoutingAction(iface ? ('Tunnel interface is already pinned to ' + iface + '.') : 'Tunnel pool is already in priority-auto mode.');
         return;
       }
 
       tunnelIfaceApply.disabled = true;
       tunnelIfaceSelect.disabled = true;
-      setRoutingAction('Switching tunnel interface to ' + iface + '…');
+      setRoutingAction(iface ? ('Pinning tunnel interface to ' + iface + '…') : 'Clearing tunnel pin…');
 
       try {
-        const data = await apiCall('/api/routing/tunnel-interface', { interface: iface });
-        setRoutingAction('Tunnel interface set to ' + data.interface + '. Proxy restarted.', 'ok');
-        showToast('Tunnel interface set to ' + data.interface + '. Proxy restarted.', 'success');
+        const data = await apiCall('/api/routing/tunnel-interface', iface ? { interface: iface } : { clear: true });
+        const msg = data.pinned_interface
+          ? ('Tunnel pinned to ' + data.pinned_interface + '. Controller checked pool.')
+          : 'Tunnel pin cleared. Priority auto-failback restored.';
+        setRoutingAction(msg, data.controller_ok ? 'ok' : '');
+        showToast(msg, 'success');
         await runPoll();
       } catch (e) {
         setRoutingAction('Failed: ' + e.message, 'error');
@@ -766,12 +765,12 @@ function renderRouting(routing) {
   if (tunnelCtl && tunnelSelect) {
     if (upstreamType === 'tunnel') {
       tunnelCtl.style.display = '';
-      const choices = Array.isArray(routing.available_tunnel_interfaces)
-        ? routing.available_tunnel_interfaces
+      const choices = Array.isArray(routing.tunnel_pool)
+        ? routing.tunnel_pool
         : [];
-      const selectedIface = String(routing.selected_tunnel_interface || '');
+      const selectedIface = String(routing.pinned_tunnel_interface || '');
       const seen = new Set();
-      const options = [];
+      const options = [''];
 
       if (selectedIface && choices.includes(selectedIface)) {
         seen.add(selectedIface);
@@ -785,7 +784,7 @@ function renderRouting(routing) {
         options.push(v);
       });
 
-      if (!options.length) {
+      if (options.length <= 1 && !choices.length) {
         tunnelSelect.innerHTML = '<option value="">no interfaces</option>';
         tunnelSelect.value = '';
         tunnelSelect.disabled = true;
@@ -794,11 +793,11 @@ function renderRouting(routing) {
         tunnelSelect.disabled = false;
         if (tunnelApplyBtn) tunnelApplyBtn.disabled = false;
         tunnelSelect.innerHTML = options
-          .map((iface) => '<option value="' + esc(iface) + '">' + esc(iface) + '</option>')
+          .map((iface) => iface
+            ? '<option value="' + esc(iface) + '">' + esc(iface) + '</option>'
+            : '<option value="">priority auto</option>')
           .join('');
-        if (selectedIface) {
-          tunnelSelect.value = selectedIface;
-        }
+        tunnelSelect.value = selectedIface || '';
       }
     } else {
       tunnelCtl.style.display = 'none';
@@ -855,7 +854,8 @@ function renderRouting(routing) {
   const policy = routing.policy || {};
   const policyTxt = (policy.rule_ok ? 'rule ok' : 'rule missing') +
     ' · ' +
-    (policy.route_ok ? ('route ok' + (policy.route_dev ? (' (' + policy.route_dev + ')') : '')) : 'route missing');
+    (policy.route_ok ? ('route ok' + (policy.route_dev ? (' (' + policy.route_dev + ')') : '')) : 'route missing') +
+    (routing.pool_status ? (' · pool ' + routing.pool_status) : '');
   $('routingPolicy').textContent = policyTxt;
 
   const list = $('routingTunnelsList');
@@ -865,25 +865,32 @@ function renderRouting(routing) {
     return;
   }
 
-  const selected = routing.selected_tunnel_interface || '';
+  const selected = routing.active_tunnel_interface || routing.selected_tunnel_interface || '';
+  const pinned = routing.pinned_tunnel_interface || '';
 
   list.innerHTML = tunnels.map((t) => {
     const iface = String(t.interface || '—');
     const isSelected = upstreamType === 'tunnel' && iface === selected;
-    const state = t.active ? 'active' : (t.link_up ? 'up' : 'down');
-    const stateClass = t.active ? 'on' : (t.link_up ? 'mid' : 'off');
+    const isPinned = pinned && iface === pinned;
+    const inPool = Boolean(t.in_pool);
+    const state = t.healthy ? 'healthy' : (t.active ? 'active' : (t.link_up ? 'up' : 'down'));
+    const stateClass = t.healthy ? 'on' : (t.active || t.link_up ? 'mid' : 'off');
 
     const meta = [];
+    if (inPool) meta.push('pool');
+    if (isPinned) meta.push('pinned');
     if (t.tool && t.tool !== '-') meta.push(String(t.tool));
     if (t.endpoint) meta.push(String(t.endpoint));
     if (t.handshake) meta.push('hs: ' + String(t.handshake));
+    if (t.probe) meta.push(String(t.probe));
     if (!meta.length) meta.push(String(t.reason || '—'));
 
     const xfer = '↓ ' + String(t.rx || '—') + ' · ↑ ' + String(t.tx || '—');
 
     return '<div class="routing-row">' +
       '<div class="routing-iface">' + esc(iface) +
-      (isSelected ? '<span class="routing-tag">selected</span>' : '') +
+      (isSelected ? '<span class="routing-tag">active</span>' : '') +
+      (isPinned ? '<span class="routing-tag">pinned</span>' : '') +
       '</div>' +
       '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
       '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +

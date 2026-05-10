@@ -60,6 +60,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         "nfqws-mtproto",
         "mtproto-mask-health.timer",
         "mtproto-mask-health.service",
+        "mtproto-tunnel-pool.timer",
+        "mtproto-tunnel-pool.service",
     };
     for (services) |svc| {
         _ = sys.execForward(&.{ "systemctl", "stop", svc }) catch {};
@@ -71,6 +73,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     }
 
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-mask-health.timer" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.timer" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.service" }) catch {};
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
 
     // 2. Remove directories

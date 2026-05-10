@@ -65,6 +65,65 @@ fn stripInlineComment(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, &[_]u8{ ' ', '\t' });
 }
 
+fn parseStringArrayValue(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    const trimmed = std.mem.trim(u8, value, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') {
+        return error.InvalidStringArray;
+    }
+
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
+    var i: usize = 1;
+    while (i + 1 < trimmed.len) {
+        while (i + 1 < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t' or trimmed[i] == ',')) : (i += 1) {}
+        if (i + 1 >= trimmed.len or trimmed[i] == ']') break;
+
+        if (trimmed[i] == '"') {
+            i += 1;
+            const start = i;
+            var escaped = false;
+            while (i < trimmed.len) : (i += 1) {
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (trimmed[i] == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (trimmed[i] == '"') break;
+            }
+            if (i >= trimmed.len or trimmed[i] != '"') return error.InvalidStringArray;
+            const item = trimmed[start..i];
+            if (item.len > 0) try list.append(allocator, try allocator.dupe(u8, item));
+            i += 1;
+            continue;
+        }
+
+        const start = i;
+        while (i < trimmed.len and trimmed[i] != ',' and trimmed[i] != ']') : (i += 1) {}
+        const item = std.mem.trim(u8, trimmed[start..i], &[_]u8{ ' ', '\t', '\r', '\n' });
+        if (item.len > 0) try list.append(allocator, try allocator.dupe(u8, item));
+    }
+
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return &.{};
+    }
+
+    return try list.toOwnedSlice(allocator);
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
+    if (values.len == 0) return;
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
     pub const Metrics = struct {
@@ -159,6 +218,11 @@ pub const Config = struct {
     /// VPN tunnel interface name (e.g. "awg0", "wg0").
     /// Parsed from [upstream.tunnel].interface.
     upstream_tunnel_interface: ?[]const u8 = null,
+    /// Ordered VPN tunnel pool. Parsed from [upstream.tunnel].interfaces.
+    upstream_tunnel_interfaces: []const []const u8 = &.{},
+    /// Optional manually preferred tunnel from the pool.
+    /// Parsed from [upstream.tunnel].pinned_interface.
+    upstream_tunnel_pinned_interface: ?[]const u8 = null,
     metrics: Metrics = .{},
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
@@ -171,6 +235,49 @@ pub const Config = struct {
 
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
         return self.direct_users.contains(user_name);
+    }
+
+    pub fn tunnelInterfaceCount(self: *const Config) usize {
+        if (self.upstream_tunnel_interfaces.len > 0) return self.upstream_tunnel_interfaces.len;
+        return 1;
+    }
+
+    pub fn tunnelInterfaceAt(self: *const Config, index: usize) ?[]const u8 {
+        if (self.upstream_tunnel_interfaces.len > 0) {
+            if (index >= self.upstream_tunnel_interfaces.len) return null;
+            return self.upstream_tunnel_interfaces[index];
+        }
+        if (index == 0) return self.upstream_tunnel_interface orelse "awg0";
+        return null;
+    }
+
+    pub fn tunnelCandidateCount(self: *const Config) usize {
+        const base = self.tunnelInterfaceCount();
+        const pinned = self.upstream_tunnel_pinned_interface orelse return base;
+        var found = false;
+        var i: usize = 0;
+        while (self.tunnelInterfaceAt(i)) |iface| : (i += 1) {
+            if (std.mem.eql(u8, iface, pinned)) {
+                found = true;
+                break;
+            }
+        }
+        return if (found) base else base + 1;
+    }
+
+    pub fn tunnelCandidateAt(self: *const Config, index: usize) ?[]const u8 {
+        if (self.upstream_tunnel_pinned_interface) |pinned| {
+            if (index == 0) return pinned;
+            var candidate_idx: usize = 1;
+            var i: usize = 0;
+            while (self.tunnelInterfaceAt(i)) |iface| : (i += 1) {
+                if (std.mem.eql(u8, iface, pinned)) continue;
+                if (candidate_idx == index) return iface;
+                candidate_idx += 1;
+            }
+            return null;
+        }
+        return self.tunnelInterfaceAt(index);
     }
 
     /// Port collision exists only when masking points to a local endpoint.
@@ -424,6 +531,12 @@ pub const Config = struct {
                 } else if (in_upstream_tunnel_section) {
                     if (std.mem.eql(u8, key, "interface")) {
                         cfg.upstream_tunnel_interface = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "interfaces")) {
+                        freeStringSlice(allocator, cfg.upstream_tunnel_interfaces);
+                        cfg.upstream_tunnel_interfaces = parseStringArrayValue(allocator, value) catch &.{};
+                    } else if (std.mem.eql(u8, key, "pinned_interface")) {
+                        if (cfg.upstream_tunnel_pinned_interface) |iface| allocator.free(iface);
+                        cfg.upstream_tunnel_pinned_interface = if (value.len > 0) try allocator.dupe(u8, value) else null;
                     }
                 }
             }
@@ -467,6 +580,10 @@ pub const Config = struct {
             allocator.free(p);
         }
         if (self.upstream_tunnel_interface) |iface| {
+            allocator.free(iface);
+        }
+        freeStringSlice(allocator, self.upstream_tunnel_interfaces);
+        if (self.upstream_tunnel_pinned_interface) |iface| {
             allocator.free(iface);
         }
         if (self.bind_address) |ba| {
@@ -1188,6 +1305,88 @@ test "parse config - upstream type wireguard backward compat" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(UpstreamMode.tunnel, cfg.upstream_mode);
+}
+
+test "parse config - upstream tunnel legacy interface only" {
+    const content =
+        \\[upstream]
+        \\type = "tunnel"
+        \\[upstream.tunnel]
+        \\interface = "wg0"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.tunnelInterfaceCount());
+    try std.testing.expectEqualStrings("wg0", cfg.tunnelInterfaceAt(0).?);
+    try std.testing.expectEqualStrings("wg0", cfg.tunnelCandidateAt(0).?);
+    try std.testing.expect(cfg.tunnelCandidateAt(1) == null);
+}
+
+test "parse config - upstream tunnel interface pool" {
+    const content =
+        \\[upstream]
+        \\type = "tunnel"
+        \\[upstream.tunnel]
+        \\interface = "awg0"
+        \\interfaces = ["awg0", "awg1"]
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.tunnelInterfaceCount());
+    try std.testing.expectEqualStrings("awg0", cfg.tunnelInterfaceAt(0).?);
+    try std.testing.expectEqualStrings("awg1", cfg.tunnelInterfaceAt(1).?);
+    try std.testing.expectEqualStrings("awg0", cfg.tunnelCandidateAt(0).?);
+    try std.testing.expectEqualStrings("awg1", cfg.tunnelCandidateAt(1).?);
+}
+
+test "parse config - upstream tunnel pinned interface candidate order" {
+    const content =
+        \\[upstream]
+        \\type = "tunnel"
+        \\[upstream.tunnel]
+        \\interfaces = ["awg0", "awg1", "awg2"]
+        \\pinned_interface = "awg1"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("awg1", cfg.upstream_tunnel_pinned_interface.?);
+    try std.testing.expectEqual(@as(usize, 3), cfg.tunnelCandidateCount());
+    try std.testing.expectEqualStrings("awg1", cfg.tunnelCandidateAt(0).?);
+    try std.testing.expectEqualStrings("awg0", cfg.tunnelCandidateAt(1).?);
+    try std.testing.expectEqualStrings("awg2", cfg.tunnelCandidateAt(2).?);
+    try std.testing.expect(cfg.tunnelCandidateAt(3) == null);
+}
+
+test "parse config - upstream tunnel pinned interface outside pool" {
+    const content =
+        \\[upstream]
+        \\type = "tunnel"
+        \\[upstream.tunnel]
+        \\interfaces = ["awg0", "awg1"]
+        \\pinned_interface = "awg9"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.tunnelCandidateCount());
+    try std.testing.expectEqualStrings("awg9", cfg.tunnelCandidateAt(0).?);
+    try std.testing.expectEqualStrings("awg0", cfg.tunnelCandidateAt(1).?);
+    try std.testing.expectEqualStrings("awg1", cfg.tunnelCandidateAt(2).?);
 }
 
 test "parse config - upstream socks5 with credentials" {
