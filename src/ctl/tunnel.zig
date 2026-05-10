@@ -46,6 +46,11 @@ const AwgQuickValidation = enum {
     invalid_config,
 };
 
+const InteractiveTunnelSelection = struct {
+    iface: []const u8,
+    replacing_existing: bool,
+};
+
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = TunnelOpts{};
@@ -79,6 +84,23 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     ui.section(i18n.get(ui.lang, .menu_setup_tunnel));
 
+    try chooseInteractiveVpnType(ui);
+
+    const selection = chooseInteractiveTunnelTarget(ui, allocator) catch |err| {
+        switch (err) {
+            error.InvalidInterfaceName => ui.fail("Invalid tunnel interface name. Use names like awg0, awg1, wg0."),
+            error.NoFreeInterface => ui.fail("No free awgN interface name found"),
+            else => ui.fail("Failed to prepare tunnel pool selection"),
+        }
+        return;
+    };
+    defer allocator.free(selection.iface);
+
+    if (selection.replacing_existing) {
+        ui.warn(i18n.get(ui.lang, .tunnel_pool_replace_warn));
+    }
+    ui.stepOk(i18n.get(ui.lang, .tunnel_pool_selected_iface), selection.iface);
+
     var conf_buf: [16 * 1024]u8 = undefined;
     const conf_source = try ui.input(
         i18n.get(ui.lang, .tunnel_conf_prompt),
@@ -92,7 +114,71 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         return;
     }
 
-    try execute(ui, allocator, .{ .awg_source = conf_source });
+    try execute(ui, allocator, .{ .awg_source = conf_source, .iface = selection.iface });
+}
+
+fn chooseInteractiveVpnType(ui: *Tui) !void {
+    const items = [_][]const u8{
+        i18n.get(ui.lang, .tunnel_vpn_amneziawg),
+    };
+    _ = try ui.menu(i18n.get(ui.lang, .tunnel_vpn_type_prompt), &items);
+    ui.stepOk(i18n.get(ui.lang, .tunnel_vpn_type_prompt), i18n.get(ui.lang, .tunnel_vpn_amneziawg));
+}
+
+fn chooseInteractiveTunnelTarget(ui: *Tui, allocator: std.mem.Allocator) !InteractiveTunnelSelection {
+    const pool = try loadConfiguredTunnelPool(allocator);
+    defer freeOwnedStringSlice(allocator, pool);
+
+    if (pool.len == 0) {
+        ui.info(i18n.get(ui.lang, .tunnel_pool_empty));
+    } else {
+        ui.info(i18n.get(ui.lang, .tunnel_pool_current));
+        for (pool, 0..) |iface, idx| {
+            ui.print("     {d}. {s}\n", .{ idx + 1, iface });
+        }
+    }
+
+    const next_iface = try selectTunnelInterface(allocator, "");
+    defer allocator.free(next_iface);
+
+    var items: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+
+    try items.append(
+        allocator,
+        try std.fmt.allocPrint(
+            allocator,
+            "{s} ({s})",
+            .{ i18n.get(ui.lang, .tunnel_pool_action_create), next_iface },
+        ),
+    );
+
+    for (pool) |iface| {
+        try items.append(
+            allocator,
+            try std.fmt.allocPrint(
+                allocator,
+                "{s}: {s}",
+                .{ i18n.get(ui.lang, .tunnel_pool_action_replace), iface },
+            ),
+        );
+    }
+
+    const selected = try ui.menu(i18n.get(ui.lang, .tunnel_pool_action_prompt), items.items);
+    if (selected == 0) {
+        return .{
+            .iface = try allocator.dupe(u8, next_iface),
+            .replacing_existing = false,
+        };
+    }
+
+    return .{
+        .iface = try allocator.dupe(u8, pool[selected - 1]),
+        .replacing_existing = true,
+    };
 }
 
 fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
@@ -825,6 +911,13 @@ fn loadTunnelPoolFromDoc(allocator: std.mem.Allocator, doc: *toml.TomlDoc) ![]co
     }
 
     return &.{};
+}
+
+fn loadConfiguredTunnelPool(allocator: std.mem.Allocator) ![]const []const u8 {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return &.{};
+    defer doc.deinit();
+
+    return try loadTunnelPoolFromDoc(allocator, &doc);
 }
 
 fn containsInterface(values: []const []const u8, iface: []const u8) bool {

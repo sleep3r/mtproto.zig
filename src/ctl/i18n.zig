@@ -81,6 +81,15 @@ pub const S = enum(u16) {
     // ── Tunnel ──
     tunnel_conf_prompt,
     tunnel_conf_help,
+    tunnel_vpn_type_prompt,
+    tunnel_vpn_amneziawg,
+    tunnel_pool_current,
+    tunnel_pool_empty,
+    tunnel_pool_action_prompt,
+    tunnel_pool_action_create,
+    tunnel_pool_action_replace,
+    tunnel_pool_selected_iface,
+    tunnel_pool_replace_warn,
 
     // ── Install ──
     install_header,
@@ -249,6 +258,24 @@ const en_strings = [_][]const u8{
     "VPN config or share link",
     // tunnel_conf_help
     "Path to a .conf file, or an Amnezia vpn:// share link.",
+    // tunnel_vpn_type_prompt
+    "VPN type",
+    // tunnel_vpn_amneziawg
+    "AmneziaWG",
+    // tunnel_pool_current
+    "Configured tunnel pool:",
+    // tunnel_pool_empty
+    "No tunnel pool configured yet.",
+    // tunnel_pool_action_prompt
+    "Tunnel pool action",
+    // tunnel_pool_action_create
+    "Create new tunnel",
+    // tunnel_pool_action_replace
+    "Replace existing tunnel",
+    // tunnel_pool_selected_iface
+    "Selected tunnel interface",
+    // tunnel_pool_replace_warn
+    "The selected tunnel config will be replaced.",
 
     // ── Install ──
     // install_header
@@ -480,6 +507,24 @@ const ru_strings = [_][]const u8{
     "Конфигурация VPN или ссылка",
     // tunnel_conf_help
     "Путь к .conf файлу или ссылка vpn:// из Amnezia.",
+    // tunnel_vpn_type_prompt
+    "Тип VPN",
+    // tunnel_vpn_amneziawg
+    "AmneziaWG",
+    // tunnel_pool_current
+    "Настроенный пул туннелей:",
+    // tunnel_pool_empty
+    "Пул туннелей пока не настроен.",
+    // tunnel_pool_action_prompt
+    "Действие с пулом туннелей",
+    // tunnel_pool_action_create
+    "Создать новый туннель",
+    // tunnel_pool_action_replace
+    "Заменить существующий туннель",
+    // tunnel_pool_selected_iface
+    "Выбранный интерфейс туннеля",
+    // tunnel_pool_replace_warn
+    "Конфиг выбранного туннеля будет заменен.",
 
     // ── Install ──
     // install_header

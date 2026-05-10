@@ -263,6 +263,8 @@ sudo mtbuddy setup tunnel 'vpn://...'
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 ```
 
+В интерактивном меню `mtbuddy` настройка туннеля сначала спрашивает тип VPN (пока доступен только AmneziaWG), затем показывает текущий пул. Выберите **Создать новый туннель**, чтобы добавить следующий свободный `awgN`, или выберите существующий интерфейс, чтобы заменить конфиг этого участника пула.
+
 `mtbuddy` не трогает `[general].use_middle_proxy`, а настраивает только transport (`[upstream].type = "tunnel"`). После setup он ставит `mtproto-tunnel-pool.timer`, проверяет `mark 200` к Telegram DC и печатает команды для эксплуатации. Контроллер пула пробует Telegram через каждый туннель и делает `ip route replace`; автоматический failover не перезапускает `mtproto-proxy`.
 
 Пример конфига:

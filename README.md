@@ -200,6 +200,7 @@ sudo mtbuddy setup dashboard
 # VPN tunnel (for servers where Telegram DCs are blocked)
 sudo mtbuddy setup tunnel /path/to/awg0.conf
 sudo mtbuddy setup tunnel 'vpn://...'
+sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 
 # IPv6 hopping
 sudo mtbuddy ipv6-hop --check
@@ -268,6 +269,8 @@ sudo mtbuddy setup tunnel 'vpn://...'
 # Add or replace a specific pool member
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 ```
+
+In the interactive `mtbuddy` menu, tunnel setup first asks for the VPN type (AmneziaWG for now), then shows the current tunnel pool. Choose **Create new tunnel** to append the next free `awgN`, or choose an existing interface to replace that pool member's config.
 
 `mtbuddy` keeps `[general].use_middle_proxy` unchanged and only configures transport (`[upstream].type = "tunnel"`).
 After setup, it installs `mtproto-tunnel-pool.timer`, validates policy routes (`mark 200`) to Telegram DC ranges, and prints operational commands. The pool controller probes Telegram through each tunnel and rewrites table 200 with `ip route replace`; automatic failover does not restart `mtproto-proxy`.
