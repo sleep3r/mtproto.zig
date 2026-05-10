@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/sleep3r/mtproto.zig/compare/v0.22.1...v0.23.0) (2026-05-10)
+
+
+### Features
+
+* add tunnel pool failover and localized docs ([#250](https://github.com/sleep3r/mtproto.zig/issues/250)) ([6eb7dff](https://github.com/sleep3r/mtproto.zig/commit/6eb7dffa92af499793a304c69236a427027386f4))
+
 ## [0.22.1](https://github.com/sleep3r/mtproto.zig/compare/v0.22.0...v0.22.1) (2026-05-05)
 
 
