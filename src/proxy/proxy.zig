@@ -2786,7 +2786,6 @@ const EventLoop = struct {
         return middle_proxy_fallback.fallbackToDirect(
             self,
             slot,
-            mpFallbackSendDcNonce,
             mpFallbackCleanupFailedUpstreamConnect,
             mpFallbackSetSingleUpstreamCandidate,
             mpFallbackStartDirectConnect,
@@ -3225,10 +3224,6 @@ fn relayQueueClient(loop: *EventLoop, slot: *ConnectionSlot, data: []const u8) !
 
 fn startConnectUpstreamDc(loop: *EventLoop, slot: *ConnectionSlot, addr: Address) !void {
     return loop.startConnectUpstream(slot, addr, .dc);
-}
-
-fn mpFallbackSendDcNonce(loop: *EventLoop, slot: *ConnectionSlot) void {
-    return loop.sendDcNonce(slot);
 }
 
 fn mpFallbackCleanupFailedUpstreamConnect(loop: *EventLoop, slot: *ConnectionSlot) void {

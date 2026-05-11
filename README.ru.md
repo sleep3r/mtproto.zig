@@ -326,6 +326,7 @@ type = "auto"            # auto | direct | tunnel | socks5 | http
 [server]
 port = 443
 # public_ip = "proxy.example.com"
+# middle_proxy_nat_ip = "203.0.113.10"   # исходящий IPv4, который видит Telegram MiddleProxy
 max_connections = 512
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -361,6 +362,7 @@ alice = true
 | `[general] use_middle_proxy` | `false` | ME mode для DC1..5 |
 | `[server] port` | `443` | TCP listen port |
 | `[server] public_ip` | auto | Явный IP/domain для ссылок |
+| `[server] middle_proxy_nat_ip` | auto | IPv4 для MiddleProxy key derivation, если DC-трафик выходит через VPN/NAT IP, отличный от `public_ip` |
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
 | `[server] tag` | — | 32-hex promotion tag от [@MTProxybot](https://t.me/MTProxybot) |
@@ -472,6 +474,8 @@ docker run --rm \
   -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
   ghcr.io/sleep3r/mtproto.zig:latest
 ```
+
+MiddleProxy для медиа/промо чувствителен к исходному source IP:port, который попадает в encrypted handshake. Для Docker-деплоя с MiddleProxy лучше использовать host networking (`--network host`) или нативный `mtbuddy install`. Если DC-трафик выходит через VPN/NAT IP, отличный от `[server].public_ip`, задайте `[server].middle_proxy_nat_ip` этим egress IPv4; bridge или удаленный NAT, переписывающий source port, всё равно может ломать MiddleProxy handshake.
 
 Локальная сборка:
 

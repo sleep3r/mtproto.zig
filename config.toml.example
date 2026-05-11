@@ -27,6 +27,12 @@ port = 443
 # Accepts IP addresses or domain names (e.g. "proxy.example.com").
 # public_ip = "proxy.example.com"
 
+# IPv4 address Telegram MiddleProxy sees for outbound DC connections.
+# Set this when DC traffic exits through a VPN/NAT IP that differs from
+# public_ip. Docker bridge or remote VPN NAT that rewrites source ports can
+# still break MiddleProxy; prefer native/host-network deployments there.
+# middle_proxy_nat_ip = "203.0.113.10"
+
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).
 # tag = "1234567890abcdef1234567890abcdef"
 

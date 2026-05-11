@@ -338,6 +338,7 @@ type = "auto"            # auto | direct | tunnel | socks5 | http
 [server]
 port = 443
 # public_ip = "proxy.example.com"   # Override auto-detected IP (recommended with tunnel)
+# middle_proxy_nat_ip = "203.0.113.10"   # Outbound IPv4 seen by Telegram MiddleProxy
 max_connections = 512
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -384,6 +385,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] port` | `443` | TCP listen port |
 | `[server] bind_address` | — | Specific IP to bind the listen socket (default: all interfaces) |
 | `[server] public_ip` | auto | Override auto-detected IP/domain. Required with VPN tunnel; set IPv4 explicitly if clients fail on IPv6 links |
+| `[server] middle_proxy_nat_ip` | auto | IPv4 used in MiddleProxy key derivation when DC traffic exits through a VPN/NAT IP different from `public_ip` |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |
@@ -525,6 +527,8 @@ docker run --rm \
   -v "$PWD/config.toml:/etc/mtproto-proxy/config.toml:ro" \
   ghcr.io/sleep3r/mtproto.zig:latest
 ```
+
+MiddleProxy media/promo traffic is sensitive to the outbound source IP:port used in its encrypted handshake. For Docker deployments that need MiddleProxy, prefer host networking (`--network host`) or a native `mtbuddy` install. If outbound DC traffic exits through a VPN/NAT IP that differs from `[server].public_ip`, set `[server].middle_proxy_nat_ip` to that egress IPv4; bridge or remote NAT that rewrites source ports can still break MiddleProxy handshakes.
 
 Build locally:
 
