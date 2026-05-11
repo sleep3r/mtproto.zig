@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.1](https://github.com/sleep3r/mtproto.zig/compare/v0.23.0...v0.23.1) (2026-05-11)
+
+
+### Bug Fixes
+
+* install minisign during bootstrap ([#253](https://github.com/sleep3r/mtproto.zig/issues/253)) ([91728de](https://github.com/sleep3r/mtproto.zig/commit/91728de163e9e3ea0eabfa628ccfd6472010c4ff))
+
 ## [0.23.0](https://github.com/sleep3r/mtproto.zig/compare/v0.22.1...v0.23.0) (2026-05-10)
 
 
