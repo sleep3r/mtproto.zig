@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.2](https://github.com/sleep3r/mtproto.zig/compare/v0.23.1...v0.23.2) (2026-05-11)
+
+
+### Bug Fixes
+
+* reconnect direct fallback after middleproxy handshake failure ([#255](https://github.com/sleep3r/mtproto.zig/issues/255)) ([9bd2e88](https://github.com/sleep3r/mtproto.zig/commit/9bd2e88fc8a99ccd53144a3bb6121acd6041f0b3))
+
 ## [0.23.1](https://github.com/sleep3r/mtproto.zig/compare/v0.23.0...v0.23.1) (2026-05-11)
 
 
