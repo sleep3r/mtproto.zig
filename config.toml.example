@@ -24,13 +24,15 @@ port = 443
 # Override the auto-detected public IP shown in startup links.
 # Useful when running inside a VPN tunnel (AmneziaWG) where ifconfig.me
 # returns the tunnel exit IP instead of the server's real address.
+# This is the inbound address for clients; it is not used for MiddleProxy NAT.
 # Accepts IP addresses or domain names (e.g. "proxy.example.com").
 # public_ip = "proxy.example.com"
 
 # IPv4 address Telegram MiddleProxy sees for outbound DC connections.
 # Set this when DC traffic exits through a VPN/NAT IP that differs from
-# public_ip. Docker bridge or remote VPN NAT that rewrites source ports can
-# still break MiddleProxy; prefer native/host-network deployments there.
+# public_ip or when auto-detection cannot see the real egress. Docker bridge
+# or remote VPN NAT that rewrites source ports can still break MiddleProxy;
+# prefer native/host-network deployments there.
 # middle_proxy_nat_ip = "203.0.113.10"
 
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).

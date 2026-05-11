@@ -179,6 +179,104 @@ fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
     return network_detect.detectPublicIpv4(allocator, fetchUrlBytes);
 }
 
+fn detectMiddleProxyNatIpv4(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    comptime detect_awg: fn (std.mem.Allocator) ?[4]u8,
+    comptime detect_public: fn (std.mem.Allocator) ?[4]u8,
+) ?[4]u8 {
+    if (cfg.middle_proxy_nat_ip) |configured_nat_ip| {
+        if (parseIpv4Literal(configured_nat_ip)) |parsed_ip| {
+            var ip_buf: [16]u8 = undefined;
+            log.info("Using server.middle_proxy_nat_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
+            return parsed_ip;
+        }
+        log.info("server.middle_proxy_nat_ip='{s}' is not an IPv4 literal; falling back to AWG/public detection", .{configured_nat_ip});
+    }
+
+    if (detect_awg(allocator)) |awg_ip| {
+        var awg_ip_buf: [16]u8 = undefined;
+        log.info("Using AWG endpoint IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(awg_ip, &awg_ip_buf)});
+        return awg_ip;
+    }
+
+    if (detect_public(allocator)) |ip| {
+        var ip_buf: [16]u8 = undefined;
+        log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+        return ip;
+    }
+
+    return null;
+}
+
+test "middle-proxy NAT detection does not derive from public_ip" {
+    const Callbacks = struct {
+        fn noAwg(_: std.mem.Allocator) ?[4]u8 {
+            return null;
+        }
+
+        fn publicEgress(_: std.mem.Allocator) ?[4]u8 {
+            return .{ 203, 0, 113, 9 };
+        }
+    };
+
+    var cfg = Config{
+        .public_ip = "198.51.100.10",
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.users.deinit();
+    defer cfg.direct_users.deinit();
+
+    const got = detectMiddleProxyNatIpv4(std.testing.allocator, &cfg, Callbacks.noAwg, Callbacks.publicEgress).?;
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, got);
+}
+
+test "middle-proxy NAT detection prefers explicit override" {
+    const Callbacks = struct {
+        fn awgEgress(_: std.mem.Allocator) ?[4]u8 {
+            return .{ 203, 0, 113, 9 };
+        }
+
+        fn publicEgress(_: std.mem.Allocator) ?[4]u8 {
+            return .{ 198, 51, 100, 20 };
+        }
+    };
+
+    var cfg = Config{
+        .middle_proxy_nat_ip = "192.0.2.7",
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.users.deinit();
+    defer cfg.direct_users.deinit();
+
+    const got = detectMiddleProxyNatIpv4(std.testing.allocator, &cfg, Callbacks.awgEgress, Callbacks.publicEgress).?;
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, got);
+}
+
+test "middle-proxy NAT detection prefers AWG endpoint before public egress probe" {
+    const Callbacks = struct {
+        fn awgEgress(_: std.mem.Allocator) ?[4]u8 {
+            return .{ 203, 0, 113, 9 };
+        }
+
+        fn publicEgress(_: std.mem.Allocator) ?[4]u8 {
+            return .{ 198, 51, 100, 20 };
+        }
+    };
+
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.users.deinit();
+    defer cfg.direct_users.deinit();
+
+    const got = detectMiddleProxyNatIpv4(std.testing.allocator, &cfg, Callbacks.awgEgress, Callbacks.publicEgress).?;
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, got);
+}
+
 fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
     var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer io_instance.deinit();
@@ -678,46 +776,10 @@ pub const ProxyState = struct {
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
-        var detected_nat_ip4: ?[4]u8 = null;
-        if (cfg.datacenter_override == null) {
-            if (cfg.middle_proxy_nat_ip) |configured_nat_ip| {
-                if (parseIpv4Literal(configured_nat_ip)) |parsed_ip| {
-                    detected_nat_ip4 = parsed_ip;
-                    var ip_buf: [16]u8 = undefined;
-                    log.info("Using server.middle_proxy_nat_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
-                } else {
-                    log.info("server.middle_proxy_nat_ip='{s}' is not an IPv4 literal; falling back to AWG/public detection", .{configured_nat_ip});
-                }
-            }
-
-            if (detected_nat_ip4 == null) {
-                if (detectAwgEndpointIpv4(allocator)) |awg_ip| {
-                    detected_nat_ip4 = awg_ip;
-                    var awg_ip_buf: [16]u8 = undefined;
-                    log.info("Using AWG endpoint IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(awg_ip, &awg_ip_buf)});
-                }
-            }
-
-            if (detected_nat_ip4 == null) {
-                if (cfg.public_ip) |configured_public_ip| {
-                    if (parseIpv4Literal(configured_public_ip)) |parsed_ip| {
-                        detected_nat_ip4 = parsed_ip;
-                        var ip_buf: [16]u8 = undefined;
-                        log.info("Using server.public_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
-                    } else {
-                        log.info("server.public_ip='{s}' is not an IPv4 literal; auto-detecting middle-proxy NAT IP", .{configured_public_ip});
-                    }
-                }
-            }
-
-            if (detected_nat_ip4 == null) {
-                detected_nat_ip4 = detectPublicIpv4(allocator);
-                if (detected_nat_ip4) |ip| {
-                    var ip_buf: [16]u8 = undefined;
-                    log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
-                }
-            }
-        }
+        const detected_nat_ip4 = if (cfg.datacenter_override == null)
+            detectMiddleProxyNatIpv4(allocator, &cfg, detectAwgEndpointIpv4, detectPublicIpv4)
+        else
+            null;
 
         const user_secrets = try secrets.toOwnedSlice(allocator);
         errdefer allocator.free(user_secrets);
