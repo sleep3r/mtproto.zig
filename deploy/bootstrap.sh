@@ -39,6 +39,35 @@ step() { printf "  ${Y}●${N} %s...\n" "$*" >&2; }
 
 [ "$(id -u)" = "0" ] || fail "Run as root: sudo bash bootstrap.sh"
 
+install_minisign_if_needed() {
+  command -v minisign >/dev/null 2>&1 && return 0
+  [ "$INSECURE_MODE" = "1" ] && return 0
+
+  step "Installing minisign for signature verification"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
+    apt-get update -qq || fail "apt-get update failed while installing minisign"
+    apt-get install -y --no-install-recommends minisign \
+      || fail "apt-get could not install minisign"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y minisign || fail "dnf could not install minisign"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y minisign || fail "yum could not install minisign"
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache minisign || fail "apk could not install minisign"
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm minisign || fail "pacman could not install minisign"
+  else
+    fail "minisign is required for signature verification, but no supported package manager was found (use --insecure or MTPROTO_INSECURE=1 to bypass)"
+  fi
+
+  command -v minisign >/dev/null 2>&1 \
+    || fail "minisign is required for signature verification (use --insecure or MTPROTO_INSECURE=1 to bypass)"
+  ok "minisign installed"
+}
+
+install_minisign_if_needed
+
 curl_try_download() {
   local out="$1"
   shift
@@ -126,9 +155,6 @@ download_artifact() {
     local sig_name="${sha_name}.minisig"
     local sig_url="https://github.com/${REPO}/releases/download/${TAG}/${sig_name}"
     curl_download "$sig_url" "$TMP/${sig_name}" || fail "Signature download failed: $sig_url"
-    if ! command -v minisign >/dev/null 2>&1; then
-      fail "minisign is required for signature verification (use --insecure or MTPROTO_INSECURE=1 to bypass)"
-    fi
     step "Verifying signature for $artifact"
     minisign -V -q -m "$TMP/${sha_name}" -x "$TMP/${sig_name}" -P "$MINISIGN_PUBKEY" \
       || fail "Signature verification failed: $sha_name"
