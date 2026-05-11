@@ -200,6 +200,9 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     if (cfg.public_ip) |public_ip| {
         ui.print("public_ip = \"{s}\"\n", .{public_ip});
     }
+    if (cfg.middle_proxy_nat_ip) |middle_proxy_nat_ip| {
+        ui.print("middle_proxy_nat_ip = \"{s}\"\n", .{middle_proxy_nat_ip});
+    }
     ui.print("backlog = {d}\n", .{cfg.backlog});
     ui.print("max_connections = {d}\n", .{cfg.max_connections});
     ui.print("idle_timeout_sec = {d}\n", .{cfg.idle_timeout_sec});
