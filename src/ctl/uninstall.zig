@@ -82,7 +82,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-rf", "/opt/zapret" }) catch {};
 
     // 3. Remove user
-    _ = sys.execForward(&.{ "userdel", "mtproto" }) catch {};
+    const userdel = sys.commandOrPath("userdel", &.{ "/usr/sbin/userdel", "/sbin/userdel" });
+    _ = sys.execForward(&.{ userdel, "mtproto" }) catch {};
 
     // 4. Cleanup tunnel routing artifacts (new + legacy)
     _ = sys.execForward(&.{ "ip", "-4", "rule", "del", "fwmark", "200", "table", "200" }) catch {};

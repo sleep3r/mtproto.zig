@@ -792,13 +792,16 @@ fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
 }
 
 fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
+    const groupadd = sys.commandOrPath("groupadd", &.{ "/usr/sbin/groupadd", "/sbin/groupadd" });
+    const useradd = sys.commandOrPath("useradd", &.{ "/usr/sbin/useradd", "/sbin/useradd" });
+
     if (!groupExists(allocator, "mtproto")) {
-        if (!runRequired(ui, allocator, &.{ "groupadd", "--system", "mtproto" }, "Failed to create system group 'mtproto'")) return false;
+        if (!runRequired(ui, allocator, &.{ groupadd, "--system", "mtproto" }, "Failed to create system group 'mtproto'")) return false;
     }
 
     if (!userExists(allocator, "mtproto")) {
         if (!runRequired(ui, allocator, &.{
-            "useradd",
+            useradd,
             "--system",
             "--no-create-home",
             "--home-dir",
@@ -836,9 +839,9 @@ fn groupExists(allocator: std.mem.Allocator, name: []const u8) bool {
 }
 
 fn runRequired(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {
-    const result = sys.exec(allocator, argv) catch {
+    const result = sys.exec(allocator, argv) catch |err| {
         ui.fail(failure_msg);
-        ui.info("Failed to spawn command");
+        ui.print("  {s}◆{s} Failed to spawn command: {s}\n", .{ Color.info, Color.reset, @errorName(err) });
         return false;
     };
     defer result.deinit();
@@ -857,10 +860,10 @@ fn runRequiredWhileSpinning(
     failure_msg: []const u8,
     sp: *tui_mod.Spinner,
 ) bool {
-    const result = sys.exec(allocator, argv) catch {
+    const result = sys.exec(allocator, argv) catch |err| {
         sp.stop(false, "");
         ui.fail(failure_msg);
-        ui.info("Failed to spawn command");
+        ui.print("  {s}◆{s} Failed to spawn command: {s}\n", .{ Color.info, Color.reset, @errorName(err) });
         return false;
     };
     defer result.deinit();

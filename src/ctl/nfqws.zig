@@ -91,10 +91,24 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 
     // ── Install dependencies ──
     ui.step("Installing build dependencies...");
-    if (!runLogged(ui, allocator, &.{ "apt-get", "update", "-qq" }, "apt-get update failed")) return;
+    if (!runLogged(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq" }, "apt-get update failed")) return;
     if (!runLogged(ui, allocator, &.{
-        "apt-get",                "install",          "-y",         "build-essential", "git",
-        "libnetfilter-queue-dev", "libnfnetlink-dev", "libcap-dev", "iptables",        "libmnl-dev",
+        "env",
+        "DEBIAN_FRONTEND=noninteractive",
+        "apt-get",
+        "-o",
+        "Dpkg::Options::=--force-confdef",
+        "-o",
+        "Dpkg::Options::=--force-confold",
+        "install",
+        "-y",
+        "build-essential",
+        "git",
+        "libnetfilter-queue-dev",
+        "libnfnetlink-dev",
+        "libcap-dev",
+        "iptables",
+        "libmnl-dev",
         "zlib1g-dev",
     }, "Failed to install nfqws build dependencies")) return;
     ui.ok("Dependencies installed");
@@ -126,16 +140,21 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     removeNfqwsRules(allocator, "iptables");
     removeNfqwsRules(allocator, "ip6tables");
 
-    _ = sys.exec(allocator, &.{
+    if (!runLogged(ui, allocator, &.{
         "iptables", "-t",          "mangle",    "-A", "OUTPUT",
         "-p",       "tcp",         "--sport",   port, "-j",
         "NFQUEUE",  "--queue-num", NFQUEUE_NUM,
-    }) catch {};
+    }, "Failed to apply IPv4 NFQUEUE rule")) return;
     _ = sys.exec(allocator, &.{
         "ip6tables", "-t",          "mangle",    "-A", "OUTPUT",
         "-p",        "tcp",         "--sport",   port, "-j",
         "NFQUEUE",   "--queue-num", NFQUEUE_NUM,
     }) catch {};
+
+    if (!outputRuleContains(allocator, "iptables", "NFQUEUE")) {
+        ui.fail("IPv4 NFQUEUE rule was not installed");
+        return;
+    }
 
     _ = sys.exec(allocator, &.{ "bash", "-c", "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ip6tables-save > /etc/iptables/rules.v6" }) catch {};
     ui.ok("NFQUEUE rules applied (queue " ++ NFQUEUE_NUM ++ ")");
@@ -212,10 +231,17 @@ fn removeNfqwsRules(allocator: std.mem.Allocator, ipt: []const u8) void {
     _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
 }
 
+fn outputRuleContains(allocator: std.mem.Allocator, ipt: []const u8, needle: []const u8) bool {
+    const result = sys.exec(allocator, &.{ ipt, "-t", "mangle", "-S", "OUTPUT" }) catch return false;
+    defer result.deinit();
+    if (result.exit_code != 0) return false;
+    return std.mem.indexOf(u8, result.stdout, needle) != null;
+}
+
 fn runLogged(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {
-    const result = sys.exec(allocator, argv) catch {
+    const result = sys.exec(allocator, argv) catch |err| {
         ui.fail(failure_msg);
-        ui.info("Failed to spawn command");
+        ui.print("  {s}◆{s} Failed to spawn command: {s}\n", .{ Color.info, Color.reset, @errorName(err) });
         return false;
     };
     defer result.deinit();

@@ -69,11 +69,19 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         ui.ok("Nginx already installed");
     } else {
         ui.step("Installing Nginx...");
-        _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled" }) catch {};
-        sys.writeFile("/etc/nginx/sites-available/default", "# Empty default\n") catch {};
-        sys.execSilent(allocator, &.{ "ln", "-sf", "/etc/nginx/sites-available/default", "/etc/nginx/sites-enabled/default" });
-        _ = sys.execForward(&.{ "apt-get", "update", "-qq" }) catch {};
-        _ = sys.execForward(&.{ "apt-get", "install", "-y", "nginx" }) catch {};
+        if (!runLogged(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq" }, "apt-get update failed")) return;
+        if (!runLogged(ui, allocator, &.{
+            "env",
+            "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",
+            "-o",
+            "Dpkg::Options::=--force-confdef",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+            "install",
+            "-y",
+            "nginx",
+        }, "Failed to install Nginx")) return;
         ui.ok("Nginx installed");
     }
 
@@ -232,4 +240,36 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         .{ .label = "Bad clients are now forwarded to local Nginx (<1ms RTT)", .style = .success },
         .{ .label = "Timing side-channel eliminated", .style = .success },
     });
+}
+
+fn runLogged(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {
+    const result = sys.exec(allocator, argv) catch |err| {
+        ui.fail(failure_msg);
+        ui.print("  {s}◆{s} Failed to spawn command: {s}\n", .{ Color.info, Color.reset, @errorName(err) });
+        return false;
+    };
+    defer result.deinit();
+
+    if (result.exit_code == 0) return true;
+
+    ui.fail(failure_msg);
+    printCommandOutput(ui, &result);
+    return false;
+}
+
+fn printCommandOutput(ui: *Tui, result: *const sys.ExecResult) void {
+    const stderr = std.mem.trim(u8, result.stderr, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (stderr.len > 0) {
+        ui.print("  stderr:\n{s}\n", .{tailBytes(stderr, 4096)});
+    }
+
+    const stdout = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (stdout.len > 0) {
+        ui.print("  stdout:\n{s}\n", .{tailBytes(stdout, 4096)});
+    }
+}
+
+fn tailBytes(bytes: []const u8, max_len: usize) []const u8 {
+    if (bytes.len <= max_len) return bytes;
+    return bytes[bytes.len - max_len ..];
 }

@@ -182,6 +182,17 @@ pub fn commandExists(name: []const u8) bool {
     return result.exit_code == 0;
 }
 
+/// Resolve a command by PATH first, then by known absolute-path fallbacks.
+pub fn commandOrPath(name: []const u8, candidates: []const []const u8) []const u8 {
+    if (commandExists(name)) return name;
+
+    for (candidates) |candidate| {
+        if (fileExists(candidate)) return candidate;
+    }
+
+    return name;
+}
+
 /// Check if a systemd service is active.
 pub fn isServiceActive(service: []const u8) bool {
     const result = exec(std.heap.page_allocator, &.{ "systemctl", "is-active", "--quiet", service }) catch return false;
