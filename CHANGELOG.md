@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.3](https://github.com/sleep3r/mtproto.zig/compare/v0.23.2...v0.23.3) (2026-05-13)
+
+
+### Bug Fixes
+
+* harden Debian installer commands ([#258](https://github.com/sleep3r/mtproto.zig/issues/258)) ([685aa12](https://github.com/sleep3r/mtproto.zig/commit/685aa125ef5c549dd787e415139b076bed63347a))
+
 ## [0.23.2](https://github.com/sleep3r/mtproto.zig/compare/v0.23.1...v0.23.2) (2026-05-11)
 
 
