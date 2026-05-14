@@ -106,6 +106,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "bash", "-c", "while iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do true; done" }) catch {};
 
     // Note: Self-removal: The mtbuddy binary is running right now. Removing it while running usually works on Linux.
+    _ = sys.execForward(&.{ "bash", "-c", "[ \"$(readlink -f /usr/bin/mtbuddy 2>/dev/null)\" = /usr/local/bin/mtbuddy ] && rm -f /usr/bin/mtbuddy || true" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtbuddy" }) catch {};
 
     sp.stop(true, "");

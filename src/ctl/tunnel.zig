@@ -728,14 +728,14 @@ fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
     if (!runCommandChecked(
         ui,
         allocator,
-        &.{ "apt-get", "-o", "APT::Update::Error-Mode=any", "update", "-qq" },
+        &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "-o", "APT::Update::Error-Mode=any", "update", "-qq" },
         "Failed to refresh apt package index",
     )) return false;
 
     if (!runCommandChecked(
         ui,
         allocator,
-        &.{ "apt-get", "install", "-y", "software-properties-common" },
+        &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "software-properties-common" },
         "Failed to install software-properties-common",
     )) return false;
 
@@ -749,14 +749,14 @@ fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
     if (!runCommandChecked(
         ui,
         allocator,
-        &.{ "apt-get", "-o", "APT::Update::Error-Mode=any", "update", "-qq" },
+        &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "-o", "APT::Update::Error-Mode=any", "update", "-qq" },
         "Failed to refresh apt index after adding Amnezia PPA",
     )) return false;
 
     if (!runCommandChecked(
         ui,
         allocator,
-        &.{ "apt-get", "install", "-y", "amneziawg-tools" },
+        &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "amneziawg-tools" },
         "Failed to install amneziawg-tools",
     )) return false;
 

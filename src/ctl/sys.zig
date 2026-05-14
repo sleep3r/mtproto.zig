@@ -56,6 +56,7 @@ pub fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !ExecResult 
 
     const result = try std.process.run(allocator, io_instance.io(), .{
         .argv = argv,
+        .expand_arg0 = .expand,
         .stdout_limit = std.Io.Limit.limited(1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(1024 * 1024),
     });
@@ -83,6 +84,7 @@ pub fn execForward(argv: []const []const u8) !u8 {
     const io_ctx = io_instance.io();
     var child = try std.process.spawn(io_ctx, .{
         .argv = argv,
+        .expand_arg0 = .expand,
         .stdout = .inherit,
         .stderr = .inherit,
     });
@@ -177,18 +179,28 @@ fn containsWord(haystack: []const u8, word: []const u8) bool {
 
 /// Check if a command exists on PATH.
 pub fn commandExists(name: []const u8) bool {
-    const result = exec(std.heap.page_allocator, &.{ "which", name }) catch return false;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return fileExists(name);
+
+    const shell = if (fileExists("/bin/sh")) "/bin/sh" else "sh";
+    const result = exec(std.heap.page_allocator, &.{
+        shell,
+        "-c",
+        "command -v \"$1\" >/dev/null 2>&1",
+        "sh",
+        name,
+    }) catch return false;
     defer result.deinit();
     return result.exit_code == 0;
 }
 
-/// Resolve a command by PATH first, then by known absolute-path fallbacks.
+/// Resolve a command by known absolute-path fallbacks first, then PATH.
+/// This avoids minimal root environments losing /usr/sbin tools at spawn time.
 pub fn commandOrPath(name: []const u8, candidates: []const []const u8) []const u8 {
-    if (commandExists(name)) return name;
-
     for (candidates) |candidate| {
         if (fileExists(candidate)) return candidate;
     }
+
+    if (commandExists(name)) return name;
 
     return name;
 }

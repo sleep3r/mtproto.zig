@@ -95,8 +95,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     // ── Ensure signature verifier dependency ──
     if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
         ui.step("Installing minisign for release signature verification...");
-        _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
-        _ = sys.exec(allocator, &.{ "apt-get", "install", "-y", "minisign" }) catch {};
+        _ = sys.exec(allocator, &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
+        _ = sys.exec(allocator, &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "minisign" }) catch {};
         if (!sys.commandExists("minisign")) {
             ui.fail("minisign is required for release signature verification");
             return;

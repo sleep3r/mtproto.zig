@@ -313,23 +313,41 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     {
         var sp = ui.spinner(ui.str(.install_checking_deps));
         sp.start();
-        _ = sys.exec(allocator, &.{ "apt-get", "update", "-qq" }) catch {};
+        if (!sys.commandExists("apt-get")) {
+            sp.stop(false, "");
+            ui.fail("apt-get is required to install system dependencies");
+            return;
+        }
+        if (!runRequiredWhileSpinning(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }, "apt-get update failed", &sp)) return;
         const base_packages: []const []const u8 = if (signature_available and !insecure_mode)
             &.{
-                "apt-get",  "install", "-y",
-                "iptables", "xxd",     "curl",
-                "openssl",  "tar",     "minisign",
+                "env",                     "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",                 "-o",
+                "DPkg::Lock::Timeout=600", "install",
+                "-y",                      "--no-install-recommends",
+                "iptables",                "xxd",
+                "curl",                    "openssl",
+                "tar",                     "passwd",
+                "minisign",
             }
         else
             &.{
-                "apt-get",  "install", "-y",
-                "iptables", "xxd",     "curl",
-                "openssl",  "tar",
+                "env",                     "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",                 "-o",
+                "DPkg::Lock::Timeout=600", "install",
+                "-y",                      "--no-install-recommends",
+                "iptables",                "xxd",
+                "curl",                    "openssl",
+                "tar",                     "passwd",
             };
-        _ = sys.exec(allocator, base_packages) catch {};
+        if (!runRequiredWhileSpinning(ui, allocator, base_packages, "Failed to install system dependencies", &sp)) return;
         if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
             sp.stop(false, "");
             ui.fail("minisign is required for release signature verification");
+            return;
+        }
+        if (!requiredAccountToolsAvailable(ui)) {
+            sp.stop(false, "");
             return;
         }
         sp.stop(true, "");
@@ -479,11 +497,17 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.ok(ui.str(.install_tcpmss_ok));
     }
 
+    var summary_opts = opts;
+
     // ── Masking (via Zig module) ──
     if (opts.enable_masking) {
         masking.execute(ui, allocator, .{ .tls_domain = opts.tls_domain }) catch {
             ui.warn("Masking setup failed");
         };
+        summary_opts.enable_masking = sys.fileExists("/etc/nginx/sites-enabled/mtproto-masking") and sys.isServiceActive("nginx");
+        if (!summary_opts.enable_masking) {
+            ui.warn("Masking setup did not complete; final summary will show it disabled.");
+        }
     }
 
     // ── nfqws (via Zig module) ──
@@ -491,6 +515,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         nfqws.execute(ui, allocator, .{}) catch {
             ui.warn("nfqws setup failed");
         };
+        summary_opts.enable_nfqws = sys.fileExists("/opt/zapret/nfq/nfqws") and sys.isServiceActive("nfqws-mtproto");
+        if (!summary_opts.enable_nfqws) {
+            ui.warn("nfqws setup did not complete; final summary will show it disabled.");
+        }
     }
 
     // ── Final restart ──
@@ -521,7 +549,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     {
         var cfg_doc = toml.TomlDoc.load(allocator, config_path_buf) catch {
-            printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts.tls_domain, opts, config_path_buf);
+            printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts.tls_domain, summary_opts, config_path_buf);
             return;
         };
         defer cfg_doc.deinit();
@@ -563,7 +591,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         summary_port,
         secret_from_cfg,
         summary_tls_domain,
-        opts,
+        summary_opts,
         config_path_buf,
     );
 }
@@ -792,8 +820,22 @@ fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
 }
 
 fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
-    const groupadd = sys.commandOrPath("groupadd", &.{ "/usr/sbin/groupadd", "/sbin/groupadd" });
-    const useradd = sys.commandOrPath("useradd", &.{ "/usr/sbin/useradd", "/sbin/useradd" });
+    const groupadd_candidates = &[_][]const u8{ "/usr/sbin/groupadd", "/sbin/groupadd" };
+    const useradd_candidates = &[_][]const u8{ "/usr/sbin/useradd", "/sbin/useradd" };
+
+    if (!commandAvailable("groupadd", groupadd_candidates)) {
+        ui.fail("Missing required system command 'groupadd'");
+        ui.info("Install Debian package 'passwd' and run the installer again.");
+        return false;
+    }
+    if (!commandAvailable("useradd", useradd_candidates)) {
+        ui.fail("Missing required system command 'useradd'");
+        ui.info("Install Debian package 'passwd' and run the installer again.");
+        return false;
+    }
+
+    const groupadd = sys.commandOrPath("groupadd", groupadd_candidates);
+    const useradd = sys.commandOrPath("useradd", useradd_candidates);
 
     if (!groupExists(allocator, "mtproto")) {
         if (!runRequired(ui, allocator, &.{ groupadd, "--system", "mtproto" }, "Failed to create system group 'mtproto'")) return false;
@@ -824,6 +866,28 @@ fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
         return false;
     }
     return true;
+}
+
+fn requiredAccountToolsAvailable(ui: *Tui) bool {
+    if (!commandAvailable("groupadd", &.{ "/usr/sbin/groupadd", "/sbin/groupadd" })) {
+        ui.fail("Missing required system command 'groupadd' after dependency install");
+        ui.info("Debian package 'passwd' should provide it.");
+        return false;
+    }
+    if (!commandAvailable("useradd", &.{ "/usr/sbin/useradd", "/sbin/useradd" })) {
+        ui.fail("Missing required system command 'useradd' after dependency install");
+        ui.info("Debian package 'passwd' should provide it.");
+        return false;
+    }
+    return true;
+}
+
+fn commandAvailable(name: []const u8, candidates: []const []const u8) bool {
+    if (sys.commandExists(name)) return true;
+    for (candidates) |candidate| {
+        if (sys.fileExists(candidate)) return true;
+    }
+    return false;
 }
 
 fn userExists(allocator: std.mem.Allocator, name: []const u8) bool {

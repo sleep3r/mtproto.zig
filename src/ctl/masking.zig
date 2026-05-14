@@ -69,11 +69,13 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         ui.ok("Nginx already installed");
     } else {
         ui.step("Installing Nginx...");
-        if (!runLogged(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq" }, "apt-get update failed")) return;
+        if (!runLogged(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }, "apt-get update failed")) return;
         if (!runLogged(ui, allocator, &.{
             "env",
             "DEBIAN_FRONTEND=noninteractive",
             "apt-get",
+            "-o",
+            "DPkg::Lock::Timeout=600",
             "-o",
             "Dpkg::Options::=--force-confdef",
             "-o",

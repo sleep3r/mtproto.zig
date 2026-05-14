@@ -74,6 +74,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 
     // ── Uninstall ──
     if (opts.remove) {
+        const ipt = iptablesCommands();
+
         ui.step("Removing nfqws-mtproto...");
         _ = sys.execForward(&.{ "systemctl", "stop", SERVICE_NAME }) catch {};
         _ = sys.execForward(&.{ "systemctl", "disable", SERVICE_NAME }) catch {};
@@ -81,9 +83,16 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
 
         // Remove iptables rules
-        removeNfqwsRules(allocator, "iptables");
-        removeNfqwsRules(allocator, "ip6tables");
-        _ = sys.exec(allocator, &.{ "bash", "-c", "iptables-save > /etc/iptables/rules.v4 2>/dev/null; ip6tables-save > /etc/iptables/rules.v6 2>/dev/null" }) catch {};
+        removeNfqwsRules(allocator, ipt.iptables);
+        removeNfqwsRules(allocator, ipt.ip6tables);
+        var save_cmd_buf: [512]u8 = undefined;
+        const save_cmd = std.fmt.bufPrint(&save_cmd_buf, "{s} > /etc/iptables/rules.v4 2>/dev/null; {s} > /etc/iptables/rules.v6 2>/dev/null", .{
+            ipt.iptables_save,
+            ipt.ip6tables_save,
+        }) catch "";
+        if (save_cmd.len > 0) {
+            _ = sys.exec(allocator, &.{ "bash", "-c", save_cmd }) catch {};
+        }
 
         ui.ok("nfqws-mtproto removed");
         return;
@@ -91,11 +100,13 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 
     // ── Install dependencies ──
     ui.step("Installing build dependencies...");
-    if (!runLogged(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq" }, "apt-get update failed")) return;
+    if (!runLogged(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }, "apt-get update failed")) return;
     if (!runLogged(ui, allocator, &.{
         "env",
         "DEBIAN_FRONTEND=noninteractive",
         "apt-get",
+        "-o",
+        "DPkg::Lock::Timeout=600",
         "-o",
         "Dpkg::Options::=--force-confdef",
         "-o",
@@ -103,6 +114,12 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         "install",
         "-y",
         "build-essential",
+        "gcc",
+        "g++",
+        "cpp",
+        "make",
+        "binutils",
+        "libc6-dev",
         "git",
         "libnetfilter-queue-dev",
         "libnfnetlink-dev",
@@ -113,10 +130,14 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     }, "Failed to install nfqws build dependencies")) return;
     ui.ok("Dependencies installed");
 
+    const ipt = iptablesCommands();
+
     // ── Clone and build zapret ──
     if (sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws")) {
         ui.ok("nfqws already built");
     } else {
+        const cc = chooseWorkingCCompiler(ui, allocator) orelse return;
+
         ui.step("Cloning and building zapret...");
         _ = sys.exec(allocator, &.{ "rm", "-rf", ZAPRET_DIR }) catch {};
         if (!runLogged(ui, allocator, &.{
@@ -124,8 +145,14 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         }, "Failed to clone zapret")) return;
 
         _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
+        var make_cmd_buf: [128]u8 = undefined;
+        const make_cmd = std.fmt.bufPrint(
+            &make_cmd_buf,
+            "cd " ++ ZAPRET_DIR ++ "/nfq && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin make CC={s}",
+            .{cc},
+        ) catch "cd " ++ ZAPRET_DIR ++ "/nfq && make";
         if (!runLogged(ui, allocator, &.{
-            "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make",
+            "bash", "-c", make_cmd,
         }, "nfqws build failed")) return;
 
         if (!sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws")) {
@@ -137,31 +164,38 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 
     // ── Configure iptables NFQUEUE ──
     ui.step("Setting up NFQUEUE rules...");
-    removeNfqwsRules(allocator, "iptables");
-    removeNfqwsRules(allocator, "ip6tables");
+    removeNfqwsRules(allocator, ipt.iptables);
+    removeNfqwsRules(allocator, ipt.ip6tables);
 
     if (!runLogged(ui, allocator, &.{
-        "iptables", "-t",          "mangle",    "-A", "OUTPUT",
-        "-p",       "tcp",         "--sport",   port, "-j",
-        "NFQUEUE",  "--queue-num", NFQUEUE_NUM,
+        ipt.iptables, "-t",          "mangle",    "-A", "OUTPUT",
+        "-p",         "tcp",         "--sport",   port, "-j",
+        "NFQUEUE",    "--queue-num", NFQUEUE_NUM,
     }, "Failed to apply IPv4 NFQUEUE rule")) return;
     _ = sys.exec(allocator, &.{
-        "ip6tables", "-t",          "mangle",    "-A", "OUTPUT",
-        "-p",        "tcp",         "--sport",   port, "-j",
-        "NFQUEUE",   "--queue-num", NFQUEUE_NUM,
+        ipt.ip6tables, "-t",          "mangle",    "-A", "OUTPUT",
+        "-p",          "tcp",         "--sport",   port, "-j",
+        "NFQUEUE",     "--queue-num", NFQUEUE_NUM,
     }) catch {};
 
-    if (!outputRuleContains(allocator, "iptables", "NFQUEUE")) {
+    if (!outputRuleContains(allocator, ipt.iptables, "NFQUEUE")) {
         ui.fail("IPv4 NFQUEUE rule was not installed");
         return;
     }
 
-    _ = sys.exec(allocator, &.{ "bash", "-c", "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ip6tables-save > /etc/iptables/rules.v6" }) catch {};
+    var save_cmd_buf: [512]u8 = undefined;
+    const save_cmd = std.fmt.bufPrint(&save_cmd_buf, "mkdir -p /etc/iptables && {s} > /etc/iptables/rules.v4 && {s} > /etc/iptables/rules.v6", .{
+        ipt.iptables_save,
+        ipt.ip6tables_save,
+    }) catch "";
+    if (save_cmd.len > 0) {
+        _ = sys.exec(allocator, &.{ "bash", "-c", save_cmd }) catch {};
+    }
     ui.ok("NFQUEUE rules applied (queue " ++ NFQUEUE_NUM ++ ")");
 
     // ── Create systemd service ──
     ui.step("Creating systemd service...");
-    var svc_buf: [2048]u8 = undefined;
+    var svc_buf: [3072]u8 = undefined;
     const svc_content = std.fmt.bufPrint(&svc_buf,
         \\[Unit]
         \\Description=nfqws TCP desync for MTProto proxy
@@ -170,6 +204,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         \\
         \\[Service]
         \\Type=simple
+        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
+        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
         \\ExecStart={[zapret_dir]s}/nfq/nfqws \
         \\    --qnum={[queue]s} \
         \\    --dpi-desync=fake,split2 \
@@ -187,7 +225,14 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         \\
         \\[Install]
         \\WantedBy=multi-user.target
-    , .{ .zapret_dir = ZAPRET_DIR, .queue = NFQUEUE_NUM, .ttl = opts.ttl }) catch "";
+    , .{
+        .iptables = ipt.iptables,
+        .ip6tables = ipt.ip6tables,
+        .port = port,
+        .zapret_dir = ZAPRET_DIR,
+        .queue = NFQUEUE_NUM,
+        .ttl = opts.ttl,
+    }) catch "";
 
     if (svc_content.len > 0) {
         sys.writeFile("/etc/systemd/system/" ++ SERVICE_NAME ++ ".service", svc_content) catch {
@@ -218,6 +263,103 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         .{ .label = "Split at byte 1 → DPI can't reassemble", .style = .success },
         .{ .label = "MD5sig fooling → fake never reaches client", .style = .success },
     });
+}
+
+const IptablesCommands = struct {
+    iptables: []const u8,
+    ip6tables: []const u8,
+    iptables_save: []const u8,
+    ip6tables_save: []const u8,
+};
+
+fn iptablesCommands() IptablesCommands {
+    return .{
+        .iptables = sys.commandOrPath("iptables", &.{ "/usr/sbin/iptables", "/sbin/iptables" }),
+        .ip6tables = sys.commandOrPath("ip6tables", &.{ "/usr/sbin/ip6tables", "/sbin/ip6tables" }),
+        .iptables_save = sys.commandOrPath("iptables-save", &.{ "/usr/sbin/iptables-save", "/sbin/iptables-save" }),
+        .ip6tables_save = sys.commandOrPath("ip6tables-save", &.{ "/usr/sbin/ip6tables-save", "/sbin/ip6tables-save" }),
+    };
+}
+
+fn chooseWorkingCCompiler(ui: *Tui, allocator: std.mem.Allocator) ?[]const u8 {
+    if (sys.fileExists("/usr/bin/gcc")) return "/usr/bin/gcc";
+    if (sys.commandExists("gcc")) return "gcc";
+
+    ui.warn("GCC not found after dependency install; reinstalling GCC toolchain...");
+    if (!repairGccToolchain(ui, allocator)) return null;
+
+    if (sys.fileExists("/usr/bin/gcc")) return "/usr/bin/gcc";
+    if (sys.commandExists("gcc")) return "gcc";
+
+    ui.fail("GCC is required to build nfqws but was not found");
+    ui.info("On Debian install it with: apt-get install gcc build-essential");
+    return null;
+}
+
+fn repairGccToolchain(ui: *Tui, allocator: std.mem.Allocator) bool {
+    _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
+
+    if (!runLogged(ui, allocator, &.{
+        "env",
+        "DEBIAN_FRONTEND=noninteractive",
+        "apt-get",
+        "-o",
+        "DPkg::Lock::Timeout=600",
+        "-o",
+        "Dpkg::Options::=--force-confdef",
+        "-o",
+        "Dpkg::Options::=--force-confold",
+        "install",
+        "--reinstall",
+        "-y",
+        "build-essential",
+        "gcc",
+        "g++",
+        "cpp",
+        "make",
+        "binutils",
+        "libc6-dev",
+    }, "Failed to reinstall GCC toolchain")) return false;
+
+    reinstallVersionedGccPackages(ui, allocator);
+    return true;
+}
+
+fn reinstallVersionedGccPackages(ui: *Tui, allocator: std.mem.Allocator) void {
+    const result = sys.exec(allocator, &.{ "gcc", "-dumpversion" }) catch return;
+    defer result.deinit();
+    if (result.exit_code != 0) return;
+
+    const version = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    var dot_pos = std.mem.indexOfScalar(u8, version, '.') orelse version.len;
+    if (dot_pos == 0) return;
+    dot_pos = @min(dot_pos, 8);
+    const major = version[0..dot_pos];
+    for (major) |c| {
+        if (!std.ascii.isDigit(c)) return;
+    }
+
+    var gcc_pkg_buf: [32]u8 = undefined;
+    var cpp_pkg_buf: [32]u8 = undefined;
+    const gcc_pkg = std.fmt.bufPrint(&gcc_pkg_buf, "gcc-{s}", .{major}) catch return;
+    const cpp_pkg = std.fmt.bufPrint(&cpp_pkg_buf, "cpp-{s}", .{major}) catch return;
+
+    const reinstall = sys.exec(allocator, &.{
+        "env",
+        "DEBIAN_FRONTEND=noninteractive",
+        "apt-get",
+        "-o",
+        "DPkg::Lock::Timeout=600",
+        "install",
+        "--reinstall",
+        "-y",
+        gcc_pkg,
+        cpp_pkg,
+    }) catch return;
+    defer reinstall.deinit();
+    if (reinstall.exit_code != 0) {
+        ui.warn("Versioned GCC package reinstall was skipped");
+    }
 }
 
 fn removeNfqwsRules(allocator: std.mem.Allocator, ipt: []const u8) void {

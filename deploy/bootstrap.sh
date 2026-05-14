@@ -46,8 +46,8 @@ install_minisign_if_needed() {
   step "Installing minisign for signature verification"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
-    apt-get update -qq || fail "apt-get update failed while installing minisign"
-    apt-get install -y --no-install-recommends minisign \
+    apt-get -o DPkg::Lock::Timeout=600 update -qq || fail "apt-get update failed while installing minisign"
+    apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends minisign \
       || fail "apt-get could not install minisign"
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y minisign || fail "dnf could not install minisign"
@@ -200,9 +200,16 @@ fi
 install -m 0755 "$BUDDY_BIN" "$INSTALL_TO"
 ok "mtbuddy installed → $INSTALL_TO"
 
+if ! command -v mtbuddy >/dev/null 2>&1 && [ -d /usr/bin ]; then
+  if [ ! -e /usr/bin/mtbuddy ] || [ -L /usr/bin/mtbuddy ]; then
+    ln -sf "$INSTALL_TO" /usr/bin/mtbuddy \
+      && ok "mtbuddy linked → /usr/bin/mtbuddy"
+  fi
+fi
+
 # ── run with forwarded args ───────────────────────────────────────
 if [ "${#FORWARD_ARGS[@]}" -gt 0 ]; then
-  exec mtbuddy "${FORWARD_ARGS[@]}"
+  exec "$INSTALL_TO" "${FORWARD_ARGS[@]}"
 else
-  mtbuddy --help
+  "$INSTALL_TO" --help
 fi
