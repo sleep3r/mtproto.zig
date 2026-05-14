@@ -200,6 +200,9 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     if (cfg.public_ip) |public_ip| {
         ui.print("public_ip = \"{s}\"\n", .{public_ip});
     }
+    if (cfg.public_port) |public_port| {
+        ui.print("public_port = {d}\n", .{public_port});
+    }
     if (cfg.middle_proxy_nat_ip) |middle_proxy_nat_ip| {
         ui.print("middle_proxy_nat_ip = \"{s}\"\n", .{middle_proxy_nat_ip});
     }

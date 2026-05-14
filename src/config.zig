@@ -150,6 +150,9 @@ pub const Config = struct {
     bind_address: ?[]const u8 = null,
     /// Explicit public IP address. If set, bypasses detection via external services.
     public_ip: ?[]const u8 = null,
+    /// Explicit public port shown in generated Telegram client links.
+    /// Useful when the proxy listens on an internal HAProxy/backend port.
+    public_port: ?u16 = null,
     /// Explicit IPv4 to use in Telegram MiddleProxy AES key derivation.
     /// Useful when `public_ip` is a domain name or when tunnel egress differs
     /// from generic "what is my IP" services.
@@ -231,6 +234,11 @@ pub const Config = struct {
 
     pub fn ownsTlsDomain(self: *const Config) bool {
         return self.tls_domain.ptr != default_tls_domain.ptr;
+    }
+
+    /// Port to advertise in generated client links.
+    pub fn publicLinkPort(self: *const Config) u16 {
+        return self.public_port orelse self.port;
     }
 
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
@@ -462,6 +470,9 @@ pub const Config = struct {
                         }
                     } else if (std.mem.eql(u8, key, "public_ip")) {
                         cfg.public_ip = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "public_port")) {
+                        const parsed = std.fmt.parseInt(u16, value, 10) catch 0;
+                        if (parsed > 0) cfg.public_port = parsed;
                     } else if (std.mem.eql(u8, key, "middle_proxy_nat_ip")) {
                         cfg.middle_proxy_nat_ip = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
@@ -617,6 +628,7 @@ test "parse config - valid complete" {
         \\
         \\[server]
         \\port = 8443
+        \\public_port = 443
         \\backlog = 8192
         \\max_connections = 6000
         \\idle_timeout_sec = 180
@@ -637,6 +649,8 @@ test "parse config - valid complete" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
+    try std.testing.expectEqual(@as(u16, 443), cfg.public_port.?);
+    try std.testing.expectEqual(@as(u16, 443), cfg.publicLinkPort());
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
@@ -662,6 +676,8 @@ test "parse config - missing fields defaults" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expect(cfg.public_port == null);
+    try std.testing.expectEqual(@as(u16, 443), cfg.publicLinkPort());
     try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);

@@ -87,7 +87,7 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
         ui.hint("Pass --server <ip-or-domain>, or set [server].public_ip in config.toml");
         return error.PublicAddressUnavailable;
     };
-    const port = opts.port orelse cfg.port;
+    const port = opts.port orelse cfg.publicLinkPort();
     const domain = opts.domain orelse cfg.tls_domain;
 
     ui.section("MTProto links");
@@ -136,6 +136,7 @@ fn printLinksHelp(ui: *Tui) void {
     ui.writeRaw("\n");
     ui.writeRaw("  mtbuddy links [--config <path>] [--server <host>] [--port <port>] [--domain <tls-domain>]\n\n");
     ui.writeRaw("  Prints tg:// and t.me proxy links from [access.users].\n");
+    ui.writeRaw("  Link port defaults to [server].public_port, then [server].port.\n");
     ui.writeRaw("  Sensitive output: links contain user secrets.\n\n");
     ui.writeRaw("  mtbuddy secret\n");
     ui.writeRaw("  Prints a fresh 32-hex MTProto secret.\n\n");

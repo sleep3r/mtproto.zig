@@ -399,6 +399,7 @@ def _load_proxy_runtime_config() -> dict:
     defaults = {
         "public_ip": "",
         "port": 443,
+        "public_port": 0,
         "mask": True,
         "mask_port": 443,
         "tls_domain": "google.com",
@@ -432,6 +433,7 @@ def _load_proxy_runtime_config() -> dict:
     result = {
         "public_ip": defaults["public_ip"],
         "port": defaults["port"],
+        "public_port": defaults["public_port"],
         "mask": defaults["mask"],
         "mask_port": defaults["mask_port"],
         "tls_domain": defaults["tls_domain"],
@@ -487,6 +489,10 @@ def _load_proxy_runtime_config() -> dict:
                         digits = "".join(ch for ch in value if ch.isdigit())
                         if digits:
                             result["port"] = int(digits)
+                    elif key == "public_port":
+                        digits = "".join(ch for ch in value if ch.isdigit())
+                        if digits:
+                            result["public_port"] = int(digits)
 
                 elif section == "[general]":
                     if key == "use_middle_proxy":
@@ -1147,7 +1153,7 @@ def _users_status() -> dict:
     server = str(cfg.get("public_ip") or "").strip()
     if not server:
         server = _detect_public_ip()
-    port = int(cfg.get("port", 443))
+    port = int(cfg.get("public_port", 0) or cfg.get("port", 443))
     tls_domain = str(cfg.get("tls_domain", "google.com"))
     domain_hex = tls_domain.encode("utf-8", errors="ignore").hex()
 
@@ -1207,6 +1213,7 @@ def _users_status() -> dict:
         "links_ready": bool(server),
         "server": server,
         "port": port,
+        "listen_port": int(cfg.get("port", 443)),
         "tls_domain": tls_domain,
         "items": items,
     }

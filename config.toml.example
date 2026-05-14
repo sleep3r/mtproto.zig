@@ -28,6 +28,10 @@ port = 443
 # Accepts IP addresses or domain names (e.g. "proxy.example.com").
 # public_ip = "proxy.example.com"
 
+# Override the port shown in generated Telegram client links.
+# Useful behind HAProxy/Nginx: listen on a backend port, advertise 443.
+# public_port = 443
+
 # IPv4 address Telegram MiddleProxy sees for outbound DC connections.
 # Set this when DC traffic exits through a VPN/NAT IP that differs from
 # public_ip or when auto-detection cannot see the real egress. Docker bridge

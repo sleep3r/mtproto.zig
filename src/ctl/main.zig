@@ -390,6 +390,7 @@ fn printHelp(lang: i18n.Lang) void {
     // ── Install options ──
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Install options", "Опции установки"), Color.reset });
     printOpt(&ui, "--port,   -p <port>", tr(lang, "Proxy port (default: 443)", "Порт прокси (по умолчанию: 443)"));
+    printOpt(&ui, "--public-port <port>", tr(lang, "Port advertised in Telegram links", "Порт для Telegram-ссылок"));
     printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: wb.ru)", "TLS-домен маскировки (по умолчанию: wb.ru)"));
     printOpt(&ui, "--secret, -s <hex32>", tr(lang, "User secret (32 hex chars, auto-generated if omitted)", "Секрет пользователя (32 hex, если не задан — генерируется)"));
     printOpt(&ui, "--user,   -u <name>", tr(lang, "Username in config.toml (default: user)", "Имя пользователя в config.toml (по умолчанию: user)"));

@@ -135,6 +135,7 @@ sudo mtbuddy --interactive
 | Флаг | По умолчанию | Описание |
 |---|---|---|
 | `--port, -p` | `443` | Порт прокси |
+| `--public-port` | — | Порт, который будет указан в Telegram-ссылках |
 | `--domain, -d` | `wb.ru` | Домен TLS-маскировки |
 | `--secret, -s` | auto | User secret, 32 hex chars |
 | `--user, -u` | `user` | Имя пользователя в `config.toml` |
@@ -326,6 +327,7 @@ type = "auto"            # auto | direct | tunnel | socks5 | http
 [server]
 port = 443
 # public_ip = "proxy.example.com"   # входящий IP/domain для клиентских ссылок
+# public_port = 443                 # порт в ссылках при HAProxy/Nginx
 # middle_proxy_nat_ip = "203.0.113.10"   # исходящий IPv4, который видит Telegram MiddleProxy
 max_connections = 512
 idle_timeout_sec = 120
@@ -362,6 +364,7 @@ alice = true
 | `[general] use_middle_proxy` | `false` | ME mode для DC1..5 |
 | `[server] port` | `443` | TCP listen port |
 | `[server] public_ip` | auto | Входящий IP/domain для клиентских ссылок |
+| `[server] public_port` | `[server].port` | Порт для клиентских ссылок, если публичный порт отличается от listen-port |
 | `[server] middle_proxy_nat_ip` | auto | Исходящий IPv4 для MiddleProxy key derivation; auto-detect не использует `public_ip`, задайте явно при VPN/NAT egress |
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |

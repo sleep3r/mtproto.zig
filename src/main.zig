@@ -352,6 +352,11 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         if (has_ip) green else yellow,
         server_ip,
     });
+    if (cfg.public_port) |public_port| {
+        if (public_port != cfg.port) {
+            writeStdout("      Public Port  " ++ B ++ green ++ "{d}" ++ R ++ "\n", .{public_port});
+        }
+    }
     writeStdout("      TLS Domain   " ++ B ++ yellow ++ "{s}" ++ R ++ "\n", .{cfg.tls_domain});
     writeRaw("      Masking      " ++ B);
     if (cfg.mask) {

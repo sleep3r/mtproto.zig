@@ -137,6 +137,7 @@ sudo mtbuddy --interactive
 | Flag | Default | Description |
 |---|---|---|
 | `--port, -p` | `443` | Proxy listen port |
+| `--public-port` | — | Port advertised in generated Telegram links |
 | `--domain, -d` | `wb.ru` | TLS masking domain |
 | `--secret, -s` | auto | User secret (32 hex chars) |
 | `--user, -u` | `user` | Username in `config.toml` |
@@ -338,6 +339,7 @@ type = "auto"            # auto | direct | tunnel | socks5 | http
 [server]
 port = 443
 # public_ip = "proxy.example.com"   # Inbound IP/domain used in client links
+# public_port = 443                 # Link port when behind HAProxy/Nginx
 # middle_proxy_nat_ip = "203.0.113.10"   # Outbound IPv4 seen by Telegram MiddleProxy
 max_connections = 512
 idle_timeout_sec = 120
@@ -385,6 +387,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] port` | `443` | TCP listen port |
 | `[server] bind_address` | — | Specific IP to bind the listen socket (default: all interfaces) |
 | `[server] public_ip` | auto | Inbound IP/domain shown in client links. Required with VPN tunnel; set IPv4 explicitly if clients fail on IPv6 links |
+| `[server] public_port` | `[server].port` | Port shown in client links; useful when HAProxy/Nginx exposes a different public port |
 | `[server] middle_proxy_nat_ip` | auto | Outbound IPv4 used in MiddleProxy key derivation; auto-detected independently from `public_ip`, set explicitly when DC traffic exits through a VPN/NAT IP |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |

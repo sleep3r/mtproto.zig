@@ -25,6 +25,8 @@ const SERVICE_NAME = release.SERVICE_NAME;
 
 pub const InstallOpts = struct {
     port: u16 = 443,
+    /// Public port to place into generated Telegram client links.
+    public_port: ?u16 = null,
     /// Bind to a specific IP address instead of all interfaces.
     bind_address: ?[]const u8 = null,
     tls_domain: []const u8 = "wb.ru",
@@ -52,6 +54,7 @@ pub const InstallOpts = struct {
     config_path: ?[]const u8 = null,
     /// Internal flags to track if user explicitly provided a value.
     port_provided: bool = false,
+    public_port_provided: bool = false,
     domain_provided: bool = false,
 };
 
@@ -65,6 +68,16 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             if (args.next()) |val| {
                 opts.port = std.fmt.parseInt(u16, val, 10) catch 443;
                 opts.port_provided = true;
+            }
+        } else if (std.mem.eql(u8, arg, "--public-port")) {
+            if (args.next()) |val| {
+                const parsed = std.fmt.parseInt(u16, val, 10) catch 0;
+                if (parsed > 0) {
+                    opts.public_port = parsed;
+                    opts.public_port_provided = true;
+                } else {
+                    ui.warn("--public-port must be a valid TCP port, ignoring");
+                }
             }
         } else if (std.mem.eql(u8, arg, "--domain") or std.mem.eql(u8, arg, "-d")) {
             if (args.next()) |val| {
@@ -129,6 +142,12 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
                 opts.port = std.fmt.parseInt(u16, p_str, 10) catch 443;
             }
         }
+        if (!opts.public_port_provided) {
+            if (doc.get("server", "public_port")) |p_str| {
+                const parsed = std.fmt.parseInt(u16, p_str, 10) catch 0;
+                if (parsed > 0) opts.public_port = parsed;
+            }
+        }
         if (!opts.domain_provided) {
             if (doc.get("censorship", "tls_domain")) |d_str| {
                 opts.tls_domain = d_str;
@@ -141,6 +160,9 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
         ui.writeRaw("\n");
         ui.print("  {s}⚡ mtbuddy install{s}\n\n", .{ Color.header, Color.reset });
         ui.print("  {s}Port:{s}     {d}\n", .{ Color.dim, Color.reset, opts.port });
+        if (opts.public_port) |public_port| {
+            ui.print("  {s}Public:{s}   {d}\n", .{ Color.dim, Color.reset, public_port });
+        }
         ui.print("  {s}Domain:{s}   {s}\n", .{ Color.dim, Color.reset, opts.tls_domain });
         ui.print("  {s}TCPMSS:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_tcpmss) "enabled" else "disabled" });
         ui.print("  {s}Masking:{s}  {s}\n", .{ Color.dim, Color.reset, if (opts.enable_masking) "enabled" else "disabled" });
@@ -415,6 +437,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         var port_val_buf: [8]u8 = undefined;
         const port_val = std.fmt.bufPrint(&port_val_buf, "{d}", .{opts.port}) catch "443";
         try doc.addKv("port", port_val);
+        if (opts.public_port) |public_port| {
+            var public_port_val_buf: [8]u8 = undefined;
+            const public_port_val = std.fmt.bufPrint(&public_port_val_buf, "{d}", .{public_port}) catch "443";
+            try doc.addKv("public_port", public_port_val);
+        }
         if (opts.bind_address) |ba| {
             try doc.addKvStr("bind_address", ba);
         }
@@ -542,6 +569,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     var summary_server: []const u8 = public_ip;
     var summary_server_buf: [256]u8 = undefined;
     var summary_port: u16 = opts.port;
+    var summary_public_port: u16 = opts.public_port orelse opts.port;
     var summary_tls_domain: []const u8 = opts.tls_domain;
     var summary_tls_domain_buf: [256]u8 = undefined;
     var secret_from_cfg: []const u8 = "unknown";
@@ -549,7 +577,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     {
         var cfg_doc = toml.TomlDoc.load(allocator, config_path_buf) catch {
-            printSummary(ui, allocator, public_ip, opts.port, secret_from_cfg, opts.tls_domain, summary_opts, config_path_buf);
+            printSummary(ui, allocator, public_ip, opts.port, opts.public_port orelse opts.port, secret_from_cfg, opts.tls_domain, summary_opts, config_path_buf);
             return;
         };
         defer cfg_doc.deinit();
@@ -565,6 +593,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
         if (cfg_doc.get("server", "port")) |configured_port| {
             summary_port = std.fmt.parseInt(u16, configured_port, 10) catch summary_port;
+            summary_public_port = summary_port;
+        }
+
+        if (cfg_doc.get("server", "public_port")) |configured_public_port| {
+            const parsed = std.fmt.parseInt(u16, configured_public_port, 10) catch 0;
+            if (parsed > 0) summary_public_port = parsed;
         }
 
         if (cfg_doc.get("censorship", "tls_domain")) |configured_domain| {
@@ -589,6 +623,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         allocator,
         summary_server,
         summary_port,
+        summary_public_port,
         secret_from_cfg,
         summary_tls_domain,
         summary_opts,
@@ -744,6 +779,7 @@ fn printSummary(
     allocator: std.mem.Allocator,
     public_ip: []const u8,
     port: u16,
+    public_port: u16,
     secret: []const u8,
     tls_domain: []const u8,
     opts: InstallOpts,
@@ -751,6 +787,8 @@ fn printSummary(
 ) void {
     var port_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "443";
+    var public_port_buf: [8]u8 = undefined;
+    const public_port_str = std.fmt.bufPrint(&public_port_buf, "{d}", .{public_port}) catch "443";
 
     ui.summaryBox(ui.str(.install_success_header), &.{
         .{ .label = ui.str(.install_status_cmd), .value = "systemctl status mtproto-proxy" },
@@ -758,6 +796,11 @@ fn printSummary(
         .{ .label = ui.str(.install_config_path), .value = INSTALL_DIR ++ "/config.toml" },
         .{ .label = "Server:", .value = public_ip },
         .{ .label = "Port:", .value = port_str },
+        .{
+            .label = if (public_port != port) "Public Port:" else "",
+            .value = public_port_str,
+            .style = if (public_port != port) .label_value else .blank,
+        },
         .{ .label = "", .style = .blank },
         .{ .label = ui.str(.install_dpi_active), .style = .highlight },
         .{
@@ -790,7 +833,7 @@ fn printSummary(
     ui.writeRaw("\n");
     ui.print("  {s}╭─ {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.bold, ui.str(.install_connection_link) });
 
-    if (!printLinksFromConfig(ui, allocator, public_ip, port, tls_domain, config_path)) {
+    if (!printLinksFromConfig(ui, allocator, public_ip, public_port, tls_domain, config_path)) {
         var ee_buf: [512]u8 = undefined;
         const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
 
@@ -800,7 +843,7 @@ fn printSummary(
         var link_buf: [512]u8 = undefined;
         const link = std.fmt.bufPrint(&link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
-            port,
+            public_port,
             ee_secret,
         }) catch "error building link";
 
