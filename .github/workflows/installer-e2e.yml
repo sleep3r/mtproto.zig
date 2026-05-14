@@ -1,0 +1,62 @@
+name: Installer E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/installer-e2e.yml"
+      - "deploy/bootstrap.sh"
+      - "src/ctl/**"
+      - "src/version.zig"
+      - "test/installer-e2e/**"
+      - "build.zig"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/installer-e2e.yml"
+      - "deploy/bootstrap.sh"
+      - "src/ctl/**"
+      - "src/version.zig"
+      - "test/installer-e2e/**"
+      - "build.zig"
+
+concurrency:
+  group: installer-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer-e2e:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            name: debian-12
+          - image: ubuntu:24.04
+            name: ubuntu-24-04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Run installer E2E
+        env:
+          MTPROTO_INSTALLER_E2E_IMAGES: ${{ matrix.image }}
+          MTPROTO_INSTALLER_E2E_VERSION: latest
+        run: test/installer-e2e/run.sh
+
+      - name: Upload installer E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-e2e-${{ matrix.name }}
+          path: test/installer-e2e/logs/
+          if-no-files-found: ignore
+          retention-days: 14

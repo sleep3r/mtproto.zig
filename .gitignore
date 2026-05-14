@@ -11,6 +11,7 @@ config.toml
 .idea
 .vscode/
 __pycache__
+test/installer-e2e/logs/
 *.json
 *.logtest_poll.zig
 fix_tui.py
