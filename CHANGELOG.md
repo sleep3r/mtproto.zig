@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.4](https://github.com/sleep3r/mtproto.zig/compare/v0.23.3...v0.23.4) (2026-05-14)
+
+
+### Bug Fixes
+
+* harden installer e2e dependencies ([#261](https://github.com/sleep3r/mtproto.zig/issues/261)) ([69931cb](https://github.com/sleep3r/mtproto.zig/commit/69931cbe462546854a8df03a890f2a665c1345b9))
+
 ## [0.23.3](https://github.com/sleep3r/mtproto.zig/compare/v0.23.2...v0.23.3) (2026-05-13)
 
 
