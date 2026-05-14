@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/sleep3r/mtproto.zig/compare/v0.23.4...v0.24.0) (2026-05-14)
+
+
+### Features
+
+* add public port override for proxy links ([#264](https://github.com/sleep3r/mtproto.zig/issues/264)) ([630de8d](https://github.com/sleep3r/mtproto.zig/commit/630de8d380356c0da5784beccac2492c64e5dc02))
+
 ## [0.23.4](https://github.com/sleep3r/mtproto.zig/compare/v0.23.3...v0.23.4) (2026-05-14)
 
 
