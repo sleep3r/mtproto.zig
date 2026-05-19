@@ -1079,6 +1079,7 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\STATE_FILE="$STATE_DIR/tunnel-pool.state"
         \\MARK=200
         \\TABLE=200
+        \\RULE_PRIORITY=1200
         \\PROBE_URL="https://core.telegram.org/getProxyConfig"
         \\
         \\mkdir -p "$STATE_DIR"
@@ -1195,6 +1196,43 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    "$quick" up "$conf" >/dev/null 2>&1
         \\}
         \\
+        \\policy_rule_exists() {
+        \\    local mark_hex
+        \\    mark_hex="$(printf '0x%x' "$MARK")"
+        \\    ip -4 rule show | awk -v mark="$MARK" -v mark_hex="$mark_hex" -v table="$TABLE" '
+        \\        (($0 ~ "fwmark " mark || $0 ~ "fwmark " mark_hex) && ($0 ~ "lookup " table || $0 ~ "table " table)) { found = 1 }
+        \\        END { exit found ? 0 : 1 }
+        \\    '
+        \\}
+        \\
+        \\ensure_policy_rule() {
+        \\    while ip -4 rule del priority "$RULE_PRIORITY" fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+        \\    while ip -4 rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+        \\    ip -4 rule add fwmark "$MARK" table "$TABLE" priority "$RULE_PRIORITY" 2>/dev/null || true
+        \\    policy_rule_exists
+        \\}
+        \\
+        \\route_table_to_iface() {
+        \\    local iface="$1"
+        \\    ip -4 route flush table "$TABLE" 2>/dev/null || true
+        \\    ip -4 route replace default dev "$iface" table "$TABLE"
+        \\}
+        \\
+        \\policy_route_matches_iface() {
+        \\    local iface="$1" target="${2:-149.154.175.50}"
+        \\    ip -4 route get "$target" mark "$MARK" 2>/dev/null |
+        \\        awk -v iface="$iface" '
+        \\            { for (i = 1; i < NF; i++) if ($i == "dev" && $(i + 1) == iface) found = 1 }
+        \\            END { exit found ? 0 : 1 }
+        \\        '
+        \\}
+        \\
+        \\telegram_probe_iface() {
+        \\    local iface="$1"
+        \\    command -v curl >/dev/null 2>&1 || return 2
+        \\    curl --interface "$iface" -fsS --connect-timeout 3 --max-time 5 "$PROBE_URL" >/dev/null 2>&1
+        \\}
+        \\
         \\probe_iface() {
         \\    local iface="$1"
         \\    reason=""
@@ -1203,8 +1241,14 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    local show_tool
         \\    show_tool="$(show_tool_for "$iface")" || { reason="awg/wg show tool missing"; return 1; }
         \\    "$show_tool" show "$iface" >/dev/null 2>&1 || { reason="tunnel show failed"; return 1; }
-        \\    curl --interface "$iface" -fsS --connect-timeout 3 --max-time 5 "$PROBE_URL" >/dev/null 2>&1 || { reason="Telegram probe failed"; return 1; }
-        \\    reason="healthy"
+        \\    route_table_to_iface "$iface" || { reason="failed to install policy route"; return 1; }
+        \\    policy_route_matches_iface "$iface" || { reason="policy route check failed"; return 1; }
+        \\    if telegram_probe_iface "$iface"; then
+        \\        reason="healthy"
+        \\    else
+        \\        reason="policy route ready; Telegram probe failed"
+        \\        log "tunnel $iface selected although Telegram HTTPS probe failed"
+        \\    fi
         \\    return 0
         \\}
         \\
@@ -1250,9 +1294,13 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    add_unique "$iface"
         \\done
         \\
-        \\ip -4 rule del fwmark "$MARK" table "$TABLE" 2>/dev/null || true
-        \\ip -4 rule add fwmark "$MARK" table "$TABLE" priority 1200
+        \\ensure_policy_rule || {
+        \\    write_state "" "degraded" "failed to install policy rule"
+        \\    echo "Failed to install tunnel policy rule: fwmark=$MARK table=$TABLE" >&2
+        \\    exit 1
+        \\}
         \\
+        \\previous="$(ip -4 route show table "$TABLE" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
         \\selected=""
         \\selected_reason=""
         \\for iface in "${candidates[@]}"; do
@@ -1270,9 +1318,7 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    exit 1
         \\fi
         \\
-        \\previous="$(ip -4 route show table "$TABLE" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }')"
-        \\ip -4 route flush table "$TABLE" 2>/dev/null || true
-        \\ip -4 route replace default dev "$selected" table "$TABLE"
+        \\route_table_to_iface "$selected"
         \\write_state "$selected" "healthy" "$selected_reason"
         \\
         \\if [[ "$previous" != "$selected" ]]; then
@@ -1519,12 +1565,16 @@ test "tunnel pool - append interface avoids duplicates" {
     try std.testing.expectEqualStrings("awg2", added[2]);
 }
 
-test "tunnel pool - script renders route replacement and Telegram probe" {
+test "tunnel pool - script renders policy route replacement and nonfatal Telegram probe" {
     const script = try renderTunnelPoolScript(std.testing.allocator);
     defer std.testing.allocator.free(script);
 
-    try std.testing.expect(std.mem.indexOf(u8, script, "ip -4 route replace default dev \"$selected\" table \"$TABLE\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "route_table_to_iface \"$selected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "policy_route_matches_iface \"$iface\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "route show table \"$TABLE\" default 2>/dev/null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "|| true)") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "https://core.telegram.org/getProxyConfig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "selected although Telegram HTTPS probe failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pinned_interface") != null);
 }
 

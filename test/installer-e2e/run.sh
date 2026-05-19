@@ -64,6 +64,7 @@ dump_container_debug() {
   docker exec "$container" journalctl --no-pager -n 300 >"$LOG_DIR/$prefix.journal.log" 2>&1 || true
   docker exec "$container" bash -lc 'systemctl --failed --no-pager || true' >"$LOG_DIR/$prefix.systemd-failed.log" 2>&1 || true
   docker exec "$container" bash -lc 'iptables -t mangle -S || true; ip6tables -t mangle -S || true' >"$LOG_DIR/$prefix.iptables.log" 2>&1 || true
+  docker exec "$container" bash -lc 'ip -4 rule show || true; ip -4 route show table 200 || true; cat /run/mtproto-proxy/tunnel-pool.state 2>/dev/null || true; systemctl status mtproto-proxy mtproto-tunnel-pool.service mtproto-tunnel-pool.timer --no-pager || true' >"$LOG_DIR/$prefix.tunnel.log" 2>&1 || true
   docker exec "$container" bash -lc 'ss -lntp || true' >"$LOG_DIR/$prefix.ss.log" 2>&1 || true
 }
 
@@ -110,6 +111,16 @@ run_in_container() {
     "$container" "$@"
 }
 
+run_script_in_container() {
+  local container="$1"
+  docker exec -i \
+    -e DEBIAN_FRONTEND=noninteractive \
+    -e LANG=C.UTF-8 \
+    -e LC_ALL=C.UTF-8 \
+    -e PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    "$container" bash -s
+}
+
 verify_install_once() {
   local container="$1"
 
@@ -138,6 +149,136 @@ verify_install_once() {
     ss -lnt "( sport = :443 or sport = :8443 )" | grep "127.0.0.1:8443" >/dev/null
     curl -kfsS --resolve "wb.ru:8443:127.0.0.1" https://wb.ru:8443/ >/dev/null
   '
+}
+
+install_fake_tunnel_tools() {
+  local container="$1"
+
+  run_script_in_container "$container" <<'CONTAINER_SCRIPT'
+set -Eeuo pipefail
+
+real_curl="$(command -v curl)"
+if [[ "$real_curl" == "/usr/local/bin/curl" ]]; then
+  real_curl="/usr/bin/curl"
+fi
+test -x "$real_curl"
+
+cat >/usr/local/bin/awg-quick <<'AWG_QUICK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+cmd="${1:-}"
+case "$cmd" in
+  strip)
+    cat "${2:?missing config}"
+    ;;
+  up)
+    conf="${2:?missing config}"
+    iface="$(basename "$conf" .conf)"
+    ip link show dev "$iface" >/dev/null 2>&1 || ip link add "$iface" type dummy 2>/dev/null || ip link add "$iface" type veth peer name "${iface}-peer"
+    ip link set dev "$iface" up
+    ip link set dev "${iface}-peer" up 2>/dev/null || true
+    ;;
+  down)
+    conf="${2:?missing config}"
+    iface="$(basename "$conf" .conf)"
+    ip link del dev "$iface" 2>/dev/null || true
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+AWG_QUICK
+chmod 0755 /usr/local/bin/awg-quick
+
+cat >/usr/local/bin/awg <<'AWG'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == "show" ]]; then
+  iface="${2:-awg0}"
+  ip link show dev "$iface" >/dev/null 2>&1 || exit 1
+  cat <<EOF
+interface: $iface
+  public key: fake-public-key
+  private key: (hidden)
+  listening port: 51820
+
+peer: fake-peer-key
+  endpoint: 203.0.113.1:51820
+  allowed ips: 0.0.0.0/0
+  latest handshake: 1 second ago
+  transfer: 1 KiB received, 1 KiB sent
+EOF
+  exit 0
+fi
+
+exit 0
+AWG
+chmod 0755 /usr/local/bin/awg
+
+cat >/usr/local/bin/curl <<CURL
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+next_is_iface=0
+for arg in "\$@"; do
+  if [[ "\$next_is_iface" == "1" ]]; then
+    if [[ "\$arg" == "awg0" ]]; then
+      echo "blocked fake tunnel probe: \$*" >>/run/mtproto-fake-curl.log
+      exit 7
+    fi
+    next_is_iface=0
+    continue
+  fi
+
+  if [[ "\$arg" == "--interface" ]]; then
+    next_is_iface=1
+  fi
+done
+
+exec "$real_curl" "\$@"
+CURL
+chmod 0755 /usr/local/bin/curl
+CONTAINER_SCRIPT
+}
+
+verify_tunnel_probe_failure_is_nonfatal() {
+  local container="$1"
+
+  run_script_in_container "$container" <<'CONTAINER_SCRIPT'
+set -Eeuo pipefail
+
+cat >/tmp/awg0.conf <<'AWG_CONF'
+[Interface]
+PrivateKey = fake-private-key
+Address = 10.123.0.2/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = fake-peer-key
+Endpoint = 203.0.113.1:51820
+AllowedIPs = 0.0.0.0/0
+AWG_CONF
+
+mtbuddy setup tunnel --iface awg0 /tmp/awg0.conf
+
+systemctl is-active --quiet mtproto-proxy
+systemctl is-active --quiet mtproto-tunnel-pool.timer
+systemctl is-enabled --quiet mtproto-tunnel-pool.timer
+
+grep -F "ExecStartPre=/usr/local/bin/setup_tunnel.sh" /etc/systemd/system/mtproto-proxy.service >/dev/null
+test -x /usr/local/bin/setup_tunnel.sh
+
+/usr/local/bin/setup_tunnel.sh
+grep -F "active=awg0" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "status=healthy" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "reason=policy route ready; Telegram probe failed" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "blocked fake tunnel probe:" /run/mtproto-fake-curl.log >/dev/null
+
+ip -4 rule show | grep -E "fwmark (0xc8|200).*(lookup|table) 200" >/dev/null
+ip -4 route get 149.154.175.50 mark 200 | grep -F " dev awg0" >/dev/null
+CONTAINER_SCRIPT
 }
 
 verify_install() {
@@ -225,6 +366,11 @@ run_case() {
   echo "::group::Re-run nfqws setup ($base_image)"
   run_in_container "$container" mtbuddy setup nfqws 2>&1 | tee "$LOG_DIR/$safe.nfqws-rerun.log"
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-nfqws-rerun.log"
+  echo "::endgroup::"
+
+  echo "::group::Setup tunnel with failing Telegram probe ($base_image)"
+  install_fake_tunnel_tools "$container"
+  verify_tunnel_probe_failure_is_nonfatal "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-probe-failure.log"
   echo "::endgroup::"
 
   dump_container_debug "$container" "$safe"
