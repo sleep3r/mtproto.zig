@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.1](https://github.com/sleep3r/mtproto.zig/compare/v0.24.0...v0.24.1) (2026-05-19)
+
+
+### Bug Fixes
+
+* tunnel prestart policy routing ([#269](https://github.com/sleep3r/mtproto.zig/issues/269)) ([7c62b30](https://github.com/sleep3r/mtproto.zig/commit/7c62b30b744c620dab916e92a89ab07fd3e70062))
+
 ## [0.24.0](https://github.com/sleep3r/mtproto.zig/compare/v0.23.4...v0.24.0) (2026-05-14)
 
 
