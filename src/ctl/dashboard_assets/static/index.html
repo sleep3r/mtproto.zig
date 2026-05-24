@@ -260,8 +260,8 @@
 
   <!-- Delete confirmation modal -->
   <div class="modal-overlay" id="deleteModal" style="display:none">
-    <div class="modal">
-      <div class="modal-title">⚠ Delete User</div>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
+      <div class="modal-title" id="deleteModalTitle">Delete User</div>
       <div class="modal-body">
         Are you sure you want to delete <b id="deleteUserName"></b>?
         <br><span class="form-hint">The proxy will be restarted to apply changes.</span>
@@ -272,8 +272,22 @@
       </div>
     </div>
   </div>
+
+  <div class="modal-overlay" id="deleteTunnelModal" style="display:none">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteTunnelTitle">
+      <div class="modal-title" id="deleteTunnelTitle">Delete Tunnel</div>
+      <div class="modal-body">
+        Delete <b id="deleteTunnelName"></b> from the tunnel pool?
+        <br><span class="form-hint">The interface will be stopped, config files removed, and proxy routing refreshed.</span>
+      </div>
+      <div class="modal-actions">
+        <button class="ui-btn danger" id="deleteTunnelConfirm" type="button">Delete</button>
+        <button class="ui-btn" id="deleteTunnelCancel" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
 </div>
 
-<script src="/app.js?v=20260422"></script>
+<script src="/app.js?v=20260524"></script>
 </body>
 </html>

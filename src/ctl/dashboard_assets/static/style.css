@@ -782,7 +782,7 @@ body::after {
 
 .routing-row {
   display: grid;
-  grid-template-columns: minmax(80px, 110px) 80px 1fr auto;
+  grid-template-columns: minmax(80px, 110px) 80px 1fr auto auto;
   gap: 10px;
   align-items: center;
   padding: 10px 24px;
@@ -844,6 +844,15 @@ body::after {
   color: var(--text-muted);
   font-family: 'JetBrains Mono', monospace;
   white-space: nowrap;
+}
+
+.routing-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.routing-actions .ui-btn {
+  min-width: 64px;
 }
 
 .routing-empty {
@@ -994,6 +1003,9 @@ body::after {
     grid-template-columns: 1fr;
     gap: 6px;
     padding: 10px 14px;
+  }
+  .routing-actions {
+    justify-content: flex-start;
   }
   .routing-meta { white-space: normal; }
   .routing-controls {

@@ -407,6 +407,7 @@ def _load_proxy_runtime_config() -> dict:
         "upstream_type": "auto",
         "upstream_tunnel_interface": "awg0",
         "upstream_tunnel_interfaces": [],
+        "upstream_tunnel_interfaces_configured": False,
         "upstream_tunnel_pinned_interface": "",
         "upstream_socks5_host": "",
         "upstream_socks5_port": 0,
@@ -441,6 +442,7 @@ def _load_proxy_runtime_config() -> dict:
         "upstream_type": defaults["upstream_type"],
         "upstream_tunnel_interface": defaults["upstream_tunnel_interface"],
         "upstream_tunnel_interfaces": [],
+        "upstream_tunnel_interfaces_configured": False,
         "upstream_tunnel_pinned_interface": "",
         "upstream_socks5_host": defaults["upstream_socks5_host"],
         "upstream_socks5_port": defaults["upstream_socks5_port"],
@@ -509,6 +511,7 @@ def _load_proxy_runtime_config() -> dict:
                         result["upstream_tunnel_interface"] = value
                     elif key == "interfaces":
                         result["upstream_tunnel_interfaces"] = _parse_toml_string_array(value)
+                        result["upstream_tunnel_interfaces_configured"] = True
                     elif key == "pinned_interface":
                         result["upstream_tunnel_pinned_interface"] = value
 
@@ -562,7 +565,7 @@ def _load_proxy_runtime_config() -> dict:
     except Exception:
         return defaults
 
-    if not result["upstream_tunnel_interfaces"]:
+    if not result["upstream_tunnel_interfaces"] and not result["upstream_tunnel_interfaces_configured"]:
         iface = str(result.get("upstream_tunnel_interface") or "awg0").strip()
         result["upstream_tunnel_interfaces"] = [iface] if iface else ["awg0"]
 
@@ -582,6 +585,9 @@ _routing_cache = {"ts": 0, "data": None}
 ROUTING_CACHE_TTL = 8  # seconds
 TUNNEL_POOL_STATE = Path("/run/mtproto-proxy/tunnel-pool.state")
 TUNNEL_POOL_SCRIPT = Path("/usr/local/bin/setup_tunnel.sh")
+TUNNEL_POOL_SERVICE = Path("/etc/systemd/system/mtproto-tunnel-pool.service")
+TUNNEL_POOL_TIMER = Path("/etc/systemd/system/mtproto-tunnel-pool.timer")
+PROXY_SERVICE_FILE = Path("/etc/systemd/system/mtproto-proxy.service")
 TUNNEL_PROBE_URL = "https://core.telegram.org/getProxyConfig"
 
 
@@ -619,7 +625,7 @@ def _tunnel_tool_hint(interface: str) -> str | None:
 
 def _effective_tunnel_pool(cfg: dict) -> list[str]:
     pool = _dedupe([str(v) for v in cfg.get("upstream_tunnel_interfaces", [])])
-    if pool:
+    if pool or cfg.get("upstream_tunnel_interfaces_configured"):
         return pool
     iface = str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip()
     return [iface] if iface else ["awg0"]
@@ -865,6 +871,22 @@ def _list_system_interfaces() -> list[str]:
     return names
 
 
+def _list_tunnel_config_interfaces() -> list[str]:
+    names: list[str] = []
+    for base in (Path("/etc/amnezia/amneziawg"), Path("/etc/wireguard")):
+        try:
+            entries = sorted(base.glob("*.conf"))
+        except Exception:
+            entries = []
+        for path in entries:
+            iface = path.stem.strip()
+            if not _valid_tunnel_interface_name(iface):
+                continue
+            if iface not in names:
+                names.append(iface)
+    return names
+
+
 def _upstream_target_from_cfg(cfg: dict, policy: dict) -> str:
     upstream_type = str(cfg.get("upstream_type", "auto") or "auto").lower().strip()
 
@@ -900,16 +922,25 @@ def _routing_status() -> dict:
     upstream_type = str(cfg.get("upstream_type", "auto") or "auto").lower().strip()
     pool = _effective_tunnel_pool(cfg)
     pinned_iface = str(cfg.get("upstream_tunnel_pinned_interface", "") or "").strip()
-    selected_iface = pinned_iface or (pool[0] if pool else str(cfg.get("upstream_tunnel_interface", "awg0") or "awg0").strip())
+    fallback_iface = str(cfg.get("upstream_tunnel_interface", "") or "").strip()
+    if not fallback_iface and not cfg.get("upstream_tunnel_interfaces_configured"):
+        fallback_iface = "awg0"
+    selected_iface = pinned_iface or (pool[0] if pool else fallback_iface)
 
-    if not selected_iface:
+    if not selected_iface and not cfg.get("upstream_tunnel_interfaces_configured"):
         selected_iface = "awg0"
 
     system_ifaces = _list_system_interfaces()
+    config_ifaces = _list_tunnel_config_interfaces()
     available_tunnel_ifaces: list[str] = []
-    for iface in system_ifaces:
+    for iface in system_ifaces + config_ifaces:
         low = iface.lower()
-        if not (low.startswith(("awg", "wg", "tun", "tap")) or iface in pool or iface == selected_iface):
+        if not (
+            low.startswith(("awg", "wg", "tun", "tap"))
+            or iface in pool
+            or iface == selected_iface
+            or iface in config_ifaces
+        ):
             continue
         if iface and iface not in available_tunnel_ifaces:
             available_tunnel_ifaces.append(iface)
@@ -924,10 +955,12 @@ def _routing_status() -> dict:
     for iface in interfaces:
         tunnel = _detect_tunnel_interface(iface, _tunnel_tool_hint(iface))
         tunnel["in_pool"] = iface in pool
+        tunnel["config_present"] = iface in config_ifaces
         tunnel["pinned"] = bool(pinned_iface and iface == pinned_iface)
         if (
             iface == selected_iface
             or iface in pool
+            or iface in config_ifaces
             or tunnel.get("link_up")
             or tunnel.get("active")
             or tunnel.get("endpoint")
@@ -1362,6 +1395,256 @@ def _set_upstream_tunnel_interface(interface: str) -> bool:
     )
     cfg_path.write_text("".join(lines), encoding="utf-8")
     return True
+
+
+def _valid_tunnel_interface_name(interface: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", str(interface or "").strip()))
+
+
+def _toml_string_array_literal(values: list[str]) -> str:
+    return json.dumps([str(v) for v in values], ensure_ascii=False)
+
+
+def _tunnel_config_paths(interface: str) -> list[Path]:
+    iface = str(interface or "").strip()
+    paths = [
+        Path("/etc/amnezia/amneziawg") / f"{iface}.conf",
+        Path("/etc/wireguard") / f"{iface}.conf",
+    ]
+    if iface == "awg0":
+        paths.append(Path("/etc/amnezia/awg0.conf"))
+    return paths
+
+
+def _tunnel_config_exists(interface: str) -> bool:
+    return any(path.exists() for path in _tunnel_config_paths(interface))
+
+
+def _remove_tunnel_from_config(interface: str) -> dict | None:
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return None
+
+    iface = str(interface or "").strip()
+    if not _valid_tunnel_interface_name(iface):
+        return None
+
+    cfg = _load_proxy_runtime_config()
+    pool = _effective_tunnel_pool(cfg)
+    in_pool = iface in pool
+    if not in_pool and not _tunnel_config_exists(iface):
+        return None
+
+    remaining = [value for value in pool if value != iface]
+    removed_last = bool(in_pool and not remaining)
+
+    if in_pool:
+        lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+            keepends=True
+        )
+        if remaining:
+            lines = _set_toml_key(
+                lines,
+                "[upstream.tunnel]",
+                "interface",
+                _toml_string_literal(remaining[0]),
+            )
+        else:
+            lines = _set_toml_key(
+                lines, "[upstream]", "type", _toml_string_literal("auto")
+            )
+            lines = _set_toml_key(
+                lines, "[upstream.tunnel]", "interface", _toml_string_literal("")
+            )
+
+        lines = _set_toml_key(
+            lines,
+            "[upstream.tunnel]",
+            "interfaces",
+            _toml_string_array_literal(remaining),
+        )
+
+        pinned = str(cfg.get("upstream_tunnel_pinned_interface", "") or "").strip()
+        if pinned == iface or removed_last:
+            lines = _set_toml_key(
+                lines,
+                "[upstream.tunnel]",
+                "pinned_interface",
+                _toml_string_literal(""),
+            )
+
+        cfg_path.write_text("".join(lines), encoding="utf-8")
+
+    return {
+        "removed_from_pool": in_pool,
+        "removed_last": removed_last,
+        "remaining_pool": remaining,
+    }
+
+
+def _clear_tunnel_config() -> bool:
+    cfg_path = _find_config_path()
+    if cfg_path is None:
+        return False
+
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines(
+        keepends=True
+    )
+    lines = _set_toml_key(lines, "[upstream]", "type", _toml_string_literal("auto"))
+    lines = _set_toml_key(
+        lines, "[upstream.tunnel]", "interface", _toml_string_literal("")
+    )
+    lines = _set_toml_key(lines, "[upstream.tunnel]", "interfaces", "[]")
+    lines = _set_toml_key(
+        lines, "[upstream.tunnel]", "pinned_interface", _toml_string_literal("")
+    )
+    cfg_path.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _quick_tool_for_interface(interface: str) -> str | None:
+    iface = str(interface or "")
+    if iface.startswith("wg") and shutil.which("wg-quick"):
+        return "wg-quick"
+    if shutil.which("awg-quick"):
+        return "awg-quick"
+    if shutil.which("wg-quick"):
+        return "wg-quick"
+    return None
+
+
+def _run_silent(args: list[str], timeout: int = 10) -> int | None:
+    try:
+        r = subprocess.run(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        return r.returncode
+    except Exception:
+        return None
+
+
+def _stop_tunnel_interface(interface: str) -> None:
+    tool = _quick_tool_for_interface(interface)
+    if tool:
+        for path in _tunnel_config_paths(interface):
+            if path.exists():
+                _run_silent([tool, "down", str(path)])
+        _run_silent([tool, "down", interface])
+    _run_silent(["ip", "link", "delete", "dev", interface])
+
+
+def _delete_tunnel_config_files(interface: str) -> None:
+    for path in _tunnel_config_paths(interface):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
+def _write_default_proxy_service() -> bool:
+    content = """[Unit]
+Description=MTProto Proxy (Zig)
+Documentation=https://github.com/sleep3r/mtproto.zig
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtproto
+Group=mtproto
+WorkingDirectory=/opt/mtproto-proxy
+ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=25
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/mtproto-proxy
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+LimitNOFILE=131582
+TasksMax=65535
+
+[Install]
+WantedBy=multi-user.target
+"""
+    try:
+        PROXY_SERVICE_FILE.write_text(content, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _disable_tunnel_pool_runtime() -> None:
+    _run_silent(["systemctl", "disable", "--now", "mtproto-tunnel-pool.timer"])
+    _run_silent(["systemctl", "stop", "mtproto-tunnel-pool.service"])
+    _run_silent(
+        [
+            "sh",
+            "-c",
+            "while ip -4 rule del priority 1200 fwmark 200 table 200 2>/dev/null; do :; done; "
+            "while ip -4 rule del fwmark 200 table 200 2>/dev/null; do :; done; "
+            "ip -4 route flush table 200 2>/dev/null || true",
+        ]
+    )
+    for path in (TUNNEL_POOL_SCRIPT, TUNNEL_POOL_STATE, TUNNEL_POOL_SERVICE, TUNNEL_POOL_TIMER):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    _write_default_proxy_service()
+    _run_silent(["systemctl", "daemon-reload"])
+
+
+def _delete_tunnel_interface(interface: str) -> dict | None:
+    iface = str(interface or "").strip()
+    if not _valid_tunnel_interface_name(iface):
+        return None
+
+    known_before = _list_tunnel_config_interfaces()
+    result = _remove_tunnel_from_config(iface)
+    if result is None:
+        return None
+
+    stale_last = (
+        not result["removed_from_pool"]
+        and not result["remaining_pool"]
+        and set(known_before).issubset({iface})
+    )
+    if stale_last:
+        _clear_tunnel_config()
+        result["removed_last"] = True
+
+    _stop_tunnel_interface(iface)
+    _delete_tunnel_config_files(iface)
+
+    if result["removed_last"]:
+        _disable_tunnel_pool_runtime()
+    elif result["removed_from_pool"]:
+        result["controller_ok"] = _run_tunnel_pool_once()
+    else:
+        result["controller_ok"] = None
+
+    _restart_proxy()
+    _awg_cache["ts"] = 0
+    _routing_cache["ts"] = 0
+    result["interface"] = iface
+    result["restarted"] = True
+    return result
 
 
 def _run_tunnel_pool_once() -> bool:
@@ -1891,6 +2174,30 @@ async def api_routing_tunnel_interface(request: Request):
             "restarted": False,
         }
     )
+
+
+@app.post("/api/routing/tunnel-delete")
+async def api_routing_tunnel_delete(request: Request):
+    """Hard-delete a tunnel interface. Body: { interface: str }"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    iface = str(body.get("interface", "")).strip()
+    if not _valid_tunnel_interface_name(iface):
+        return JSONResponse(
+            {"ok": False, "error": "invalid tunnel interface"}, status_code=400
+        )
+
+    result = _delete_tunnel_interface(iface)
+    if result is None:
+        return JSONResponse(
+            {"ok": False, "error": "tunnel interface is not configured"},
+            status_code=404,
+        )
+
+    return JSONResponse({"ok": True, **result})
 
 
 @app.post("/api/routing/proxy-target")

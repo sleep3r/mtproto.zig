@@ -307,6 +307,7 @@ async function copyText(text) {
 // ── User Management ──
 
 let pendingDeleteUser = null;
+let pendingDeleteTunnel = null;
 let pendingToggleUser = null;
 
 function showToast(msg, type) {
@@ -429,6 +430,59 @@ function showDeleteModal(name) {
   pendingDeleteUser = name;
   $('deleteUserName').textContent = name;
   $('deleteModal').style.display = '';
+  $('deleteConfirm').focus();
+}
+
+function setupTunnelDeleteModal() {
+  const modal = $('deleteTunnelModal');
+  const confirmBtn = $('deleteTunnelConfirm');
+  const cancelBtn = $('deleteTunnelCancel');
+  if (!modal || !confirmBtn || !cancelBtn) return;
+
+  const close = () => {
+    modal.style.display = 'none';
+    pendingDeleteTunnel = null;
+  };
+
+  cancelBtn.addEventListener('click', close);
+
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+
+  modal.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close();
+  });
+
+  confirmBtn.addEventListener('click', async () => {
+    if (!pendingDeleteTunnel) return;
+    const iface = pendingDeleteTunnel;
+    confirmBtn.disabled = true;
+    setRoutingAction('Deleting tunnel ' + iface + '…');
+    try {
+      const data = await apiCall('/api/routing/tunnel-delete', { interface: iface });
+      const left = Array.isArray(data.remaining_pool) ? data.remaining_pool.length : 0;
+      const msg = data.removed_last
+        ? ('Tunnel ' + iface + ' deleted. No tunnels left; upstream switched to auto.')
+        : ('Tunnel ' + iface + ' deleted. ' + left + ' tunnel(s) remain.');
+      showToast(msg, 'success');
+      setRoutingAction(msg, 'ok');
+      await runPoll();
+    } catch (e) {
+      setRoutingAction('Delete failed: ' + e.message, 'error');
+      showToast('Delete failed: ' + e.message, 'error');
+    } finally {
+      confirmBtn.disabled = false;
+      close();
+    }
+  });
+}
+
+function showTunnelDeleteModal(iface) {
+  pendingDeleteTunnel = iface;
+  $('deleteTunnelName').textContent = iface;
+  $('deleteTunnelModal').style.display = '';
+  $('deleteTunnelConfirm').focus();
 }
 
 async function toggleDirect(name, newDirect) {
@@ -878,6 +932,7 @@ function renderRouting(routing) {
 
     const meta = [];
     if (inPool) meta.push('pool');
+    if (t.config_present && !inPool) meta.push('config');
     if (isPinned) meta.push('pinned');
     if (t.tool && t.tool !== '-') meta.push(String(t.tool));
     if (t.endpoint) meta.push(String(t.endpoint));
@@ -886,6 +941,7 @@ function renderRouting(routing) {
     if (!meta.length) meta.push(String(t.reason || '—'));
 
     const xfer = '↓ ' + String(t.rx || '—') + ' · ↑ ' + String(t.tx || '—');
+    const canDelete = inPool || t.config_present || t.link_up || iface.startsWith('awg') || iface.startsWith('wg');
 
     return '<div class="routing-row">' +
       '<div class="routing-iface">' + esc(iface) +
@@ -895,8 +951,20 @@ function renderRouting(routing) {
       '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
       '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +
       '<div class="routing-xfer">' + esc(xfer) + '</div>' +
+      '<div class="routing-actions">' +
+      (canDelete
+        ? '<button class="ui-btn danger routing-delete" type="button" data-iface="' + esc(iface) + '" aria-label="Delete tunnel ' + esc(iface) + '">Delete</button>'
+        : '') +
+      '</div>' +
       '</div>';
   }).join('');
+
+  list.querySelectorAll('.routing-delete').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const iface = String(btn.dataset.iface || '').trim();
+      if (iface) showTunnelDeleteModal(iface);
+    });
+  });
 }
 
 // ── Polling ──
@@ -1105,6 +1173,7 @@ updatePollControls();
 updateFreshness();
 setupAddUserForm();
 setupDeleteModal();
+setupTunnelDeleteModal();
 setupRoutingControls();
 runPoll();
 restartPollingLoop();
