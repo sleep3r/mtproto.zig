@@ -1414,7 +1414,7 @@ fn installTunnelPoolUnits(ui: *Tui, allocator: std.mem.Allocator) void {
         \\
         \\[Timer]
         \\OnBootSec=30s
-        \\OnUnitActiveSec=30s
+        \\OnUnitInactiveSec=30s
         \\RandomizedDelaySec=5s
         \\Persistent=true
         \\
@@ -1946,6 +1946,12 @@ test "tunnel pool - script renders policy route replacement and nonfatal Telegra
     try std.testing.expect(std.mem.indexOf(u8, script, "pinned_interface") != null);
 }
 
+test "tunnel pool timer repeats after oneshot service exits" {
+    const source = @embedFile("tunnel.zig");
+    const needle = "OnUnitInactiveSec" ++ "=30s";
+    try std.testing.expect(std.mem.indexOf(u8, source, needle) != null);
+}
+
 test "tunnel pool - parses interface array" {
     const pool = try parseTunnelInterfaceArray(std.testing.allocator, "[\"awg0\", \"awg1\"]");
     defer freeOwnedStringSlice(std.testing.allocator, pool);
@@ -2037,7 +2043,7 @@ test "tunnel - strips empty AWG assignments" {
     defer tmp.cleanup();
 
     const name = "awg0.conf";
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(io(), .{
         .sub_path = name,
         .data =
         \\[Interface]
@@ -2057,7 +2063,7 @@ test "tunnel - strips empty AWG assignments" {
 
     try std.testing.expect(try stripAwgEmptyAssignments(std.testing.allocator, path));
 
-    const sanitized = try tmp.dir.readFileAlloc(std.testing.allocator, name, 4096);
+    const sanitized = try tmp.dir.readFileAlloc(io(), name, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(sanitized);
 
     try std.testing.expect(std.mem.indexOf(u8, sanitized, "I2") == null);

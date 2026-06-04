@@ -480,3 +480,7 @@ fn printLangFlagError(msg: []const u8) void {
 fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
     return if (lang == .ru) ru else en;
 }
+
+test {
+    std.testing.refAllDecls(tunnel);
+}
