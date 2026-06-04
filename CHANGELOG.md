@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.1](https://github.com/sleep3r/mtproto.zig/compare/v0.25.0...v0.25.1) (2026-06-04)
+
+
+### Bug Fixes
+
+* keep tunnel pool timer recurring ([7c5fa30](https://github.com/sleep3r/mtproto.zig/commit/7c5fa307dfceeab93031e722b1377d4e7b331285))
+
 ## [0.25.0](https://github.com/sleep3r/mtproto.zig/compare/v0.24.1...v0.25.0) (2026-05-24)
 
 
