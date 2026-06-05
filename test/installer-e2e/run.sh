@@ -267,7 +267,10 @@ systemctl is-active --quiet mtproto-proxy
 systemctl is-active --quiet mtproto-tunnel-pool.timer
 systemctl is-enabled --quiet mtproto-tunnel-pool.timer
 
-grep -F "ExecStartPre=/usr/local/bin/setup_tunnel.sh" /etc/systemd/system/mtproto-proxy.service >/dev/null
+# The tunnel unit runs the routing setup privileged (ExecStartPre=+...) while the
+# proxy itself drops to User=mtproto, so the prefix is part of the expected line.
+grep -F "ExecStartPre=+/usr/local/bin/setup_tunnel.sh" /etc/systemd/system/mtproto-proxy.service >/dev/null
+grep -F "User=mtproto" /etc/systemd/system/mtproto-proxy.service >/dev/null
 test -x /usr/local/bin/setup_tunnel.sh
 
 /usr/local/bin/setup_tunnel.sh
