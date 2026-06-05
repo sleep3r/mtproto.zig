@@ -2,6 +2,7 @@ const std = @import("std");
 const tui_mod = @import("tui.zig");
 const sys = @import("sys.zig");
 const i18n = @import("i18n.zig");
+const toml = @import("toml.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -41,7 +42,6 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 }
 
 fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
-    _ = allocator;
     if (!sys.isRoot()) {
         ui.fail(ui.str(.error_not_root));
         return;
@@ -52,6 +52,22 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     var sp = ui.spinner(ui.str(.uninstall_in_progress));
     sp.start();
+
+    // Read the configured listen port BEFORE we delete /opt, so we can revert
+    // the port-specific ufw rule the installer added.
+    var port_buf: [8]u8 = undefined;
+    var configured_port: []const u8 = "443";
+    {
+        var doc = toml.TomlDoc.load(allocator, "/opt/mtproto-proxy/config.toml") catch null;
+        if (doc) |*d| {
+            defer d.deinit();
+            if (d.get("server", "port")) |p| {
+                const copy_len = @min(p.len, port_buf.len);
+                @memcpy(port_buf[0..copy_len], p[0..copy_len]);
+                configured_port = port_buf[0..copy_len];
+            }
+        }
+    }
 
     // 1. Stop and disable all associated systemd services
     const services = &[_][]const u8{
@@ -75,6 +91,14 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-mask-health.timer" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.timer" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.service" }) catch {};
+
+    // Remove the systemd drop-ins recovery.zig may have written. Only delete our
+    // own files; rmdir the nginx drop-in dir only if it ends up empty so we don't
+    // clobber unrelated operator drop-ins.
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/nginx.service.d/restart.conf" }) catch {};
+    _ = sys.execForward(&.{ "bash", "-c", "rmdir /etc/systemd/system/nginx.service.d 2>/dev/null || true" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-rf", "/etc/systemd/system/mtproto-proxy.service.d" }) catch {};
+
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
 
     // 2. Remove directories
@@ -92,18 +116,49 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_netns.sh" }) catch {};
     _ = sys.execForward(&.{ "ip", "netns", "del", "tg_proxy_ns" }) catch {};
 
-    // 5. Remove masking config if exists
+    // 5. Remove masking config. The site name MUST match masking.zig
+    //    ("mtproto-masking"); the old "mtproto-mask" name never matched the
+    //    installed vhost, so it was left enabled while its cert was deleted,
+    //    breaking every later nginx reload.
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-enabled/mtproto-masking" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-available/mtproto-masking" }) catch {};
+    // Legacy name from older installs (best-effort).
     _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-enabled/mtproto-mask" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-available/mtproto-mask" }) catch {};
     _ = sys.execForward(&.{ "rm", "-rf", "/etc/nginx/ssl/mtproto" }) catch {};
+    // The masking installer disables the default site; restore it so nginx has a
+    // valid vhost again instead of a dangling (now deleted) masking config.
+    _ = sys.execForward(&.{ "bash", "-c", "[ -f /etc/nginx/sites-available/default ] && ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default || true" }) catch {};
 
     // Attempt Nginx reload if active, to flush deleted configs
     if (sys.isServiceActive("nginx")) {
         _ = sys.execForward(&.{ "systemctl", "try-reload-or-restart", "nginx" }) catch {};
     }
 
-    // 6. Attempt to clear TCPMSS iptables rules specifically set by install
-    _ = sys.execForward(&.{ "bash", "-c", "while iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do true; done" }) catch {};
+    // 6. Clear the TCPMSS=88 SYN/ACK clamp the installer set. The install rule
+    //    carries `--sport <port>`, so a `-D` without it never matches. List the
+    //    live rules and replay them as deletes (exact match), for BOTH IPv4 and
+    //    IPv6, then re-persist rules.v4/v6 so the clamp doesn't return on reboot.
+    const tcpmss_cleanup =
+        \\for ipt in iptables ip6tables; do
+        \\  "$ipt" -t mangle -S OUTPUT 2>/dev/null | grep -- '--set-mss 88' | while read -r line; do
+        \\    rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
+        \\    "$ipt" -t mangle $rule 2>/dev/null || true
+        \\  done
+        \\done
+        \\if [ -d /etc/iptables ]; then
+        \\  command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        \\  command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        \\fi
+    ;
+    _ = sys.execForward(&.{ "bash", "-c", tcpmss_cleanup }) catch {};
+
+    // Revert the port-specific ufw allow rule the installer added.
+    if (sys.commandExists("ufw")) {
+        var ufw_buf: [16]u8 = undefined;
+        const port_rule = std.fmt.bufPrint(&ufw_buf, "{s}/tcp", .{configured_port}) catch "443/tcp";
+        _ = sys.execForward(&.{ "ufw", "delete", "allow", port_rule }) catch {};
+    }
 
     // Note: Self-removal: The mtbuddy binary is running right now. Removing it while running usually works on Linux.
     _ = sys.execForward(&.{ "bash", "-c", "[ \"$(readlink -f /usr/bin/mtbuddy 2>/dev/null)\" = /usr/local/bin/mtbuddy ] && rm -f /usr/bin/mtbuddy || true" }) catch {};

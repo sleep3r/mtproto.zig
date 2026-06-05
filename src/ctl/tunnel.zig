@@ -558,14 +558,30 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\
         \\[Service]
         \\Type=simple
-        \\ExecStartPre=/usr/local/bin/setup_tunnel.sh
+        \\User=mtproto
+        \\Group=mtproto
+        \\WorkingDirectory=/opt/mtproto-proxy
+        \\# Routing/policy setup needs root; the '+' prefix runs ONLY this command
+        \\# with full privileges while the proxy itself drops to User=mtproto.
+        \\ExecStartPre=+/usr/local/bin/setup_tunnel.sh
         \\ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
         \\ExecReload=/bin/kill -HUP $MAINPID
         \\KillSignal=SIGTERM
         \\TimeoutStopSec=25
         \\Restart=on-failure
         \\RestartSec=5
+        \\
+        \\# Security hardening — mirrors the default unit so tunnel mode does NOT
+        \\# silently run the internet-facing proxy as unsandboxed root. CAP_NET_ADMIN
+        \\# is added (on top of CAP_NET_BIND_SERVICE) for the SO_MARK policy routing
+        \\# the tunnel data path uses.
+        \\NoNewPrivileges=yes
+        \\ProtectSystem=strict
+        \\ProtectHome=yes
+        \\PrivateTmp=yes
+        \\ReadOnlyPaths=/opt/mtproto-proxy
         \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
         \\LimitNOFILE=131582
         \\TasksMax=65535
         \\

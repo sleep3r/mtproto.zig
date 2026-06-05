@@ -5,6 +5,7 @@ const linux = std.os.linux;
 pub const ConnectionPhase = enum {
     idle,
     reading_tls_header,
+    reading_direct_obfuscated_handshake,
     reading_client_hello_body,
     writing_server_hello_first,
     desync_wait,
@@ -77,5 +78,6 @@ test "fatal hangup close policy distinguishes client/upstream while connecting" 
     try std.testing.expect(shouldCloseOnFatalHangup(.connecting_upstream, client_fd, upstream_fd));
     try std.testing.expect(!shouldCloseOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
     try std.testing.expect(shouldCloseOnFatalHangup(.reading_tls_header, client_fd, upstream_fd));
+    try std.testing.expect(shouldCloseOnFatalHangup(.reading_direct_obfuscated_handshake, client_fd, upstream_fd));
     try std.testing.expect(!shouldCloseOnFatalHangup(.idle, client_fd, upstream_fd));
 }

@@ -165,6 +165,17 @@ pub fn buildServerHelloWithTemplate(
     crypto.randomBytes(&x25519_key);
     @memcpy(response[tmpl_x25519_key_offset..][0..32], &x25519_key);
 
+    // 3b. Randomize the fake "encrypted certificate" AppData per connection.
+    //     A real TLS 1.3 server's first AppData record is AEAD ciphertext keyed
+    //     by per-connection ephemeral ECDHE, so it is never byte-identical
+    //     across connections. Reusing the template's fixed 2878-byte body lets a
+    //     passive observer correlate two connections to the same endpoint and
+    //     see a verbatim-repeating ciphertext that no genuine TLS server emits —
+    //     a passive FakeTLS distinguisher. The client never inspects this body
+    //     and the HMAC in step 4 covers it, so fresh randomness is protocol-safe.
+    //     The record length stays fixed, preserving the size fingerprint.
+    crypto.randomBytes(response[tmpl_appdata_offset..][0..fake_cert_payload_len]);
+
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
     //    Stream bytes sequentially into the hasher to avoid a ~3KB heap
@@ -192,7 +203,9 @@ pub fn buildServerHelloWithTemplate(
 // 1. Extension ordering: OpenSSL sends supported_versions (0x002b) BEFORE key_share (0x0033)
 // 2. AppData size: fixed 2878 bytes (realistic Let's Encrypt ECDSA cert chain),
 //    NOT random in [1024,4096) which is an entropy fingerprint
-// 3. AppData body: deterministic pseudo-random (same across connections, like a real cert)
+// 3. AppData body: the comptime template seeds a deterministic body, but
+//    buildServerHelloWithTemplate overwrites it with fresh random bytes on every
+//    connection (a real cert record is unique per-connection AEAD ciphertext)
 
 /// Offset of Server Random field (32 bytes) — patched with HMAC at runtime
 const tmpl_random_offset: usize = 11;
@@ -200,6 +213,10 @@ const tmpl_random_offset: usize = 11;
 const tmpl_session_id_offset: usize = 44;
 /// Offset of X25519 public key (32 bytes) — filled with random at runtime
 const tmpl_x25519_key_offset: usize = 95;
+/// Offset of the fake AppData ("encrypted certificate") body — overwritten with
+/// fresh per-connection random bytes at runtime so it isn't byte-identical
+/// across connections (which would be a passive DPI distinguisher).
+const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_len;
 
 /// Fake encrypted certificate payload size.
 /// 2878 bytes matches a typical Nginx + Let's Encrypt ECDSA P-256 cert chain:
@@ -327,8 +344,9 @@ fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
     t[pos + 4] = @intCast(fake_cert_payload_len & 0xFF);
     pos += 5;
 
-    // Fill with deterministic pseudo-random bytes (SplitMix64).
-    // Looks like encrypted data to DPI, same every time like a real cert.
+    // Fill with deterministic pseudo-random bytes (SplitMix64) as a placeholder.
+    // This body is overwritten per-connection with fresh CSPRNG bytes in
+    // buildServerHelloWithTemplate; only the fixed record length matters here.
     var prng_state: u64 = seed;
     for (0..fake_cert_payload_len) |i| {
         prng_state +%= 0x9E3779B97F4A7C15;
@@ -506,23 +524,24 @@ test "buildServerHello produces valid three-record Nginx template structure" {
     ));
 }
 
-test "buildServerHello deterministic AppData (no random size fingerprint)" {
+test "buildServerHello AppData: fixed length, per-connection-random body" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0xAA} ** 32;
     const session_id = [_]u8{0xBB} ** 32;
 
-    // Build two responses — AppData body should be identical (deterministic template)
     const r1 = try buildServerHello(allocator, &digest, &digest, &session_id);
     defer allocator.free(r1);
     const r2 = try buildServerHello(allocator, &digest, &digest, &session_id);
     defer allocator.free(r2);
 
-    // Same total size (fixed template)
+    // Same total size (fixed-length cert record — no random *size* fingerprint).
     try std.testing.expectEqual(r1.len, r2.len);
 
-    // AppData bodies are identical (deterministic PRNG, same "certificate" every time)
+    // AppData body MUST differ across connections: a real TLS 1.3 server's first
+    // AppData record is unique per-connection AEAD ciphertext, so a byte-identical
+    // body would be a passive DPI distinguisher.
     const app_offset = 127 + 6 + 5; // after ServerHello + CCS + AppData header
-    try std.testing.expectEqualSlices(u8, r1[app_offset..], r2[app_offset..]);
+    try std.testing.expect(!std.mem.eql(u8, r1[app_offset..], r2[app_offset..]));
 }
 
 test "buildServerHello rejects non-32-byte session id" {

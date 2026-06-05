@@ -64,7 +64,10 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 
 pub fn runSecret(ui: *Tui) void {
     var secret: [32]u8 = undefined;
-    sys.generateSecret(&secret);
+    sys.generateSecret(&secret) catch {
+        ui.fail(ui.str(.install_secret_gen_failed));
+        return;
+    };
     ui.print("{s}\n", .{secret[0..]});
 }
 
@@ -122,8 +125,35 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
 
         ui.print("  {s}:\n", .{entry.key_ptr.*});
         ui.print("    secret: {s}\n", .{secret_hex[0..]});
-        ui.print("    tg:     {s}\n", .{tg_link});
-        ui.print("    t.me:   {s}\n\n", .{tme_link});
+        ui.print("    fakeTLS tg:   {s}\n", .{tg_link});
+        ui.print("    fakeTLS t.me: {s}\n", .{tme_link});
+
+        // dd (non-TLS, DPI-fingerprintable) links are printed ONLY when the
+        // operator has explicitly enabled the dd transport. With the secure
+        // default (fake_tls_only = true) the proxy rejects dd, so printing dd
+        // links would hand out non-working, fingerprintable links.
+        if (!cfg.fake_tls_only) {
+            var dd_buf: [128]u8 = undefined;
+            const dd_secret = buildDdSecret(secret_hex[0..], &dd_buf);
+
+            var tg_dd_buf: [1024]u8 = undefined;
+            const tg_dd_link = std.fmt.bufPrint(&tg_dd_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
+                safe_server,
+                port,
+                dd_secret,
+            }) catch continue;
+
+            var tme_dd_buf: [1024]u8 = undefined;
+            const tme_dd_link = std.fmt.bufPrint(&tme_dd_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
+                safe_server,
+                port,
+                dd_secret,
+            }) catch continue;
+
+            ui.print("    dd tg:        {s}\n", .{tg_dd_link});
+            ui.print("    dd t.me:      {s}\n", .{tme_dd_link});
+        }
+        ui.print("\n", .{});
     }
 }
 
@@ -158,6 +188,26 @@ fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) [
     pos += domain_len;
 
     return ee_buf[0..pos];
+}
+
+fn buildDdSecret(secret: []const u8, dd_buf: []u8) []const u8 {
+    var pos: usize = 0;
+    @memcpy(dd_buf[pos..][0..2], "dd");
+    pos += 2;
+
+    // Strip surrounding quotes so a config-derived (possibly quoted) secret never
+    // produces a malformed dd"..." link. Mirrors install.zig's buildDdSecret to
+    // keep the two copies behaviourally identical (no quote-handling divergence).
+    var clean_secret = secret;
+    if (clean_secret.len >= 2 and clean_secret[0] == '"' and clean_secret[clean_secret.len - 1] == '"') {
+        clean_secret = clean_secret[1 .. clean_secret.len - 1];
+    }
+
+    const sec_len = @min(clean_secret.len, dd_buf.len - pos);
+    @memcpy(dd_buf[pos..][0..sec_len], clean_secret[0..sec_len]);
+    pos += sec_len;
+
+    return dd_buf[0..pos];
 }
 
 fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
@@ -198,6 +248,18 @@ test "links - ee secret includes domain hex" {
     var buf: [512]u8 = undefined;
     const ee = buildEeSecret("0123456789abcdef0123456789abcdef", "wb.ru", &buf);
     try std.testing.expectEqualStrings("ee0123456789abcdef0123456789abcdef77622e7275", ee);
+}
+
+test "links - dd secret uses secure transport prefix" {
+    var buf: [128]u8 = undefined;
+    const dd = buildDdSecret("0123456789abcdef0123456789abcdef", &buf);
+    try std.testing.expectEqualStrings("dd0123456789abcdef0123456789abcdef", dd);
+}
+
+test "links - dd secret strips surrounding quotes (no malformed link)" {
+    var buf: [128]u8 = undefined;
+    const dd = buildDdSecret("\"0123456789abcdef0123456789abcdef\"", &buf);
+    try std.testing.expectEqualStrings("dd0123456789abcdef0123456789abcdef", dd);
 }
 
 test "links - server escaping preserves IPv4 and escapes IPv6 punctuation" {

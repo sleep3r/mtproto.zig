@@ -12,10 +12,12 @@ config.toml
 .vscode/
 __pycache__
 test/installer-e2e/logs/
-*.json
-*.logtest_poll.zig
-fix_tui.py
+*.log
+test_poll.zig
+test_addr.zig
+test_al.zig
 test_list.zig
+fix_tui.py
 bundle.sh
 codebase.txt
 .agent/skills/local-env/

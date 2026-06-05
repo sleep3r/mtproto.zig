@@ -178,9 +178,10 @@ sudo mtbuddy status
 # Проверка и просмотр конфига
 sudo mtbuddy config validate
 sudo mtbuddy config doctor
+sudo mtbuddy config doctor --network
 sudo mtbuddy config print-effective
 
-# Напечатать Telegram proxy links из config.toml
+# Напечатать Telegram proxy links из config.toml (FakeTLS ee + secure dd)
 sudo mtbuddy links
 sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config.toml
 
@@ -308,7 +309,7 @@ username = "admin"    # optional
 password = "secret"
 ```
 
-> **Важно:** через upstream маршрутизируется только трафик к DC. Mask/camouflage-соединения всегда идут напрямую.
+> **Важно:** через upstream маршрутизируется трафик к DC и refresh MiddleProxy metadata (`getProxyConfig` / `getProxySecret`). Mask/camouflage-соединения всегда идут напрямую.
 
 ---
 
@@ -334,7 +335,7 @@ idle_timeout_sec = 120
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"
-rate_limit_per_subnet = 30
+rate_limit_per_subnet = 0   # 0 = выключено (по умолчанию; не ложно-срабатывает на carrier-NAT). Для не-NAT хостов задайте напр. 30
 handshake_flood_guard_enabled = true
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
@@ -374,7 +375,7 @@ alice = true
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
 | `[server] tag` | — | 32-hex promotion tag от [@MTProxybot](https://t.me/MTProxybot) |
-| `[server] rate_limit_per_subnet` | `30` | Лимит новых соединений в секунду на /24 (IPv4) или /48 (IPv6), `0` отключает |
+| `[server] rate_limit_per_subnet` | `0` | Лимит новых соединений/сек на /24 (IPv4) или /48 (IPv6). `0` = выключено (по умолчанию, NAT-friendly); для не-NAT хостов задайте напр. `30` |
 | `[server] handshake_flood_guard_enabled` | `true` | Временно отклонять IP, которые часто не проходят MTProto handshake |
 | `[server] handshake_flood_guard_threshold` | `20` | Число плохих handshake/rate/budget событий с одного IP до временного deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
@@ -389,7 +390,11 @@ alice = true
 
 > Secret можно сгенерировать через `mtbuddy secret` или `openssl rand -hex 16`.
 >
-> Ссылки печатаются командой `sudo mtbuddy links`. Runtime-логи намеренно скрывают secrets и proxy links.
+> Ссылки печатаются командой `sudo mtbuddy links`: команда показывает и FakeTLS (`ee...domain`), и secure padded (`dd...`) варианты. Runtime-логи намеренно скрывают secrets и proxy links.
+>
+> **Транспорт `dd` («secure»/padded) по умолчанию отключён** (`[censorship].fake_tls_only = true`) — это обычный обфусцированный MTProto **без TLS-маскировки**, который DPI фингерпринтит напрямую как MTProto. По умолчанию прокси принимает только FakeTLS (`ee`), и `mtbuddy links` печатает только `ee`-ссылки. Чтобы раздавать `dd`-ссылки (сценарии с низким DPI / совместимость), задайте `fake_tls_only = false`. См. [THREAT_MODEL.md](THREAT_MODEL.md).
+>
+> Per-subnet rate limit **по умолчанию выключен** (`rate_limit_per_subnet = 0`), чтобы carrier-NAT/офисные сети (много легитимных клиентов за одним IP/подсетью) не получали ложных блокировок. Handshake flood guard остаётся включённым, но с выключенным subnet-лимитом он реагирует только на брошенные/незавершённые handshake — которые легитимные владельцы secret практически не создают. Если `flood_guard+` всё же блокирует реальных пользователей при burst, поднимите `handshake_flood_guard_threshold` / window / block или задайте `handshake_flood_guard_enabled = false`. `rate_limit_per_subnet` включайте только на single-tenant / не-NAT хостах.
 
 ---
 
@@ -405,7 +410,7 @@ ssh -L 61208:localhost:61208 root@<server_ip>
 # → http://localhost:61208
 ```
 
-Можно также открыть dashboard напрямую через секцию `[monitor]`, но у него нет встроенной auth. Не публикуйте его без firewall или reverse proxy с auth/TLS.
+Dashboard требует **HTTP Basic auth** (имя пользователя: любое; пароль генерируется автоматически в `/opt/mtproto-proxy/monitor/dashboard.token` — выведите его командой `cat` на сервере). Это root-привилегированная панель управления, поэтому держите её на loopback/SSH-туннеле и никогда не публикуйте по plain HTTP — только за HTTPS + reverse proxy.
 
 <details>
 <summary>Демо: dashboard</summary>
@@ -573,6 +578,7 @@ journalctl -u mtproto-proxy | grep -E "dc=203|Middle"
 ```
 
 Прокси обновляет DC203 metadata с Telegram на старте. Если `core.telegram.org` недоступен, используются bundled fallback addresses.
+При `[upstream].type = "socks5"` или `"http"` metadata refresh идёт через этот upstream; проверьте путь командой `sudo mtbuddy config doctor --network`.
 
 ---
 

@@ -167,15 +167,18 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     removeNfqwsRules(allocator, ipt.iptables);
     removeNfqwsRules(allocator, ipt.ip6tables);
 
+    // --queue-bypass: if nfqws is not attached (down/crashed/failed to start),
+    // queued packets fall through to ACCEPT instead of the kernel default DROP.
+    // Without it, a stopped nfqws silently blackholes ALL proxy egress on this port.
     if (!runLogged(ui, allocator, &.{
-        ipt.iptables, "-t",          "mangle",    "-A", "OUTPUT",
-        "-p",         "tcp",         "--sport",   port, "-j",
-        "NFQUEUE",    "--queue-num", NFQUEUE_NUM,
+        ipt.iptables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "-p",         "tcp",         "--sport",   port,             "-j",
+        "NFQUEUE",    "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }, "Failed to apply IPv4 NFQUEUE rule")) return;
     _ = sys.exec(allocator, &.{
-        ipt.ip6tables, "-t",          "mangle",    "-A", "OUTPUT",
-        "-p",          "tcp",         "--sport",   port, "-j",
-        "NFQUEUE",     "--queue-num", NFQUEUE_NUM,
+        ipt.ip6tables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "-p",          "tcp",         "--sport",   port,             "-j",
+        "NFQUEUE",     "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }) catch {};
 
     if (!outputRuleContains(allocator, ipt.iptables, "NFQUEUE")) {
@@ -204,10 +207,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         \\
         \\[Service]
         \\Type=simple
-        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
-        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
-        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
-        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s}
+        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
         \\ExecStart={[zapret_dir]s}/nfq/nfqws \
         \\    --qnum={[queue]s} \
         \\    --dpi-desync=fake,split2 \

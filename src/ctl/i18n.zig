@@ -170,6 +170,12 @@ pub const S = enum(u16) {
     error_binary_not_found,
     error_service_failed,
     error_install_dir_missing,
+
+    // ── Install warnings ──
+    install_warn_secret_ignored,
+    install_warn_user_ignored,
+    install_warn_ipv6_hop_manual,
+    install_secret_gen_failed,
 };
 
 /// Get a localized string by key.
@@ -428,6 +434,14 @@ const en_strings = [_][]const u8{
     "Service failed to start after update",
     // error_install_dir_missing
     "Install directory not found: /opt/mtproto-proxy",
+    // install_warn_secret_ignored
+    "Existing config kept; --secret was not applied. Edit [access.users] or remove config.toml to regenerate.",
+    // install_warn_user_ignored
+    "Existing config kept; --user was not applied. Edit [access.users] or remove config.toml to regenerate.",
+    // install_warn_ipv6_hop_manual
+    "IPv6 auto-hopping is not configured by install. Run `mtbuddy ipv6-hop` (requires Cloudflare API credentials).",
+    // install_secret_gen_failed
+    "Failed to generate a secure random secret (getrandom unavailable)",
 };
 
 // ── Russian strings ─────────────────────────────────────────────
@@ -677,6 +691,14 @@ const ru_strings = [_][]const u8{
     "Сервис не запустился после обновления",
     // error_install_dir_missing
     "Директория установки не найдена: /opt/mtproto-proxy",
+    // install_warn_secret_ignored
+    "Существующий конфиг сохранён; --secret не применён. Отредактируйте [access.users] или удалите config.toml для пересоздания.",
+    // install_warn_user_ignored
+    "Существующий конфиг сохранён; --user не применён. Отредактируйте [access.users] или удалите config.toml для пересоздания.",
+    // install_warn_ipv6_hop_manual
+    "IPv6 auto-hopping не настраивается при установке. Запустите `mtbuddy ipv6-hop` (нужны Cloudflare API credentials).",
+    // install_secret_gen_failed
+    "Не удалось сгенерировать безопасный случайный секрет (getrandom недоступен)",
 };
 
 // ── Comptime validation ─────────────────────────────────────────

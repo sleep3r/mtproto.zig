@@ -1265,7 +1265,10 @@ function addLine(d, anim) {
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
-  return d.innerHTML;
+  // textContent->innerHTML escapes & < > but NOT quotes; escape them too so the
+  // result is safe to interpolate into double/single-quoted HTML attributes
+  // (e.g. data-user="..."), preventing attribute-injection XSS.
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function connectWS() {

@@ -262,6 +262,10 @@ def perform_valid_client_handshake(sock: socket.socket, secret_hex: str, tls_dom
     sock.sendall(build_tls_record(TLS_RECORD_APPLICATION, hs))
 
 
+def perform_direct_obfuscated_handshake(sock: socket.socket, secret_hex: str, dc_idx: int = 1) -> None:
+    sock.sendall(generate_obf_handshake(secret_hex, dc_idx, "secure"))
+
+
 def wait_socket_closed(sock: socket.socket, timeout_sec: float = 2.0) -> bool:
     deadline = time.time() + timeout_sec
     sock.setblocking(False)
@@ -657,6 +661,7 @@ def base_config(
     mask: bool = False,
     mask_target: Optional[str] = None,
     mask_port: Optional[int] = None,
+    fake_tls_only: bool = True,
     use_middle_proxy: bool = False,
     force_media_middle_proxy: bool = False,
     upstream_type: str = "auto",
@@ -691,6 +696,7 @@ def base_config(
         lines.append(f'mask_target = "{mask_target}"')
     if mask_port is not None:
         lines.append(f"mask_port = {mask_port}")
+    lines.append(f"fake_tls_only = {'true' if fake_tls_only else 'false'}")
     lines.append("desync = false")
     lines.append("fast_mode = false")
     lines.append("")
@@ -744,6 +750,62 @@ def scenario_fake_telegram_dc_via_socks5() -> None:
             assert forwarded, "no C2S bytes reached fake DC tunnel"
         assert socks.tunnel_bytes > 0, "no C2S bytes reached fake DC tunnel"
         assert any(p == 443 for _, p in socks.connect_targets), f"no DC connect in {socks.connect_targets}"
+    finally:
+        proxy.stop()
+        socks.stop()
+
+
+def scenario_direct_secure_via_socks5() -> None:
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        fake_tls_only=False,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(2.0)
+            perform_direct_obfuscated_handshake(c, DEFAULT_SECRET_HEX)
+            c.sendall(b"\x44" * 128)
+            connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=2.0)
+            assert connected, "SOCKS5 CONNECT was not attempted for direct secure transport"
+            forwarded = wait_for_condition(lambda: socks.tunnel_bytes > 0, timeout_sec=2.0)
+            assert forwarded, "direct secure transport did not reach fake DC tunnel"
+        assert any(p == 443 for _, p in socks.connect_targets), f"no DC connect in {socks.connect_targets}"
+    finally:
+        proxy.stop()
+        socks.stop()
+
+
+def scenario_direct_secure_bad_secret_not_relayed() -> None:
+    """Negative: a direct-obfuscated (dd) handshake with an unknown secret must
+    NOT be relayed to a DC (the proxy masks/closes instead), so no upstream
+    SOCKS CONNECT happens."""
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        fake_tls_only=False,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        wrong_secret = "ffffffffffffffffffffffffffffffff"  # not in the proxy config
+        assert wrong_secret != DEFAULT_SECRET_HEX
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(2.0)
+            perform_direct_obfuscated_handshake(c, wrong_secret)
+            c.sendall(b"\x44" * 128)
+            relayed = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=1.5)
+            assert not relayed, f"bad dd secret was relayed upstream: {socks.connect_targets}"
     finally:
         proxy.stop()
         socks.stop()
@@ -1122,6 +1184,8 @@ def scenario_sigterm_during_active_relay() -> None:
 
 SCENARIOS: dict[str, Callable[[], None]] = {
     "fake_telegram_dc_via_socks5": scenario_fake_telegram_dc_via_socks5,
+    "direct_secure_via_socks5": scenario_direct_secure_via_socks5,
+    "direct_secure_bad_secret": scenario_direct_secure_bad_secret_not_relayed,
     "socks5_upstream_failure": scenario_socks5_upstream_failure,
     "http_connect_success": scenario_http_connect_success,
     "http_connect_failure": scenario_http_connect_failure,

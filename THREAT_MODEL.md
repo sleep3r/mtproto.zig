@@ -55,10 +55,36 @@ Secondary assets:
 - Censorship techniques evolve quickly; bypass methods can degrade without prior notice.
 - Traffic camouflage can be weakened by network-level heuristics outside proxy control.
 - Some mitigations depend on host networking setup (iptables/nftables, kernel routing, NIC offload behavior).
-- Dashboard and metrics endpoints are plain HTTP; exposing them publicly is unsafe unless protected by a reverse proxy and auth.
+- The dashboard requires HTTP Basic auth (auto-generated token at `/opt/mtproto-proxy/monitor/dashboard.token`) and pins the Host header on loopback binds, but it is still plain HTTP and runs a root-privileged control plane — reach it over an SSH tunnel and only ever expose it behind HTTPS + a reverse proxy. The Prometheus `/metrics` endpoint has no auth; keep it on loopback.
 - Proxy behavior depends on Telegram DC availability and protocol expectations that can change.
 - Telegram calls are out of scope and do not work through this proxy. Calls use Telegram's SOCKS-style call path, which is outside the MTProto/TLS-masking model and cannot be disguised cleanly as normal HTTPS here.
 - Media for non-Premium accounts requires MiddleProxy (`[general].use_middle_proxy = true`). Without it, photos, videos, stories, and other media on non-Premium accounts should be considered unavailable.
+
+## Client Transports: FakeTLS vs direct-obfuscated (dd)
+
+The proxy accepts two client transports on the same port:
+
+- **FakeTLS (`ee...` secret, recommended):** the obfuscated MTProto handshake is
+  wrapped in a TLS 1.3 ClientHello/ServerHello so the connection looks like normal
+  HTTPS to DPI. This is the transport the camouflage design (FakeTLS, DRS, desync,
+  masking) is built around.
+- **Direct-obfuscated (`dd...` secret, "secure"/padded mode):** plain obfuscated
+  MTProto with random padding and **no TLS wrapper**. It still requires a valid
+  user secret, but it is **not disguised as TLS** and is therefore directly
+  fingerprintable as MTProto by DPI. The `dd` name refers to the padding mode, not
+  to any DPI-resistance property.
+
+Implications:
+
+- The `dd` transport is **rejected by default** (`[censorship].fake_tls_only =
+  true`): non-TLS first bytes are masked immediately (matching the masking
+  target) instead of being parsed as an obfuscated handshake, so there is no dd
+  active-probe timing difference and the proxy only ever speaks FakeTLS on the
+  wire. This is the secure default for a TLS-camouflage proxy.
+- To hand out `dd` links (lower-DPI / compatibility scenarios), set
+  `fake_tls_only = false`. Only then does `mtbuddy links` print dd links, and
+  only then does the proxy accept the DPI-fingerprintable dd transport. Prefer
+  `ee`/FakeTLS links wherever active DPI is a concern.
 
 ## Region-Specific Caveats
 

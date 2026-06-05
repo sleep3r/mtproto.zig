@@ -44,8 +44,16 @@ pub const TomlDoc = struct {
     /// Save the document back to a file.
     pub fn save(self: *Self, path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        // config.toml carries [access.users] secrets and the FakeTLS identity.
+        // Create it 0640 (owner+group only) so unprivileged local accounts
+        // (e.g. the www-data user this tool installs for masking) cannot read
+        // the proxy secrets. createFile only sets the mode on creation, so also
+        // fchmod to tighten an already-existing world-readable config in place.
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{
+            .permissions = std.Io.File.Permissions.fromMode(0o640),
+        });
         defer file.close(io);
+        file.setPermissions(io, std.Io.File.Permissions.fromMode(0o640)) catch {};
 
         for (self.lines.items) |line| {
             try file.writeStreamingAll(io, line);

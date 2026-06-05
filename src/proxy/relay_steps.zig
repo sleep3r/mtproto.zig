@@ -167,8 +167,12 @@ pub fn startRelay(
     comptime queue_upstream: fn (@TypeOf(loop), @TypeOf(slot), []const u8) anyerror!bool,
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
 ) void {
-    // Handshake complete — release from handshake budget.
-    _ = loop.state.handshakes_inflight.fetchSub(1, .monotonic);
+    // Handshake complete — release from handshake budget exactly once (the
+    // connection was charged at first byte, so hs_counted is set here).
+    if (slot.hs_counted) {
+        _ = loop.state.handshakes_inflight.fetchSub(1, .monotonic);
+        slot.hs_counted = false;
+    }
     slot.phase = .relaying;
 
     if (slot.pipelined_data) |buf| {

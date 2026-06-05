@@ -25,6 +25,10 @@ concurrency:
   group: installer-e2e-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this workflow only reads the repo.
+permissions:
+  contents: read
+
 jobs:
   installer-e2e:
     name: ${{ matrix.image }}
@@ -39,10 +43,10 @@ jobs:
             name: ubuntu-24-04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
 
@@ -54,7 +58,7 @@ jobs:
 
       - name: Upload installer E2E logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: installer-e2e-${{ matrix.name }}
           path: test/installer-e2e/logs/

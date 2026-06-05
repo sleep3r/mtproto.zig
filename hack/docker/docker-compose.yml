@@ -16,7 +16,8 @@ services:
       - "127.0.0.1:9400:9400"
 
   prometheus:
-    image: prom/prometheus:latest
+    # Pinned (not :latest) for reproducible monitoring; bump deliberately.
+    image: prom/prometheus:v2.53.0
     container_name: mtg-prometheus
     restart: unless-stopped
     depends_on:
@@ -28,14 +29,17 @@ services:
       - "127.0.0.1:9090:9090"
 
   grafana:
-    image: grafana/grafana:latest
+    # Pinned (not :latest) for reproducibility; bump deliberately.
+    image: grafana/grafana:11.0.0
     container_name: mtg-grafana
     restart: unless-stopped
     depends_on:
       - prometheus
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # No hardcoded admin/admin. Set these in a .env file next to the compose
+      # file; the password is required (compose errors if it is unset).
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD (e.g. in hack/docker/.env)}
     volumes:
       - grafana-data:/var/lib/grafana
     ports:

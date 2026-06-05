@@ -2,6 +2,8 @@
 """MTProto Proxy Dashboard — API server."""
 
 import asyncio
+import base64
+import hmac
 import json
 import os
 import re
@@ -13,7 +15,7 @@ import subprocess
 import sys
 import shutil
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 try:
     import tomllib  # Python 3.11+
@@ -25,7 +27,7 @@ except ModuleNotFoundError:
 
 import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -139,6 +141,95 @@ def _proxy_version() -> str | None:
 
 
 app = FastAPI()
+
+# ── Dashboard authentication & hardening ─────────────────────────────────────
+# The dashboard is a ROOT-privileged control plane: it can rewrite config.toml,
+# delete WireGuard tunnels, restart the proxy, and read every MTProto user
+# secret. It is gated behind:
+#   1. HTTP Basic auth using an auto-generated 0600 token file (password = token,
+#      username ignored). With auth required, /api/stats returning secrets is
+#      only reachable by the authenticated operator who already owns them.
+#   2. Host-header pinning for loopback binds — defeats DNS-rebinding that would
+#      otherwise let a page in the operator's browser drive a 127.0.0.1 bind.
+#   3. An Origin check on state-changing requests — defeats CSRF (a cross-origin
+#      "simple" POST the browser would auto-attach Basic credentials to).
+# Default bind stays 127.0.0.1; reach it over an SSH tunnel.
+_DASHBOARD_TOKEN_FILE = Path(__file__).parent / "dashboard.token"
+
+
+def _load_or_create_dashboard_token() -> str:
+    try:
+        if _DASHBOARD_TOKEN_FILE.is_file():
+            tok = _DASHBOARD_TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if tok:
+                return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(str(_DASHBOARD_TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(tok + "\n")
+    except OSError as exc:
+        print(f"[dashboard] WARNING: could not persist auth token: {exc}", file=sys.stderr)
+    return tok
+
+
+DASHBOARD_TOKEN = _load_or_create_dashboard_token()
+_DASH_BIND_HOST = str(DASHBOARD_CFG.get("host", "127.0.0.1")).strip().lower()
+# Only pin Host for loopback binds (the DNS-rebinding scenario). If the operator
+# deliberately bound a routable address, Basic auth is the gate.
+_DASH_ENFORCE_HOST = _DASH_BIND_HOST in ("127.0.0.1", "::1", "localhost", "")
+_DASH_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _dashboard_auth_ok(authorization) -> bool:
+    if not authorization or not authorization.startswith("Basic "):
+        return False
+    try:
+        raw = base64.b64decode(authorization[6:]).decode("utf-8", "replace")
+    except Exception:
+        return False
+    _, _, pw = raw.partition(":")
+    return hmac.compare_digest(pw, DASHBOARD_TOKEN)
+
+
+def _host_hostname(host_header: str) -> str:
+    h = host_header
+    if h.startswith("["):  # [::1]:port
+        h = h[1:].split("]", 1)[0]
+    else:
+        h = h.split(":", 1)[0]
+    return h.strip().lower()
+
+
+@app.middleware("http")
+async def _dashboard_security(request: Request, call_next):
+    host_header = (request.headers.get("host") or "").strip()
+    if _DASH_ENFORCE_HOST and _host_hostname(host_header) not in _DASH_LOOPBACK_HOSTS:
+        return PlainTextResponse("forbidden host", status_code=403)
+
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and urlparse(origin).netloc != host_header:
+            return PlainTextResponse("cross-origin request blocked", status_code=403)
+
+    if not _dashboard_auth_ok(request.headers.get("authorization")):
+        return PlainTextResponse(
+            "authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="mtproto dashboard"'},
+        )
+
+    response = await call_next(request)
+    # Conservative hardening headers (no source restrictions, so the UI keeps
+    # rendering): block framing/clickjacking and MIME sniffing, drop referrers.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    return response
+
 
 _prev_net = {"ts": 0, "rx": 0, "tx": 0}
 _net_history = []
@@ -2410,6 +2501,11 @@ def api_logs():
 
 @app.websocket("/ws/logs")
 async def ws_logs(ws: WebSocket):
+    # WebSocket upgrades bypass HTTP middleware, so enforce the same Basic auth
+    # here (browsers replay cached same-origin Basic credentials on the handshake).
+    if not _dashboard_auth_ok(ws.headers.get("authorization")):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     _drain_to_recent()
     with _recent_lock:
@@ -2431,6 +2527,12 @@ async def ws_logs(ws: WebSocket):
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 if __name__ == "__main__":
+    print(
+        f"[dashboard] HTTP Basic auth required (username: any, password in "
+        f"{_DASHBOARD_TOKEN_FILE}). Listening on "
+        f"{DASHBOARD_CFG['host']}:{DASHBOARD_CFG['port']} — reach it over an SSH tunnel.",
+        file=sys.stderr,
+    )
     uvicorn.run(
         app, host=DASHBOARD_CFG["host"], port=DASHBOARD_CFG["port"], log_level="warning"
     )

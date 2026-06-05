@@ -8,6 +8,10 @@
 # as normal HTTPS by this project.
 use_middle_proxy = true
 
+# Force media-path traffic (DC203 / media DCs) through MiddleProxy even when
+# use_middle_proxy = false, so non-Premium media keeps loading. Default true.
+# force_media_middle_proxy = true
+
 # Telemt-compatible alias for promotion tag (alternative to [server].tag).
 # If both are set, [server].tag takes priority.
 # ad_tag = "1234567890abcdef1234567890abcdef"
@@ -68,22 +72,37 @@ port = 443
 # log_level = "info"
 
 # Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet.
-# Limits scanner/flood/DPI-probe impact. Default of 30 is generous for
-# legitimate Telegram clients (3-6 connections at startup, then hold).
-# Set to 0 to disable rate limiting entirely.
-# rate_limit_per_subnet = 30
+# DISABLED by default (0): the target audience sits behind heavy carrier-grade
+# NAT where many legitimate users share one subnet, so a per-subnet cap mostly
+# false-positives on real users. Access is already gated by the per-user secret,
+# the handshake flood guard, the handshake-inflight budget, and max_connections.
+# Set a value (e.g. 30) only for single-tenant / non-NAT deployments.
+# rate_limit_per_subnet = 0
 
 # By default, max_connections is auto-clamped to a RAM-safe estimate on startup.
 # Set to true to disable this safety mechanism (only if you're sure your host
 # has enough memory for the configured limits).
 # unsafe_override_limits = false
 
+# Handshake flood guard: temporarily blocks source IPs that generate too many
+# failed/abandoned handshakes. Raise the threshold / window for carrier-NAT or
+# shared-office networks where many legitimate clients share one IP.
+# handshake_flood_guard_enabled = true
+# handshake_flood_guard_threshold = 20     # failed handshakes per window before block
+# handshake_flood_guard_window_sec = 30
+# handshake_flood_guard_block_sec = 120
+
+# Seconds to let active relays drain on SIGTERM before forcing shutdown.
+# graceful_shutdown_timeout_sec = 15
+
 [monitor]
 # Bind address for the monitoring dashboard HTTP server.
 # Default: 127.0.0.1 (localhost only).
 # Set to "0.0.0.0" to expose the dashboard on all interfaces.
-# WARNING: the dashboard has no authentication — use a firewall or
-# reverse proxy with auth if binding to a public interface.
+# The dashboard requires HTTP Basic auth (password auto-generated at
+# /opt/mtproto-proxy/monitor/dashboard.token) and pins the Host header on
+# loopback binds, but it is still plain HTTP over a root-privileged control
+# plane: reach it via SSH tunnel and only expose it behind HTTPS + auth.
 # host = "127.0.0.1"
 
 # TCP port for the monitoring dashboard.
@@ -108,6 +127,12 @@ port = 443
 # "socks5"     — route via SOCKS5 proxy
 # "http"       — route via HTTP CONNECT proxy
 # type = "auto"
+
+# When type is socks5/http, allow MiddleProxy metadata refresh to fall back to a
+# DIRECT fetch if the configured upstream is unreachable. Default false (the
+# upstream is treated as mandatory). Note: socks5/http/tunnel metadata refresh
+# shells out to `curl`, so curl must be installed for those modes.
+# allow_direct_fallback = false
 
 # ── VPN tunnel configuration ──
 # Activate with: type = "tunnel"
@@ -143,6 +168,14 @@ tls_domain = "google.com"
 
 # Forward unauthenticated / invalid connections to tls_domain (active probing defense).
 mask = true
+
+# Reject the non-TLS "direct obfuscated" (dd / secure) transport. ENABLED by
+# default (true): only FakeTLS (ee) clients are accepted and any non-TLS first
+# bytes are masked immediately. This is the secure default for a TLS-camouflage
+# proxy — dd is plain, DPI-fingerprintable MTProto. Set to false ONLY if you
+# need to hand out dd links (lower-DPI / compatibility scenarios); `mtbuddy links`
+# then also prints dd links.
+# fake_tls_only = true
 
 # Local port override for mask forwarding (e.g. 8443 for zero-RTT local Nginx).
 # When unset, connects to tls_domain:443 directly.

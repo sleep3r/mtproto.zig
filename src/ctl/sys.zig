@@ -281,18 +281,23 @@ pub fn envFlagSet(name: []const u8) bool {
 }
 
 /// Generate 16 random bytes as a hex string (32 chars).
-pub fn generateSecret(buf: *[32]u8) void {
+pub fn generateSecret(buf: *[32]u8) error{NoEntropy}!void {
     var bytes: [16]u8 = undefined;
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = std.os.linux.getrandom(bytes[off..].ptr, bytes.len - off, 0);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
-                if (rc == 0) break;
+                // A 0-byte return for a non-empty request is unexpected; treat
+                // it as failure rather than spinning forever.
+                if (rc == 0) return error.NoEntropy;
                 off += rc;
             },
             .INTR => continue,
-            else => break,
+            // getrandom failed (ENOSYS on <3.17, EFAULT, seccomp, …). Do NOT
+            // fall through to hex-encoding uninitialized stack memory as a
+            // "secret" — a predictable proxy secret silently breaks auth.
+            else => return error.NoEntropy,
         }
     }
     const hex = "0123456789abcdef";

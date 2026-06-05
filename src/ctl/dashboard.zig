@@ -241,11 +241,15 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
             .{ .label = "Logs:", .value = "journalctl -u " ++ SERVICE_NAME ++ " -f" },
             .{ .label = "Port:", .value = "61208 (default, see config.toml)" },
             .{ .label = "", .style = .blank },
+            .{ .label = "Login: HTTP Basic auth (username: any)", .style = .success },
+            .{ .label = "  password: cat /opt/mtproto-proxy/monitor/dashboard.token", .style = .success },
+            .{ .label = "", .style = .blank },
             .{ .label = "Access via secure SSH Tunnel:", .style = .success },
             .{ .label = "  ssh -L 61208:localhost:61208 root@<server_ip>", .style = .success },
             .{ .label = "  open http://localhost:61208", .style = .success },
             .{ .label = "", .style = .blank },
-            .{ .label = "Or expose to internet via Nginx proxy_pass", .style = .success },
+            .{ .label = "Exposing publicly? Keep the token secret and put HTTPS +", .style = .highlight },
+            .{ .label = "the proxy behind Nginx — never expose plain HTTP to the internet.", .style = .highlight },
         });
     }
 }

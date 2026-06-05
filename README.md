@@ -180,9 +180,10 @@ sudo mtbuddy status
 # Validate and inspect config
 sudo mtbuddy config validate
 sudo mtbuddy config doctor
+sudo mtbuddy config doctor --network
 sudo mtbuddy config print-effective
 
-# Print Telegram proxy links from config.toml (sensitive output)
+# Print Telegram proxy links from config.toml (FakeTLS ee + secure dd; sensitive output)
 sudo mtbuddy links
 sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config.toml
 
@@ -320,7 +321,9 @@ username = "admin"    # optional, omit for no-auth
 password = "secret"
 ```
 
-> **Note:** Only DC-bound traffic is routed through the configured upstream. Mask (camouflage) connections always go direct.
+> **Note:** DC-bound relay traffic and MiddleProxy metadata refreshes (`getProxyConfig` / `getProxySecret`) use the configured upstream. Mask (camouflage) connections always go direct.
+>
+> **Dependency note:** the "zero dependencies" claim holds for the default `auto`/`direct` egress. With `socks5`, `http`, or `tunnel` upstream modes, MiddleProxy metadata refresh shells out to `curl`, so `curl` must be installed on the host (the standard installer pulls it in).
 
 ---
 
@@ -346,7 +349,7 @@ idle_timeout_sec = 120
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
-rate_limit_per_subnet = 30
+rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
 handshake_flood_guard_enabled = true
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
@@ -402,7 +405,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] middleproxy_buffer_kb` | `1024` | ME per-connection buffer (KiB). Below 1024 may cause overflow on media traffic |
 | `[server] tag` | — | 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
-| `[server] rate_limit_per_subnet` | `30` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). Set `0` to disable |
+| `[server] rate_limit_per_subnet` | `0` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). `0` = disabled (default, NAT-friendly); set e.g. `30` for non-NAT hosts |
 | `[server] handshake_flood_guard_enabled` | `true` | Temporarily deny exact source IPs that repeatedly fail the MTProto handshake |
 | `[server] handshake_flood_guard_threshold` | `20` | Bad handshake/rate/budget events per source IP before temporary deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Rolling window for `handshake_flood_guard_threshold` |
@@ -427,7 +430,11 @@ alice = true   # bypass MiddleProxy for this user
 
 > Generate a secret: `mtbuddy secret` or `openssl rand -hex 16`
 >
-> Print client links explicitly: `sudo mtbuddy links`. Runtime proxy logs intentionally hide secrets and proxy links.
+> Print client links explicitly: `sudo mtbuddy links`. It prints both FakeTLS (`ee...domain`) and secure padded (`dd...`) links. Runtime proxy logs intentionally hide secrets and proxy links.
+>
+> **The `dd` ("secure"/padded) transport is rejected by default** (`[censorship].fake_tls_only = true`) — it is plain obfuscated MTProto with **no TLS disguise**, directly fingerprintable as MTProto by DPI. By default the proxy accepts only FakeTLS (`ee`), and `mtbuddy links` prints only `ee` links. To hand out `dd` links (lower-DPI / compatibility scenarios), set `fake_tls_only = false`. See [THREAT_MODEL.md](THREAT_MODEL.md).
+>
+> The per-subnet new-connection rate limit is **off by default** (`rate_limit_per_subnet = 0`) so large carrier-NAT or shared-office networks (many legitimate clients behind one IP/subnet) aren't false-positived. The handshake flood guard stays on but, with the subnet limit off, it only acts on abandoned/incomplete handshakes — which legitimate secret-holders virtually never produce. If you still see `flood_guard+` blocking real users in bursts, raise `handshake_flood_guard_threshold` / window / block, or set `handshake_flood_guard_enabled = false`. Enable `rate_limit_per_subnet` only on single-tenant / non-NAT hosts.
 
 ---
 
@@ -446,7 +453,7 @@ ssh -L 61208:localhost:61208 root@<server_ip>
 # → http://localhost:61208
 ```
 
-Alternatively, expose the dashboard port via `[monitor]` config section and access directly.
+The dashboard requires **HTTP Basic auth** (username: any; password auto-generated at `/opt/mtproto-proxy/monitor/dashboard.token` — `cat` it on the server). It is a root-privileged control plane, so keep it on the loopback/SSH-tunnel path and never expose plain HTTP to the internet — front it with HTTPS + a reverse proxy if you must.
 
 <details>
 <summary>Demo: monitoring dashboard</summary>
@@ -626,6 +633,7 @@ Fix: `iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT`
 **5. DC203 media resets on non-premium clients.**
 Check logs: `journalctl -u mtproto-proxy | grep -E "dc=203|Middle"`.
 The proxy auto-refreshes DC203 metadata from Telegram on startup. If `core.telegram.org` is unreachable, it uses bundled fallback addresses.
+With `[upstream].type = "socks5"` or `"http"`, metadata refreshes use that upstream; run `sudo mtbuddy config doctor --network` to verify the proxy endpoint and Telegram metadata fetch path.
 
 ---
 

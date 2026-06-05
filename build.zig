@@ -92,6 +92,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const proxy_http_fetch_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy/http_fetch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const proxy_net_helpers_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy/net_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
         .target = target,
@@ -101,6 +113,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
             .{ .name = "proxy_config", .module = proxy_config_mod },
+            .{ .name = "proxy_http_fetch", .module = proxy_http_fetch_mod },
+            .{ .name = "proxy_net_helpers", .module = proxy_net_helpers_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
     });

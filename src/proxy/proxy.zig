@@ -74,6 +74,12 @@ const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
 const event_loop_wait_ms: i32 = 37;
+/// How long after its first byte a non-TLS (dd) connection may take to deliver
+/// the full 64-byte obfuscated handshake before we treat it as a probe and serve
+/// the masking cover. Real dd clients send the whole handshake in the first
+/// packet, so a few seconds is generous; keeping it well below
+/// handshake_timeout_sec shrinks the active-probe timing oracle on the dd path.
+const dd_handshake_decision_ms: i64 = 4000;
 const desync_wait_poll_ms: i32 = 3;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
@@ -174,6 +180,11 @@ const UpstreamKind = enum {
     mask,
 };
 
+const ClientTransport = enum {
+    fake_tls,
+    direct_obfuscated,
+};
+
 const MiddleProxyHandshakeStep = enum {
     none,
     sending_rpc_nonce,
@@ -182,6 +193,39 @@ const MiddleProxyHandshakeStep = enum {
     waiting_rpc_handshake_response,
     done,
 };
+
+const MiddleProxyFetchRoute = enum {
+    direct,
+    tunnel,
+    socks5,
+    http_connect,
+};
+
+fn middleProxyFetchRouteForConfig(cfg: *const Config) MiddleProxyFetchRoute {
+    return switch (cfg.upstream_mode) {
+        .socks5 => .socks5,
+        .http => .http_connect,
+        .tunnel => .tunnel,
+        .auto, .direct => .direct,
+    };
+}
+
+test "middle-proxy refresh selects proxy route for explicit socks5 and http upstreams" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    cfg.upstream_mode = .socks5;
+    try std.testing.expectEqual(MiddleProxyFetchRoute.socks5, middleProxyFetchRouteForConfig(&cfg));
+
+    cfg.upstream_mode = .http;
+    try std.testing.expectEqual(MiddleProxyFetchRoute.http_connect, middleProxyFetchRouteForConfig(&cfg));
+
+    cfg.upstream_mode = .tunnel;
+    try std.testing.expectEqual(MiddleProxyFetchRoute.tunnel, middleProxyFetchRouteForConfig(&cfg));
+}
 
 const DcConnectPlan = middle_proxy_routing.DcConnectPlan;
 const buildDcConnectPlan = middle_proxy_routing.buildDcConnectPlan;
@@ -309,10 +353,15 @@ const ConnectionSlot = struct {
     client_fd: posix.fd_t = -1,
     upstream_fd: posix.fd_t = -1,
     upstream_kind: UpstreamKind = .none,
+    client_transport: ClientTransport = .fake_tls,
     peer_addr: Address = undefined,
 
     phase: ConnectionPhase = .idle,
     active_reserved: bool = false,
+    /// True while this connection occupies a handshake-inflight budget slot.
+    /// Counted at FIRST BYTE (not accept), so silent/pre-first-byte TCP sessions
+    /// (mobile pre-warmed sockets, zero-byte slow-loris) never hold the budget.
+    hs_counted: bool = false,
 
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
@@ -441,6 +490,7 @@ const ConnectionSlot = struct {
     fn handshakeInProgress(self: *const ConnectionSlot) bool {
         return switch (self.phase) {
             .reading_tls_header,
+            .reading_direct_obfuscated_handshake,
             .reading_client_hello_body,
             .writing_server_hello_first,
             .desync_wait,
@@ -976,19 +1026,21 @@ pub const ProxyState = struct {
         setNonBlocking(server.socket.handle);
 
         if (self.config.use_middle_proxy and self.config.datacenter_override == null) {
-            self.refreshMiddleProxyInfo() catch |err| {
-                if (isMiddleProxyRefreshNetworkError(err)) {
-                    log.info("Initial middle-proxy refresh unavailable ({s}), using bundled defaults", .{@errorName(err)});
-                } else {
-                    log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
-                }
-            };
-
+            // The INITIAL middle-proxy metadata refresh now runs inside the
+            // updater thread (see middleProxyUpdaterMain), NOT synchronously
+            // here, so a blocked/stalled core.telegram.org fetch on a censored
+            // host cannot delay the event loop from accepting connections (the
+            // std.http fetch has no read timeout). The proxy serves immediately
+            // on bundled fallback addresses and upgrades the cache in the
+            // background as soon as the network allows.
             self.middle_proxy_updater_shutdown.store(false, .release);
             if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
                 self.middle_proxy_updater_thread = updater;
             } else |err| {
                 log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
+                // No background thread: best-effort synchronous refresh so
+                // metadata is still populated (bounded by the OS connect timeout).
+                self.refreshMiddleProxyInfo() catch {};
             }
         }
 
@@ -1046,12 +1098,55 @@ pub const ProxyState = struct {
     /// active tunnel route (`table 200`), pool state, then configured tunnel
     /// candidates. This keeps the media MP cache warm after tunnel failover.
     fn fetchMiddleProxyAsset(self: *ProxyState, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-        if (fetchUrlBytes(allocator, url)) |bytes| {
-            return bytes;
-        } else |direct_err| {
-            if (self.config.upstream_mode != .tunnel) return direct_err;
-            return self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, direct_err);
+        switch (middleProxyFetchRouteForConfig(&self.config)) {
+            .socks5, .http_connect => {
+                if (self.fetchMiddleProxyAssetViaConfiguredProxy(allocator, url)) |bytes| {
+                    return bytes;
+                } else |proxy_err| {
+                    if (!self.config.allow_direct_fallback) return proxy_err;
+                    log.warn("Middle-proxy asset {s} unavailable through configured upstream ({s}); trying direct fallback", .{
+                        url,
+                        @errorName(proxy_err),
+                    });
+                    return fetchUrlBytes(allocator, url) catch proxy_err;
+                }
+            },
+            .tunnel => {
+                if (fetchUrlBytes(allocator, url)) |bytes| {
+                    return bytes;
+                } else |direct_err| {
+                    return self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, direct_err);
+                }
+            },
+            .direct => return fetchUrlBytes(allocator, url),
         }
+    }
+
+    fn fetchMiddleProxyAssetViaConfiguredProxy(
+        self: *ProxyState,
+        allocator: std.mem.Allocator,
+        url: []const u8,
+    ) ![]u8 {
+        const host = self.config.upstream_proxy_host orelse return error.InvalidProxyUpstreamConfig;
+        if (self.config.upstream_proxy_port == 0) return error.InvalidProxyUpstreamConfig;
+
+        const kind: http_fetch.ProxyKind = switch (self.config.upstream_mode) {
+            .socks5 => .socks5,
+            .http => .http_connect,
+            else => return error.InvalidProxyUpstreamConfig,
+        };
+
+        log.info("Fetching middle-proxy asset {s} through configured {s} upstream", .{
+            url,
+            if (kind == .socks5) "SOCKS5" else "HTTP CONNECT",
+        });
+        return http_fetch.fetchUrlBytesViaProxy(allocator, url, .{
+            .kind = kind,
+            .host = host,
+            .port = self.config.upstream_proxy_port,
+            .username = self.config.upstream_proxy_username,
+            .password = self.config.upstream_proxy_password,
+        });
     }
 
     fn fetchMiddleProxyAssetViaTunnelPool(
@@ -1093,11 +1188,24 @@ pub const ProxyState = struct {
     }
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {
-        // Initial refresh runs before the proxy event loop starts, so on a
-        // censored host it typically fails (tunnel handshake may not be up yet).
-        // Do a short-cycle retry loop early, then fall back to the normal
-        // 24-hour cadence. This gets media MP addresses into the cache within
-        // the first few minutes of uptime instead of the next day.
+        // The INITIAL refresh happens here (in this background thread) so it
+        // never blocks the boot path. On a censored host it may fail (tunnel
+        // handshake may not be up yet), so on failure run a short-cycle retry
+        // loop before falling back to the normal 24-hour cadence. This gets
+        // media MP addresses into the cache within the first few minutes of
+        // uptime instead of the next day, all without delaying startup.
+        var initial_ok = false;
+        if (self.refreshMiddleProxyInfo()) |_| {
+            initial_ok = true;
+        } else |err| {
+            if (isMiddleProxyRefreshNetworkError(err)) {
+                log.info("Initial middle-proxy refresh unavailable ({s}), using bundled defaults", .{@errorName(err)});
+            } else {
+                log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
+            }
+        }
+        if (self.middle_proxy_updater_shutdown.load(.acquire)) return;
+
         const short_retries: [5]u64 = .{
             10 * std.time.ns_per_s,
             30 * std.time.ns_per_s,
@@ -1106,7 +1214,7 @@ pub const ProxyState = struct {
             30 * 60 * std.time.ns_per_s,
         };
         var retry_idx: usize = 0;
-        while (retry_idx < short_retries.len) : (retry_idx += 1) {
+        while (!initial_ok and retry_idx < short_retries.len) : (retry_idx += 1) {
             if (self.waitForUpdaterDelay(short_retries[retry_idx])) return;
             if (self.refreshMiddleProxyInfo()) |_| {
                 break;
@@ -1573,34 +1681,30 @@ const EventLoop = struct {
                 continue;
             }
 
-            // Handshake inflight budget: cap at 30% of max_connections.
-            // Prevents churn (scanners/probes) from starving established relay sessions.
-            const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
-            const hs_max = (self.state.config.max_connections * 3) / 10;
-            if (hs_max > 0 and hs_inflight >= hs_max) {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-                _ = self.state.active_connections.fetchSub(1, .monotonic);
-                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
-                _ = self.flood_guard.record(client_addr, .handshake_budget, flood_cfg);
-                closeFd(cfd);
-                continue;
-            }
+            // NOTE: the handshake-inflight budget is charged at FIRST BYTE
+            // (reserveHandshakeBudget in readTlsHeader), not here at accept, so
+            // a flood of silent/zero-byte TCP sessions can no longer exhaust the
+            // budget and starve real handshakes. accept() is still bounded by the
+            // flood guard, per-/24 subnet rate limit, and the active_connections
+            // cap above.
 
             const slot = self.pool.acquire() orelse {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 closeFd(cfd);
                 continue;
             };
 
             slot.active_reserved = true;
+            slot.hs_counted = false;
             slot.traffic_client_to_upstream_counter = &self.state.client_to_upstream_bytes_total;
             slot.traffic_upstream_to_client_counter = &self.state.upstream_to_client_bytes_total;
             slot.user_metrics = null;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
+            slot.client_transport = .fake_tls;
             slot.phase = .reading_tls_header;
+            slot.handshake_pos = 0;
             slot.created_at_ms = nowMs();
             slot.last_activity_ms = slot.created_at_ms;
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
@@ -2045,6 +2149,7 @@ const EventLoop = struct {
 
         switch (slot.phase) {
             .reading_tls_header => self.readTlsHeader(slot),
+            .reading_direct_obfuscated_handshake => self.readDirectObfuscatedHandshake(slot),
             .reading_client_hello_body => self.readClientHelloBody(slot),
             .reading_mtproto_tls_header, .reading_mtproto_tls_body => self.readMtprotoHandshake(slot),
             .relaying => self.relayClientToUpstream(slot),
@@ -2237,6 +2342,33 @@ const EventLoop = struct {
         self.desync_wait_slots.shrinkRetainingCapacity(write_idx);
     }
 
+    /// Charge a connection against the handshake-inflight budget once it has
+    /// sent its first byte. Returns false (and reverts) if the budget is
+    /// exhausted, in which case the caller must close the slot. The budget caps
+    /// concurrent in-flight handshakes at 30% of max_connections so churn
+    /// (scanners/probes that actually handshake) cannot starve established
+    /// relays. Pre-first-byte sessions are deliberately NOT counted.
+    fn reserveHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) bool {
+        if (slot.hs_counted) return true;
+        const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
+        const hs_max = (self.state.config.max_connections * 3) / 10;
+        if (hs_max > 0 and hs_inflight >= hs_max) {
+            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+            return false;
+        }
+        slot.hs_counted = true;
+        return true;
+    }
+
+    /// Release a connection's handshake-budget slot exactly once (idempotent).
+    fn releaseHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.hs_counted) {
+            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            slot.hs_counted = false;
+        }
+    }
+
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
         while (slot.tls_hdr_pos < tls_header_len) {
             const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
@@ -2250,15 +2382,37 @@ const EventLoop = struct {
             }
             if (slot.first_byte_at_ms == 0) {
                 slot.first_byte_at_ms = nowMs();
+                // First byte arrived → the connection is now actually
+                // handshaking. Charge it against the handshake-inflight budget
+                // here (not at accept) so pre-first-byte silent sessions never
+                // occupied a budget slot. Covers both FakeTLS and the dd path,
+                // which is entered from this function after the TLS sniff.
+                if (!self.reserveHandshakeBudget(slot)) {
+                    self.closeSlot(slot, "handshake budget exhausted");
+                    return;
+                }
             }
             slot.tls_hdr_pos += @intCast(n);
             slot.last_activity_ms = nowMs();
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
-            self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
-                self.closeSlot(slot, "non-tls masked failed");
-            };
+            if (self.state.config.fake_tls_only) {
+                // Strict FakeTLS-only: never accept the non-TLS "direct
+                // obfuscated" (dd) transport. Mask the bytes immediately so a
+                // non-TLS active probe gets the masking cover (matching the old
+                // behavior) instead of being read up to 64 bytes — no dd
+                // transport and no dd active-probe distinguisher.
+                self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
+                    self.closeSlot(slot, "non-tls masked failed");
+                };
+                return;
+            }
+            slot.client_transport = .direct_obfuscated;
+            @memcpy(slot.handshake_buf[0..tls_header_len], slot.tls_hdr_buf[0..]);
+            slot.handshake_pos = tls_header_len;
+            slot.phase = .reading_direct_obfuscated_handshake;
+            self.readDirectObfuscatedHandshake(slot);
             return;
         }
 
@@ -2283,6 +2437,38 @@ const EventLoop = struct {
         slot.tls_body_len = @intCast(record_len);
         slot.tls_body_pos = 0;
         slot.phase = .reading_client_hello_body;
+    }
+
+    fn readDirectObfuscatedHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
+        while (slot.handshake_pos < constants.handshake_len) {
+            const n = posix.read(slot.client_fd, slot.handshake_buf[slot.handshake_pos..]) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeSlot(slot, "direct obfuscated handshake read error");
+                return;
+            };
+            if (n == 0) {
+                // A real dd client sends all 64 obfuscation bytes; a short
+                // non-TLS payload followed by EOF is a probe shape. Serve the
+                // masking cover for whatever was buffered instead of a bare
+                // silent close, so the response matches the masking target
+                // rather than fingerprinting the proxy.
+                self.startMasking(slot, slot.handshake_buf[0..slot.handshake_pos]) catch {
+                    self.closeSlot(slot, "client eof during direct obfuscated handshake");
+                };
+                return;
+            }
+            slot.handshake_pos += @intCast(n);
+            slot.last_activity_ms = nowMs();
+        }
+
+        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, self.state.user_secrets) orelse {
+            self.startMasking(slot, slot.handshake_buf[0..]) catch {
+                self.closeSlot(slot, "bad direct obfuscated handshake");
+            };
+            return;
+        };
+
+        self.finishParsedClientHandshake(slot, result);
     }
 
     fn readClientHelloBody(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2498,6 +2684,10 @@ const EventLoop = struct {
             return;
         };
 
+        self.finishParsedClientHandshake(slot, result);
+    }
+
+    fn finishParsedClientHandshake(self: *EventLoop, slot: *ConnectionSlot, result: anytype) void {
         slot.obf_params = result.params;
         slot.proto_tag = result.params.proto_tag;
         slot.dc_idx = result.params.dc_idx;
@@ -2647,7 +2837,7 @@ const EventLoop = struct {
                 }
             }
             // Handshake complete (mask path) — release from handshake budget
-            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            self.releaseHandshakeBudget(slot);
             slot.phase = .mask_relaying;
             return;
         }
@@ -2771,6 +2961,10 @@ const EventLoop = struct {
 
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
+        if (slot.client_transport == .direct_obfuscated) {
+            self.relayObfuscatedClientToUpstream(slot);
+            return;
+        }
 
         const mp_c2s_scratch = if (slot.middle_ctx != null)
             self.ensureMpC2sScratch() catch {
@@ -2796,6 +2990,10 @@ const EventLoop = struct {
 
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
+        if (slot.client_transport == .direct_obfuscated) {
+            self.relayObfuscatedUpstreamToClient(slot);
+            return;
+        }
 
         const mp_s2c_scratch = if (slot.middle_ctx != null)
             self.ensureMpS2cScratch() catch {
@@ -2817,6 +3015,97 @@ const EventLoop = struct {
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = nowMs();
         }
+    }
+
+    fn relayObfuscatedClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
+        const n = posix.read(slot.client_fd, self.shared_read_buf[0..]) catch |err| {
+            if (err == error.WouldBlock) return;
+            self.closeSlot(slot, "direct obfuscated c2s read error");
+            return;
+        };
+        if (n == 0) {
+            self.closeSlot(slot, "direct obfuscated c2s eof");
+            return;
+        }
+
+        const payload = self.shared_read_buf[0..n];
+        if (slot.client_decryptor) |*dec| dec.apply(payload);
+
+        if (slot.middle_ctx) |*mp| {
+            const scratch = self.ensureMpC2sScratch() catch {
+                self.closeSlot(slot, "alloc middleproxy c2s scratch failed");
+                return;
+            };
+            const out_data = mp.encapsulateC2S(payload, scratch) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy c2s failed");
+                return;
+            };
+            if (out_data.len > 0) {
+                _ = proxyHandshakeQueueUpstream(self, slot, out_data) catch {
+                    self.closeSlot(slot, "direct obfuscated c2s queue failed");
+                    return;
+                };
+            }
+        } else if (slot.tg_encryptor) |*enc| {
+            enc.apply(payload);
+            _ = proxyHandshakeQueueUpstream(self, slot, payload) catch {
+                self.closeSlot(slot, "direct obfuscated c2s queue failed");
+                return;
+            };
+        } else {
+            // No encapsulation/encryptor wired up: forwarding here would silently
+            // black-hole decrypted client data while still counting it. The dd
+            // path only reaches .relaying after dc_nonce/middleProxyBegin set one
+            // of these, so this is unreachable today — fail loudly if it changes.
+            self.closeSlot(slot, "direct obfuscated c2s missing encryptor/middle_ctx");
+            return;
+        }
+
+        slot.c2s_bytes += payload.len;
+        slot.last_activity_ms = nowMs();
+    }
+
+    fn relayObfuscatedUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
+        const n = posix.read(slot.upstream_fd, self.shared_read_buf[0..]) catch |err| {
+            if (err == error.WouldBlock) return;
+            self.closeSlot(slot, "direct obfuscated s2c read error");
+            return;
+        };
+        if (n == 0) {
+            self.closeSlot(slot, "direct obfuscated s2c eof");
+            return;
+        }
+
+        const raw = self.shared_read_buf[0..n];
+        if (slot.middle_ctx) |*mp| {
+            const scratch = self.ensureMpS2cScratch() catch {
+                self.closeSlot(slot, "alloc middleproxy s2c scratch failed");
+                return;
+            };
+            const payload = mp.decapsulateS2C(raw, scratch) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy s2c failed");
+                return;
+            };
+            if (payload.len == 0) return;
+            if (slot.client_encryptor) |*enc| enc.apply(payload);
+            _ = relayQueueClient(self, slot, payload) catch {
+                self.closeSlot(slot, "direct obfuscated s2c queue failed");
+                return;
+            };
+            slot.s2c_bytes += payload.len;
+        } else {
+            if (!slot.use_fast_mode) {
+                if (slot.tg_decryptor) |*dec| dec.apply(raw);
+                if (slot.client_encryptor) |*enc| enc.apply(raw);
+            }
+            _ = relayQueueClient(self, slot, raw) catch {
+                self.closeSlot(slot, "direct obfuscated s2c queue failed");
+                return;
+            };
+            slot.s2c_bytes += raw.len;
+        }
+
+        slot.last_activity_ms = nowMs();
     }
 
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2929,6 +3218,19 @@ const EventLoop = struct {
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
+                } else if (slot.phase == .reading_direct_obfuscated_handshake and
+                    now_ms - slot.first_byte_at_ms > dd_handshake_decision_ms)
+                {
+                    // A non-TLS (dd) connection that hasn't completed its 64-byte
+                    // handshake shortly after the first byte is almost certainly a
+                    // probe. Serve the masking cover now instead of waiting out the
+                    // full handshake_timeout and then closing silently — this makes
+                    // the response match the masking target and shrinks the active-
+                    // probe timing oracle. Falls back to close if masking is off.
+                    self.startMasking(slot, slot.handshake_buf[0..slot.handshake_pos]) catch {
+                        self.closeSlot(slot, "dd handshake decision timeout");
+                    };
+                    continue;
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
                     _ = self.flood_guard.record(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
@@ -2959,6 +3261,7 @@ const EventLoop = struct {
 
         switch (slot.phase) {
             .reading_tls_header,
+            .reading_direct_obfuscated_handshake,
             .reading_client_hello_body,
             .reading_mtproto_tls_header,
             .reading_mtproto_tls_body,
@@ -3105,13 +3408,14 @@ const EventLoop = struct {
             if (user_metrics) |entry| {
                 _ = entry.connections_active.fetchSub(1, .monotonic);
             }
-            // If connection was still in handshake phase, release from handshake budget
-            if (slot.handshakeInProgress()) {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-            }
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
+        // Release the handshake-budget slot exactly once, keyed on hs_counted
+        // (set at first byte). Pre-first-byte sessions were never counted, and
+        // relay/mask completion already released, so this is a no-op in those
+        // cases and avoids both leaks and underflow.
+        self.releaseHandshakeBudget(slot);
 
         slot.desync_wait_enqueued = false;
         slot.phase = .idle;
