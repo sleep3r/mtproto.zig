@@ -202,6 +202,7 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeCounter(writer, "mtproto_drops_capacity_total", "connections dropped because max_connections was reached", snapshot.drops_capacity_total);
     try writeCounter(writer, "mtproto_drops_saturation_total", "accept attempts dropped due to saturation hysteresis", snapshot.drops_saturation_total);
     try writeCounter(writer, "mtproto_drops_rate_limit_total", "connections dropped by subnet rate limiter", snapshot.drops_rate_limit_total);
+    try writeCounter(writer, "mtproto_drops_flood_guard_total", "connections dropped by exact-IP handshake flood guard", snapshot.drops_flood_guard_total);
     try writeCounter(writer, "mtproto_drops_handshake_budget_total", "connections dropped because handshake budget was exhausted", snapshot.drops_handshake_budget_total);
     try writeCounter(writer, "mtproto_handshake_timeouts_total", "connections dropped due to handshake timeout", snapshot.handshake_timeouts_total);
     try writeCounter(writer, "mtproto_middleproxy_fallback_total", "times middleproxy fell back to direct path", snapshot.middleproxy_fallback_total);

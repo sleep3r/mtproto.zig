@@ -214,6 +214,10 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     ui.print("middleproxy_buffer_kb = {d}\n", .{cfg.middleproxy_buffer_kb});
     ui.print("log_level = \"{s}\"\n", .{@tagName(cfg.log_level)});
     ui.print("rate_limit_per_subnet = {d}\n", .{cfg.rate_limit_per_subnet});
+    ui.print("handshake_flood_guard_enabled = {}\n", .{cfg.handshake_flood_guard_enabled});
+    ui.print("handshake_flood_guard_threshold = {d}\n", .{cfg.handshake_flood_guard_threshold});
+    ui.print("handshake_flood_guard_window_sec = {d}\n", .{cfg.handshake_flood_guard_window_sec});
+    ui.print("handshake_flood_guard_block_sec = {d}\n", .{cfg.handshake_flood_guard_block_sec});
     ui.print("unsafe_override_limits = {}\n", .{cfg.unsafe_override_limits});
     ui.writeRaw("\n");
 

@@ -335,6 +335,10 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"
 rate_limit_per_subnet = 30
+handshake_flood_guard_enabled = true
+handshake_flood_guard_threshold = 20
+handshake_flood_guard_window_sec = 30
+handshake_flood_guard_block_sec = 120
 tag = ""                  # Optional: promotion tag from @MTProxybot
 
 [censorship]
@@ -369,6 +373,11 @@ alice = true
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
 | `[server] tag` | — | 32-hex promotion tag от [@MTProxybot](https://t.me/MTProxybot) |
+| `[server] rate_limit_per_subnet` | `30` | Лимит новых соединений в секунду на /24 (IPv4) или /48 (IPv6), `0` отключает |
+| `[server] handshake_flood_guard_enabled` | `true` | Временно отклонять IP, которые часто не проходят MTProto handshake |
+| `[server] handshake_flood_guard_threshold` | `20` | Число плохих handshake/rate/budget событий с одного IP до временного deny |
+| `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
+| `[server] handshake_flood_guard_block_sec` | `120` | Длительность временного deny для шумного IP |
 | `[censorship] tls_domain` | `"google.com"` | Домен для TLS-маскировки |
 | `[censorship] mask` | `true` | Forward invalid clients на `tls_domain` |
 | `[censorship] fast_mode` | `false` | Делегировать S2C encryption DC |

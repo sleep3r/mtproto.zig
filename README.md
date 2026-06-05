@@ -347,6 +347,10 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 30
+handshake_flood_guard_enabled = true
+handshake_flood_guard_threshold = 20
+handshake_flood_guard_window_sec = 30
+handshake_flood_guard_block_sec = 120
 tag = ""                  # Optional: promotion tag from @MTProxybot
 
 [censorship]
@@ -398,6 +402,10 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] tag` | — | 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
 | `[server] rate_limit_per_subnet` | `30` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). Set `0` to disable |
+| `[server] handshake_flood_guard_enabled` | `true` | Temporarily deny exact source IPs that repeatedly fail the MTProto handshake |
+| `[server] handshake_flood_guard_threshold` | `20` | Bad handshake/rate/budget events per source IP before temporary deny |
+| `[server] handshake_flood_guard_window_sec` | `30` | Rolling window for `handshake_flood_guard_threshold` |
+| `[server] handshake_flood_guard_block_sec` | `120` | Temporary deny duration for noisy source IPs |
 | `[server] unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` |
 | `[monitor] host` | `"127.0.0.1"` | Dashboard bind address |
 | `[monitor] port` | `61208` | Dashboard port |

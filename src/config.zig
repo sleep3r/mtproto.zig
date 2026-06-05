@@ -198,6 +198,12 @@ pub const Config = struct {
     /// Limits scanner/flood/DPI-probe impact. Generous for legitimate Telegram clients
     /// which open 3-6 connections at startup and hold them.
     rate_limit_per_subnet: u8 = 30,
+    /// Exact-IP handshake flood guard. Temporarily denies clients that repeatedly
+    /// hit handshake timeouts, subnet rate limits, or the handshake budget.
+    handshake_flood_guard_enabled: bool = true,
+    handshake_flood_guard_threshold: u16 = 20,
+    handshake_flood_guard_window_sec: u16 = 30,
+    handshake_flood_guard_block_sec: u16 = 120,
     /// When true, disables auto-clamping of max_connections to the RAM-safe estimate.
     /// Use only if you know your host has enough memory for the configured limits.
     unsafe_override_limits: bool = false,
@@ -492,6 +498,17 @@ pub const Config = struct {
                         }
                     } else if (std.mem.eql(u8, key, "rate_limit_per_subnet")) {
                         cfg.rate_limit_per_subnet = std.fmt.parseInt(u8, value, 10) catch cfg.rate_limit_per_subnet;
+                    } else if (std.mem.eql(u8, key, "handshake_flood_guard_enabled")) {
+                        cfg.handshake_flood_guard_enabled = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "handshake_flood_guard_threshold")) {
+                        const parsed = std.fmt.parseInt(u16, value, 10) catch cfg.handshake_flood_guard_threshold;
+                        cfg.handshake_flood_guard_threshold = @max(@as(u16, 1), parsed);
+                    } else if (std.mem.eql(u8, key, "handshake_flood_guard_window_sec")) {
+                        const parsed = std.fmt.parseInt(u16, value, 10) catch cfg.handshake_flood_guard_window_sec;
+                        cfg.handshake_flood_guard_window_sec = @max(@as(u16, 1), parsed);
+                    } else if (std.mem.eql(u8, key, "handshake_flood_guard_block_sec")) {
+                        const parsed = std.fmt.parseInt(u16, value, 10) catch cfg.handshake_flood_guard_block_sec;
+                        cfg.handshake_flood_guard_block_sec = @max(@as(u16, 1), parsed);
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
                         cfg.unsafe_override_limits = std.mem.eql(u8, value, "true");
                     }
@@ -691,6 +708,10 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
     try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
+    try std.testing.expect(cfg.handshake_flood_guard_enabled);
+    try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
+    try std.testing.expectEqual(@as(u16, 30), cfg.handshake_flood_guard_window_sec);
+    try std.testing.expectEqual(@as(u16, 120), cfg.handshake_flood_guard_block_sec);
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expect(!cfg.metrics.enabled);
     try std.testing.expect(cfg.metrics.host == null);
@@ -1062,6 +1083,41 @@ test "parse config - rate_limit_per_subnet disabled" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - handshake flood guard defaults enabled" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.handshake_flood_guard_enabled);
+    try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
+    try std.testing.expectEqual(@as(u16, 30), cfg.handshake_flood_guard_window_sec);
+    try std.testing.expectEqual(@as(u16, 120), cfg.handshake_flood_guard_block_sec);
+}
+
+test "parse config - handshake flood guard custom values" {
+    const content =
+        \\[server]
+        \\handshake_flood_guard_enabled = false
+        \\handshake_flood_guard_threshold = 9
+        \\handshake_flood_guard_window_sec = 17
+        \\handshake_flood_guard_block_sec = 45
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(!cfg.handshake_flood_guard_enabled);
+    try std.testing.expectEqual(@as(u16, 9), cfg.handshake_flood_guard_threshold);
+    try std.testing.expectEqual(@as(u16, 17), cfg.handshake_flood_guard_window_sec);
+    try std.testing.expectEqual(@as(u16, 45), cfg.handshake_flood_guard_block_sec);
 }
 
 test "parse config - unsafe_override_limits true" {

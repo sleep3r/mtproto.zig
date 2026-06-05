@@ -21,6 +21,7 @@ const tunnel_mod = @import("../tunnel.zig");
 const socks5 = @import("socks5.zig");
 const http_connect = @import("http_connect.zig");
 const SubnetRateLimit = @import("subnet_rate_limit.zig").SubnetRateLimit;
+const HandshakeFloodGuard = @import("handshake_flood_guard.zig").HandshakeFloodGuard;
 const DynamicRecordSizer = @import("drs.zig").DynamicRecordSizer;
 const ReplayCache = @import("replay_cache.zig").ReplayCache;
 const MessageQueue = @import("message_queue.zig").MessageQueue;
@@ -46,6 +47,7 @@ const runtime_log = @import("../runtime_log.zig");
 test {
     // Keep extracted proxy submodule tests in the default `zig build test` run.
     _ = @import("subnet_rate_limit.zig");
+    _ = @import("handshake_flood_guard.zig");
     _ = @import("drs.zig");
     _ = @import("replay_cache.zig");
     _ = @import("message_queue.zig");
@@ -93,6 +95,46 @@ const max_pipelined_handshake_bytes: usize = 128 * 1024;
 const graceful_shutdown_check_ms: i32 = 100;
 
 const upstream_candidates_inline_cap: usize = 4;
+
+fn floodGuardSettings(cfg: *const Config) HandshakeFloodGuard.Settings {
+    return HandshakeFloodGuard.settings(
+        cfg.handshake_flood_guard_enabled,
+        cfg.handshake_flood_guard_threshold,
+        cfg.handshake_flood_guard_window_sec,
+        cfg.handshake_flood_guard_block_sec,
+    );
+}
+
+fn formatFloodGuardTop(entries: []const HandshakeFloodGuard.TopEntry, buf: *[1024]u8) []const u8 {
+    const now_s = @divTrunc(nowMs(), std.time.ms_per_s);
+    var pos: usize = 0;
+
+    for (entries) |entry| {
+        var ip_buf: [64]u8 = undefined;
+        const ip = HandshakeFloodGuard.formatKey(entry.key, &ip_buf);
+        const blocked_for = if (entry.blocked_until_s > now_s) entry.blocked_until_s - now_s else 0;
+
+        if (pos > 0 and pos < buf.len) {
+            buf[pos] = ',';
+            pos += 1;
+        }
+        const written = std.fmt.bufPrint(
+            buf[pos..],
+            "{s}=total:{d}/rate:{d}/budget:{d}/timeout:{d}/blocked:{d}s",
+            .{
+                ip,
+                entry.total,
+                entry.rate_limit,
+                entry.handshake_budget,
+                entry.handshake_timeout,
+                blocked_for,
+            },
+        ) catch break;
+        pos += written.len;
+    }
+
+    return buf[0..pos];
+}
 
 const CompatRwLock = struct {
     mutex: std.Io.Mutex = .init,
@@ -572,6 +614,7 @@ pub const ProxyState = struct {
         drops_capacity_total: u64,
         drops_saturation_total: u64,
         drops_rate_limit_total: u64,
+        drops_flood_guard_total: u64,
         drops_handshake_budget_total: u64,
         handshake_timeouts_total: u64,
         middleproxy_fallback_total: u64,
@@ -608,6 +651,7 @@ pub const ProxyState = struct {
     stats_dropped_cap: std.atomic.Value(u64),
     stats_dropped_saturation: std.atomic.Value(u64),
     stats_dropped_rate_limit: std.atomic.Value(u64),
+    stats_dropped_flood_guard: std.atomic.Value(u64),
     stats_dropped_hs_budget: std.atomic.Value(u64),
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
@@ -712,6 +756,7 @@ pub const ProxyState = struct {
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
             .stats_dropped_saturation = std.atomic.Value(u64).init(0),
             .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
+            .stats_dropped_flood_guard = std.atomic.Value(u64).init(0),
             .stats_dropped_hs_budget = std.atomic.Value(u64).init(0),
             .stats_hs_timeout = std.atomic.Value(u64).init(0),
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
@@ -848,6 +893,7 @@ pub const ProxyState = struct {
             .drops_capacity_total = self.stats_dropped_cap.load(.monotonic),
             .drops_saturation_total = self.stats_dropped_saturation.load(.monotonic),
             .drops_rate_limit_total = self.stats_dropped_rate_limit.load(.monotonic),
+            .drops_flood_guard_total = self.stats_dropped_flood_guard.load(.monotonic),
             .drops_handshake_budget_total = self.stats_dropped_hs_budget.load(.monotonic),
             .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
             .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
@@ -1267,10 +1313,12 @@ const EventLoop = struct {
     accepted_since_log: u64,
     closed_since_log: u64,
     subnet_limiter: SubnetRateLimit,
+    flood_guard: *HandshakeFloodGuard,
     // Snapshot of degradation counters for delta logging
     prev_dropped_cap: u64,
     prev_dropped_saturation: u64,
     prev_dropped_rate_limit: u64,
+    prev_dropped_flood_guard: u64,
     prev_dropped_hs_budget: u64,
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
@@ -1282,6 +1330,9 @@ const EventLoop = struct {
     fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
+
+        const flood_guard = try HandshakeFloodGuard.create(state.allocator);
+        errdefer flood_guard.destroy(state.allocator);
 
         var loop = EventLoop{
             .state = state,
@@ -1299,9 +1350,11 @@ const EventLoop = struct {
             .accepted_since_log = 0,
             .closed_since_log = 0,
             .subnet_limiter = SubnetRateLimit.init(),
+            .flood_guard = flood_guard,
             .prev_dropped_cap = 0,
             .prev_dropped_saturation = 0,
             .prev_dropped_rate_limit = 0,
+            .prev_dropped_flood_guard = 0,
             .prev_dropped_hs_budget = 0,
             .prev_hs_timeout = 0,
             .prev_mp_fallback = 0,
@@ -1331,6 +1384,7 @@ const EventLoop = struct {
         self.desync_wait_slots.deinit(self.state.allocator);
 
         self.pool.deinit();
+        self.flood_guard.destroy(self.state.allocator);
         closeFd(self.epoll_fd);
     }
 
@@ -1482,12 +1536,20 @@ const EventLoop = struct {
             const client_addr = accepted.?.addr;
             accepted_this_round += 1;
 
+            const flood_cfg = floodGuardSettings(&self.state.config);
+            if (self.flood_guard.isBlocked(client_addr, flood_cfg)) {
+                _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
+                closeFd(cfd);
+                continue;
+            }
+
             // Ensure desync byte-splitting is not coalesced by Nagle during early handshake.
             setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
             if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
+                _ = self.flood_guard.record(client_addr, .rate_limit, flood_cfg);
                 closeFd(cfd);
                 continue;
             }
@@ -1508,6 +1570,7 @@ const EventLoop = struct {
                 _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+                _ = self.flood_guard.record(client_addr, .handshake_budget, flood_cfg);
                 closeFd(cfd);
                 continue;
             }
@@ -1553,6 +1616,7 @@ const EventLoop = struct {
         const cur_cap = self.state.stats_dropped_cap.load(.monotonic);
         const cur_sat = self.state.stats_dropped_saturation.load(.monotonic);
         const cur_rate = self.state.stats_dropped_rate_limit.load(.monotonic);
+        const cur_flood = self.state.stats_dropped_flood_guard.load(.monotonic);
         const cur_hs = self.state.stats_dropped_hs_budget.load(.monotonic);
         const cur_hst = self.state.stats_hs_timeout.load(.monotonic);
         const cur_mpf = self.state.stats_mp_fallback.load(.monotonic);
@@ -1560,6 +1624,7 @@ const EventLoop = struct {
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
         const d_rate = cur_rate - self.prev_dropped_rate_limit;
+        const d_flood = cur_flood - self.prev_dropped_flood_guard;
         const d_hs = cur_hs - self.prev_dropped_hs_budget;
         const d_hst = cur_hst - self.prev_hs_timeout;
         const d_mpf = cur_mpf - self.prev_mp_fallback;
@@ -1567,11 +1632,12 @@ const EventLoop = struct {
         self.prev_dropped_cap = cur_cap;
         self.prev_dropped_saturation = cur_sat;
         self.prev_dropped_rate_limit = cur_rate;
+        self.prev_dropped_flood_guard = cur_flood;
         self.prev_dropped_hs_budget = cur_hs;
         self.prev_hs_timeout = cur_hst;
         self.prev_mp_fallback = cur_mpf;
 
-        const has_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
+        const has_drops = d_cap + d_sat + d_rate + d_flood + d_hs + d_hst + d_mpf > 0;
 
         // Build per-user active connection counts for dashboard parsing
         var user_buf: [1024]u8 = undefined;
@@ -1607,9 +1673,20 @@ const EventLoop = struct {
         });
 
         if (has_drops) {
-            log.info("  drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
-                d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf,
+            log.info("  drops: cap+={d} sat+={d} rate+={d} flood_guard+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
+                d_cap, d_sat, d_rate, d_flood, d_hs, d_hst, d_mpf,
             });
+        }
+
+        var top_entries: [5]HandshakeFloodGuard.TopEntry = undefined;
+        const flood_cfg = floodGuardSettings(&self.state.config);
+        const top_len = self.flood_guard.top(flood_cfg, top_entries[0..]);
+        if (top_len > 0 and (d_flood + d_rate + d_hs + d_hst > 0 or hs > 0)) {
+            var top_buf: [1024]u8 = undefined;
+            const top = formatFloodGuardTop(top_entries[0..top_len], &top_buf);
+            if (top.len > 0) {
+                log.info("  flood_guard: blocked+={d} top{{{s}}}", .{ d_flood, top });
+            }
         }
 
         self.accepted_since_log = 0;
@@ -1769,7 +1846,7 @@ const EventLoop = struct {
     fn dumpSignalStats(self: *EventLoop) void {
         const snapshot = self.state.getMetricsSnapshot();
         log.info(
-            "SIGUSR1 stats: active={d}/{d} hs={d} total={d} closed={d} c2s={d} s2c={d} paused={}/{} drops(cap/sat/rate/hs)={d}/{d}/{d}/{d}",
+            "SIGUSR1 stats: active={d}/{d} hs={d} total={d} closed={d} c2s={d} s2c={d} paused={}/{} drops(cap/sat/rate/flood/hs)={d}/{d}/{d}/{d}/{d}",
             .{
                 snapshot.connections_active,
                 snapshot.connections_max,
@@ -1783,6 +1860,7 @@ const EventLoop = struct {
                 snapshot.drops_capacity_total,
                 snapshot.drops_saturation_total,
                 snapshot.drops_rate_limit_total,
+                snapshot.drops_flood_guard_total,
                 snapshot.drops_handshake_budget_total,
             },
         );
@@ -1835,6 +1913,22 @@ const EventLoop = struct {
         }
         if (next.rate_limit_per_subnet != self.state.config.rate_limit_per_subnet) {
             self.state.config.rate_limit_per_subnet = next.rate_limit_per_subnet;
+            applied += 1;
+        }
+        if (next.handshake_flood_guard_enabled != self.state.config.handshake_flood_guard_enabled) {
+            self.state.config.handshake_flood_guard_enabled = next.handshake_flood_guard_enabled;
+            applied += 1;
+        }
+        if (next.handshake_flood_guard_threshold != self.state.config.handshake_flood_guard_threshold) {
+            self.state.config.handshake_flood_guard_threshold = next.handshake_flood_guard_threshold;
+            applied += 1;
+        }
+        if (next.handshake_flood_guard_window_sec != self.state.config.handshake_flood_guard_window_sec) {
+            self.state.config.handshake_flood_guard_window_sec = next.handshake_flood_guard_window_sec;
+            applied += 1;
+        }
+        if (next.handshake_flood_guard_block_sec != self.state.config.handshake_flood_guard_block_sec) {
+            self.state.config.handshake_flood_guard_block_sec = next.handshake_flood_guard_block_sec;
             applied += 1;
         }
         if (next.log_level != self.state.config.log_level) {
@@ -2808,6 +2902,7 @@ const EventLoop = struct {
                     }
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
+                    _ = self.flood_guard.record(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
