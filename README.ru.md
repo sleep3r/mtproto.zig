@@ -390,7 +390,7 @@ alice = true
 
 > Secret можно сгенерировать через `mtbuddy secret` или `openssl rand -hex 16`.
 >
-> Ссылки печатаются командой `sudo mtbuddy links`: команда показывает и FakeTLS (`ee...domain`), и secure padded (`dd...`) варианты. Runtime-логи намеренно скрывают secrets и proxy links.
+> Ссылки печатаются командой `sudo mtbuddy links`: по умолчанию показываются только FakeTLS (`ee...domain`) ссылки; secure padded (`dd...`) варианты выводятся, когда включён транспорт `dd` (`fake_tls_only = false`). Runtime-логи намеренно скрывают secrets и proxy links.
 >
 > **Транспорт `dd` («secure»/padded) по умолчанию отключён** (`[censorship].fake_tls_only = true`) — это обычный обфусцированный MTProto **без TLS-маскировки**, который DPI фингерпринтит напрямую как MTProto. По умолчанию прокси принимает только FakeTLS (`ee`), и `mtbuddy links` печатает только `ee`-ссылки. Чтобы раздавать `dd`-ссылки (сценарии с низким DPI / совместимость), задайте `fake_tls_only = false`. См. [THREAT_MODEL.md](THREAT_MODEL.md).
 >

@@ -430,7 +430,7 @@ alice = true   # bypass MiddleProxy for this user
 
 > Generate a secret: `mtbuddy secret` or `openssl rand -hex 16`
 >
-> Print client links explicitly: `sudo mtbuddy links`. It prints both FakeTLS (`ee...domain`) and secure padded (`dd...`) links. Runtime proxy logs intentionally hide secrets and proxy links.
+> Print client links explicitly: `sudo mtbuddy links`. By default it prints FakeTLS (`ee...domain`) links only; it also prints secure padded (`dd...`) links when the `dd` transport is enabled (`fake_tls_only = false`). Runtime proxy logs intentionally hide secrets and proxy links.
 >
 > **The `dd` ("secure"/padded) transport is rejected by default** (`[censorship].fake_tls_only = true`) — it is plain obfuscated MTProto with **no TLS disguise**, directly fingerprintable as MTProto by DPI. By default the proxy accepts only FakeTLS (`ee`), and `mtbuddy links` prints only `ee` links. To hand out `dd` links (lower-DPI / compatibility scenarios), set `fake_tls_only = false`. See [THREAT_MODEL.md](THREAT_MODEL.md).
 >

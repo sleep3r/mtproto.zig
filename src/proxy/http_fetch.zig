@@ -21,12 +21,17 @@ test "http fetch - proxy endpoint brackets IPv6 hosts" {
     try std.testing.expectEqualStrings("[2001:db8::1]:1080", formatProxyEndpoint("2001:db8::1", 1080, &buf));
 }
 
-test "http fetch - userinfo percent-encoding escapes URL-reserved characters" {
+test "http fetch - curl config escaping backslash and double-quote" {
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("alice", percentEncodeUserinfo("alice", &buf));
-    // ':' '@' '/' and space must be encoded so they don't corrupt the proxy URL.
-    try std.testing.expectEqualStrings("p%40ss%3Aw%2Frd%20", percentEncodeUserinfo("p@ss:w/rd ", &buf));
-    try std.testing.expectEqualStrings("", percentEncodeUserinfo("", &buf));
+    // Plain text is copied verbatim.
+    const a = curlEscapeInto(&buf, 0, "alice").?;
+    try std.testing.expectEqualStrings("alice", buf[0..a]);
+    // Backslash and double-quote are backslash-escaped for curl's quoted value.
+    const b = curlEscapeInto(&buf, 0, "p\"a\\ss").?;
+    try std.testing.expectEqualStrings("p\\\"a\\\\ss", buf[0..b]);
+    // Overflow is reported as null rather than truncating silently.
+    var tiny: [1]u8 = undefined;
+    try std.testing.expect(curlEscapeInto(&tiny, 0, "\"") == null);
 }
 
 pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
@@ -67,28 +72,62 @@ fn formatProxyEndpoint(host: []const u8, port: u16, out: []u8) []const u8 {
     return std.fmt.bufPrint(out, "{s}:{d}", .{ host, port }) catch out[0..0];
 }
 
-/// Percent-encode a URL userinfo subcomponent (RFC 3986 unreserved set kept
-/// literal, everything else %XX-encoded) so credentials can be safely embedded
-/// in a proxy URL without ':'/'@'/'/' corrupting the parse.
-fn percentEncodeUserinfo(s: []const u8, out: []u8) []const u8 {
-    const hex = "0123456789ABCDEF";
-    var pos: usize = 0;
+/// Append `s` into `buf` starting at `start`, escaping `\` and `"` for curl's
+/// double-quoted config-file value syntax. Returns the new position, or null on
+/// overflow.
+fn curlEscapeInto(buf: []u8, start: usize, s: []const u8) ?usize {
+    var pos = start;
     for (s) |c| {
-        const unreserved = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
-            (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~';
-        if (unreserved) {
-            if (pos >= out.len) break;
-            out[pos] = c;
-            pos += 1;
+        if (c == '\\' or c == '"') {
+            if (pos + 2 > buf.len) return null;
+            buf[pos] = '\\';
+            buf[pos + 1] = c;
+            pos += 2;
         } else {
-            if (pos + 3 > out.len) break;
-            out[pos] = '%';
-            out[pos + 1] = hex[c >> 4];
-            out[pos + 2] = hex[c & 0x0F];
-            pos += 3;
+            if (pos + 1 > buf.len) return null;
+            buf[pos] = c;
+            pos += 1;
         }
     }
-    return out[0..pos];
+    return pos;
+}
+
+/// Write a curl config file (mode 0600) carrying the proxy URL and credentials,
+/// and return its path (the caller unlinks it). Passing creds via `--config`
+/// instead of `--proxy-user` keeps the password off the world-readable process
+/// cmdline (/proc/<pid>/cmdline), and — unlike replacing the child environment —
+/// lets curl inherit the full parent environment (PATH, CA bundle paths, locale).
+fn writeCurlProxyConfig(
+    io: std.Io,
+    scheme: []const u8,
+    endpoint: []const u8,
+    username: []const u8,
+    password: []const u8,
+    path_buf: []u8,
+    content_buf: []u8,
+) ![]const u8 {
+    const path = std.fmt.bufPrint(path_buf, "/tmp/.mtproxy-curl-{d}.conf", .{std.os.linux.getpid()}) catch
+        return error.CurlConfigPathTooLong;
+
+    const header = std.fmt.bufPrint(content_buf, "proxy = \"{s}://{s}\"\nproxy-user = \"", .{ scheme, endpoint }) catch
+        return error.CurlConfigTooLong;
+    var pos: usize = header.len;
+    pos = curlEscapeInto(content_buf, pos, username) orelse return error.CurlConfigTooLong;
+    if (pos >= content_buf.len) return error.CurlConfigTooLong;
+    content_buf[pos] = ':';
+    pos += 1;
+    pos = curlEscapeInto(content_buf, pos, password) orelse return error.CurlConfigTooLong;
+    if (pos + 2 > content_buf.len) return error.CurlConfigTooLong;
+    content_buf[pos] = '"';
+    content_buf[pos + 1] = '\n';
+    pos += 2;
+
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch return error.CurlConfigWriteFailed;
+    defer file.close(io);
+    file.writeStreamingAll(io, content_buf[0..pos]) catch return error.CurlConfigWriteFailed;
+    return path;
 }
 
 pub fn fetchUrlBytesViaProxy(
@@ -116,29 +155,39 @@ pub fn fetchUrlBytesViaProxy(
         "10",
     });
 
-    // When the upstream proxy needs credentials, pass the whole proxy URL (with
-    // the percent-encoded user:pass embedded) through the ALL_PROXY environment
-    // variable instead of `--proxy-user` on argv. /proc/<pid>/environ is 0400
-    // (owner/root only) whereas /proc/<pid>/cmdline is world-readable, so this
-    // keeps the upstream proxy password out of `ps`/cmdline (CWE-214).
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    var all_proxy_buf: [1100]u8 = undefined;
-    var proxy_url_buf: [640]u8 = undefined;
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+    const io = io_instance.io();
 
+    // When the upstream proxy needs credentials, pass them via a 0600 curl
+    // config file (--config) instead of `--proxy-user` on argv, so the password
+    // never appears on the world-readable process cmdline (CWE-214). curl keeps
+    // its full inherited environment (PATH, CA paths, locale). The config-file
+    // path itself is not secret.
+    var cfg_path_buf: [64]u8 = undefined;
+    var cfg_content_buf: [1024]u8 = undefined;
+    var cfg_path: ?[]const u8 = null;
+    defer if (cfg_path) |p| std.Io.Dir.deleteFileAbsolute(io, p) catch {};
+
+    var proxy_url_buf: [640]u8 = undefined;
     if (has_creds) {
-        var user_buf: [320]u8 = undefined;
-        var pass_buf: [320]u8 = undefined;
-        const enc_user = percentEncodeUserinfo(opts.username orelse "", &user_buf);
-        const enc_pass = percentEncodeUserinfo(opts.password orelse "", &pass_buf);
         const scheme = switch (opts.kind) {
             .socks5 => "socks5h",
             .http_connect => "http",
         };
-        const all_proxy = std.fmt.bufPrint(&all_proxy_buf, "{s}://{s}:{s}@{s}", .{
-            scheme, enc_user, enc_pass, endpoint,
-        }) catch return error.InvalidProxyEndpoint;
-        try env_map.put("ALL_PROXY", all_proxy);
+        cfg_path = writeCurlProxyConfig(
+            io,
+            scheme,
+            endpoint,
+            opts.username orelse "",
+            opts.password orelse "",
+            &cfg_path_buf,
+            &cfg_content_buf,
+        ) catch |err| {
+            log.warn("failed to stage curl proxy config: {any}", .{err});
+            return error.UnexpectedConnectFailure;
+        };
+        try argv.appendSlice(allocator, &.{ "--config", cfg_path.? });
     } else {
         const proxy_url = switch (opts.kind) {
             .socks5 => endpoint,
@@ -151,12 +200,8 @@ pub fn fetchUrlBytesViaProxy(
     }
     try argv.append(allocator, url);
 
-    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer io_instance.deinit();
-
-    const result = std.process.run(allocator, io_instance.io(), .{
+    const result = std.process.run(allocator, io, .{
         .argv = argv.items,
-        .environ_map = if (has_creds) &env_map else null,
         .stdout_limit = std.Io.Limit.limited(1 * 1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(1 * 1024 * 1024),
     }) catch |err| {
