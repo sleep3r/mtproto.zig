@@ -344,6 +344,7 @@ tag = ""                  # Optional: promotion tag from @MTProxybot
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+# mask_target = "host.docker.internal" # Optional: custom masking backend host для Docker/remote Nginx
 mask_port = 8443
 fast_mode = true
 drs = true
@@ -380,6 +381,8 @@ alice = true
 | `[server] handshake_flood_guard_block_sec` | `120` | Длительность временного deny для шумного IP |
 | `[censorship] tls_domain` | `"google.com"` | Домен для TLS-маскировки |
 | `[censorship] mask` | `true` | Forward invalid clients на `tls_domain` |
+| `[censorship] mask_target` | unset | Optional backend host для masked clients |
+| `[censorship] mask_port` | `443` | Local masking port (`8443` для Nginx zero-RTT) |
 | `[censorship] fast_mode` | `false` | Делегировать S2C encryption DC |
 | `[access.users] <name>` | — | 32-hex secret на пользователя |
 | `[access.direct_users] <name>` | — | Bypass MiddleProxy для пользователя |

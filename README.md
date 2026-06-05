@@ -356,6 +356,7 @@ tag = ""                  # Optional: promotion tag from @MTProxybot
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+# mask_target = "host.docker.internal" # Optional: custom masking backend host (Docker/remote Nginx)
 mask_port = 8443          # 8443 for local Nginx zero-RTT masking
 fast_mode = true          # Recommended: delegates S2C AES to the DC, saves CPU/RAM
 drs = true                # Dynamic Record Sizing (mimics Chrome/Firefox)
@@ -414,6 +415,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] port` | `9400` | Metrics port |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
 | `[censorship] mask` | `true` | Forward unauthenticated clients to `tls_domain` |
+| `[censorship] mask_target` | unset | Optional backend host for masked clients |
 | `[censorship] mask_port` | `443` | Local masking port (use `8443` for Nginx zero-RTT) |
 | `[censorship] desync` | `true` | Split-TLS: 1-byte Application records |
 | `[censorship] drs` | `false` | Dynamic Record Sizing |

@@ -585,7 +585,8 @@ class FakeHttpConnectServer:
 
 
 class FakeMaskServer:
-    def __init__(self):
+    def __init__(self, host: str = "127.0.0.1"):
+        self.host = host
         self.port = free_port()
         self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
@@ -600,7 +601,7 @@ class FakeMaskServer:
     def start(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("127.0.0.1", self.port))
+        self._sock.bind((self.host, self.port))
         self._sock.listen()
         self._sock.settimeout(0.2)
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -654,6 +655,7 @@ def base_config(
     port: int,
     secret_hex: str = DEFAULT_SECRET_HEX,
     mask: bool = False,
+    mask_target: Optional[str] = None,
     mask_port: Optional[int] = None,
     use_middle_proxy: bool = False,
     force_media_middle_proxy: bool = False,
@@ -685,6 +687,8 @@ def base_config(
     lines.append("[censorship]")
     lines.append(f'tls_domain = "{DEFAULT_TLS_DOMAIN}"')
     lines.append(f"mask = {'true' if mask else 'false'}")
+    if mask_target is not None:
+        lines.append(f'mask_target = "{mask_target}"')
     if mask_port is not None:
         lines.append(f"mask_port = {mask_port}")
     lines.append("desync = false")
@@ -877,6 +881,34 @@ def scenario_mask_fallback_local_nginx() -> None:
             _ = c.recv(1024)
         received = wait_for_condition(lambda: mask.received_bytes().startswith(payload), timeout_sec=2.0)
         assert received, f"mask target did not receive original bad client bytes: {mask.received_bytes()!r}"
+    finally:
+        proxy.stop()
+        mask.stop()
+
+
+def scenario_mask_fallback_custom_target() -> None:
+    mask = FakeMaskServer(host="127.0.0.2")
+    mask.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        mask=True,
+        mask_target=mask.host,
+        mask_port=mask.port,
+        upstream_type="auto",
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        payload = b"GET / HTTP/1.1\r\nHost: custom-mask.example\r\n\r\n"
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(2.0)
+            c.sendall(payload)
+            try:
+                _ = c.recv(1024)
+            except (ConnectionResetError, TimeoutError, socket.timeout):
+                pass
+        received = wait_for_condition(lambda: mask.received_bytes().startswith(payload), timeout_sec=2.0)
+        assert received, f"custom mask target did not receive original bad client bytes: {mask.received_bytes()!r}"
     finally:
         proxy.stop()
         mask.stop()
@@ -1095,6 +1127,7 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "http_connect_failure": scenario_http_connect_failure,
     "middleproxy_fallback_to_direct": scenario_middleproxy_fallback_to_direct,
     "mask_fallback_local_nginx": scenario_mask_fallback_local_nginx,
+    "mask_fallback_custom_target": scenario_mask_fallback_custom_target,
     "invalid_tls_and_mtproto": scenario_invalid_tls_and_mtproto,
     "replay_attack_rejected": scenario_replay_attack_rejected,
     "slowloris_partial_clienthello": scenario_slowloris_partial_clienthello,

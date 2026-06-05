@@ -401,6 +401,7 @@ def _load_proxy_runtime_config() -> dict:
         "port": 443,
         "public_port": 0,
         "mask": True,
+        "mask_target": "",
         "mask_port": 443,
         "tls_domain": "google.com",
         "use_middle_proxy": False,
@@ -436,6 +437,7 @@ def _load_proxy_runtime_config() -> dict:
         "port": defaults["port"],
         "public_port": defaults["public_port"],
         "mask": defaults["mask"],
+        "mask_target": defaults["mask_target"],
         "mask_port": defaults["mask_port"],
         "tls_domain": defaults["tls_domain"],
         "use_middle_proxy": defaults["use_middle_proxy"],
@@ -542,6 +544,8 @@ def _load_proxy_runtime_config() -> dict:
                 elif section == "[censorship]":
                     if key == "mask":
                         result["mask"] = _parse_bool(value, defaults["mask"])
+                    elif key == "mask_target":
+                        result["mask_target"] = value
                     elif key == "mask_port":
                         digits = "".join(ch for ch in value if ch.isdigit())
                         if digits:
@@ -576,6 +580,7 @@ def _load_censorship_config() -> dict:
     cfg = _load_proxy_runtime_config()
     return {
         "mask": bool(cfg["mask"]),
+        "mask_target": str(cfg["mask_target"]),
         "mask_port": int(cfg["mask_port"]),
         "tls_domain": str(cfg["tls_domain"]),
     }
@@ -1095,6 +1100,7 @@ def _masking_status() -> dict:
 
     censorship = _load_censorship_config()
     mask_enabled = bool(censorship["mask"])
+    mask_target = str(censorship.get("mask_target") or "").strip()
     mask_port = int(censorship["mask_port"])
     tls_domain = censorship["tls_domain"]
 
@@ -1103,6 +1109,9 @@ def _masking_status() -> dict:
     if not mask_enabled:
         mode = "disabled"
         target_host = "-"
+    elif mask_target:
+        mode = "custom"
+        target_host = mask_target
     elif mask_port == 443:
         mode = "remote"
         target_host = tls_domain
@@ -1111,7 +1120,7 @@ def _masking_status() -> dict:
         target_host = "127.0.0.1"
 
     endpoint_ok = None
-    if mode == "local":
+    if mode in ("local", "custom"):
         endpoint_ok = _probe_mask_endpoint(target_host, mask_port)
 
     nginx_active = _unit_active("nginx.service")
@@ -1122,11 +1131,14 @@ def _masking_status() -> dict:
     healthy = True
     if mode == "local":
         healthy = nginx_active and timer_active and bool(endpoint_ok)
+    elif mode == "custom":
+        healthy = bool(endpoint_ok)
 
     result = {
         "enabled": mask_enabled,
         "mode": mode,
         "mask_port": mask_port,
+        "mask_target": mask_target,
         "tls_domain": tls_domain,
         "target": f"{target_host}:{mask_port}" if mode != "disabled" else "-",
         "using_netns": using_netns_target,

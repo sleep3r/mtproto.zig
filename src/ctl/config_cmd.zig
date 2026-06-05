@@ -117,6 +117,8 @@ fn doctor(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !void {
     if (cfg.hasLocalMaskPortCollision()) {
         ui.fail("server.port == censorship.mask_port in local masking mode");
         errors += 1;
+    } else if (cfg.mask and cfg.mask_target != null) {
+        ui.ok("masking uses custom mask_target");
     } else if (cfg.mask and cfg.mask_port == 443) {
         ui.ok("masking uses remote tls_domain:443 (no local bind collision)");
     }
@@ -249,6 +251,9 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     ui.writeRaw("[censorship]\n");
     ui.print("tls_domain = \"{s}\"\n", .{cfg.tls_domain});
     ui.print("mask = {}\n", .{cfg.mask});
+    if (cfg.mask_target) |target| {
+        ui.print("mask_target = \"{s}\"\n", .{target});
+    }
     ui.print("mask_port = {d}\n", .{cfg.mask_port});
     ui.print("desync = {}\n", .{cfg.desync});
     ui.print("drs = {}\n", .{cfg.drs});

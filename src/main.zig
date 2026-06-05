@@ -440,7 +440,8 @@ pub fn main(init: std.process.Init) !void {
         writeStderr("\n  Usage: mtproto-proxy [config.toml]\n\n", .{});
         return;
     };
-    defer cfg.deinit(allocator);
+    var cfg_owned_by_main = true;
+    defer if (cfg_owned_by_main) cfg.deinit(allocator);
 
     // Apply runtime log level from config
     runtime_log.level = cfg.log_level;
@@ -469,6 +470,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Create shared state (DI — no globals)
     var state = try proxy.ProxyState.init(allocator, cfg, config_path);
+    cfg_owned_by_main = false;
     defer state.deinit();
 
     // Run the proxy

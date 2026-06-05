@@ -136,6 +136,14 @@ fn formatFloodGuardTop(entries: []const HandshakeFloodGuard.TopEntry, buf: *[102
     return buf[0..pos];
 }
 
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |av| {
+        if (b) |bv| return std.mem.eql(u8, av, bv);
+        return false;
+    }
+    return b == null;
+}
+
 const CompatRwLock = struct {
     mutex: std.Io.Mutex = .init,
 
@@ -702,9 +710,11 @@ pub const ProxyState = struct {
 
         var resolved_addr: ?Address = null;
         if (cfg.mask) {
-            const mask_target = if (cfg.mask_port == 443) cfg.tls_domain else "127.0.0.1";
-            if (cfg.mask_port != 443) {
-                log.info("mask_port={d} configured, using local mask target 127.0.0.1", .{cfg.mask_port});
+            const mask_target = cfg.effectiveMaskTarget();
+            if (cfg.mask_target) |configured_target| {
+                log.info("mask_target={s} configured, using mask target {s}:{d}", .{ configured_target, mask_target, cfg.mask_port });
+            } else if (cfg.mask_port != 443) {
+                log.info("mask_port={d} configured, using local mask target {s}", .{ cfg.mask_port, mask_target });
             }
             const list = getAddressList(allocator, mask_target, cfg.mask_port) catch |err| blk: {
                 log.err("Failed to resolve mask target '{s}': {any}", .{ mask_target, err });
@@ -867,6 +877,7 @@ pub const ProxyState = struct {
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         self.allocator.free(self.user_metrics);
+        self.config.deinit(self.allocator);
     }
 
     pub fn findUserMetrics(self: *ProxyState, user_name: []const u8) ?*UserMetrics {
@@ -1937,7 +1948,8 @@ const EventLoop = struct {
             applied += 1;
         }
         const tls_domain_changed = !std.mem.eql(u8, next.tls_domain, self.state.config.tls_domain);
-        if (next.mask != self.state.config.mask or next.mask_port != self.state.config.mask_port or tls_domain_changed) {
+        const mask_target_changed = !optionalStringEql(next.mask_target, self.state.config.mask_target);
+        if (next.mask != self.state.config.mask or next.mask_port != self.state.config.mask_port or tls_domain_changed or mask_target_changed) {
             const resolved_mask_addr = self.resolveMaskAddress(&next);
             if (next.mask) {
                 if (resolved_mask_addr) |addr| {
@@ -1958,6 +1970,23 @@ const EventLoop = struct {
                     self.state.config.tls_domain = owned_tls_domain;
                 } else |_| {
                     log.warn("SIGHUP: failed to apply new tls_domain due to allocation error", .{});
+                }
+            }
+            if (mask_target_changed) {
+                if (next.mask_target) |target| {
+                    if (self.state.allocator.dupe(u8, target)) |owned_mask_target| {
+                        if (self.state.config.ownsMaskTarget()) {
+                            self.state.allocator.free(self.state.config.mask_target.?);
+                        }
+                        self.state.config.mask_target = owned_mask_target;
+                    } else |_| {
+                        log.warn("SIGHUP: failed to apply new mask_target due to allocation error", .{});
+                    }
+                } else {
+                    if (self.state.config.ownsMaskTarget()) {
+                        self.state.allocator.free(self.state.config.mask_target.?);
+                    }
+                    self.state.config.mask_target = null;
                 }
             }
             applied += 1;
@@ -2001,7 +2030,7 @@ const EventLoop = struct {
 
     fn resolveMaskAddress(self: *EventLoop, cfg: *const Config) ?Address {
         if (!cfg.mask) return null;
-        const mask_target = if (cfg.mask_port == 443) cfg.tls_domain else "127.0.0.1";
+        const mask_target = cfg.effectiveMaskTarget();
         const list = getAddressList(self.state.allocator, mask_target, cfg.mask_port) catch |err| {
             log.warn("SIGHUP: mask target resolve failed for '{s}:{d}': {any}", .{ mask_target, cfg.mask_port, err });
             return null;

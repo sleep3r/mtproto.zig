@@ -1048,6 +1048,8 @@ async function poll() {
     let modeText = masking.mode || '—';
     if (masking.mode === 'remote') {
       modeText = 'remote (' + (masking.tls_domain || '—') + ':443)';
+    } else if (masking.mode === 'custom') {
+      modeText = 'custom';
     } else if (masking.mode === 'local' && masking.using_netns) {
       modeText = 'local (netns)';
     } else if (masking.mode === 'local') {
@@ -1056,7 +1058,7 @@ async function poll() {
     $('maskMode').textContent = modeText;
 
     let endpointText = masking.target || '—';
-    if (masking.mode === 'local') {
+    if (masking.mode === 'local' || masking.mode === 'custom') {
       if (masking.endpoint_ok === true) {
         endpointText += ' (OK)';
       } else if (masking.endpoint_ok === false) {

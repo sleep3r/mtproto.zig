@@ -147,6 +147,11 @@ mask = true
 # Local port override for mask forwarding (e.g. 8443 for zero-RTT local Nginx).
 # When unset, connects to tls_domain:443 directly.
 # mask_port = 8443
+#
+# Optional host override for the masking backend. When unset, mask_port=443
+# targets tls_domain and non-443 mask ports target 127.0.0.1.
+# Useful for Docker deployments that forward probes to host Nginx.
+# mask_target = "host.docker.internal"
 
 # Split ServerHello into 1-byte + 3ms delay + rest (defeats passive DPI signatures).
 # Enabled by default.

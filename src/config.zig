@@ -6,6 +6,7 @@
 const std = @import("std");
 const net = std.Io.net;
 const default_tls_domain = "google.com";
+const default_local_mask_target = "127.0.0.1";
 
 pub const UpstreamMode = enum {
     /// Automatic egress mode (default).
@@ -178,7 +179,10 @@ pub const Config = struct {
     direct_users: std.StringHashMap(void),
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
-    /// Test-only hook to override the mask port
+    /// Optional backend host for masked clients. When unset, mask_port=443 uses
+    /// tls_domain and non-443 mask ports use the local Nginx target.
+    mask_target: ?[]const u8 = null,
+    /// Port used by the masking backend.
     mask_port: u16 = 443,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
@@ -242,6 +246,23 @@ pub const Config = struct {
         return self.tls_domain.ptr != default_tls_domain.ptr;
     }
 
+    pub fn ownsMaskTarget(self: *const Config) bool {
+        return self.mask_target != null;
+    }
+
+    pub fn effectiveMaskTarget(self: *const Config) []const u8 {
+        if (self.mask_target) |target| return target;
+        if (self.mask_port == 443) return self.tls_domain;
+        return default_local_mask_target;
+    }
+
+    pub fn maskTargetIsLocal(self: *const Config) bool {
+        const target = self.effectiveMaskTarget();
+        return std.mem.eql(u8, target, default_local_mask_target) or
+            std.mem.eql(u8, target, "localhost") or
+            std.mem.eql(u8, target, "::1");
+    }
+
     /// Port to advertise in generated client links.
     pub fn publicLinkPort(self: *const Config) u16 {
         return self.public_port orelse self.port;
@@ -297,7 +318,7 @@ pub const Config = struct {
     /// Port collision exists only when masking points to a local endpoint.
     /// With mask_port=443, masking targets tls_domain:443 (remote), so no local bind clash.
     pub fn hasLocalMaskPortCollision(self: *const Config) bool {
-        return self.mask and self.mask_port != 443 and self.port == self.mask_port;
+        return self.mask and self.maskTargetIsLocal() and self.port == self.mask_port;
     }
 
     /// Emit startup warnings for configuration values known to cause issues.
@@ -517,6 +538,9 @@ pub const Config = struct {
                         cfg.tls_domain = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "mask_target")) {
+                        if (cfg.mask_target) |target| allocator.free(target);
+                        cfg.mask_target = if (value.len > 0) try allocator.dupe(u8, value) else null;
                     } else if (std.mem.eql(u8, key, "mask_port")) {
                         cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "desync")) {
@@ -591,6 +615,9 @@ pub const Config = struct {
         // Free tls_domain only when it does not point to the compile-time default.
         if (self.tls_domain.ptr != default_tls_domain.ptr) {
             allocator.free(self.tls_domain);
+        }
+        if (self.mask_target) |target| {
+            allocator.free(target);
         }
         if (self.public_ip) |ip| {
             allocator.free(ip);
@@ -701,6 +728,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
+    try std.testing.expect(cfg.mask_target == null);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
@@ -718,6 +746,26 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u16, 9400), cfg.metrics.port);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
     try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
+}
+
+test "parse config - custom mask target" {
+    const content =
+        \\[censorship]
+        \\tls_domain = "example.com"
+        \\mask = true
+        \\mask_target = "host.docker.internal"
+        \\mask_port = 4443
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("host.docker.internal", cfg.mask_target.?);
+    try std.testing.expectEqualStrings("host.docker.internal", cfg.effectiveMaskTarget());
+    try std.testing.expectEqual(@as(u16, 4443), cfg.mask_port);
 }
 
 test "parse config - metrics section" {
@@ -760,6 +808,20 @@ test "local mask collision check detects local nginx clash" {
     };
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.hasLocalMaskPortCollision());
+}
+
+test "local mask collision check ignores custom non-local target" {
+    const target = try std.testing.allocator.dupe(u8, "host.docker.internal");
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = true,
+        .port = 8443,
+        .mask_target = target,
+        .mask_port = 8443,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(!cfg.hasLocalMaskPortCollision());
 }
 
 test "parse config - direct users allowlist" {
