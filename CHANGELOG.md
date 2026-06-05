@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.0](https://github.com/sleep3r/mtproto.zig/compare/v0.25.1...v0.26.0) (2026-06-05)
+
+
+### Features
+
+* add handshake flood guard ([#295](https://github.com/sleep3r/mtproto.zig/issues/295)) ([0630632](https://github.com/sleep3r/mtproto.zig/commit/0630632cf3ab67fdd8a3f6e75c2677c8bb744acc))
+
 ## [0.25.1](https://github.com/sleep3r/mtproto.zig/compare/v0.25.0...v0.25.1) (2026-06-04)
 
 
