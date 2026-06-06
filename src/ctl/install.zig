@@ -235,7 +235,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
         ui.print("  {s}Middle:{s}   {s}\n", .{ Color.dim, Color.reset, if (opts.enable_middle_proxy) "enabled" else "disabled" });
         ui.writeRaw("\n");
 
-        if (!try ui.confirm("Proceed with installation?", true)) {
+        if (!try ui.confirm(localized(ui, "Proceed with installation?", "Начать установку?"), true)) {
             ui.info(ui.str(.aborting));
             return;
         }
@@ -300,38 +300,55 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
             @memcpy(&secret_hex, sec_str[0..32]);
             break;
         } else {
-            ui.print("  {s}✗ Secret must be exactly 32 hex characters, or 'auto'{s}\n", .{ Color.err, Color.reset });
+            ui.print("  {s}✗ {s}{s}\n", .{ Color.err, localized(ui, "Secret must be exactly 32 hex characters, or 'auto'", "Секрет должен быть ровно 32 hex-символа или 'auto'"), Color.reset });
         }
     }
 
-    // DPI modules — checkbox selection
-    const dpi_result = try ui.checkboxes(
-        ui.str(.install_dpi_header),
-        &.{
-            ui.str(.install_dpi_tcpmss),
-            ui.str(.install_dpi_masking),
-            ui.str(.install_dpi_nfqws),
-            ui.str(.install_dpi_desync),
-            ui.str(.install_dpi_drs),
-            ui.str(.install_dpi_ipv6),
-        },
-        &.{
-            ui.str(.install_dpi_tcpmss_help),
-            ui.str(.install_dpi_masking_help),
-            ui.str(.install_dpi_nfqws_help),
-            ui.str(.install_dpi_desync_help),
-            ui.str(.install_dpi_drs_help),
-            ui.str(.install_dpi_ipv6_help),
-        },
-        &.{ true, true, true, true, false, false },
+    // Protection against blocking. Most people should just accept the recommended
+    // defaults — so ask one friendly yes/no, and only reveal the six expert
+    // checkboxes to those who deliberately choose "Advanced".
+    const use_recommended = try ui.confirm(
+        localized(ui, "Turn on recommended protection against blocking? (recommended)", "Включить рекомендуемую защиту от блокировок? (рекомендуется)"),
+        true,
     );
+    if (use_recommended) {
+        // The shields that hide the proxy from blocking systems, on by default.
+        opts.enable_tcpmss = true;
+        opts.enable_masking = true;
+        opts.enable_nfqws = true;
+        opts.enable_desync = true;
+        opts.enable_drs = false;
+        opts.enable_ipv6_hop = false;
+    } else {
+        // Advanced: the granular six-checkbox view for people who want it.
+        const dpi_result = try ui.checkboxes(
+            ui.str(.install_dpi_header),
+            &.{
+                ui.str(.install_dpi_tcpmss),
+                ui.str(.install_dpi_masking),
+                ui.str(.install_dpi_nfqws),
+                ui.str(.install_dpi_desync),
+                ui.str(.install_dpi_drs),
+                ui.str(.install_dpi_ipv6),
+            },
+            &.{
+                ui.str(.install_dpi_tcpmss_help),
+                ui.str(.install_dpi_masking_help),
+                ui.str(.install_dpi_nfqws_help),
+                ui.str(.install_dpi_desync_help),
+                ui.str(.install_dpi_drs_help),
+                ui.str(.install_dpi_ipv6_help),
+            },
+            &.{ true, true, true, true, false, false },
+        );
 
-    opts.enable_tcpmss = (dpi_result & 1) != 0;
-    opts.enable_masking = (dpi_result & 2) != 0;
-    opts.enable_nfqws = (dpi_result & 4) != 0;
-    opts.enable_desync = (dpi_result & 8) != 0;
-    opts.enable_drs = (dpi_result & 16) != 0;
-    opts.enable_ipv6_hop = (dpi_result & 32) != 0;
+        opts.enable_tcpmss = (dpi_result & 1) != 0;
+        opts.enable_masking = (dpi_result & 2) != 0;
+        opts.enable_nfqws = (dpi_result & 4) != 0;
+        opts.enable_desync = (dpi_result & 8) != 0;
+        opts.enable_drs = (dpi_result & 16) != 0;
+        opts.enable_ipv6_hop = (dpi_result & 32) != 0;
+    }
     opts.secret = secret_hex;
 
     // MiddleProxy toggle
