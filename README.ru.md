@@ -331,6 +331,7 @@ port = 443
 # public_port = 443                 # порт в ссылках при HAProxy/Nginx
 # middle_proxy_nat_ip = "203.0.113.10"   # исходящий IPv4, который видит Telegram MiddleProxy
 max_connections = 512
+# workers = 1            # SO_REUSEPORT epoll-воркеры: 1 = однопоточно (дефолт); 0 = по числу CPU; N распределяет нагрузку по ядрам
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
@@ -373,6 +374,7 @@ alice = true
 | `[server] public_port` | `[server].port` | Порт для клиентских ссылок, если публичный порт отличается от listen-port |
 | `[server] middle_proxy_nat_ip` | auto | Исходящий IPv4 для MiddleProxy key derivation; auto-detect не использует `public_ip`, задайте явно при VPN/NAT egress |
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
+| `[server] workers` | `1` | SO_REUSEPORT epoll-воркеры: `1` = однопоточно; `0` = по числу CPU; `N` распределяет нагрузку relay/crypto по ядрам. При `>1` перезагрузка конфига по SIGHUP требует рестарта |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
 | `[server] tag` | — | 32-hex promotion tag от [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] rate_limit_per_subnet` | `0` | Лимит новых соединений/сек на /24 (IPv4) или /48 (IPv6). `0` = выключено (по умолчанию, NAT-friendly); для не-NAT хостов задайте напр. `30` |

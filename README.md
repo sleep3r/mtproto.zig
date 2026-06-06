@@ -345,6 +345,7 @@ port = 443
 # public_port = 443                 # Link port when behind HAProxy/Nginx
 # middle_proxy_nat_ip = "203.0.113.10"   # Outbound IPv4 seen by Telegram MiddleProxy
 max_connections = 512
+# workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
@@ -399,6 +400,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] middle_proxy_nat_ip` | auto | Outbound IPv4 used in MiddleProxy key derivation; auto-detected independently from `public_ip`, set explicitly when DC traffic exits through a VPN/NAT IP |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
+| `[server] workers` | `1` | SO_REUSEPORT epoll worker threads. `1` = single-threaded; `0` = one per CPU; `N` spreads relay/crypto load across cores. SIGHUP config reload requires a restart when `>1` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |
 | `[server] handshake_timeout_sec` | `15` | Handshake completion timeout |
 | `[server] graceful_shutdown_timeout_sec` | `15` | SIGTERM drain timeout before force-close |

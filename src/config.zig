@@ -163,6 +163,12 @@ pub const Config = struct {
     /// Hard cap for concurrently handled client connections
     /// Default tuned for 1 vCPU / 1 GB VPS profile.
     max_connections: u32 = 512,
+    /// Number of SO_REUSEPORT epoll worker threads. 1 (default) = the classic
+    /// single-threaded loop, behavior identical to before. 0 = auto (one per CPU,
+    /// clamped). >1 spreads the relay/crypto load across cores; the kernel
+    /// load-balances connections across workers. max_connections stays the global
+    /// total (workers share it, bounded by the saturation cap).
+    workers: u16 = 1,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
     /// Handshake read timeout after first byte arrives
@@ -503,6 +509,8 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "max_connections")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.max_connections;
                         cfg.max_connections = @max(@as(u32, 32), parsed);
+                    } else if (std.mem.eql(u8, key, "workers")) {
+                        cfg.workers = std.fmt.parseInt(u16, value, 10) catch cfg.workers;
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
                         cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
@@ -1710,6 +1718,24 @@ test "parse config - rate_limit_per_subnet defaults to 0 (disabled)" {
     );
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - workers defaults to 1 (single-threaded) and parses" {
+    var cfg_default = try Config.parse(std.testing.allocator,
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg_default.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 1), cfg_default.workers);
+
+    var cfg_multi = try Config.parse(std.testing.allocator,
+        \\[server]
+        \\workers = 4
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg_multi.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 4), cfg_multi.workers);
 }
 
 test "parse config - duplicate user key does not leak (last value wins)" {

@@ -75,6 +75,8 @@ test {
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
+/// Upper bound on SO_REUSEPORT epoll worker threads ([server].workers / 0=auto).
+const max_workers = 256;
 const event_loop_wait_ms: i32 = 37;
 /// How long after its first byte a non-TLS (dd) connection may take to deliver
 /// the full 64-byte obfuscated handshake before we treat it as a probe and serve
@@ -152,6 +154,15 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return b == null;
 }
 
+// Lock around the shared middle-proxy snapshot. Zig 0.16 has no std.Thread.Mutex
+// / std.Thread.RwLock, so this wraps std.Io.Mutex — a real cross-thread futex
+// mutex (atomic CAS fast path + futex park/wake via the Io) driven by the global
+// single-threaded Io (which disables only async task spawning, NOT mutual
+// exclusion). Cross-thread correctness matters because the middle-proxy updater
+// runs on its own thread AND, under the SO_REUSEPORT multi-worker model, N worker
+// threads read the snapshot concurrently. Readers serialize (no real RwLock
+// available), which is fine — the snapshot is read once per connection at routing
+// time, not on the per-byte relay path.
 const CompatRwLock = struct {
     mutex: std.Io.Mutex = .init,
 
@@ -788,6 +799,12 @@ pub const ProxyState = struct {
     notify_socket: ?[]const u8 = null,
     /// $WATCHDOG_USEC (systemd WatchdogSec); 0 disables watchdog pings.
     watchdog_usec: u64 = 0,
+    /// Resolved SO_REUSEPORT worker count (1 = single-threaded). Set in run().
+    /// Gates SIGHUP config reload: a live reload mutates shared config string
+    /// slices (e.g. tls_domain) and frees the old ones, which would race the N
+    /// worker threads reading them on the handshake path — so with >1 worker the
+    /// reload is refused and a restart is required to apply config changes.
+    effective_workers: usize = 1,
 
     middle_proxy_lock: CompatRwLock = .{},
     // Regular (non-media) primary endpoints per DC 1..5. Matches `proxy_for N`
@@ -1073,6 +1090,9 @@ pub const ProxyState = struct {
 
         var ipv6_ok = true;
         var server: net.Server = undefined;
+        // The address `server` is bound to, captured so additional SO_REUSEPORT
+        // worker listeners can be created on the same addr:port.
+        var listen_addr: Address = undefined;
 
         if (self.config.bind_address) |bind_str| {
             // Explicit bind address from config
@@ -1081,11 +1101,12 @@ pub const ProxyState = struct {
                 return error.InvalidBindAddress;
             };
             ipv6_ok = isIpv6(parsed);
+            listen_addr = parsed;
             server = try parsed.listen(io_ctx, .{
                 .reuse_address = true,
                 .kernel_backlog = @intCast(self.config.backlog),
             });
-            log.info("Listening on {s}:{d} (epoll, single-thread)", .{ bind_str, self.config.port });
+            log.info("Listening on {s}:{d} (epoll)", .{ bind_str, self.config.port });
         } else {
             // Default: try [::] (dual-stack), fall back to 0.0.0.0
             const address = ip6(
@@ -1094,6 +1115,7 @@ pub const ProxyState = struct {
                 0,
                 0,
             );
+            listen_addr = address;
             server = address.listen(io_ctx, .{
                 .reuse_address = true,
                 .kernel_backlog = @intCast(self.config.backlog),
@@ -1102,6 +1124,7 @@ pub const ProxyState = struct {
                     ipv6_ok = false;
                     log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
                     const address_v4 = ip4(.{ 0, 0, 0, 0 }, self.config.port);
+                    listen_addr = address_v4;
                     break :blk try address_v4.listen(io_ctx, .{
                         .reuse_address = true,
                         .kernel_backlog = @intCast(self.config.backlog),
@@ -1111,14 +1134,22 @@ pub const ProxyState = struct {
             };
 
             if (ipv6_ok) {
-                log.info("Listening on [::]:{d} (epoll, single-thread)", .{self.config.port});
+                log.info("Listening on [::]:{d} (epoll)", .{self.config.port});
             } else {
-                log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
+                log.info("Listening on 0.0.0.0:{d} (epoll)", .{self.config.port});
             }
         }
         defer server.deinit(io_ctx);
 
         setNonBlocking(server.socket.handle);
+
+        // Resolve the worker count: 1 = classic single loop (default, unchanged),
+        // 0 = auto (one per CPU), clamped to [1, max_workers]. Published on the
+        // shared state so SIGHUP reload can refuse a racy live-reload under >1.
+        var worker_count: usize = self.config.workers;
+        if (worker_count == 0) worker_count = std.Thread.getCpuCount() catch 1;
+        worker_count = std.math.clamp(worker_count, 1, max_workers);
+        self.effective_workers = worker_count;
 
         if (self.config.use_middle_proxy and self.config.datacenter_override == null) {
             // The INITIAL middle-proxy metadata refresh now runs inside the
@@ -1155,21 +1186,88 @@ pub const ProxyState = struct {
             }
         }
 
-        const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
+        // Connection fds stay bounded by the GLOBAL saturation cap (not N×max),
+        // but each worker adds its own listener + epoll fd — account for that 2×N
+        // overhead so the RLIMIT warning is accurate under the multi-worker model.
+        const effective_needed_fds = requiredFdsForConnections(self.config.max_connections) + 2 * worker_count;
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
         if (self.config.metrics.enabled) {
             try @import("../monitoring.zig").start(self);
         }
 
-        var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
-        defer loop.deinit();
+        if (worker_count <= 1) {
+            // Classic single-threaded path — byte-for-byte the previous behavior.
+            var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
+            defer loop.deinit();
+            // Listener bound, epoll + metrics up: tell systemd we're ready
+            // (Type=notify gate). No-op when not under systemd ($NOTIFY_SOCKET unset).
+            sd_notify.ready(self.notify_socket);
+            try loop.run();
+            return;
+        }
 
-        // Listener bound, epoll + metrics up: tell systemd we're ready (Type=notify
-        // gate). No-op when not under systemd ($NOTIFY_SOCKET unset).
+        // Multi-worker (SO_REUSEPORT): worker 0 runs on this (main) thread and owns
+        // the signalfd; workers 1..N-1 are spawned threads, each with its OWN
+        // SO_REUSEPORT listener and no signalfd. The kernel load-balances incoming
+        // connections across the N listeners. Shared ProxyState (atomic counters,
+        // mutex-guarded replay cache + middle-proxy snapshot) is read/written by all.
+        log.info("Starting {d} SO_REUSEPORT epoll workers", .{worker_count});
+
+        var extra_servers: [max_workers]net.Server = undefined;
+        var extra_count: usize = 0;
+        var threads: [max_workers]std.Thread = undefined;
+        var thread_count: usize = 0;
+        // Order matters (defers run LIFO): join all worker threads FIRST, then tear
+        // down the listener sockets whose fds those threads were using.
+        defer for (extra_servers[0..extra_count]) |*s| s.deinit(io_ctx);
+        defer for (threads[0..thread_count]) |t| t.join();
+
+        var i: usize = 1;
+        while (i < worker_count) : (i += 1) {
+            const extra = listen_addr.listen(io_ctx, .{
+                .reuse_address = true,
+                .kernel_backlog = @intCast(self.config.backlog),
+            }) catch |err| {
+                log.err("worker {d} listener failed ({any}); continuing with {d} workers", .{ i, err, i });
+                break;
+            };
+            setNonBlocking(extra.socket.handle);
+            extra_servers[extra_count] = extra;
+            extra_count += 1;
+            const t = std.Thread.spawn(.{}, ProxyState.eventLoopWorkerMain, .{ self, extra.socket.handle }) catch |err| {
+                log.err("worker {d} thread spawn failed ({any}); continuing with {d} workers", .{ i, err, extra_count });
+                break;
+            };
+            threads[thread_count] = t;
+            thread_count += 1;
+        }
+
+        // Worker 0 on the main thread owns the signalfd (signal handling + watchdog).
+        var loop0 = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
+        defer loop0.deinit();
         sd_notify.ready(self.notify_socket);
+        loop0.run() catch |err| {
+            log.err("worker 0 event loop error: {any}", .{err});
+            // Make the other workers drain and exit so we don't leave a half-dead set.
+            self.shutting_down.store(true, .release);
+        };
+    }
 
-        try loop.run();
+    /// Worker thread entry: run a non-signal-owning EventLoop on its own
+    /// SO_REUSEPORT listener. On any failure it sets the shared shutdown flag so
+    /// the rest of the fleet drains rather than running degraded.
+    fn eventLoopWorkerMain(self: *ProxyState, listen_fd: posix.fd_t) void {
+        var loop = EventLoop.init(self, listen_fd, -1) catch |err| {
+            log.err("worker EventLoop.init failed: {any}", .{err});
+            self.shutting_down.store(true, .release);
+            return;
+        };
+        defer loop.deinit();
+        loop.run() catch |err| {
+            log.err("worker event loop error: {any}", .{err});
+            self.shutting_down.store(true, .release);
+        };
     }
 
     const MiddleProxySnapshot = middle_proxy_routing.MiddleProxySnapshot;
@@ -1587,7 +1685,9 @@ const EventLoop = struct {
         errdefer loop.pool.deinit();
 
         try loop.addFd(listen_fd, true, false);
-        try loop.addFd(signal_fd, true, false);
+        // Only the signal-owning worker has a real signalfd; other SO_REUSEPORT
+        // workers pass -1 and learn about shutdown via state.shutting_down.
+        if (signal_fd >= 0) try loop.addFd(signal_fd, true, false);
         return loop;
     }
 
@@ -1615,15 +1715,21 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = nowNs();
 
         while (true) {
-            // Liveness heartbeat for /healthz, and pet the systemd watchdog at
-            // half the configured interval (WATCHDOG_USEC is microseconds).
+            // Liveness heartbeat for /healthz (any alive worker keeps it green),
+            // and pet the systemd watchdog at half the configured interval — but
+            // ONLY from the signal-owning worker, so there is exactly one sd_notify.
             const tick_ms = nowMs();
             self.state.loop_heartbeat_ms.store(tick_ms, .monotonic);
-            if (self.state.watchdog_usec > 0 and
+            if (self.signal_fd >= 0 and self.state.watchdog_usec > 0 and
                 tick_ms - self.last_watchdog_ms >= @as(i64, @intCast(self.state.watchdog_usec / 2000)))
             {
                 sd_notify.watchdog(self.state.notify_socket);
                 self.last_watchdog_ms = tick_ms;
+            }
+            // Non-owner SO_REUSEPORT workers learn about shutdown via the shared
+            // flag the signal owner sets, so they also stop accepting and drain.
+            if (!self.shutting_down and self.state.shutting_down.load(.acquire)) {
+                self.beginGracefulShutdown("peer shutdown");
             }
             var current_wait_ms: i32 = event_loop_wait_ms;
             if (self.desync_wait_slots.items.len > 0) {
@@ -2095,6 +2201,14 @@ const EventLoop = struct {
     }
 
     fn reloadConfigFromDisk(self: *EventLoop) void {
+        // With multiple SO_REUSEPORT workers, a live reload would swap and FREE
+        // shared config string slices (tls_domain, mask_target, …) that the other
+        // worker threads read on the handshake hot path — a torn-pointer /
+        // use-after-free data race. Refuse the reload and require a restart.
+        if (self.state.effective_workers > 1) {
+            log.warn("SIGHUP: config reload is not supported with [server].workers>1 ({d} workers); restart to apply changes", .{self.state.effective_workers});
+            return;
+        }
         var next = Config.loadFromFile(self.state.allocator, self.state.config_path) catch |err| {
             log.err("SIGHUP: failed to reload config '{s}': {any}", .{ self.state.config_path, err });
             return;

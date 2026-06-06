@@ -592,7 +592,11 @@ single pass without standing up new external systems** (no external monitoring s
 plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds clean
 (`zig build test` + `x86_64-linux+aes` + `aarch64-linux`) and is committed (no Claude co-author).
 
-### ✅ Done this pass (15 commits)
+### ✅ Done this pass (16+ commits)
+
+> WS1 multi-core (`reuseport-workers` + `shared-state-multicore`) was added in a follow-up after a
+> map-the-mechanics workflow + an adversarial concurrency-review workflow (which found and fixed 2 real
+> races/accounting bugs before commit). See row 16 below.
 
 | # | Item (roadmap ID) | What shipped | Commit |
 |---|---|---|---|
@@ -611,6 +615,7 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
 | 13 | `binary-exploit-mitigations` (WS5) | proxy built **PIE** (ASLR; verified `e_type=DYN`); full RELRO already default | `6fa730c` |
 | 14 | `fuzz-targets-core` (WS4) | `std.testing.fuzz` (Smith) targets for TLS/socks5/http_connect parsers — deterministic in CI, coverage-guided under `--fuzz` | `7b64de6` |
 | 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | *this commit* |
+| 16 | `reuseport-workers` + `shared-state-multicore` (WS1) | **opt-in** `[server].workers` SO_REUSEPORT thread-per-worker model (default 1 = unchanged); replay cache + middle-proxy snapshot mutex-guarded (real `std.Io.Mutex`); SIGHUP reload refused under >1 worker; worker fd accounting; map + adversarial-review workflows (fixed a `tls_domain` use-after-free race + fd-accounting before commit) | `<this>` |
 
 ### ⏸️ Investigated but deliberately NOT changed (with reason)
 
@@ -632,9 +637,10 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
 ### ❌ Not attempted this pass — needs new systems / scale / live validation (per the brief)
 
 Explicitly out of scope for a single no-new-systems pass; these remain the headline roadmap work:
-- **WS1 multi-core**: `reuseport-workers` + `shared-state-multicore` (large coupled change; needs a
-  load harness to validate). `aes-ctr-wide` (#5) and the already-atomic global state landed as
-  prerequisites.
+- **WS1 multi-core**: `reuseport-workers` + `shared-state-multicore` are now **done** (row 16) — but
+  still need **real-load validation on Linux** (throughput scaling, even distribution, graceful
+  shutdown) before `workers>1` becomes a default. The companion `load-throughput-relay-ci` gate (WS4)
+  is the missing piece to validate it automatically.
 - **WS2 evasion (deeper rungs)**: `probe-real-template` / `reality-reflect` (runtime outbound TLS
   scout), `evasion-profiles` + `transport-strategy-interface` (large hot-path refactor),
   `traffic-shape-modeling`, `mss-clienthello-frag-tuning` (needs empirical MSS tuning).

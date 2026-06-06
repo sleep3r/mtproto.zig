@@ -22,6 +22,18 @@ pub const ReplayCache = struct {
 
     hash_seed: u64 = 0,
     entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+    /// Guards the table. The replay cache is shared ProxyState read+written by
+    /// every worker on the handshake path (not the per-byte relay path), so under
+    /// the SO_REUSEPORT multi-worker model N threads call checkAndInsert
+    /// concurrently — without this lock that is a data race on the bucket array
+    /// and a security regression (a replay landing on another worker could slip
+    /// through). std.Io.Mutex is a real cross-thread futex mutex (Zig 0.16 has no
+    /// std.Thread.Mutex); uncontended (≈free) at workers=1.
+    lock: std.Io.Mutex = .init,
+
+    fn lockIo() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
+    }
 
     pub fn init() ReplayCache {
         return .{
@@ -47,6 +59,10 @@ pub const ReplayCache = struct {
     /// Returns true if this digest was already seen (duplicate replay),
     /// false when inserted as a new digest.
     pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
+        const io = lockIo();
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+
         const key = digestKey(digest);
         const now_s = nowSeconds();
         const start = self.indexFor(key);

@@ -24,20 +24,34 @@ deployment. This document is the in-repo architecture reference; the public stab
 
 ## Runtime model
 
-- **Single-threaded network core**: one Linux `epoll` event loop (`src/proxy/proxy.zig`,
-  `EventLoop.run`) handles all socket I/O. No thread-per-connection; handling is state-machine driven.
-- **Connection slots** are pre-allocated and reused; per-connection heavy buffers are allocated
-  on-demand, not embedded in idle slots.
-- **Shared state** (`ProxyState`) holds config, the middle-proxy snapshot (behind an RW lock), and all
-  global counters as `std.atomic.Value` — already multi-core-safe for the planned SO_REUSEPORT worker
-  model (see ROADMAP WS1). Per-EventLoop state (connection pool, flood guard, subnet limiter) is
-  shared-nothing. **Exception**: the replay cache lives in `ProxyState` (shared), and the flood
-  guard/subnet limiter are per-EventLoop — so for the planned multi-core worker model these three
-  guards need the `shared-state-multicore` work (shared striped-locked replay cache + per-IP steering)
-  before they are correct under N workers. They are *not* on the per-byte relay path, so contention is
-  bounded to the handshake.
+- **Epoll event-loop core** (`src/proxy/proxy.zig`, `EventLoop.run`): each worker runs one Linux
+  `epoll` loop and handles all its socket I/O with no thread-per-connection — handling is
+  state-machine driven.
+- **Multi-core via SO_REUSEPORT workers** (`[server].workers`, default `1`): `1` = the classic single
+  loop (unchanged); `>1` (or `0`=auto=one-per-CPU) spawns N workers, each on its own thread with its
+  **own SO_REUSEPORT listener + epoll**. The kernel load-balances incoming connections across workers,
+  spreading the relay/crypto load across cores. Worker 0 runs on the main thread and owns the signalfd;
+  workers 1..N−1 observe `ProxyState.shutting_down` (atomic) to drain together on shutdown. Total
+  active connections stay bounded by the **global saturation cap** (`active_connections` vs
+  `max_connections`), so per-worker pools are not divided.
+- **Connection slots** are pre-allocated per worker and reused; per-connection heavy buffers are
+  allocated on-demand, not embedded in idle slots.
+- **Shared state** (`ProxyState`): global counters are `std.atomic.Value` (so `/metrics` aggregates
+  across workers for free); the **replay cache** and the **middle-proxy snapshot** are guarded by a
+  real cross-thread mutex (`std.Io.Mutex`, since Zig 0.16 has no `std.Thread.Mutex`), correct under N
+  workers (both are touched only on the handshake/routing path, not per-byte relay). The **flood guard**
+  and **subnet limiter** are intentionally **per-worker**, so each enforces ~1/N of the global limit
+  (acceptable; tighter global coordination is a future item).
+- **SIGHUP config reload is refused when `workers>1`** (logs a message): a live reload swaps and frees
+  shared config strings (e.g. `tls_domain`) that the other worker threads read on the hot path, so a
+  restart is required to apply config changes under multi-worker. Single-worker hot-reload is unchanged.
 - **Background threads**: a middle-proxy metadata updater and the metrics server run as detached
-  threads reading atomics/snapshots; they never touch the per-byte relay path.
+  threads reading atomics/snapshots; they are spawned once (not per worker) and never touch the
+  per-byte relay path.
+
+> Runtime validation note: the multi-worker path builds and cross-compiles and was adversarially
+> concurrency-reviewed, but it is **opt-in** and should be validated under real load on a Linux host
+> (throughput scaling, even distribution, graceful shutdown) before being made the default.
 
 ## Core connection flow
 
