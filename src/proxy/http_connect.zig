@@ -268,6 +268,16 @@ test "http_connect - parser fuzz random malformed bytes" {
     }
 }
 
+test "fuzz: http connect response parser never panics" {
+    // Coverage-guided under `zig build test --fuzz`; deterministic single run otherwise.
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, s: *std.testing.Smith) anyerror!void {
+            var buf: [2048]u8 = undefined;
+            _ = parseResponse(buf[0..s.slice(&buf)]);
+        }
+    }.one, .{});
+}
+
 test "http_connect - fragmented response prefixes" {
     const full = "HTTP/1.1 200 Connection Established\r\nX-Test: 1\r\n\r\n";
     for (0..full.len) |prefix_len| {

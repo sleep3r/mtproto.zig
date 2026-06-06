@@ -586,6 +586,22 @@ test "buildServerHello AppData: fixed length, per-connection-random body" {
     try std.testing.expect(!std.mem.eql(u8, r1[app_offset..], r2[app_offset..]));
 }
 
+test "fuzz: TLS ClientHello parsers never panic on arbitrary input" {
+    // Coverage-guided under `zig build test --fuzz`; runs deterministically as a
+    // normal unit test otherwise. Asserts the attacker-reachable FakeTLS parsers
+    // tolerate any byte sequence without a panic/OOB (a parser panic = remote DoS).
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, s: *std.testing.Smith) anyerror!void {
+            var buf: [4096]u8 = undefined;
+            const data = buf[0..s.slice(&buf)];
+            _ = extractSni(data);
+            _ = extractFirstTls13Cipher(data);
+            const secrets = [_]UserSecret{.{ .name = "u", .secret = [_]u8{0x11} ** 16 }};
+            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true) catch {};
+        }
+    }.one, .{});
+}
+
 test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
     // Minimal ClientHello: record hdr, hs hdr, version, 32-byte random,
     // session_id_len=0, cipher_suites_len=6 = [GREASE 0x0a0a, 0x1303, 0x1301].

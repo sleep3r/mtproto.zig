@@ -314,6 +314,20 @@ test "socks5 - parser fuzz random malformed bytes" {
     }
 }
 
+test "fuzz: socks5 response parsers never panic" {
+    // Coverage-guided under `zig build test --fuzz`; deterministic single run
+    // otherwise. Supersedes the fixed-seed PRNG loop above for new-edge discovery.
+    try std.testing.fuzz({}, struct {
+        fn one(_: void, s: *std.testing.Smith) anyerror!void {
+            var buf: [512]u8 = undefined;
+            const data = buf[0..s.slice(&buf)];
+            _ = parseGreetingResponse(data);
+            _ = parseAuthResponse(data);
+            _ = parseConnectResponse(data);
+        }
+    }.one, .{});
+}
+
 test "socks5 - connect response fragmented prefixes" {
     const full = [_]u8{ 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x01, 0xBB };
 
