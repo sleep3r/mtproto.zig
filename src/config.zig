@@ -1287,7 +1287,7 @@ test "parse config - full production-like config" {
         \\rate_limit_per_subnet = 30
         \\
         \\[censorship]
-        \\tls_domain = "rutube.ru"
+        \\tls_domain = "wb.ru"
         \\mask = true
         \\fast_mode = true
         \\mask_port = 8443
