@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh | sudo bash
-#   curl -fsSL .../bootstrap.sh | sudo bash -s -- install --port 443 --domain wb.ru --yes
+#   curl -fsSL .../bootstrap.sh | sudo bash -s -- install --port 443 --domain rutube.ru --yes
 #   curl -fsSL .../bootstrap.sh | sudo bash -s -- --interactive
 #
 # After bootstrap, mtbuddy lives at /usr/local/bin/mtbuddy and can be called directly.

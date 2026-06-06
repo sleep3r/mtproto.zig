@@ -293,7 +293,7 @@ const en_strings = [_][]const u8{
     // install_domain_prompt
     "TLS masking domain",
     // install_domain_help
-    "The domain your proxy pretends to be.\nDPI sees a connection to this site instead of Telegram.\nShort domains like wb.ru look like legitimate traffic.",
+    "The domain your proxy pretends to be.\nDPI sees a connection to this site instead of Telegram.\nShort domains like rutube.ru look like legitimate traffic.",
     // install_secret_prompt
     "Proxy secret (32 hex chars)",
     // install_secret_help
@@ -550,7 +550,7 @@ const ru_strings = [_][]const u8{
     // install_domain_prompt
     "TLS домен для маскировки",
     // install_domain_help
-    "Домен, под который прокси маскирует трафик.\nDPI видит подключение к этому сайту вместо Telegram.\nКороткие домены вроде wb.ru похожи на легитимный трафик.",
+    "Домен, под который прокси маскирует трафик.\nDPI видит подключение к этому сайту вместо Telegram.\nКороткие домены вроде rutube.ru похожи на легитимный трафик.",
     // install_secret_prompt
     "Секрет прокси (32 hex символа)",
     // install_secret_help

@@ -19,7 +19,7 @@ const CERT_DIR = "/etc/nginx/ssl";
 pub const NGINX_PORT = "8443";
 
 pub const MaskingOpts = struct {
-    tls_domain: []const u8 = "wb.ru",
+    tls_domain: []const u8 = "rutube.ru",
     skip_monitor: bool = false,
 };
 
@@ -46,7 +46,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     const domain = try ui.input(
         i18n.get(ui.lang, .install_domain_prompt),
         i18n.get(ui.lang, .install_domain_help),
-        "wb.ru",
+        "rutube.ru",
         &domain_buf,
     );
 
@@ -119,7 +119,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     if (!cert_ok) {
         ui.step("Generating self-signed certificate...");
         var subj_buf: [128]u8 = undefined;
-        const subj = std.fmt.bufPrint(&subj_buf, "/CN={s}", .{opts.tls_domain}) catch "/CN=wb.ru";
+        const subj = std.fmt.bufPrint(&subj_buf, "/CN={s}", .{opts.tls_domain}) catch "/CN=rutube.ru";
         _ = sys.execForward(&.{
             "openssl", "req",                  "-x509", "-newkey",               "ec",    "-pkeyopt", "ec_paramgen_curve:prime256v1",
             "-keyout", CERT_DIR ++ "/key.pem", "-out",  CERT_DIR ++ "/cert.pem", "-days", "3650",     "-nodes",

@@ -4,8 +4,8 @@
 //! Downloads pre-built release artifacts from GitHub (same path as update).
 //!
 //! One-liner usage:
-//!   sudo mtbuddy install --port 443 --domain wb.ru --yes
-//!   sudo mtbuddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --secret <hex> --user myuser --yes
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -29,7 +29,7 @@ pub const InstallOpts = struct {
     public_port: ?u16 = null,
     /// Bind to a specific IP address instead of all interfaces.
     bind_address: ?[]const u8 = null,
-    tls_domain: []const u8 = "wb.ru",
+    tls_domain: []const u8 = "rutube.ru",
     max_connections: u32 = 512,
     enable_tcpmss: bool = true,
     /// TCPMSS --set-mss value on the SYN,ACK: forces the client's ClientHello to be
@@ -78,7 +78,7 @@ fn printInstallHelp(ui: *Tui) void {
     ui.writeRaw("  Options:\n");
     ui.writeRaw("    --port, -p <port>          Listen port (default: 443)\n");
     ui.writeRaw("    --public-port <port>       Port shown in client links\n");
-    ui.writeRaw("    --domain, -d <domain>      FakeTLS masking domain (default: wb.ru)\n");
+    ui.writeRaw("    --domain, -d <domain>      FakeTLS masking domain (default: rutube.ru)\n");
     ui.writeRaw("    --secret, -s <32-hex>      Initial user secret for a new config\n");
     ui.writeRaw("    --user, -u <name>          Initial user name for a new config\n");
     ui.writeRaw("    --config, -c <path>        Install using an existing config.toml\n");
@@ -265,7 +265,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     const domain = try ui.input(
         ui.str(.install_domain_prompt),
         ui.str(.install_domain_help),
-        "wb.ru",
+        "rutube.ru",
         &domain_buf,
     );
     opts.tls_domain = domain;

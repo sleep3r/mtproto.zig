@@ -100,19 +100,19 @@ This downloads the latest `mtbuddy` binary, verifies minisign signature + SHA-25
 
 ```bash
 # Minimal — auto-generates a secret, enables all DPI bypass modules
-sudo mtbuddy install --port 443 --domain wb.ru --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --yes
 
 # Bring your own secret and username
-sudo mtbuddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --secret <32-hex> --user alice --yes
 
 # Disable all DPI modules (bare proxy only)
-sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --no-dpi --yes
 
 # Install using an existing config file (auto-maps port and domain)
 sudo mtbuddy install --config /path/to/config.toml --yes
 
 # Explicitly allow unsigned mode (not recommended)
-sudo mtbuddy install --insecure --port 443 --domain wb.ru --yes
+sudo mtbuddy install --insecure --port 443 --domain rutube.ru --yes
 ```
 
 At the end, mtbuddy prints a ready-to-use `tg://` connection link.
@@ -154,7 +154,7 @@ sudo mtbuddy --interactive
 |---|---|---|
 | `--port, -p` | `443` | Proxy listen port |
 | `--public-port` | — | Port advertised in generated Telegram links |
-| `--domain, -d` | `wb.ru` | TLS masking domain |
+| `--domain, -d` | `rutube.ru` | TLS masking domain |
 | `--secret, -s` | auto | User secret (32 hex chars) |
 | `--user, -u` | `user` | Username in `config.toml` |
 | `--config, -c` | — | Use existing `config.toml` file |
@@ -211,7 +211,7 @@ mtbuddy secret
 sudo mtbuddy reload
 
 # Setup DPI modules after the fact
-sudo mtbuddy setup masking --domain wb.ru
+sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
@@ -375,7 +375,7 @@ handshake_flood_guard_block_sec = 120
 tag = ""                  # Optional: promotion tag from @MTProxybot
 
 [censorship]
-tls_domain = "wb.ru"
+tls_domain = "rutube.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host (Docker/remote Nginx)
 mask_port = 443           # 443 = forward probes to the real tls_domain (secure default); 8443 = local Nginx backend

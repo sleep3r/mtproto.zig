@@ -5,8 +5,8 @@
 //! and non-interactive CLI with flags.
 //!
 //! One-liner install:
-//!   sudo mtbuddy install --port 443 --domain wb.ru --yes
-//!   sudo mtbuddy install --port 443 --domain wb.ru --secret <hex> --user myuser --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --yes
+//!   sudo mtbuddy install --port 443 --domain rutube.ru --secret <hex> --user myuser --yes
 //!
 //! Interactive wizard:
 //!   sudo mtbuddy --interactive
@@ -371,12 +371,12 @@ fn printHelp(lang: i18n.Lang) void {
     // ── One-liner examples ──
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Quick install (one-liner)", "Быстрая установка (one-liner)"), Color.reset });
     ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "Minimal — auto-generates secret", "Минимум — секрет сгенерируется автоматически"), Color.reset });
-    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain rutube.ru --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
     ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "Full control — bring your own secret and username", "Полный контроль — свой секрет и имя пользователя"), Color.reset });
-    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru \\\n", .{Color.bright_yellow});
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain rutube.ru \\\n", .{Color.bright_yellow});
     ui.print("    {s}  --secret <32-hex> --user alice --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
     ui.print("    {s}# {s}:{s}\n", .{ Color.gray, tr(lang, "No DPI bypass (bare install)", "Без обхода DPI (чистая установка)"), Color.reset });
-    ui.print("    {s}sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
+    ui.print("    {s}sudo mtbuddy install --port 443 --domain rutube.ru --no-dpi --yes{s}\n\n", .{ Color.bright_yellow, Color.reset });
 
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Interactive wizard", "Интерактивный мастер"), Color.reset });
     ui.print("    {s}sudo mtbuddy --interactive{s}\n\n", .{ Color.bright_yellow, Color.reset });
@@ -405,7 +405,7 @@ fn printHelp(lang: i18n.Lang) void {
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Install options", "Опции установки"), Color.reset });
     printOpt(&ui, "--port,   -p <port>", tr(lang, "Proxy port (default: 443)", "Порт прокси (по умолчанию: 443)"));
     printOpt(&ui, "--public-port <port>", tr(lang, "Port advertised in Telegram links", "Порт для Telegram-ссылок"));
-    printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: wb.ru)", "TLS-домен маскировки (по умолчанию: wb.ru)"));
+    printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: rutube.ru)", "TLS-домен маскировки (по умолчанию: rutube.ru)"));
     printOpt(&ui, "--secret, -s <hex32>", tr(lang, "User secret (32 hex chars, auto-generated if omitted)", "Секрет пользователя (32 hex, если не задан — генерируется)"));
     printOpt(&ui, "--user,   -u <name>", tr(lang, "Username in config.toml (default: user)", "Имя пользователя в config.toml (по умолчанию: user)"));
     printOpt(&ui, "--config, -c <path>", tr(lang, "Use existing config.toml file", "Использовать существующий config.toml"));

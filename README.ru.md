@@ -100,19 +100,19 @@ curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/boo
 
 ```bash
 # Минимально: secret генерируется автоматически, DPI-модули включены
-sudo mtbuddy install --port 443 --domain wb.ru --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --yes
 
 # Свой secret и имя пользователя
-sudo mtbuddy install --port 443 --domain wb.ru --secret <32-hex> --user alice --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --secret <32-hex> --user alice --yes
 
 # Без DPI-модулей, только bare proxy
-sudo mtbuddy install --port 443 --domain wb.ru --no-dpi --yes
+sudo mtbuddy install --port 443 --domain rutube.ru --no-dpi --yes
 
 # Установка из существующего config.toml
 sudo mtbuddy install --config /path/to/config.toml --yes
 
 # Явно разрешить unsigned mode (не рекомендуется)
-sudo mtbuddy install --insecure --port 443 --domain wb.ru --yes
+sudo mtbuddy install --insecure --port 443 --domain rutube.ru --yes
 ```
 
 В конце `mtbuddy` напечатает готовую `tg://` ссылку для подключения.
@@ -149,7 +149,7 @@ sudo mtbuddy --interactive
 |---|---|---|
 | `--port, -p` | `443` | Порт прокси |
 | `--public-port` | — | Порт, который будет указан в Telegram-ссылках |
-| `--domain, -d` | `wb.ru` | Домен TLS-маскировки |
+| `--domain, -d` | `rutube.ru` | Домен TLS-маскировки |
 | `--secret, -s` | auto | User secret, 32 hex chars |
 | `--user, -u` | `user` | Имя пользователя в `config.toml` |
 | `--config, -c` | — | Использовать существующий `config.toml` |
@@ -205,7 +205,7 @@ mtbuddy secret
 sudo mtbuddy reload
 
 # Настроить DPI-модули после установки
-sudo mtbuddy setup masking --domain wb.ru
+sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
@@ -357,7 +357,7 @@ handshake_flood_guard_block_sec = 120
 tag = ""                  # Optional: promotion tag from @MTProxybot
 
 [censorship]
-tls_domain = "wb.ru"
+tls_domain = "rutube.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host для Docker/remote Nginx
 mask_port = 443           # 443 = пробы уходят на реальный tls_domain (безопасный дефолт); 8443 = локальный Nginx
