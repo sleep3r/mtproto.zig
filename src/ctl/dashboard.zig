@@ -17,6 +17,9 @@ const SummaryLine = tui_mod.SummaryLine;
 const INSTALL_DIR = "/opt/mtproto-proxy/monitor";
 const VENV_DIR = INSTALL_DIR ++ "/.venv";
 const VENV_PYTHON = VENV_DIR ++ "/bin/python";
+/// Pinned uv release (verified against its published .sha256 at install time).
+/// Bump deliberately; do not float to "latest".
+const UV_VERSION = "0.11.19";
 const SERVICE_NAME = "proxy-monitor";
 const SERVICE_FILE = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
 
@@ -71,9 +74,14 @@ fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
         .aarch64 => "uv-aarch64-unknown-linux-gnu.tar.gz",
     };
 
+    // Pin uv to a specific release (no moving "latest" target) and verify the
+    // download against uv's own published .sha256 from that same release before
+    // installing it as a root binary. This closes the unverified-root-download
+    // supply-chain hole. (Hardcoding the per-arch SHA in-repo, Dockerfile-style,
+    // is the stronger follow-up tracked in ROADMAP_1.0.md.)
     const uv_url = std.fmt.allocPrint(
         allocator,
-        "https://github.com/astral-sh/uv/releases/latest/download/{s}",
+        "https://github.com/astral-sh/uv/releases/download/" ++ UV_VERSION ++ "/{s}",
         .{archive_name},
     ) catch {
         ui.fail("Failed to prepare uv download URL");
@@ -88,6 +96,13 @@ fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
         \\TMP_DIR=$(mktemp -d)
         \\trap 'rm -rf "$TMP_DIR"' EXIT
         \\curl -fsSL "$UV_URL" -o "$TMP_DIR/uv.tar.gz"
+        \\curl -fsSL "$UV_URL.sha256" -o "$TMP_DIR/uv.tar.gz.sha256"
+        \\EXPECTED=$(cut -d' ' -f1 "$TMP_DIR/uv.tar.gz.sha256")
+        \\ACTUAL=$(sha256sum "$TMP_DIR/uv.tar.gz" | cut -d' ' -f1)
+        \\if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+        \\  echo "uv checksum mismatch (expected '$EXPECTED' got '$ACTUAL')" >&2
+        \\  exit 1
+        \\fi
         \\tar -xzf "$TMP_DIR/uv.tar.gz" -C "$TMP_DIR" --strip-components=1
         \\install -m 0755 "$TMP_DIR/uv" /usr/local/bin/uv
         \\if [ -f "$TMP_DIR/uvx" ]; then install -m 0755 "$TMP_DIR/uvx" /usr/local/bin/uvx; fi
@@ -99,8 +114,9 @@ fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
     };
     defer allocator.free(install_script);
 
-    // Download the latest release tarball from GitHub and extract `uv` binary.
-    // GitHub is reliably accessible even when astral.sh is blocked.
+    // Download the pinned release tarball from GitHub, verify its checksum, and
+    // extract the `uv` binary. GitHub is reliably accessible even when astral.sh
+    // is blocked.
     const result = sys.exec(allocator, &.{ "sh", "-c", install_script }) catch {
         ui.fail("Failed to download uv from GitHub");
         return false;
@@ -174,11 +190,16 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
 
     ui.step("Installing Python dependencies (fastapi, uvicorn, psutil, websockets)...");
 
+    // Pin exact versions instead of floating to latest (removes dependency
+    // drift / confusion for the root-privileged control-plane venv). fastapi
+    // 0.115.6 requires starlette>=0.40,<0.42, satisfied by 0.41.3. The stronger
+    // `uv pip install --require-hashes -r requirements.txt` (full transitive hash
+    // pinning) is the follow-up tracked in ROADMAP_1.0.md.
     const pip_res = sys.exec(allocator, &.{
-        "uv",        "pip",       "install",
-        "--python",  VENV_PYTHON, "fastapi",
-        "uvicorn",   "psutil",    "websockets",
-        "starlette",
+        "uv",                "pip",           "install",
+        "--python",          VENV_PYTHON,     "fastapi==0.115.6",
+        "uvicorn==0.34.0",   "psutil==6.1.1", "websockets==14.1",
+        "starlette==0.41.3",
     }) catch {
         ui.fail("Failed to install Python dependencies via uv");
         return;

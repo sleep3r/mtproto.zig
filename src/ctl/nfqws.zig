@@ -14,6 +14,10 @@ const Color = tui_mod.Color;
 const SummaryLine = tui_mod.SummaryLine;
 
 const ZAPRET_DIR = "/opt/zapret";
+/// Pinned zapret release: clone this tag (not HEAD) and verify the resolved
+/// commit before building+running it as root with NET_ADMIN. Bump deliberately.
+const ZAPRET_TAG = "v72.12";
+const ZAPRET_COMMIT = "5cc46a9815b00e97401b1459984dff44abfec411";
 const SERVICE_NAME = "nfqws-mtproto";
 const NFQUEUE_NUM = "200";
 const INSTALL_DIR = "/opt/mtproto-proxy";
@@ -138,11 +142,27 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     } else {
         const cc = chooseWorkingCCompiler(ui, allocator) orelse return;
 
-        ui.step("Cloning and building zapret...");
+        ui.step("Cloning and building zapret (" ++ ZAPRET_TAG ++ ")...");
         _ = sys.exec(allocator, &.{ "rm", "-rf", ZAPRET_DIR }) catch {};
         if (!runLogged(ui, allocator, &.{
-            "git", "clone", "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
+            "git", "clone", "--branch", ZAPRET_TAG, "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
         }, "Failed to clone zapret")) return;
+
+        // Supply-chain pin: refuse to build+run (as root, NET_ADMIN) unless the
+        // cloned tag resolves to the exact reviewed commit. Guards against a
+        // moved/retagged release.
+        const rev = sys.exec(allocator, &.{ "git", "-C", ZAPRET_DIR, "rev-parse", "HEAD" }) catch null;
+        if (rev) |r| {
+            defer r.deinit();
+            const got = std.mem.trim(u8, r.stdout, " \t\r\n");
+            if (!std.mem.eql(u8, got, ZAPRET_COMMIT)) {
+                ui.fail("zapret commit mismatch (" ++ ZAPRET_TAG ++ ") — refusing to build untrusted code");
+                return;
+            }
+        } else {
+            ui.fail("Could not verify zapret commit — refusing to build");
+            return;
+        }
 
         _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
         var make_cmd_buf: [128]u8 = undefined;
