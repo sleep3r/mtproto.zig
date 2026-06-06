@@ -412,6 +412,103 @@ pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
     return null;
 }
 
+fn fpAppendStr(out: []u8, pos: usize, s: []const u8) ?usize {
+    if (pos + s.len > out.len) return null;
+    @memcpy(out[pos .. pos + s.len], s);
+    return pos + s.len;
+}
+
+fn fpAppendHexCsv(out: []u8, pos: usize, v: u16, first: *bool) ?usize {
+    var p = pos;
+    if (!first.*) p = fpAppendStr(out, p, ",") orelse return null;
+    first.* = false;
+    const s = std.fmt.bufPrint(out[p..], "{x:0>4}", .{v}) catch return null;
+    return p + s.len;
+}
+
+/// Diagnostic: summarize a client's ClientHello — the non-GREASE cipher suites it
+/// offered, its supported_groups, and the groups it sent key_shares for — into
+/// `out` (e.g. "ciphers=1301,1303 groups=11ec,001d keyshare=11ec"). Read-only; used
+/// to learn what a real client (e.g. a Telegram app behind a censor) actually
+/// presents, so the ServerHello can be matched to it instead of guessed. Returns
+/// null on a malformed/truncated hello. Bounded + panic-free (attacker input).
+pub fn formatClientHelloFingerprint(handshake: []const u8, out: []u8) ?[]const u8 {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return null; // ClientHello
+    pos += 4; // hs type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > handshake.len) return null;
+    const sid_len: usize = handshake[pos];
+    pos += 1 + sid_len;
+
+    if (pos + 2 > handshake.len) return null;
+    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return null;
+    const ciphers_start = pos;
+    const ciphers_end = pos + cs_len;
+    pos = ciphers_end;
+
+    if (pos + 1 > handshake.len) return null;
+    const comp_len: usize = handshake[pos];
+    pos += 1 + comp_len;
+
+    var groups_start: usize = 0;
+    var groups_end: usize = 0;
+    var ks_groups: [16]u16 = undefined;
+    var ks_count: usize = 0;
+    if (pos + 2 <= handshake.len) {
+        const ext_total = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+        pos += 2;
+        const ext_end = @min(pos + ext_total, handshake.len);
+        while (pos + 4 <= ext_end) {
+            const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+            const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
+            pos += 4;
+            if (pos + elen > ext_end) break;
+            if (etype == 0x000a and elen >= 2) { // supported_groups
+                const list_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+                if (2 + @as(usize, list_len) <= elen) {
+                    groups_start = pos + 2;
+                    groups_end = pos + 2 + list_len;
+                }
+            } else if (etype == 0x0033) { // key_share (client: list_len then entries)
+                var kp: usize = pos + 2;
+                const ks_end = pos + elen;
+                while (kp + 4 <= ks_end and ks_count < ks_groups.len) {
+                    ks_groups[ks_count] = std.mem.readInt(u16, handshake[kp..][0..2], .big);
+                    ks_count += 1;
+                    kp += 4 + @as(usize, std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big));
+                }
+            }
+            pos += elen;
+        }
+    }
+
+    var p: usize = 0;
+    p = fpAppendStr(out, p, "ciphers=") orelse return null;
+    var first = true;
+    var i = ciphers_start;
+    while (i + 2 <= ciphers_end) : (i += 2) {
+        const c = std.mem.readInt(u16, handshake[i..][0..2], .big);
+        if ((c & 0x0f0f) == 0x0a0a) continue; // skip GREASE
+        p = fpAppendHexCsv(out, p, c, &first) orelse return out[0..p];
+    }
+    p = fpAppendStr(out, p, " groups=") orelse return out[0..p];
+    first = true;
+    i = groups_start;
+    while (i + 2 <= groups_end) : (i += 2) {
+        p = fpAppendHexCsv(out, p, std.mem.readInt(u16, handshake[i..][0..2], .big), &first) orelse return out[0..p];
+    }
+    p = fpAppendStr(out, p, " keyshare=") orelse return out[0..p];
+    first = true;
+    for (ks_groups[0..ks_count]) |g| {
+        p = fpAppendHexCsv(out, p, g, &first) orelse return out[0..p];
+    }
+    return out[0..p];
+}
+
 pub fn extractSni(handshake: []const u8) ?[]const u8 {
     if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
 
@@ -678,10 +775,66 @@ test "fuzz: TLS ClientHello parsers never panic on arbitrary input" {
             const data = buf[0..s.slice(&buf)];
             _ = extractSni(data);
             _ = extractFirstTls13Cipher(data);
+            var fp_buf: [256]u8 = undefined;
+            _ = formatClientHelloFingerprint(data, &fp_buf);
             const secrets = [_]UserSecret{.{ .name = "u", .secret = [_]u8{0x11} ** 16 }};
             _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true) catch {};
         }
     }.one, .{});
+}
+
+test "formatClientHelloFingerprint summarizes ciphers/groups/keyshare" {
+    // Hand-built ClientHello: ciphers [1301,1303], supported_groups [001d,11ec],
+    // one key_share for 001d (x25519). Verifies we can read what a real client
+    // offers (incl. whether it offers X25519MLKEM768 0x11ec).
+    var ch: [106]u8 = undefined;
+    var n: usize = 0;
+    const W = struct {
+        fn b(buf: []u8, i: *usize, v: u8) void {
+            buf[i.*] = v;
+            i.* += 1;
+        }
+        fn h(buf: []u8, i: *usize, v: u16) void {
+            std.mem.writeInt(u16, buf[i.*..][0..2], v, .big);
+            i.* += 2;
+        }
+    };
+    W.b(&ch, &n, 0x16);
+    W.b(&ch, &n, 0x03);
+    W.b(&ch, &n, 0x01);
+    W.h(&ch, &n, 101); // record len
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0x00);
+    W.h(&ch, &n, 97); // hs type + 24-bit len
+    W.h(&ch, &n, 0x0303); // version
+    var r: usize = 0;
+    while (r < 32) : (r += 1) W.b(&ch, &n, 0xAA); // random
+    W.b(&ch, &n, 0x00); // session_id len
+    W.h(&ch, &n, 4); // cipher_suites len
+    W.h(&ch, &n, 0x1301);
+    W.h(&ch, &n, 0x1303);
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0x00); // compression
+    W.h(&ch, &n, 52); // ext_total
+    W.h(&ch, &n, 0x000a);
+    W.h(&ch, &n, 6);
+    W.h(&ch, &n, 4);
+    W.h(&ch, &n, 0x001d);
+    W.h(&ch, &n, 0x11ec); // supported_groups
+    W.h(&ch, &n, 0x0033);
+    W.h(&ch, &n, 38);
+    W.h(&ch, &n, 36);
+    W.h(&ch, &n, 0x001d);
+    W.h(&ch, &n, 32); // key_share entry
+    var k: usize = 0;
+    while (k < 32) : (k += 1) W.b(&ch, &n, 0xBB); // key
+    try std.testing.expectEqual(@as(usize, 106), n);
+
+    var out: [256]u8 = undefined;
+    const fp = formatClientHelloFingerprint(&ch, &out).?;
+    try std.testing.expectEqualStrings("ciphers=1301,1303 groups=001d,11ec keyshare=001d", fp);
+    // Truncated input never panics.
+    try std.testing.expect(formatClientHelloFingerprint(ch[0..30], &out) == null);
 }
 
 test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {

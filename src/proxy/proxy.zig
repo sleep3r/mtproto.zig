@@ -810,6 +810,10 @@ pub const ProxyState = struct {
     notify_socket: ?[]const u8 = null,
     /// $WATCHDOG_USEC (systemd WatchdogSec); 0 disables watchdog pings.
     watchdog_usec: u64 = 0,
+    /// Diagnostic budget: log the first N incoming ClientHello fingerprints (what a
+    /// real client offers) at info, then go quiet. Lets an operator capture the
+    /// real client shape on deploy (connect once) without ongoing log spam.
+    clienthello_fp_budget: std.atomic.Value(u32) = std.atomic.Value(u32).init(16),
     /// Resolved SO_REUSEPORT worker count (1 = single-threaded). Set in run().
     /// Gates SIGHUP config reload: a live reload mutates shared config string
     /// slices (e.g. tls_domain) and frees the old ones, which would race the N
@@ -2827,7 +2831,22 @@ const EventLoop = struct {
         // Echo a client-offered cipher in the ServerHello (naturalistic, matches
         // how a real server negotiates) instead of a constant. Falls back to the
         // template default when the client offered no parseable TLS 1.3 suite.
-        const echoed_cipher = tls.extractFirstTls13Cipher(slot.clientHelloBuf()[0..slot.client_hello_len]);
+        const client_hello_bytes = slot.clientHelloBuf()[0..slot.client_hello_len];
+
+        // Diagnostic: log the first few real ClientHello fingerprints so an operator
+        // can see what their client actually offers (e.g. whether it presents
+        // X25519MLKEM768) before we match the ServerHello to it. Quiets after the budget.
+        if (self.state.clienthello_fp_budget.load(.monotonic) != 0) {
+            const old = self.state.clienthello_fp_budget.fetchSub(1, .monotonic);
+            if (old != 0 and old <= 16) {
+                var fp_buf: [256]u8 = undefined;
+                if (tls.formatClientHelloFingerprint(client_hello_bytes, &fp_buf)) |fp| {
+                    log.info("client ClientHello [{s}] (we serve: cipher echoes client, key_share=x25519 0x001d)", .{fp});
+                }
+            }
+        }
+
+        const echoed_cipher = tls.extractFirstTls13Cipher(client_hello_bytes);
         slot.server_hello = tls.buildServerHelloWithTemplate(
             self.state.allocator,
             self.state.tls_server_hello_template[0..],
