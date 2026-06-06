@@ -703,8 +703,12 @@ pub const CloseReason = enum(u8) {
         if (has(reason, "timeout")) return .handshake_timeout;
         if (has(reason, "shutdown") or has(reason, "closing")) return .shutdown;
         if (has(reason, "bad ") or has(reason, "invalid") or has(reason, "unexpected") or has(reason, "alert")) return .bad_handshake;
+        // Upstream-side markers FIRST: "s2c" (server→client reads) and the dd-relay's
+        // "direct obfuscated s2c …" reasons are upstream reads, so they must bucket as
+        // upstream_error rather than falling through to the generic eof/read-error
+        // (client) buckets below.
+        if (has(reason, "connect") or has(reason, "upstream") or has(reason, "candidate") or has(reason, "relay ") or has(reason, "dc tail") or has(reason, "middleproxy") or has(reason, "s2c")) return .upstream_error;
         if (has(reason, "eof")) return .client_eof;
-        if (has(reason, "connect") or has(reason, "upstream") or has(reason, "candidate") or has(reason, "relay ") or has(reason, "dc tail") or has(reason, "middleproxy")) return .upstream_error;
         if (has(reason, "epoll") or has(reason, "interest") or has(reason, "desync") or has(reason, "fd map")) return .epoll_error;
         if (has(reason, "read error")) return .client_error;
         // Only reasons that actually signal an error map to internal_error; any
@@ -2843,13 +2847,24 @@ const EventLoop = struct {
         // Diagnostic: log the first few real ClientHello fingerprints so an operator
         // can see what their client actually offers (e.g. whether it presents
         // X25519MLKEM768) before we match the ServerHello to it. Quiets after the budget.
-        if (self.state.clienthello_fp_budget.load(.monotonic) != 0) {
-            const old = self.state.clienthello_fp_budget.fetchSub(1, .monotonic);
-            if (old != 0 and old <= 16) {
-                var fp_buf: [256]u8 = undefined;
-                if (tls.formatClientHelloFingerprint(client_hello_bytes, &fp_buf)) |fp| {
-                    log.info("client ClientHello [{s}] (we serve: cipher echoes client, key_share=x25519 0x001d)", .{fp});
+        // Saturating decrement: only consume a slot while the budget is > 0, via
+        // cmpxchg, so two SO_REUSEPORT workers racing at value 1 can't both fetchSub
+        // and wrap the u32 past zero (which would keep the counter non-zero forever).
+        const fp_consumed = blk: {
+            var cur = self.state.clienthello_fp_budget.load(.monotonic);
+            while (cur != 0) {
+                if (self.state.clienthello_fp_budget.cmpxchgWeak(cur, cur - 1, .monotonic, .monotonic)) |actual| {
+                    cur = actual; // lost the race — retry with the observed value
+                } else {
+                    break :blk true; // decremented from a positive value
                 }
+            }
+            break :blk false;
+        };
+        if (fp_consumed) {
+            var fp_buf: [256]u8 = undefined;
+            if (tls.formatClientHelloFingerprint(client_hello_bytes, &fp_buf)) |fp| {
+                log.info("client ClientHello [{s}] (we serve: cipher echoes client, key_share=x25519 0x001d)", .{fp});
             }
         }
 
