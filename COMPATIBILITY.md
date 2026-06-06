@@ -34,9 +34,11 @@ any surface below requires a MAJOR bump; backward-compatible additions are MINOR
   their documented behaviors are stable. New flags/subcommands may be added.
 
 ### 5. systemd units & deployment layout
-- Unit names (`mtproto-proxy.service`), the install layout (`/opt/mtproto-proxy/…`,
-  `/usr/local/bin/mtbuddy`), and the `Type=notify`/watchdog contract are stable. Hardening directives
-  may be tightened in a MINOR release **only if** they do not break a documented egress mode.
+- Unit names (`mtproto-proxy.service`) and the install layout (`/opt/mtproto-proxy/…`,
+  `/usr/local/bin/mtbuddy`) are stable. The installed unit is `Type=simple` (robust in
+  containers); `Type=notify`/watchdog is implemented but dormant pending container detection.
+  Hardening directives may be tightened in a MINOR release **only if** they do not break a
+  documented egress mode.
 
 ### 6. Release artifacts & verification
 - Release binaries are minisign-signed against the public key pinned at build time (`build.zig`,

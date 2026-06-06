@@ -9,7 +9,7 @@ const I18N = {
   en: {
     'header.refresh': 'Refresh', 'header.uptime': 'Uptime', 'header.lastUpdate': 'Last update',
     'card.cpu': '⬡ CPU', 'card.cpuSub': 'utilization', 'card.memory': '◈ Memory', 'card.network': '◎ Network Throughput',
-    'stats.activeOf': 'Active /', 'stats.handshakes': 'Handshakes', 'stats.total': 'Total Connections', 'stats.drops': 'Drops',
+    'stats.activeOf': 'Active /', 'stats.handshakes': 'Handshakes', 'stats.total': 'Total Connections',
     'users.title': '👥 Users', 'users.add': '+ Add User', 'users.who': 'Who is this for?',
     'users.secret': 'Secret', 'users.secretHint': '(leave empty to auto-generate)',
     'users.namePh': 'e.g. Мама, dad, work 💼', 'users.secretPh': "Leave blank — we'll create one for you",
@@ -21,6 +21,7 @@ const I18N = {
     'modal.deleteUser': 'Delete User', 'modal.deleteTunnel': 'Delete Tunnel', 'modal.restartNote': 'The proxy will be restarted to apply changes.',
     'share.subtitle': 'Point their phone camera at this code to connect.', 'share.copyLink': 'Copy link', 'share.send': 'Send', 'share.with': 'Share with',
     'status.online': 'Online', 'status.offline': 'Offline', 'status.stuck': 'Stuck',
+    'status.healthy': 'Healthy', 'status.needsAttention': 'Needs attention', 'status.disabled': 'Disabled', 'status.remoteMode': 'Remote mode', 'status.endpointOk': 'OK', 'status.endpointDown': 'not responding',
     'hero.checking': 'Checking…', 'hero.offline': "Your proxy is offline — friends can't connect until it's back.",
     'hero.stalled': 'Your proxy is running but not responding — it looks stuck. Restarting usually fixes this.',
     'hero.idle': 'Your proxy is online and ready. No one is connected yet — share a link to get started.',
@@ -32,7 +33,7 @@ const I18N = {
   ru: {
     'header.refresh': 'Обновление', 'header.uptime': 'Аптайм', 'header.lastUpdate': 'Обновлено',
     'card.cpu': '⬡ CPU', 'card.cpuSub': 'загрузка', 'card.memory': '◈ Память', 'card.network': '◎ Сетевой трафик',
-    'stats.activeOf': 'Активно /', 'stats.handshakes': 'Подключаются', 'stats.total': 'Всего подключений', 'stats.drops': 'Отклонено',
+    'stats.activeOf': 'Активно /', 'stats.handshakes': 'Подключаются', 'stats.total': 'Всего подключений',
     'users.title': '👥 Пользователи', 'users.add': '+ Добавить', 'users.who': 'Для кого это?',
     'users.secret': 'Секрет', 'users.secretHint': '(пусто — сгенерируем сами)',
     'users.namePh': 'напр. Мама, папа, работа 💼', 'users.secretPh': 'Оставьте пустым — создадим сами',
@@ -44,6 +45,7 @@ const I18N = {
     'modal.deleteUser': 'Удалить пользователя', 'modal.deleteTunnel': 'Удалить туннель', 'modal.restartNote': 'Прокси будет перезапущен для применения изменений.',
     'share.subtitle': 'Наведите камеру их телефона на этот код, чтобы подключиться.', 'share.copyLink': 'Скопировать ссылку', 'share.send': 'Отправить', 'share.with': 'Поделиться с',
     'status.online': 'Онлайн', 'status.offline': 'Офлайн', 'status.stuck': 'Завис',
+    'status.healthy': 'Здоров', 'status.needsAttention': 'Требует внимания', 'status.disabled': 'Выключено', 'status.remoteMode': 'Удалённый режим', 'status.endpointOk': 'OK', 'status.endpointDown': 'не отвечает',
     'hero.checking': 'Проверка…', 'hero.offline': 'Прокси офлайн — близкие не смогут подключиться, пока он не запустится.',
     'hero.stalled': 'Прокси запущен, но не отвечает — похоже, завис. Обычно помогает перезапуск.',
     'hero.idle': 'Прокси онлайн и готов. Пока никто не подключён — поделитесь ссылкой, чтобы начать.',
@@ -502,7 +504,7 @@ function setupAddUserForm() {
 
     try {
       const data = await apiCall('/api/users/add', { name, secret: secret || undefined });
-      showToast(`Done! Here is ${data.name}'s connection — send it to them now.`, 'success');
+      showToast(`Done! Here is ${data.label || data.name}'s connection — send it to them now.`, 'success');
       form.style.display = 'none';
       _users_cache_bust();
       await runPoll();
@@ -1037,10 +1039,10 @@ function renderRouting(routing) {
   const badge = $('routingBadge');
   if (routing.healthy) {
     badge.className = 'badge';
-    $('routingStatus').textContent = 'Healthy';
+    $('routingStatus').textContent = t('status.healthy');
   } else {
     badge.className = 'badge off';
-    $('routingStatus').textContent = 'Needs attention';
+    $('routingStatus').textContent = t('status.needsAttention');
   }
 
   $('routingMiddle').textContent = routing.middle_proxy_enabled ? 'enabled' : 'disabled';
@@ -1183,16 +1185,16 @@ async function poll() {
     const maskBadge = $('maskBadge');
     if (!masking.enabled) {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = 'Disabled';
+      $('maskStatus').textContent = t('status.disabled');
     } else if (masking.mode === 'remote') {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = 'Remote mode';
+      $('maskStatus').textContent = t('status.remoteMode');
     } else if (masking.healthy) {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = 'Healthy';
+      $('maskStatus').textContent = t('status.healthy');
     } else {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = 'Needs attention';
+      $('maskStatus').textContent = t('status.needsAttention');
     }
 
     let modeText = masking.mode || '—';
@@ -1210,9 +1212,9 @@ async function poll() {
     let endpointText = masking.target || '—';
     if (masking.mode === 'local' || masking.mode === 'custom') {
       if (masking.endpoint_ok === true) {
-        endpointText += ' (OK)';
+        endpointText += ' (' + t('status.endpointOk') + ')';
       } else if (masking.endpoint_ok === false) {
-        endpointText += ' (not responding)';
+        endpointText += ' (' + t('status.endpointDown') + ')';
       }
     }
     $('maskTarget').textContent = endpointText;
@@ -1327,7 +1329,7 @@ if (langToggleBtn) {
   langToggleBtn.addEventListener('click', () => {
     setLang(LANG === 'ru' ? 'en' : 'ru');
     updatePollControls();
-    if (typeof updateAutoScrollBtn === 'function') updateAutoScrollBtn();
+    updateAutoScrollButton();
   });
 }
 applyStaticI18n();

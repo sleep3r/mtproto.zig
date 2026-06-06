@@ -151,8 +151,11 @@ confirm is byte-reversed for abridged, verbatim for intermediate/secure).
   (`mtproto_connection_close_reason_total{reason}` — the evasion/block signal), bytes, middleproxy.
 - `/healthz` — liveness (event loop ticked within 5s).
 - `/readyz` — readiness (serving and not draining; **not** gated on middleproxy).
-- **systemd**: `Type=notify` (READY=1 after bind) + `WatchdogSec` (WATCHDOG=1 each loop iteration) via
-  a native dependency-free sd_notify (`src/proxy/sd_notify.zig`).
+- **systemd**: mtbuddy installs `Type=simple` (robust on bare-metal **and** in containers).
+  A native dependency-free sd_notify (`src/proxy/sd_notify.zig`) implementing READY=1 +
+  WATCHDOG=1 is present but dormant — `Type=notify`/`WatchdogSec` is gated off until
+  container detection lands, because containerized systemd often drops the notify datagram
+  and would restart-loop a healthy proxy under `Restart=always`.
 
 ## mtbuddy (installer & control panel)
 
@@ -186,7 +189,7 @@ ROADMAP_1.0.md.
 ├── env.sh                 # optional env vars (TAG, etc.)
 └── monitor/               # dashboard assets (optional)
 /usr/local/bin/mtbuddy
-/etc/systemd/system/mtproto-proxy.service   # Type=notify, hardened (seccomp/RestrictAddressFamilies/…)
+/etc/systemd/system/mtproto-proxy.service   # Type=simple, hardened (seccomp/RestrictAddressFamilies/…)
 ```
 
 ## Platform scope

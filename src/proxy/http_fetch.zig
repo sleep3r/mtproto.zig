@@ -106,7 +106,14 @@ fn writeCurlProxyConfig(
     path_buf: []u8,
     content_buf: []u8,
 ) ![]const u8 {
-    const path = std.fmt.bufPrint(path_buf, "/tmp/.mtproxy-curl-{d}.conf", .{std.os.linux.getpid()}) catch
+    // Unpredictable name (random suffix, not just the pid) so a local attacker
+    // cannot pre-create the path to read the staged proxy-user password or symlink
+    // it onto a target file. Combined with .exclusive=true (O_EXCL) below — which
+    // refuses to open an existing file OR a final-component symlink — this closes
+    // the CWE-377/CWE-59 insecure-temp-file window.
+    var rnd_source: std.Random.IoSource = .{ .io = std.Io.Threaded.global_single_threaded.io() };
+    const rnd = rnd_source.interface().int(u64);
+    const path = std.fmt.bufPrint(path_buf, "/tmp/.mtproxy-curl-{d}-{x}.conf", .{ std.os.linux.getpid(), rnd }) catch
         return error.CurlConfigPathTooLong;
 
     const header = std.fmt.bufPrint(content_buf, "proxy = \"{s}://{s}\"\nproxy-user = \"", .{ scheme, endpoint }) catch
@@ -124,6 +131,7 @@ fn writeCurlProxyConfig(
 
     var file = std.Io.Dir.createFileAbsolute(io, path, .{
         .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .exclusive = true,
     }) catch return error.CurlConfigWriteFailed;
     defer file.close(io);
     file.writeStreamingAll(io, content_buf[0..pos]) catch return error.CurlConfigWriteFailed;

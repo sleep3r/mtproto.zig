@@ -5,12 +5,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Type=notify: the proxy sends READY=1 once the listener is bound and the event
-# loop is up, and pets the watchdog each loop iteration (WATCHDOG=1). A stuck
-# single-threaded epoll loop is then restarted automatically.
-Type=notify
-NotifyAccess=main
-WatchdogSec=30
+# Type=simple to match what mtbuddy installs (release.zig / tunnel.zig). The proxy
+# DOES implement sd_notify READY=1 + WATCHDOG=1, but containerized systemd
+# (Docker/LXC) frequently fails to deliver the datagram, which with Restart=always
+# restart-loops a healthy proxy. Re-enable Type=notify + WatchdogSec only behind
+# container detection + ping validation.
+Type=simple
 User=mtproto
 Group=mtproto
 WorkingDirectory=/opt/mtproto-proxy

@@ -11,7 +11,6 @@ import secrets
 import time
 import threading
 import queue
-import socket
 import subprocess
 import sys
 import shutil
@@ -387,18 +386,27 @@ def _proxy_stats() -> dict:
 
 
 def _proxy_listening(port: int) -> bool:
-    """True if something is accepting TCP on the proxy's local listen port.
+    """True if the proxy holds a LISTEN socket on `port`.
 
-    The proxy normally binds all interfaces, so a loopback connect confirms it is
-    actually serving (not just running). This is a LOCAL check — it confirms the
-    listener is up, not that a censor elsewhere isn't blocking the public port.
+    Reads /proc/net/tcp{,6} instead of connect()-ing: a real connection would be
+    accepted and counted by the proxy (inflating Total Connections by one per poll),
+    and a loopback connect would also wrongly report 'stalled' when the proxy binds a
+    specific non-loopback bind_address. A LISTEN-state lookup avoids both. This is a
+    LOCAL check — it confirms the listener is up, not that a censor isn't blocking the
+    public port.
     """
     if not port:
         return False
-    for host in ("127.0.0.1", "::1"):
+    want = format(int(port), "04X")  # /proc/net/tcp local port is uppercase hex
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
-            with socket.create_connection((host, port), timeout=0.8):
-                return True
+            with open(path, "r") as f:
+                next(f, None)  # skip the header row
+                for line in f:
+                    parts = line.split()
+                    # parts[1] = "HEXADDR:HEXPORT", parts[3] = state (0A == LISTEN)
+                    if len(parts) > 3 and parts[3] == "0A" and parts[1].rsplit(":", 1)[-1].upper() == want:
+                        return True
         except OSError:
             continue
     return False
@@ -1690,9 +1698,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
-NotifyAccess=main
-WatchdogSec=30
+# Type=simple (NOT notify): must match the installer (release.zig / tunnel.zig).
+# Containerized systemd (Docker/LXC) often fails to deliver the sd_notify datagram,
+# which with Restart=always restart-loops a perfectly healthy proxy. Re-enable
+# Type=notify + WatchdogSec only behind container detection + ping validation.
+Type=simple
 User=mtproto
 Group=mtproto
 WorkingDirectory=/opt/mtproto-proxy
