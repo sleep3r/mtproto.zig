@@ -419,8 +419,9 @@ pub fn main(init: std.process.Init) !void {
                 \\  Defaults to 'config.toml' in the current directory.
                 \\
                 \\  Options:
-                \\    -h, --help       Show this help message and exit
-                \\    -v, --version    Show version and exit
+                \\    -h, --help            Show this help message and exit
+                \\    -v, --version         Show version and exit
+                \\    --check-config [path] Validate the config and exit (0=ok, 1=invalid)
                 \\
                 \\
             , .{});
@@ -429,6 +430,20 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             writeStderr("mtproto-proxy v" ++ version ++ "\n", .{});
             return;
+        }
+        // Config dry-run (like `nginx -t`): parse + validate, then exit with a
+        // shell-usable status. Usage: mtproto-proxy --check-config [config.toml]
+        if (std.mem.eql(u8, arg, "--check-config") or std.mem.eql(u8, arg, "--check")) {
+            const path = args.next() orelse "config.toml";
+            var check_cfg = config.Config.loadFromFile(allocator, path) catch |err| {
+                writeStderr("\x1b[1m\x1b[31m  ✗ config '{s}' is INVALID: {}\x1b[0m\n", .{ path, err });
+                std.process.exit(1);
+            };
+            defer check_cfg.deinit(allocator);
+            runtime_log.level = check_cfg.log_level;
+            check_cfg.emitWarnings();
+            writeStdout("  \x1b[32m✓\x1b[0m config '{s}' is valid ({d} user(s))\n", .{ path, check_cfg.users.count() });
+            std.process.exit(0);
         }
     }
 

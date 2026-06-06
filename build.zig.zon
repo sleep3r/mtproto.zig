@@ -1,0 +1,18 @@
+.{
+    .name = .mtproto_zig,
+    .version = "0.26.0",
+    .fingerprint = 0x4a7d5f2904e880a5, // Changing this has security and trust implications.
+    // Earliest supported Zig. The codebase rides churn-prone std APIs
+    // (std.Io.Threaded, CompatRwLock shim), so the toolchain is pinned: a 1.0
+    // that markets a 177 KB zero-dep binary must guarantee which compiler
+    // produces it. See also .zig-version for toolchain managers (zvm/zigup).
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
