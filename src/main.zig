@@ -339,7 +339,8 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeRaw("      | |  | | | | |  __/| | | (_) | || (_) |\n");
     writeRaw("      |_|  |_| |_| |_|   |_|  \\___/ \\__\\___/\n");
     writeRaw(R);
-    writeStdout("      {s}{s}proxy · zig edition · v{s}{s}\n\n", .{ D, white, version, R });
+    writeStdout("      {s}{s}proxy · zig edition · v{s}{s}\n", .{ D, white, version, R });
+    writeStdout("      {s}keeping your people connected{s}\n\n", .{ D, R });
 
     // ─── SERVER ─────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "SERVER" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
@@ -398,7 +399,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
 
     // Footer
     writeRaw("\n  " ++ D ++ "──────────────────────────────────────────────────" ++ R ++ "\n");
-    writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
+    writeRaw("  " ++ B ++ cyan ++ "⏳ Your door is open. Waiting for the people you love..." ++ R ++ "\n\n");
 }
 
 pub fn main(init: std.process.Init) !void {

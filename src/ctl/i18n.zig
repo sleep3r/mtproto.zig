@@ -365,7 +365,7 @@ const en_strings = [_][]const u8{
     // install_config_path
     "Config:",
     // install_connection_link
-    "Connection link:",
+    "Your invite link — send this to connect a device:",
     // install_dpi_active
     "DPI bypass active:",
 
@@ -425,13 +425,13 @@ const en_strings = [_][]const u8{
     // error_arch_unsupported
     "Unsupported architecture",
     // error_no_release
-    "Could not determine latest release tag",
+    "Couldn't reach GitHub to find the latest version. Check the server's internet and try again.",
     // error_download_failed
     "Failed to download artifact",
     // error_binary_not_found
     "Extracted binary not found in artifact",
     // error_service_failed
-    "Service failed to start after update",
+    "The proxy didn't start after the update — rolled back to the previous version. Check: journalctl -u mtproto-proxy -n 30",
     // error_install_dir_missing
     "Install directory not found: /opt/mtproto-proxy",
     // install_warn_secret_ignored
@@ -441,7 +441,7 @@ const en_strings = [_][]const u8{
     // install_warn_ipv6_hop_manual
     "IPv6 auto-hopping is not configured by install. Run `mtbuddy ipv6-hop` (requires Cloudflare API credentials).",
     // install_secret_gen_failed
-    "Failed to generate a secure random secret (getrandom unavailable)",
+    "Couldn't generate a secure secret on this system. Pass your own 32-hex secret with --secret instead.",
 };
 
 // ── Russian strings ─────────────────────────────────────────────
@@ -566,7 +566,7 @@ const ru_strings = [_][]const u8{
     // install_dpi_masking
     "Nginx маскировка (zero-RTT)",
     // install_dpi_masking_help
-    "Локальный Nginx отвечает на TLS пробы, устраняя fingerprint по таймингу.",
+    "Локальный Nginx отвечает на TLS-пробы, убирая отпечаток по времени ответа.",
     // install_dpi_nfqws
     "nfqws TCP desync (Zapret)",
     // install_dpi_nfqws_help
@@ -576,7 +576,7 @@ const ru_strings = [_][]const u8{
     // install_dpi_ipv6_help
     "Ротация IPv6 адреса при обнаружении блокировки. Нужен Cloudflare API.",
     // install_dpi_desync
-    "Desync ServerHello",
+    "Десинхронизация ServerHello",
     // install_dpi_desync_help
     "Фрагментирует ServerHello: 1 байт + 3мс задержка + остаток (обход пассивного DPI).",
     // install_dpi_drs
@@ -622,7 +622,7 @@ const ru_strings = [_][]const u8{
     // install_config_path
     "Конфиг:",
     // install_connection_link
-    "Ссылка для подключения:",
+    "Ваша ссылка-приглашение — отправьте её, чтобы подключить устройство:",
     // install_dpi_active
     "Обход DPI активен:",
 
@@ -646,7 +646,7 @@ const ru_strings = [_][]const u8{
     // update_validation_ok
     "Бинарник совместим с этим CPU",
     // update_validation_fail
-    "Бинарник несовместим с этим CPU (illegal instruction)",
+    "Бинарник несовместим с этим CPU (недопустимая инструкция)",
     // update_backing_up
     "Резервная копия текущего бинарника...",
     // update_stopping
@@ -682,13 +682,13 @@ const ru_strings = [_][]const u8{
     // error_arch_unsupported
     "Неподдерживаемая архитектура",
     // error_no_release
-    "Не удалось определить последнюю версию",
+    "Не удалось связаться с GitHub, чтобы найти последнюю версию. Проверьте интернет на сервере и повторите.",
     // error_download_failed
     "Не удалось скачать артефакт",
     // error_binary_not_found
     "Бинарник не найден в артефакте",
     // error_service_failed
-    "Сервис не запустился после обновления",
+    "Прокси не запустился после обновления — откатились к прежней версии. Подробности: journalctl -u mtproto-proxy -n 30",
     // error_install_dir_missing
     "Директория установки не найдена: /opt/mtproto-proxy",
     // install_warn_secret_ignored
@@ -696,9 +696,9 @@ const ru_strings = [_][]const u8{
     // install_warn_user_ignored
     "Существующий конфиг сохранён; --user не применён. Отредактируйте [access.users] или удалите config.toml для пересоздания.",
     // install_warn_ipv6_hop_manual
-    "IPv6 auto-hopping не настраивается при установке. Запустите `mtbuddy ipv6-hop` (нужны Cloudflare API credentials).",
+    "Авто-смена IPv6 не настраивается при установке. Запустите `mtbuddy ipv6-hop` (нужны ключи Cloudflare API).",
     // install_secret_gen_failed
-    "Не удалось сгенерировать безопасный случайный секрет (getrandom недоступен)",
+    "Не удалось сгенерировать безопасный случайный секрет (системный генератор недоступен). Укажите свой 32-hex секрет через --secret.",
 };
 
 // ── Comptime validation ─────────────────────────────────────────

@@ -673,7 +673,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     // ── Print summary ──
     var sp = ui.spinner("Detecting public IP");
     sp.start();
-    const public_ip = sys.detectPublicIp(allocator) orelse "<SERVER_IP>";
+    // Plain token (no angle brackets — those break copy-paste in some terminals).
+    // printSummary prints an explicit "replace SERVER_IP with your VPS IP" warning.
+    const public_ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
     sp.stop(true, public_ip);
 
     // Read summary values from active config
@@ -893,15 +895,29 @@ fn printLinksFromConfig(
             port,
             ee_secret,
         }) catch continue;
+        // The t.me link is the one to SHARE — it renders a tappable "Connect proxy"
+        // card in Telegram and opens from any browser/messenger; tg:// is the direct
+        // app link.
+        var tme_link_buf: [512]u8 = undefined;
+        const tme_link = std.fmt.bufPrint(&tme_link_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
+            safe_public_ip,
+            port,
+            ee_secret,
+        }) catch continue;
 
-        ui.print("  {s}│{s}  {s}{s} fakeTLS:{s} {s}{s}{s}\n", .{
-            tui_mod.Color.gray,
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{
+            tui_mod.Color.gray,  tui_mod.Color.reset,
+            tui_mod.Color.white, user_name,
             tui_mod.Color.reset,
-            tui_mod.Color.dim,
-            user_name,
+        });
+        ui.print("  {s}│{s}    {s}{s}{s}\n", .{
+            tui_mod.Color.gray,  tui_mod.Color.reset,
+            tui_mod.Color.white, tme_link,
             tui_mod.Color.reset,
-            tui_mod.Color.white,
-            ee_link,
+        });
+        ui.print("  {s}│{s}    {s}{s}{s}\n", .{
+            tui_mod.Color.gray,  tui_mod.Color.reset,
+            tui_mod.Color.dim,   ee_link,
             tui_mod.Color.reset,
         });
         if (dd_enabled) {
@@ -1009,11 +1025,27 @@ fn printSummary(
             ee_secret,
         }) catch "error building link";
 
-        ui.print("  {s}│{s}  {s}fakeTLS: {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, ee_link, tui_mod.Color.reset });
+        var tme_link_buf: [512]u8 = undefined;
+        const tme_link = std.fmt.bufPrint(&tme_link_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
+            safe_public_ip,
+            public_port,
+            ee_secret,
+        }) catch ee_link;
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.white, tme_link, tui_mod.Color.reset });
+        ui.print("  {s}│{s}  {s}{s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset, tui_mod.Color.dim, ee_link, tui_mod.Color.reset });
     }
 
     ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
-    ui.hint(localized(ui, "Run `sudo mtbuddy links` later to print these links again.", "Позже выполните `sudo mtbuddy links`, чтобы снова показать эти ссылки."));
+
+    if (std.mem.indexOf(u8, public_ip, "SERVER_IP") != null) {
+        ui.warn(localized(ui, "Couldn't auto-detect this server's public IP. In the links above, replace SERVER_IP with your VPS's IP address (e.g. 203.0.113.5).", "Не удалось определить публичный IP сервера. В ссылках выше замените SERVER_IP на IP-адрес вашего VPS (например, 203.0.113.5)."));
+    }
+
+    ui.writeRaw("\n");
+    ui.hint(localized(ui, "Share with someone you love — send them the top (t.me) link with:", "Поделитесь с близким — отправьте ему верхнюю (t.me) ссылку со словами:"));
+    ui.hint(localized(ui, "\"I set up a private door to Telegram for us. Tap this link, choose Connect, and Telegram will work again.\"", "«Я сделал для нас личный вход в Telegram. Нажми на ссылку, выбери «Подключить» — и Telegram снова заработает.»"));
+    ui.writeRaw("\n");
+    ui.hint(localized(ui, "Print these links again anytime: sudo mtbuddy links", "Показать эти ссылки снова в любой момент: sudo mtbuddy links"));
     ui.hint(localized(ui, "Runtime proxy logs intentionally hide secrets and links.", "Runtime-логи прокси намеренно скрывают секреты и ссылки."));
 }
 

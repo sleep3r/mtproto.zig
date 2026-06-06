@@ -92,6 +92,12 @@ pub fn main(init: std.process.Init) !void {
             ui.lang = if (lang_choice == 1) .ru else .en;
         }
 
+        ui.print("  {s}{s}{s}\n", .{
+            Color.dim,
+            tr(ui.lang, "Hi — I'm mtbuddy. Let's get your people online.", "Привет — я mtbuddy. Давайте подключим ваших близких."),
+            Color.reset,
+        });
+
         try interactiveMain(&ui, allocator);
         return;
     }
@@ -281,24 +287,26 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     const sys = @import("sys.zig");
 
     const svc_active = sys.isServiceActive("mtproto-proxy");
+    // The one question the user opened this to answer — first, in plain words.
     if (svc_active) {
-        ui.ok(tr(ui.lang, "mtproto-proxy is running", "mtproto-proxy запущен"));
+        ui.ok(tr(ui.lang, "You're online — your proxy is up and accepting connections.", "Вы онлайн — прокси работает и принимает подключения."));
     } else {
-        ui.fail(tr(ui.lang, "mtproto-proxy is not running", "mtproto-proxy не запущен"));
+        ui.fail(tr(ui.lang, "Your proxy is offline — friends can't connect until it's back. Try \"Restart proxy\".", "Прокси офлайн — близкие не смогут подключиться, пока он не запустится. Попробуйте «Перезапустить прокси»."));
     }
+    ui.writeRaw("\n");
 
     const nginx_active = sys.isServiceActive("nginx");
     if (nginx_active) {
-        ui.ok(tr(ui.lang, "nginx is running", "nginx запущен"));
+        ui.ok(tr(ui.lang, "Camouflage backend (Nginx) is running", "Бэкенд маскировки (Nginx) запущен"));
     } else {
-        ui.info(tr(ui.lang, "nginx is not running (masking may be disabled)", "nginx не запущен (маскировка может быть выключена)"));
+        ui.info(tr(ui.lang, "Camouflage backend (Nginx) is not running", "Бэкенд маскировки (Nginx) не запущен"));
     }
 
     const nfqws_active = sys.isServiceActive("nfqws-mtproto");
     if (nfqws_active) {
-        ui.ok(tr(ui.lang, "nfqws-mtproto is running", "nfqws-mtproto запущен"));
+        ui.ok(tr(ui.lang, "Extra TCP protection (nfqws) is running", "Дополнительная TCP-защита (nfqws) запущена"));
     } else {
-        ui.info(tr(ui.lang, "nfqws-mtproto is not running (TCP desync disabled)", "nfqws-mtproto не запущен (TCP desync выключен)"));
+        ui.info(tr(ui.lang, "Extra TCP protection (nfqws) is not running", "Дополнительная TCP-защита (nfqws) не запущена"));
     }
 
     const timer_active = sys.isServiceActive("mtproto-mask-health.timer");
@@ -347,11 +355,17 @@ fn printHelp(lang: i18n.Lang) void {
     var ui = Tui.init(lang);
 
     ui.writeRaw("\n");
-    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  {s}\n\n", .{
+    ui.print("  {s}⚡ mtbuddy{s} {s}v{s}{s}  —  {s}{s}{s}\n", .{
         Color.header, Color.reset,
         Color.dim,    version,
+        Color.reset,  Color.header,
+        tr(lang, "a door they can't close.", "дверь, которую им не закрыть."),
         Color.reset,
+    });
+    ui.print("  {s}{s}{s}\n\n", .{
+        Color.dim,
         tr(lang, "MTProto Proxy installer & control panel", "Установщик и панель управления MTProto Proxy"),
+        Color.reset,
     });
 
     // ── One-liner examples ──
