@@ -388,6 +388,21 @@ pub const MiddleProxyContext = struct {
         return out_len;
     }
 
+    /// Relay a 4-byte quick-ack confirm to the client. The abridged transport
+    /// expects the confirm byte-REVERSED; intermediate/secure expect it verbatim
+    /// (matches alexbers/mtprotoproxy: MTProtoCompactFrameStreamWriter writes
+    /// data[::-1] on SIMPLE_ACK, the intermediate writers pass it through).
+    fn relaySimpleAck(proto_tag: constants.ProtoTag, confirm: *const [4]u8, out: *[4]u8) void {
+        if (proto_tag == .abridged) {
+            out[0] = confirm[3];
+            out[1] = confirm[2];
+            out[2] = confirm[1];
+            out[3] = confirm[0];
+        } else {
+            out.* = confirm.*;
+        }
+    }
+
     /// Takes raw AES-CBC bytes from DC, decrypts them block by block, parses MTProtoFrames,
     /// strips RPC_PROXY_ANS, and writes the inner payload into `out_buf`.
     pub fn decapsulateS2C(self: *MiddleProxyContext, dc_chunk: []const u8, out_buf: []u8) ![]u8 {
@@ -447,11 +462,15 @@ pub const MiddleProxyContext = struct {
             const payload = self.s2c_buf[parse_pos + 8 .. frame_end - 4];
 
             if (payload.len >= 16 and std.mem.eql(u8, payload[0..4], &rpc_simple_ack)) {
-                // RPC_SIMPLE_ACK format: type(4) + conn_id(8) + confirm(4)
-                const confirm = payload[12..16];
-                if (out_pos + confirm.len > out_buf.len) return error.OutBufOverflow;
-                @memcpy(out_buf[out_pos .. out_pos + confirm.len], confirm);
-                out_pos += confirm.len;
+                // RPC_SIMPLE_ACK format: type(4) + conn_id(8) + confirm(4).
+                // The 4-byte quick-ack confirm is byte-REVERSED for the abridged
+                // transport and sent verbatim for intermediate/secure — matches
+                // alexbers/mtprotoproxy (MTProtoCompactFrameStreamWriter writes
+                // data[::-1] on SIMPLE_ACK; the intermediate writers pass it
+                // through). Sending it verbatim for abridged corrupts the ack.
+                if (out_pos + 4 > out_buf.len) return error.OutBufOverflow;
+                relaySimpleAck(self.proto_tag, payload[12..16], out_buf[out_pos..][0..4]);
+                out_pos += 4;
             } else if (payload.len >= 4 and std.mem.eql(u8, payload[0..4], &rpc_close_ext)) {
                 return error.ConnectionReset;
             } else if (payload.len >= 16 and std.mem.eql(u8, payload[0..4], &rpc_proxy_ans)) {
@@ -726,6 +745,17 @@ test "decapsulate s2c skips noop padding words" {
     const out = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
     try std.testing.expectEqual(@as(usize, 4), out.len);
     try std.testing.expectEqualSlices(u8, &confirm, out);
+}
+
+test "relaySimpleAck reverses confirm for abridged, verbatim otherwise" {
+    const confirm = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var out: [4]u8 = undefined;
+    MiddleProxyContext.relaySimpleAck(.abridged, &confirm, &out);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x44, 0x33, 0x22, 0x11 }, &out);
+    MiddleProxyContext.relaySimpleAck(.intermediate, &confirm, &out);
+    try std.testing.expectEqualSlices(u8, &confirm, &out);
+    MiddleProxyContext.relaySimpleAck(.secure, &confirm, &out);
+    try std.testing.expectEqualSlices(u8, &confirm, &out);
 }
 
 test "decapsulate s2c validates seq and checksum" {
