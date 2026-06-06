@@ -59,6 +59,14 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    // Exploit mitigation on the internet-facing proxy: position-independent
+    // executable (ASLR). Full RELRO is already Zig's default (link_z_relro =
+    // true, link_z_lazy = false → -z relro -z now). Stack canaries are NOT
+    // enabled because they require libc (__stack_chk_fail) and this binary is
+    // deliberately libc-free; ReleaseSafe bounds/overflow checks cover the data
+    // plane instead.
+    exe.pie = true;
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
