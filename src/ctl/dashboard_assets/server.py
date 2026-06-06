@@ -2642,8 +2642,12 @@ def api_logs():
 
 @app.websocket("/ws/logs")
 async def ws_logs(ws: WebSocket):
-    # WebSocket upgrades bypass HTTP middleware, so enforce the same Basic auth
-    # here (browsers replay cached same-origin Basic credentials on the handshake).
+    # WebSocket upgrades bypass HTTP middleware, so enforce the same gates here as
+    # _dashboard_security: the loopback Host-pin (DNS-rebinding defense) AND Basic auth
+    # (browsers replay cached same-origin Basic credentials on the handshake).
+    if _DASH_ENFORCE_HOST and _host_hostname(ws.headers.get("host", "")) not in _DASH_LOOPBACK_HOSTS:
+        await ws.close(code=1008)
+        return
     if not _dashboard_auth_ok(ws.headers.get("authorization")):
         await ws.close(code=1008)
         return

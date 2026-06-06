@@ -7,7 +7,10 @@ LOG_DIR="${MTPROTO_INSTALLER_E2E_LOG_DIR:-$ROOT/test/installer-e2e/logs}"
 IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:12 ubuntu:24.04}"
 VERSION="${MTPROTO_INSTALLER_E2E_VERSION:-latest}"
 PORT="${MTPROTO_INSTALLER_E2E_PORT:-443}"
-DOMAIN="${MTPROTO_INSTALLER_E2E_DOMAIN:-wb.ru}"
+# Default to the shipped installer default (rutube.ru), not the domain the installer
+# now warns against (wb.ru). The verify curl is domain-agnostic (-k + --resolve forces
+# the local nginx on 127.0.0.1:8443 regardless of SNI/Host), so this stays green.
+DOMAIN="${MTPROTO_INSTALLER_E2E_DOMAIN:-rutube.ru}"
 SECRET="${MTPROTO_INSTALLER_E2E_SECRET:-00112233445566778899aabbccddeeff}"
 
 mkdir -p "$LOG_DIR"

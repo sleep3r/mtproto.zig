@@ -10,7 +10,8 @@
       "draft": false,
       "prerelease": false,
       "extra-files": [
-        "src/version.zig"
+        "src/version.zig",
+        "build.zig.zon"
       ]
     }
   }
