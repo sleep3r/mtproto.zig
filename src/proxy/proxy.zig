@@ -810,6 +810,9 @@ pub const ProxyState = struct {
         const old_user_secrets = self.user_secrets;
         const old_user_metrics = self.user_metrics;
 
+        self.user_metrics_lock.lock();
+        defer self.user_metrics_lock.unlock();
+
         self.user_secrets = new_user_secrets;
         self.user_metrics = new_metrics_slice;
         self.moveAccessMapsFrom(next);
@@ -833,10 +836,27 @@ pub const ProxyState = struct {
         self.collectRetiredUserMetrics();
     }
 
+    pub fn lockUserMetricsForRead(self: *ProxyState) void {
+        self.user_metrics_lock.lockShared();
+    }
+
+    pub fn unlockUserMetricsForRead(self: *ProxyState) void {
+        self.user_metrics_lock.unlockShared();
+    }
+
+    pub fn lockUserMetricsForReadForTest(self: *ProxyState) void {
+        self.lockUserMetricsForRead();
+    }
+
+    pub fn unlockUserMetricsForReadForTest(self: *ProxyState) void {
+        self.unlockUserMetricsForRead();
+    }
+
     allocator: std.mem.Allocator,
     config_path: []const u8,
     config: Config,
     user_secrets: []const obfuscation.UserSecret,
+    user_metrics_lock: CompatRwLock = .{},
     user_metrics: []*UserMetrics,
     retired_user_metrics: std.ArrayList(*UserMetrics),
     start_time_seconds: i64,
@@ -3639,4 +3659,57 @@ test "ProxyState access reload keeps active metrics safe" {
         }
     }
     try std.testing.expect(saw_alice_new_secret);
+}
+
+fn reloadAccessUsersInThread(
+    state: *ProxyState,
+    next_cfg: *Config,
+    done: *std.atomic.Value(bool),
+    failed: *std.atomic.Value(bool),
+) void {
+    state.reloadAccessUsersForTest(next_cfg) catch {
+        failed.store(true, .release);
+    };
+    done.store(true, .release);
+}
+
+test "ProxyState access reload waits for metrics readers" {
+    const allocator = std.testing.allocator;
+
+    const initial_cfg = try Config.parse(allocator,
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "00000000000000000000000000000001"
+    );
+    var state = try ProxyState.init(allocator, initial_cfg, "/tmp/mtproto-test.toml");
+    defer state.deinit();
+
+    var next_cfg = try Config.parse(allocator,
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "0000000000000000000000000000000a"
+        \\bob = "0000000000000000000000000000000b"
+    );
+    defer next_cfg.deinit(allocator);
+
+    state.lockUserMetricsForReadForTest();
+
+    var done = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, reloadAccessUsersInThread, .{ &state, &next_cfg, &done, &failed });
+
+    sleepNs(20 * std.time.ns_per_ms);
+    const completed_while_reader_locked = done.load(.acquire);
+
+    state.unlockUserMetricsForReadForTest();
+    thread.join();
+
+    try std.testing.expect(!completed_while_reader_locked);
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(state.findUserMetrics("bob") != null);
 }

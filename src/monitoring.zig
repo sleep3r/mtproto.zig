@@ -247,6 +247,9 @@ fn writeMetricHeader(writer: anytype, name: []const u8, help: []const u8, metric
 }
 
 fn writePerUserMetrics(writer: anytype, state: *proxy.ProxyState) !void {
+    state.lockUserMetricsForRead();
+    defer state.unlockUserMetricsForRead();
+
     try writeMetricHeader(writer, "mtproto_user_connections_active", "active connections by configured user", "gauge");
     for (state.user_metrics) |entry| {
         try writeLabeledMetricLine(
