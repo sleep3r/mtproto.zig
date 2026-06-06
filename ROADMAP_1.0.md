@@ -574,3 +574,79 @@ evasion moat, then the fleet platform, then harden and freeze for 1.0. The singl
 this "the best in the world" is the combination no competitor ships: an authentic, domain-matched
 FakeTLS identity **proven undetectable in CI** and **measured in the field**, on a **multi-core**,
 **fuzzed**, **ReleaseSafe** core, operated as a **rotating fleet** behind one link.*
+
+---
+
+# Implementation status — one-pass execution (2026-06)
+
+This section tracks a focused execution pass that closed **everything realistically shippable in a
+single pass without standing up new external systems** (no external monitoring stack, no fleet control
+plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds clean
+(`zig build test` + `x86_64-linux+aes` + `aarch64-linux`) and is committed (no Claude co-author).
+
+## ✅ Done this pass (15 commits)
+
+| # | Item (roadmap ID) | What shipped | Commit |
+|---|---|---|---|
+| 1 | `pin-zig-toolchain` (WS8) | `build.zig.zon` (`minimum_zig_version=0.16.0`) + `.zig-version` | `6babb76` |
+| 2 | `config-check-mode` (WS6/8) | `mtproto-proxy --check-config [path]` → exit 0/1 (nginx -t style) | `6babb76` |
+| 3 | `serverhello-echo-client-params` (WS2) | ServerHello echoes the client's non-GREASE TLS1.3 cipher (kills the constant-`0x1301` passive tell) + `extractFirstTls13Cipher` + tests | `b981457` |
+| 4 | `mask-real-backend-default` (WS2) | `mtbuddy setup-masking` no longer self-signs for an unowned domain — fronts the real `tls_domain:443` instead | `dc6f162` |
+| 5 | `aes-ctr-wide` (WS1) | 8-wide AES-CTR on the relay hot path + cross-boundary byte-equivalence test (incl. counter wrap) | `b7a8b35` |
+| 6 | `close-reason-counter` + `evasion-block-telemetry` (WS6) | bounded `CloseReason` + `mtproto_connection_close_reason_total{reason}` (the block signal) + classifier test | `b1a92d1` |
+| 7 | `health-readiness-endpoints` (WS6) | `/healthz` + `/readyz` on the metrics server (loop heartbeat + drain flag; not gated on middleproxy) | `6e5af77` |
+| 8 | `systemd-notify-watchdog` (WS6) | native dependency-free sd_notify; `Type=notify` + `WatchdogSec=30` on all proxy units + encoding test | `a474509`, `7ea731f` |
+| 9 | `systemd-seccomp-hardening` (WS5) | proxy unit: `SystemCallFilter=@system-service`, `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `ProtectKernel*`, `ProtectProc`, … (3 unit copies); tunnel unit gets the device/netlink-safe subset | `a474509`, `7ea731f` |
+| 10 | `verify-thirdparty-install-supplychain` (WS5) | `uv` pinned 0.11.19 + `.sha256` verify; Python deps pinned exact; `zapret` pinned tag v72.12 + commit check | `47da6f7` |
+| 11 | `mp-quickack-abridged-reversal` (WS7) | **confirmed bug fixed** vs reference: byte-reverse the abridged `RPC_SIMPLE_ACK` confirm; `relaySimpleAck` + golden test | `c91ac94` |
+| 12 | `safety-on-wire-parsers` (WS5) | proxy data plane built **ReleaseSafe** by default (`-Ddataplane_safety`, default on); mtbuddy/bench unchanged | `5090f60` |
+| 13 | `binary-exploit-mitigations` (WS5) | proxy built **PIE** (ASLR; verified `e_type=DYN`); full RELRO already default | `6fa730c` |
+| 14 | `fuzz-targets-core` (WS4) | `std.testing.fuzz` (Smith) targets for TLS/socks5/http_connect parsers — deterministic in CI, coverage-guided under `--fuzz` | `7b64de6` |
+| 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | _this commit_ |
+
+## ⏸️ Investigated but deliberately NOT changed (with reason)
+
+- **`dc203-direct-fallback-fix` (WS7)** — *investigated, real-but-narrow, not changed.* The MP direct
+  fallback IS wired (`mpHandshakeFallbackToDirect` → `fallbackToDirect`) and populated for the common
+  media path (`dc_idx<0` → `dc_abs` 1–5 → a real direct DC, which works). For the literal `dc_abs==203`
+  case, `getDcAddressV4(203)` returns a *MiddleProxy* IP, so a direct-obfuscated fallback there can't
+  work — but there is no genuine "direct DC203" endpoint, so the correct failure semantics need a live
+  media repro. Not changed speculatively (high-blast-radius media router, not locally testable).
+
+- **`e2e-bidirectional-integrity` (WS4)** — *deferred, not safely closeable this pass.* Requires
+  decrypting the relayed stream in `test/e2e/run.py`, but Python's stdlib has **no AES** (CI may lack a
+  crypto dependency) and the proxy is **Linux-only**, so no run.py change can be validated locally —
+  modifying an un-runnable harness blind risks red CI. The Zig-side relay integrity is instead covered
+  deterministically and locally-verified by the new **AES-CTR cross-boundary equivalence test** (#5)
+  and the **quick-ack golden vector** (#11). The Python harness work (incl. the plaintext
+  `dpi-mask-probe-byteidentity` mask-path check) needs a Linux e2e env — tracked under WS4.
+
+## ❌ Not attempted this pass — needs new systems / scale / live validation (per the brief)
+
+Explicitly out of scope for a single no-new-systems pass; these remain the headline roadmap work:
+- **WS1 multi-core**: `reuseport-workers` + `shared-state-multicore` (large coupled change; needs a
+  load harness to validate). `aes-ctr-wide` (#5) and the already-atomic global state landed as
+  prerequisites.
+- **WS2 evasion (deeper rungs)**: `probe-real-template` / `reality-reflect` (runtime outbound TLS
+  scout), `evasion-profiles` + `transport-strategy-interface` (large hot-path refactor),
+  `traffic-shape-modeling`, `mss-clienthello-frag-tuning` (needs empirical MSS tuning).
+- **WS3 measured undetectability**: `dpi-validation-ci` (external JA4S/tshark tooling) and
+  `geo-reachability-monitoring` (external vantage points).
+- **WS4**: `load-throughput-relay-ci`, `mp-golden-vectors` (full FakeMiddleProxy + reference oracle),
+  `client-compat-e2e-matrix`.
+- **WS5 (stronger follow-ups)**: hardcoded in-repo per-arch `uv` SHA (Dockerfile-style),
+  `--require-hashes` Python lockfile, offline/SLSA signing, distroless image.
+- **WS6**: RED histograms + per-DC labels, `sighup-reload-users` (the safe fix needs the
+  use-after-free-avoiding refcount design), `dashboard-scrape-metrics`.
+- **WS9 fleet platform**: `fleet-identity`, `dns-fronting`, `ipv6hop-productize`, etc.
+
+## ⚠️ Needs validation before relying on (un-testable locally)
+
+- **systemd `Type=notify` + watchdog** (#8) and the **seccomp/RestrictAddressFamilies** hardening (#9)
+  follow the spec and the sd_notify address encoding is unit-tested, but the systemd handshake and the
+  egress-mode interaction (direct/tunnel/socks5/http) can only be confirmed on a **real systemd host**
+  / the installer-e2e CI job. Conservative choices were made (`@system-service` keeps `setrlimit`;
+  `AF_NETLINK` kept for glibc `getaddrinfo`; tunnel unit omits the syscall/family filters). Run
+  `systemd-analyze security mtproto-proxy.service` + the installer-e2e before tightening further.
+- **PIE / ReleaseSafe** (#12, #13) change the release artifact; the marketed footprint/throughput
+  numbers were measured at ReleaseFast — re-measure RSS/size/throughput on the release build.

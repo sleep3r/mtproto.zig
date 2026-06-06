@@ -1,0 +1,120 @@
+# Architecture
+
+A production MTProto proxy in Zig with FakeTLS fronting, active anti-replay, and Linux-first
+deployment. This document is the in-repo architecture reference; the public stability contract is in
+[COMPATIBILITY.md](COMPATIBILITY.md), and the forward-looking plan is in [ROADMAP_1.0.md](ROADMAP_1.0.md).
+
+## Build artifacts
+
+`build.zig` produces two binaries:
+
+| Binary | Source | Install path | Purpose |
+|--------|--------|--------------|---------|
+| `mtproto-proxy` | `src/main.zig` | `/opt/mtproto-proxy/mtproto-proxy` | The proxy server (data plane) |
+| `mtbuddy` | `src/ctl/main.zig` | `/usr/local/bin/mtbuddy` | Installer & control panel (TUI) |
+
+- **Toolchain**: pinned via `build.zig.zon` (`minimum_zig_version`) and `.zig-version`. The codebase
+  rides churn-prone `std` APIs, so the compiler is part of the contract.
+- **Data-plane safety**: the proxy is built **ReleaseSafe by default** in release builds
+  (`-Ddataplane_safety`, default on) — it parses untrusted network input, so bounds/overflow/null
+  checks stay on. `mtbuddy`/`bench` keep the requested mode. The proxy is also a **PIE** (ASLR); full
+  RELRO is Zig's default.
+- Cross-compile for production: `make build` (or
+  `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes`).
+
+## Runtime model
+
+- **Single-threaded network core**: one Linux `epoll` event loop (`src/proxy/proxy.zig`,
+  `EventLoop.run`) handles all socket I/O. No thread-per-connection; handling is state-machine driven.
+- **Connection slots** are pre-allocated and reused; per-connection heavy buffers are allocated
+  on-demand, not embedded in idle slots.
+- **Shared state** (`ProxyState`) holds config, the middle-proxy snapshot (behind an RW lock), and all
+  global counters as `std.atomic.Value` — already multi-core-safe for the planned SO_REUSEPORT worker
+  model (see ROADMAP WS1). Per-EventLoop state (pool, replay cache, flood guard, subnet limiter) is
+  shared-nothing.
+- **Background threads**: a middle-proxy metadata updater and the metrics server run as detached
+  threads reading atomics/snapshots; they never touch the per-byte relay path.
+
+## Core connection flow
+
+1. Accept client socket (non-blocking); reserve handshake budget at **first byte** (slow-loris guard).
+2. Parse the TLS ClientHello record header/body incrementally.
+3. Validate the TLS-auth HMAC (`tls.validateTlsHandshake`) and SNI against `tls_domain`.
+4. Build/send the fake `ServerHello` — a comptime nginx/OpenSSL template whose per-connection fields
+   (server-random=HMAC, echoed session_id, fresh x25519 key, randomized cert AppData) and the
+   **client-echoed cipher suite** are patched in. Optional split/desync behavior follows.
+5. Read the 64-byte MTProto obfuscation handshake.
+6. Resolve route: direct DC or MiddleProxy (RPC relay), media-aware (`dc_idx < 0` / DC203).
+7. Enter relay mode (C2S/S2C transform pipeline).
+
+Non-validating / probe traffic is **masked**: the buffered bytes are forwarded to the configured mask
+target (real `tls_domain:443` by default) so an active prober sees only a real backend.
+
+## Relay pipeline
+
+**C2S**: TLS unwrap → client AES-CTR decrypt → transport encapsulation (direct: AES-CTR re-encrypt for
+the DC; MiddleProxy: `RPC_PROXY_REQ` framing + AES-CBC layer). **S2C**: transport
+decapsulation/decrypt → client AES-CTR encrypt (unless fast-mode) → TLS application-record wrapping.
+AES-CTR runs **8-wide** on the block-aligned bulk (`src/crypto/crypto.zig`).
+
+## MiddleProxy (media / ad-tag relay)
+
+Event-loop-integrated non-blocking handshake; periodic endpoint/secret metadata refresh; per-DC
+routing with a direct fallback. Quick-acks (`RPC_SIMPLE_ACK`) are relayed per-transport (the 4-byte
+confirm is byte-reversed for abridged, verbatim for intermediate/secure).
+
+## Anti-replay & flood
+
+- Handshake digest validated within a timestamp-skew window; the replay-cache key is the canonical
+  pre-XOR HMAC.
+- Per-IP handshake flood guard + per-/24 subnet rate limiter (both off by default; opt-in).
+
+## Observability (metrics server, localhost by default)
+
+- `/metrics` — Prometheus text: connections, drops, per-reason close counters
+  (`mtproto_connection_close_reason_total{reason}` — the evasion/block signal), bytes, middleproxy.
+- `/healthz` — liveness (event loop ticked within 5s).
+- `/readyz` — readiness (serving and not draining; **not** gated on middleproxy).
+- **systemd**: `Type=notify` (READY=1 after bind) + `WatchdogSec` (WATCHDOG=1 each loop iteration) via
+  a native dependency-free sd_notify (`src/proxy/sd_notify.zig`).
+
+## mtbuddy (installer & control panel)
+
+Source: `src/ctl/`. Interactive TUI (raw terminal, arrow-key nav, EN/RU i18n).
+
+| Module | Purpose |
+|--------|---------|
+| `main.zig` | CLI dispatch + interactive menu |
+| `install.zig` / `update.zig` / `uninstall.zig` | Install / signed self-update / clean removal |
+| `tunnel.zig` | AmneziaWG tunnel + SO_MARK policy routing |
+| `dashboard.zig` | FastAPI dashboard installer (pinned+verified `uv` + pinned deps) |
+| `masking.zig` / `nfqws.zig` / `recovery.zig` | Masking backend / zapret desync (pinned tag) / recovery |
+| `release.zig` / `links.zig` / `i18n.zig` | Unit/asset generation / tg:// link builder / localization |
+
+Third-party install artifacts are pinned and verified: `uv` (version + published `.sha256`), Python
+deps (exact versions), `zapret` (tag + commit check).
+
+## Deployment layout (server)
+
+```
+/opt/mtproto-proxy/
+├── mtproto-proxy          # proxy binary (ReleaseSafe, PIE)
+├── config.toml            # runtime configuration
+├── env.sh                 # optional env vars (TAG, etc.)
+└── monitor/               # dashboard assets (optional)
+/usr/local/bin/mtbuddy
+/etc/systemd/system/mtproto-proxy.service   # Type=notify, hardened (seccomp/RestrictAddressFamilies/…)
+```
+
+## Platform scope
+
+- **Linux-only runtime target** (epoll, `std.os.linux`). macOS is supported for development /
+  cross-compile / `zig build test`, not for production runtime.
+
+## Design principles
+
+- Keep the hot path non-blocking and allocation-light.
+- Favor explicit state transitions over hidden control flow.
+- Keep handshake-path security checks strict and cheap.
+- Avoid stale parallel implementations of the same protocol path.
+- Secure-by-default config; opt-in for anything that weakens evasion or adds attack surface.
