@@ -79,6 +79,43 @@ the DC; MiddleProxy: `RPC_PROXY_REQ` framing + AES-CBC layer). **S2C**: transpor
 decapsulation/decrypt → client AES-CTR encrypt (unless fast-mode) → TLS application-record wrapping.
 AES-CTR runs **8-wide** on the block-aligned bulk (`src/crypto/crypto.zig`).
 
+## FakeTLS fronting & domain selection
+
+The FakeTLS ServerHello is a fixed three-record shape — `ServerHello` (one x25519
+key_share, a client-echoed cipher) + `ChangeCipherSpec` + one `ApplicationData`
+"certificate" record — validated by the Telegram client only for framing + the HMAC
+in `server-random`. Two hard constraints follow:
+
+1. **`tls_domain` is immutable once links are distributed.** The `ee` secret embeds
+   the domain as hex, so a tg:// link is a function of `(secret, tls_domain)`.
+   Changing `tls_domain` on a live deployment invalidates **every** user's link.
+   Treat it as frozen the moment a link is shared. (See `config.zig` /
+   [COMPATIBILITY.md](COMPATIBILITY.md).)
+
+2. **We can only mimic a domain whose genuine TLS 1.3 is single-round x25519.** Our
+   FakeTLS emits exactly one ServerHello with an **x25519** key_share and cannot
+   replicate a `HelloRetryRequest` or a non-x25519 group. So a *good* fronting
+   domain negotiates **x25519 in one round** for a modern (Chrome-shaped, MLKEM-
+   offering) ClientHello — the client offers key_shares for both MLKEM and x25519,
+   and such a server simply picks x25519, which is exactly what we emit. Big RU
+   sites like `rutube.ru`, `ozon.ru`, `vk.com`, `yandex.ru`, `dzen.ru` do this.
+
+   Some domains do **not**: e.g. `wb.ru` and `mail.ru` prefer `secp521r1` and send a
+   `HelloRetryRequest` (they even fail an x25519-only hello). For such a domain a
+   genuine handshake is `ClientHello → HRR → ClientHello#2 → ServerHello(secp521r1)`
+   while ours is a single `ServerHello(x25519)` — a **passive ServerHello mismatch we
+   cannot fix without changing `tls_domain`**, which constraint (1) forbids. The
+   installer therefore probes the chosen domain and **warns** if it is a poor mimicry
+   target, so the choice is made well *before* the link is locked. There is no
+   runtime fix for an already-distributed link pointed at a poor domain — it is an
+   accepted residual.
+
+**Masking / active probes** are independent of the link: non-validating (no-secret)
+traffic is forwarded to the mask target, which should be the **real** `tls_domain:443`
+(`mask_port=443`) so a prober sees the genuine site + a CA-chained cert. A local
+self-signed nginx (`mask_port=8443`) serves a self-signed cert for a domain the
+operator does not own — a decisive active-probe tell — and should be avoided.
+
 ## MiddleProxy (media / ad-tag relay)
 
 Event-loop-integrated non-blocking handshake; periodic endpoint/secret metadata refresh; per-DC

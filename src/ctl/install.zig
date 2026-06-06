@@ -374,6 +374,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         return;
     }
 
+    // Warn NOW (before the link — which embeds tls_domain — is generated and frozen)
+    // if the fronting domain is a poor FakeTLS mimicry target.
+    warnIfPoorFrontingDomain(ui, allocator, opts.tls_domain);
+
     // ── Check port / masking collision ──
     // The masking Nginx binds to 127.0.0.1:8443. If the proxy listens on
     // the same port, its 0.0.0.0 bind will collide with Nginx and the
@@ -1081,6 +1085,42 @@ fn requiredAccountToolsAvailable(ui: *Tui) bool {
         return false;
     }
     return true;
+}
+
+/// Best-effort warning if `domain` is a poor FakeTLS fronting target. Our 3-record
+/// ServerHello (single x25519 key_share, no HelloRetryRequest) cannot mimic a domain
+/// whose genuine TLS 1.3 prefers a non-x25519 group / does an HRR — e.g. wb.ru and
+/// mail.ru pick secp521r1 and reject an x25519-only hello — producing a passive
+/// ServerHello mismatch. tls_domain is immutable once links ship, so this runs while
+/// the choice is still free. Probes via openssl; skips silently if openssl is absent.
+fn warnIfPoorFrontingDomain(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) void {
+    if (domain.len == 0 or domain.len > 253) return;
+    if (!sys.commandExists("openssl")) return;
+    // Sanitize: a real hostname is [a-z0-9.-] only, so interpolating it into the
+    // probe command below cannot inject shell metacharacters.
+    for (domain) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '-';
+        if (!ok) return;
+    }
+    ui.step("Checking fronting-domain TLS suitability...");
+    var cmd_buf: [512]u8 = undefined;
+    // Prints "Server Temp Key" iff the domain negotiates x25519 in a SINGLE round;
+    // an HRR / x25519-reject yields a handshake_failure and no temp key (exit != 0).
+    const cmd = std.fmt.bufPrint(
+        &cmd_buf,
+        "echo | timeout 10 openssl s_client -connect {s}:443 -servername {s} -groups x25519 -tls1_3 2>/dev/null | grep -q 'Server Temp Key'",
+        .{ domain, domain },
+    ) catch return;
+    const r = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch return;
+    defer r.deinit();
+    if (r.exit_code == 0) return; // good: single-round x25519
+
+    ui.warn("Could not confirm single-round x25519 for this fronting domain.");
+    var msg_buf: [320]u8 = undefined;
+    if (std.fmt.bufPrint(&msg_buf, "  '{s}' may do a HelloRetryRequest / reject x25519 (like wb.ru), or be unreachable.", .{domain}) catch null) |m| ui.warn(m);
+    ui.warn("  If so, our FakeTLS ServerHello can't match it — a passive observer sees a mismatch.");
+    ui.hint("  Prefer a domain with single-round x25519 (e.g. rutube.ru, ozon.ru, vk.com). tls_domain is IMMUTABLE once links are shared — choose now.");
 }
 
 fn commandAvailable(name: []const u8, candidates: []const []const u8) bool {

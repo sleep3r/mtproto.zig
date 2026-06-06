@@ -178,6 +178,20 @@ pub const Config = struct {
     /// for this many seconds before forced close.
     graceful_shutdown_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
+    /// FakeTLS fronting domain (the SNI clients present).
+    ///
+    /// ⚠️ IMMUTABLE once links are distributed: the `ee` secret embeds this domain
+    /// as hex, so the tg:// link is a function of (secret, tls_domain). Changing
+    /// tls_domain changes EVERY user's link — never do it on a live deployment.
+    ///
+    /// Mimicry note: our 3-record FakeTLS emits ONE ServerHello with an x25519
+    /// key_share and cannot replicate a HelloRetryRequest. Pick a domain whose
+    /// genuine TLS 1.3 negotiates **x25519 in a single round** (most big sites:
+    /// rutube.ru, ozon.ru, vk.com, yandex.ru, dzen.ru). Domains that prefer
+    /// secp521r1 / reject x25519 and HRR (e.g. wb.ru, mail.ru) produce a passive
+    /// ServerHello mismatch that cannot be fixed without changing tls_domain —
+    /// which the immutability rule above forbids. So choose well at install time.
+    /// See ARCHITECTURE.md "FakeTLS fronting & domain selection".
     tls_domain: []const u8 = default_tls_domain,
     users: std.StringHashMap([16]u8),
     /// Users that always bypass MiddleProxy and connect to DC directly.

@@ -11,6 +11,10 @@ any surface below requires a MAJOR bump; backward-compatible additions are MINOR
 ### 1. `tg://` / `https://t.me/proxy` link & secret format
 - The FakeTLS (`ee` + tls_domain hex) and dd (`dd`) secret encodings, and the `server`/`port`/`secret`
   link parameters, are stable. Existing links keep working across MINOR/PATCH upgrades.
+- ⚠️ **`tls_domain` is part of the `ee` secret** (encoded as hex), so the link is a function of
+  `(secret, tls_domain)`. **Never change `tls_domain` (or the secret) on a live deployment** — it
+  invalidates every distributed link. The fronting domain must be chosen well at install time and then
+  treated as frozen; see [ARCHITECTURE.md](ARCHITECTURE.md) "FakeTLS fronting & domain selection".
 
 ### 2. Configuration file (`config.toml`)
 - Existing **keys, sections, value semantics, and defaults** are stable. New keys may be added (MINOR);
