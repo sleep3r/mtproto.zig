@@ -3,6 +3,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // The proxy parses untrusted network input (FakeTLS/obfuscation/middleproxy/
+    // socks5/http/TOML) on the most internet-exposed process. Ship its data plane
+    // with runtime bounds/overflow/null checks ON: a single off-by-one becomes a
+    // safe panic instead of exploitable UB. mtbuddy/bench keep the requested mode.
+    // ReleaseSafe grows the binary and adds parse-loop overhead (AES is HW
+    // accelerated) vs the marketed ReleaseFast numbers — measure before relying on
+    // them. Override with -Ddataplane_safety=false to force the requested mode.
+    const dataplane_safety = b.option(
+        bool,
+        "dataplane_safety",
+        "Build the internet-facing proxy with runtime safety on (ReleaseSafe) even in release builds (default: true)",
+    ) orelse true;
+    const dataplane_optimize: std.builtin.OptimizeMode =
+        if (dataplane_safety and optimize == .ReleaseFast) .ReleaseSafe else optimize;
     const pinned_minisign_pubkey = "RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO";
     const minisign_pubkey = b.option(
         []const u8,
@@ -32,7 +47,7 @@ pub fn build(b: *std.Build) void {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dataplane_optimize,
         .imports = &.{
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
