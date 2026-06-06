@@ -590,6 +590,25 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.stop(true, "");
     }
 
+    // The proxy is already live and usable here — show the link NOW, before the
+    // optional (and slow, from-source) masking + zapret steps, so the "aha" moment
+    // lands in seconds instead of after a multi-minute compile. The final summary
+    // below reprints it together with the protection status.
+    {
+        var ip_sp = ui.spinner("Detecting public IP");
+        ip_sp.start();
+        const early_ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
+        ip_sp.stop(true, early_ip);
+        ui.writeRaw("\n");
+        ui.ok(localized(ui, "Your proxy is LIVE — here's your link:", "Прокси ЗАПУЩЕН — вот ваша ссылка:"));
+        ui.print("  {s}╭─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
+        _ = printLinksFromConfig(ui, allocator, early_ip, opts.public_port orelse opts.port, opts.tls_domain, config_path_buf);
+        ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
+        if (opts.enable_masking or opts.enable_nfqws) {
+            ui.info(localized(ui, "Now turning on extra anti-blocking protection — the link above already works...", "Теперь включаю дополнительную защиту от блокировок — ссылка выше уже работает..."));
+        }
+    }
+
     // ── Firewall ──
     if (sys.commandExists("ufw")) {
         var port_str_buf: [8]u8 = undefined;
