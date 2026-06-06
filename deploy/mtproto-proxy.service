@@ -5,7 +5,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify: the proxy sends READY=1 once the listener is bound and the event
+# loop is up, and pets the watchdog each loop iteration (WATCHDOG=1). A stuck
+# single-threaded epoll loop is then restarted automatically.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
 User=mtproto
 Group=mtproto
 WorkingDirectory=/opt/mtproto-proxy
@@ -22,6 +27,33 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/opt/mtproto-proxy
+
+# Syscall + kernel surface reduction. @system-service is the systemd-recommended
+# allowlist for network daemons (keeps setrlimit/timer/io); AF_NETLINK is kept
+# because glibc getaddrinfo (the curl egress helper) needs it, AF_UNIX for
+# sd_notify. This caps the blast radius of a parser RCE without breaking the data
+# plane. NOTE: validate `systemd-analyze security` + all egress modes on a real
+# host before tightening further (e.g. dropping @resources / AF_NETLINK).
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+RemoveIPC=yes
+UMask=0077
 
 # Allow binding to privileged ports (443)
 AmbientCapabilities=CAP_NET_BIND_SERVICE

@@ -222,7 +222,9 @@ pub fn writeServiceFile() void {
         \\Wants=network-online.target
         \\
         \\[Service]
-        \\Type=simple
+        \\Type=notify
+        \\NotifyAccess=main
+        \\WatchdogSec=30
         \\User=mtproto
         \\Group=mtproto
         \\WorkingDirectory=/opt/mtproto-proxy
@@ -239,6 +241,30 @@ pub fn writeServiceFile() void {
         \\ProtectHome=yes
         \\PrivateTmp=yes
         \\ReadOnlyPaths=/opt/mtproto-proxy
+        \\
+        \\# Syscall + kernel surface reduction (@system-service baseline; AF_NETLINK
+        \\# for glibc getaddrinfo, AF_UNIX for sd_notify). Validate egress modes on a
+        \\# real host before tightening further.
+        \\SystemCallFilter=@system-service
+        \\SystemCallArchitectures=native
+        \\SystemCallErrorNumber=EPERM
+        \\RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+        \\MemoryDenyWriteExecute=yes
+        \\RestrictNamespaces=yes
+        \\LockPersonality=yes
+        \\RestrictRealtime=yes
+        \\RestrictSUIDSGID=yes
+        \\ProtectKernelTunables=yes
+        \\ProtectKernelModules=yes
+        \\ProtectKernelLogs=yes
+        \\ProtectControlGroups=yes
+        \\ProtectClock=yes
+        \\ProtectHostname=yes
+        \\ProtectProc=invisible
+        \\ProcSubset=pid
+        \\PrivateDevices=yes
+        \\RemoveIPC=yes
+        \\UMask=0077
         \\
         \\# Allow binding to privileged ports (443)
         \\AmbientCapabilities=CAP_NET_BIND_SERVICE

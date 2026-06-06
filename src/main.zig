@@ -488,6 +488,13 @@ pub fn main(init: std.process.Init) !void {
     cfg_owned_by_main = false;
     defer state.deinit();
 
+    // systemd notify/watchdog wiring (no-op when not run under systemd). The env
+    // strings are owned by the process environ and live for the whole run.
+    state.notify_socket = init.environ_map.get("NOTIFY_SOCKET");
+    if (init.environ_map.get("WATCHDOG_USEC")) |w| {
+        state.watchdog_usec = std.fmt.parseInt(u64, w, 10) catch 0;
+    }
+
     // Run the proxy
     try state.run();
 }

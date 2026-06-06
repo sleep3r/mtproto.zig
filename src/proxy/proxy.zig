@@ -15,6 +15,7 @@ const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
+const sd_notify = @import("sd_notify.zig");
 const Config = @import("../config.zig").Config;
 const upstream_mod = @import("upstream.zig");
 const tunnel_mod = @import("../tunnel.zig");
@@ -56,6 +57,7 @@ test {
     _ = @import("socket_utils.zig");
     _ = @import("network_detect.zig");
     _ = @import("http_fetch.zig");
+    _ = @import("sd_notify.zig");
     _ = @import("fd_limits.zig");
     _ = @import("connection_phase.zig");
     _ = @import("net_helpers.zig");
@@ -781,6 +783,11 @@ pub const ProxyState = struct {
     loop_heartbeat_ms: std.atomic.Value(i64),
     /// True once graceful shutdown/drain has begun — drives /readyz.
     shutting_down: std.atomic.Value(bool),
+    /// $NOTIFY_SOCKET (set by systemd Type=notify); null when not run under
+    /// systemd. Borrowed from the process environ (lives for process lifetime).
+    notify_socket: ?[]const u8 = null,
+    /// $WATCHDOG_USEC (systemd WatchdogSec); 0 disables watchdog pings.
+    watchdog_usec: u64 = 0,
 
     middle_proxy_lock: CompatRwLock = .{},
     // Regular (non-media) primary endpoints per DC 1..5. Matches `proxy_for N`
@@ -1157,6 +1164,11 @@ pub const ProxyState = struct {
 
         var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
         defer loop.deinit();
+
+        // Listener bound, epoll + metrics up: tell systemd we're ready (Type=notify
+        // gate). No-op when not under systemd ($NOTIFY_SOCKET unset).
+        sd_notify.ready(self.notify_socket);
+
         try loop.run();
     }
 
@@ -1515,6 +1527,8 @@ const EventLoop = struct {
     saturation_paused: bool,
     shutting_down: bool,
     shutdown_deadline_ns: i128,
+    /// Monotonic ms of the last systemd WATCHDOG=1 ping (0 = never).
+    last_watchdog_ms: i64 = 0,
     timer_scan_cursor: u32,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
@@ -1601,8 +1615,16 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = nowNs();
 
         while (true) {
-            // Liveness heartbeat for /healthz + the systemd watchdog.
-            self.state.loop_heartbeat_ms.store(nowMs(), .monotonic);
+            // Liveness heartbeat for /healthz, and pet the systemd watchdog at
+            // half the configured interval (WATCHDOG_USEC is microseconds).
+            const tick_ms = nowMs();
+            self.state.loop_heartbeat_ms.store(tick_ms, .monotonic);
+            if (self.state.watchdog_usec > 0 and
+                tick_ms - self.last_watchdog_ms >= @as(i64, @intCast(self.state.watchdog_usec / 2000)))
+            {
+                sd_notify.watchdog(self.state.notify_socket);
+                self.last_watchdog_ms = tick_ms;
+            }
             var current_wait_ms: i32 = event_loop_wait_ms;
             if (self.desync_wait_slots.items.len > 0) {
                 current_wait_ms = @min(current_wait_ms, desync_wait_poll_ms);
