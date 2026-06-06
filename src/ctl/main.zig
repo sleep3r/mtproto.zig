@@ -413,7 +413,8 @@ fn printHelp(lang: i18n.Lang) void {
     printOpt(&ui, "--max-connections <N>", tr(lang, "Max proxy connections (default: 512)", "Максимум подключений (по умолчанию: 512)"));
     printOpt(&ui, "--no-masking", tr(lang, "Disable Nginx DPI masking", "Отключить DPI-маскировку через Nginx"));
     printOpt(&ui, "--no-nfqws", tr(lang, "Disable nfqws TCP desync", "Отключить nfqws TCP desync"));
-    printOpt(&ui, "--no-tcpmss", tr(lang, "Disable TCPMSS=88 clamping", "Отключить TCPMSS=88"));
+    printOpt(&ui, "--no-tcpmss", tr(lang, "Disable TCPMSS clamping", "Отключить TCPMSS-клампинг"));
+    printOpt(&ui, "--tcpmss <n>", tr(lang, "TCPMSS clamp value (default: 88)", "Значение TCPMSS-клампинга (по умолчанию: 88)"));
     printOpt(&ui, "--no-dpi", tr(lang, "Disable all DPI bypass modules", "Отключить все DPI-модули"));
     printOpt(&ui, "--bind,   -b <ip>", tr(lang, "Bind to specific IP (default: all interfaces)", "Слушать конкретный IP (по умолчанию: все интерфейсы)"));
     printOpt(&ui, "--middle-proxy", tr(lang, "Enable Telegram MiddleProxy relay", "Включить Telegram MiddleProxy relay"));

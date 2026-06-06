@@ -170,8 +170,10 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
         } else if (std.mem.eql(u8, arg, "--tcpmss")) {
             if (args.next()) |val| {
                 if (std.fmt.parseInt(u16, val, 10)) |n| {
-                    if (n >= 40) opts.tcpmss_value = n;
-                } else |_| {}
+                    if (n >= 40) opts.tcpmss_value = n else ui.warn("--tcpmss must be >= 40, keeping default 88");
+                } else |_| {
+                    ui.warn("--tcpmss must be a number, keeping default 88");
+                }
             }
         } else if (std.mem.eql(u8, arg, "--no-dpi")) {
             // Disable all DPI bypass modules at once
@@ -439,7 +441,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
                 "iptables",                "xxd",
                 "curl",                    "openssl",
                 "tar",                     "passwd",
-                "minisign",                "qrencode",
+                "minisign",
             }
         else
             &.{
@@ -450,9 +452,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
                 "iptables",                "xxd",
                 "curl",                    "openssl",
                 "tar",                     "passwd",
-                "qrencode",
             };
         if (!runRequiredWhileSpinning(ui, allocator, base_packages, "Failed to install system dependencies", &sp)) return;
+        // qrencode powers the optional terminal/dashboard QR; the feature degrades
+        // gracefully without it (printQrCode no-ops), so install it best-effort and
+        // never fail the whole install if it's unavailable.
+        _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "--no-install-recommends", "qrencode" }) catch {};
         if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
             sp.stop(false, "");
             ui.fail("minisign is required for release signature verification");
@@ -612,15 +617,13 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     // optional (and slow, from-source) masking + zapret steps, so the "aha" moment
     // lands in seconds instead of after a multi-minute compile. The final summary
     // below reprints it together with the protection status.
+    var resolved_server_buf: [256]u8 = undefined;
+    const resolved_server = resolvePublicServer(ui, allocator, config_path_buf, &resolved_server_buf);
     {
-        var ip_sp = ui.spinner("Detecting public IP");
-        ip_sp.start();
-        const early_ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
-        ip_sp.stop(true, early_ip);
         ui.writeRaw("\n");
         ui.ok(localized(ui, "Your proxy is LIVE — here's your link:", "Прокси ЗАПУЩЕН — вот ваша ссылка:"));
         ui.print("  {s}╭─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
-        _ = printLinksFromConfig(ui, allocator, early_ip, opts.public_port orelse opts.port, opts.tls_domain, config_path_buf, true);
+        _ = printLinksFromConfig(ui, allocator, resolved_server, opts.public_port orelse opts.port, opts.tls_domain, config_path_buf, true);
         ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
         if (opts.enable_masking or opts.enable_nfqws) {
             ui.info(localized(ui, "Now turning on extra anti-blocking protection — the link above already works...", "Теперь включаю дополнительную защиту от блокировок — ссылка выше уже работает..."));
@@ -708,12 +711,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     ui.rule();
 
     // ── Print summary ──
-    var sp = ui.spinner("Detecting public IP");
-    sp.start();
-    // Plain token (no angle brackets — those break copy-paste in some terminals).
-    // printSummary prints an explicit "replace SERVER_IP with your VPS IP" warning.
-    const public_ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
-    sp.stop(true, public_ip);
+    // The public server was already resolved once (resolved_server: configured
+    // [server].public_ip preferred, else auto-detected) and reused here, so the
+    // early link/QR and the summary agree and detection runs only once. The
+    // SERVER_IP placeholder => printSummary warns the operator to replace it.
+    const public_ip = resolved_server;
 
     // Read summary values from active config
     var summary_server: []const u8 = public_ip;
@@ -1112,6 +1114,30 @@ fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
         .en => en,
         .ru => ru,
     };
+}
+
+/// Resolve the public server address used in client links: a configured
+/// [server].public_ip wins over auto-detection (matching main.zig/links.zig/the
+/// summary). Computed once and reused for both the early "LIVE" link/QR and the
+/// final summary so they encode the SAME address and detection runs only once.
+fn resolvePublicServer(ui: *Tui, allocator: std.mem.Allocator, config_path: []const u8, out_buf: []u8) []const u8 {
+    if (toml.TomlDoc.load(allocator, config_path)) |loaded| {
+        var cfg_doc = loaded;
+        defer cfg_doc.deinit();
+        if (cfg_doc.get("server", "public_ip")) |configured| {
+            const trimmed = std.mem.trim(u8, configured, &[_]u8{ ' ', '\t' });
+            if (trimmed.len > 0) {
+                const n = @min(trimmed.len, out_buf.len);
+                @memcpy(out_buf[0..n], trimmed[0..n]);
+                return out_buf[0..n];
+            }
+        }
+    } else |_| {}
+    var ip_sp = ui.spinner("Detecting public IP");
+    ip_sp.start();
+    const ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
+    ip_sp.stop(true, ip);
+    return ip;
 }
 
 fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
