@@ -117,15 +117,35 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     }
 
     if (!cert_ok) {
-        ui.step("Generating self-signed certificate...");
-        var subj_buf: [128]u8 = undefined;
-        const subj = std.fmt.bufPrint(&subj_buf, "/CN={s}", .{opts.tls_domain}) catch "/CN=wb.ru";
-        _ = sys.execForward(&.{
-            "openssl", "req",                  "-x509", "-newkey",               "ec",    "-pkeyopt", "ec_paramgen_curve:prime256v1",
-            "-keyout", CERT_DIR ++ "/key.pem", "-out",  CERT_DIR ++ "/cert.pem", "-days", "3650",     "-nodes",
-            "-subj",   subj,
-        }) catch {};
-        ui.ok("Self-signed certificate generated");
+        // No real (CA-chained) certificate for this domain. Serving a SELF-SIGNED
+        // cert for a domain the operator does not own is a decisive active-probe
+        // distinguisher: a prober that connects with this SNI receives a cert that
+        // does not chain to the real CA and a ServerHello that differs from the
+        // genuine domain. Instead of that tell, SKIP local masking and front the
+        // REAL domain — probes are forwarded to tls_domain:443 (mask_port=443),
+        // exactly what a genuine visitor sees (REALITY/mtg-style domain fronting).
+        ui.warn("No CA certificate available for this domain.");
+        ui.warn("Skipping local nginx masking to avoid a self-signed-cert distinguisher.");
+        ui.warn("Active probes will be forwarded to the REAL domain:443 instead (mask_port=443).");
+        ui.hint("To run a local masking backend, point a domain you OWN at this host and re-run (Let's Encrypt must succeed).");
+
+        const config_path = INSTALL_DIR ++ "/config.toml";
+        if (sys.fileExists(config_path)) {
+            var doc = toml.TomlDoc.load(allocator, config_path) catch {
+                ui.warn("Could not read config.toml");
+                return;
+            };
+            defer doc.deinit();
+            var tls_domain_val_buf: [320]u8 = undefined;
+            const tls_domain_val = std.fmt.bufPrint(&tls_domain_val_buf, "\"{s}\"", .{opts.tls_domain}) catch return;
+            doc.set("censorship", "tls_domain", tls_domain_val) catch {};
+            doc.set("censorship", "mask_port", "443") catch {};
+            doc.set("censorship", "mask", "true") catch {};
+            doc.save(config_path) catch {};
+            _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path }) catch {};
+            ui.ok("Configured real-domain fronting: mask=true, mask_port=443.");
+        }
+        return;
     }
 
     // ── Configure Nginx ──
