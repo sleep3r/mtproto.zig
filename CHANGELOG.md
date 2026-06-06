@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/sleep3r/mtproto.zig/compare/v0.26.0...v0.27.0) (2026-06-05)
+
+
+### Features
+
+* add custom mask target ([#298](https://github.com/sleep3r/mtproto.zig/issues/298)) ([443b016](https://github.com/sleep3r/mtproto.zig/commit/443b0162e4b2cf5e650fa7abb5a54cf7c3dfa1f8))
+
 ## [0.26.0](https://github.com/sleep3r/mtproto.zig/compare/v0.25.1...v0.26.0) (2026-06-05)
 
 
