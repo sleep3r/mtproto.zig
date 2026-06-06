@@ -322,6 +322,29 @@ function showToast(msg, type) {
   }, 3000);
 }
 
+// One plain-language verdict at the top of the page — the answer to the only
+// question most people open the dashboard to ask: "is everything OK?"
+function setStatusHero(online, active) {
+  const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText');
+  if (!el) return;
+  if (!online) {
+    el.style.background = 'rgba(255,80,80,0.10)';
+    el.style.color = 'var(--red,#ff6b6b)';
+    icon.textContent = '✖';
+    txt.textContent = "Your proxy is offline — friends can't connect until it's back.";
+  } else if (active > 0) {
+    el.style.background = 'rgba(80,220,120,0.10)';
+    el.style.color = 'var(--green,#46d369)';
+    icon.textContent = '✓';
+    txt.textContent = "Everything's working. " + active + (active === 1 ? ' person' : ' people') + ' connected right now.';
+  } else {
+    el.style.background = 'rgba(80,220,120,0.08)';
+    el.style.color = 'var(--green,#46d369)';
+    icon.textContent = '✓';
+    txt.textContent = 'Your proxy is online and ready. No one is connected yet — share a link to get started.';
+  }
+}
+
 async function apiCall(url, body) {
   const r = await fetch(url, {
     method: 'POST',
@@ -1010,6 +1033,7 @@ async function poll() {
     showToast('Someone just connected through your proxy.', 'success');
   }
   window._prevActive = _act;
+  setStatusHero(pi.online, _act);
   $('pxActive').textContent = _act;
   $('pxMax').textContent = p.max || 0;
   $('pxHs').textContent = p.hs_inflight || 0;
