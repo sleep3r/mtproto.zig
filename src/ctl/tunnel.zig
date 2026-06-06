@@ -557,9 +557,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\Wants=network-online.target
         \\
         \\[Service]
-        \\Type=notify
-        \\NotifyAccess=main
-        \\WatchdogSec=30
+        \\# Type=simple (not notify): containerized systemd (Docker/LXC) often fails to
+        \\# deliver the sd_notify datagram, which would restart-loop a healthy proxy.
+        \\# simple is robust everywhere; Restart=always still recovers crashes.
+        \\Type=simple
         \\User=mtproto
         \\Group=mtproto
         \\WorkingDirectory=/opt/mtproto-proxy

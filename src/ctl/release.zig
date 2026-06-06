@@ -222,9 +222,12 @@ pub fn writeServiceFile() void {
         \\Wants=network-online.target
         \\
         \\[Service]
-        \\Type=notify
-        \\NotifyAccess=main
-        \\WatchdogSec=30
+        \\# Type=simple (not notify): the proxy's sd_notify READY works on bare-metal
+        \\# systemd, but containerized systemd (Docker/LXC) frequently fails to deliver
+        \\# the notify datagram, which would restart-loop a perfectly healthy proxy.
+        \\# simple is robust everywhere; Restart=always still recovers crashes. Re-enable
+        \\# Type=notify + WatchdogSec only behind container detection + ping validation.
+        \\Type=simple
         \\User=mtproto
         \\Group=mtproto
         \\WorkingDirectory=/opt/mtproto-proxy
