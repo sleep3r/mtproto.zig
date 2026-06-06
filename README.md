@@ -2,11 +2,13 @@
 
 # mtproto.zig
 
-**High-performance Telegram MTProto proxy written in Zig**
+**Keep the people you love connected.**
 
-Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
+A tiny Telegram proxy you run on your own server. It hides inside ordinary HTTPS, so censorship can't find it — and your family can't lose it. One command to set up, one link to share.
 
-**177 KB binary · Sub-1 MB RAM · Boots in <10 ms · Zero dependencies**
+`177 KB · under 1 MB RAM · 0 dependencies` — yes, it's that lean *(details below ↓)*
+
+<sub>Technically: a tiny, dependency-free MTProto proxy in Zig that disguises Telegram traffic as standard TLS 1.3 HTTPS.</sub>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
@@ -29,7 +31,18 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ---
 
-## Why this one?
+## Who it's for
+
+- **You live somewhere Telegram is throttled or blocked** and you just want it back.
+- **You're the one your family asks for help** — and you want to protect your parents and friends with a link they tap once and never think about again.
+
+It runs on **your own server** — your messages never pass through ours, and there's nothing to sign up for. Open source under MIT; the proxy deliberately never logs secrets or who connects.
+
+## Why not just a VPN?
+
+A VPN announces itself — censors recognize the protocol and block it, and a whole-device VPN is slow and drains the battery. This looks like a plain HTTPS website, carries only Telegram, and the people you share it with **install nothing**: they tap one link and Telegram does the rest. Small enough for the cheapest VPS you can rent, it starts instantly, and there's nothing else to set up.
+
+## Compared to other MTProto proxies
 
 Most MTProto proxies are large, dependency-heavy, and use lots of memory. This one is different:
 
@@ -49,13 +62,13 @@ We chose Zig because it provides the raw performance and micro-footprint of C, b
 - **Hermetic cross-compilation:** Run `zig build` on macOS, and out comes a statically linked Linux binary. No Docker, no `glibc` version mismatches.
 - **Comptime:** Costly operations like protocol definition mapping, endianness conversions, and bilingual string lookup for `mtbuddy` are resolved during compilation, giving instant startup times.
 
-It also ships more evasion techniques than any of the above:
+**You don't need to understand any of the names below — the default install turns them all on for you.** Under the hood, the proxy stacks more anti-censorship techniques than any other MTProto proxy, and keeps adapting as the blocks get smarter:
 
 | Technique | What it does |
 |---|---|
 | **Fake TLS 1.3** | Connections look like normal HTTPS to DPI |
 | **DRS** | Mimics Chrome/Firefox TLS record sizes |
-| **Zero-RTT masking** | Active probes are forwarded to a real backend — the fronted `tls_domain:443` (secure default) or a local Nginx when you own the domain — so probers see a genuine site |
+| **Active-probe masking** | If a censor probes your server, it gets a real TLS handshake from a local web backend (or the genuine site, when you own the domain) instead of a tell-tale silent proxy |
 | **TCPMSS=88** | Fragments ClientHello across 6 TCP packets, breaking DPI reassembly |
 | **nfqws TCP desync** | Sends fake packets + TTL-limited splits to confuse stateful DPI |
 | **Split-TLS** | 1-byte Application records to defeat passive signatures |
@@ -103,6 +116,9 @@ sudo mtbuddy install --insecure --port 443 --domain wb.ru --yes
 ```
 
 At the end, mtbuddy prints a ready-to-use `tg://` connection link.
+
+> **Share it with someone you love.** Send them this, with the link:
+> *"I set up a private door to Telegram for us. Tap this link, choose Connect, and Telegram will work again — nothing to install, nothing to pay, and it's only ours."*
 
 ### Interactive wizard
 

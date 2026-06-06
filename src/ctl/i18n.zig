@@ -357,7 +357,7 @@ const en_strings = [_][]const u8{
     // install_tcpmss_ok
     "TCPMSS clamping applied",
     // install_success_header
-    "MTProto Proxy installed successfully!",
+    "Done. Your proxy is live — and invisible.",
     // install_status_cmd
     "Status:",
     // install_logs_cmd
@@ -614,7 +614,7 @@ const ru_strings = [_][]const u8{
     // install_tcpmss_ok
     "TCPMSS clamping применён",
     // install_success_header
-    "MTProto Proxy успешно установлен!",
+    "Готово. Ваш прокси работает — и его не видно.",
     // install_status_cmd
     "Статус:",
     // install_logs_cmd
