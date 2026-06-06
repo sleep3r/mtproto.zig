@@ -324,7 +324,7 @@ function showToast(msg, type) {
 
 // One plain-language verdict at the top of the page — the answer to the only
 // question most people open the dashboard to ask: "is everything OK?"
-function setStatusHero(online, active) {
+function setStatusHero(online, active, state) {
   const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText');
   if (!el) return;
   if (!online) {
@@ -332,6 +332,11 @@ function setStatusHero(online, active) {
     el.style.color = 'var(--red,#ff6b6b)';
     icon.textContent = '✖';
     txt.textContent = "Your proxy is offline — friends can't connect until it's back.";
+  } else if (state === 'stalled') {
+    el.style.background = 'rgba(240,180,40,0.12)';
+    el.style.color = 'var(--amber,#f0b428)';
+    icon.textContent = '!';
+    txt.textContent = "Your proxy is running but not responding — it looks stuck. Restarting usually fixes this.";
   } else if (active > 0) {
     el.style.background = 'rgba(80,220,120,0.10)';
     el.style.color = 'var(--green,#46d369)';
@@ -1072,7 +1077,7 @@ async function poll() {
   // Server
   $('srvUptime').textContent = d.uptime;
   const pi = d.proxy_info || {};
-  $('proxyUp').textContent = pi.online ? ('Online · ' + (pi.uptime || '')) : 'Offline';
+  $('proxyUp').textContent = !pi.online ? 'Offline' : (pi.state === 'stalled' ? 'Stuck' : ('Online · ' + (pi.uptime || '')));
   $('proxyPid').textContent = pi.pid || '—';
   $('proxyRss').textContent = (pi.rss_mb || 0) + ' MB';
   $('statusBadge').className = pi.online ? 'badge' : 'badge off';
@@ -1085,7 +1090,7 @@ async function poll() {
     showToast('Someone just connected through your proxy.', 'success');
   }
   window._prevActive = _act;
-  setStatusHero(pi.online, _act);
+  setStatusHero(pi.online, _act, pi.state);
   $('pxActive').textContent = _act;
   $('pxMax').textContent = p.max || 0;
   $('pxHs').textContent = p.hs_inflight || 0;

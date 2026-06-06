@@ -11,6 +11,7 @@ import secrets
 import time
 import threading
 import queue
+import socket
 import subprocess
 import sys
 import shutil
@@ -385,6 +386,24 @@ def _proxy_stats() -> dict:
         return {}
 
 
+def _proxy_listening(port: int) -> bool:
+    """True if something is accepting TCP on the proxy's local listen port.
+
+    The proxy normally binds all interfaces, so a loopback connect confirms it is
+    actually serving (not just running). This is a LOCAL check — it confirms the
+    listener is up, not that a censor elsewhere isn't blocking the public port.
+    """
+    if not port:
+        return False
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, port), timeout=0.8):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _proxy_info() -> dict:
     for proc in psutil.process_iter(["name", "create_time", "pid", "memory_info"]):
         if proc.info["name"] == "mtproto-proxy":
@@ -398,10 +417,21 @@ def _proxy_info() -> dict:
                 if proc.info["memory_info"]
                 else 0
             )
+            try:
+                listen_port = int(_load_proxy_runtime_config().get("port", 443))
+            except Exception:
+                listen_port = 443
+            listening = _proxy_listening(listen_port)
+            # Process up but the port isn't accepting → the event loop is wedged.
             return dict(
-                uptime=up, pid=proc.info["pid"], rss_mb=round(rss, 1), online=True
+                uptime=up,
+                pid=proc.info["pid"],
+                rss_mb=round(rss, 1),
+                online=True,
+                listening=listening,
+                state="online" if listening else "stalled",
             )
-    return dict(uptime="offline", pid=0, rss_mb=0, online=False)
+    return dict(uptime="offline", pid=0, rss_mb=0, online=False, listening=False, state="offline")
 
 
 _awg_cache = {"ts": 0, "data": None}
