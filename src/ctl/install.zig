@@ -439,7 +439,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
                 "iptables",                "xxd",
                 "curl",                    "openssl",
                 "tar",                     "passwd",
-                "minisign",
+                "minisign",                "qrencode",
             }
         else
             &.{
@@ -450,6 +450,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
                 "iptables",                "xxd",
                 "curl",                    "openssl",
                 "tar",                     "passwd",
+                "qrencode",
             };
         if (!runRequiredWhileSpinning(ui, allocator, base_packages, "Failed to install system dependencies", &sp)) return;
         if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
@@ -619,7 +620,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         ui.writeRaw("\n");
         ui.ok(localized(ui, "Your proxy is LIVE — here's your link:", "Прокси ЗАПУЩЕН — вот ваша ссылка:"));
         ui.print("  {s}╭─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
-        _ = printLinksFromConfig(ui, allocator, early_ip, opts.public_port orelse opts.port, opts.tls_domain, config_path_buf);
+        _ = printLinksFromConfig(ui, allocator, early_ip, opts.public_port orelse opts.port, opts.tls_domain, config_path_buf, true);
         ui.print("  {s}╰─{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.reset });
         if (opts.enable_masking or opts.enable_nfqws) {
             ui.info(localized(ui, "Now turning on extra anti-blocking protection — the link above already works...", "Теперь включаю дополнительную защиту от блокировок — ссылка выше уже работает..."));
@@ -876,6 +877,19 @@ fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
     return out[0..pos];
 }
 
+/// Render a scannable QR of `text` to the terminal via qrencode (UTF8 half-blocks).
+/// Best-effort: a silent no-op when qrencode is unavailable. Lets the operator scan
+/// the link straight from an SSH session onto a phone — or show it to a relative.
+fn printQrCode(ui: *Tui, allocator: std.mem.Allocator, text: []const u8) void {
+    if (!sys.commandExists("qrencode")) return;
+    const r = sys.exec(allocator, &.{ "qrencode", "-t", "UTF8", "-m", "1", text }) catch return;
+    defer r.deinit();
+    if (r.stdout.len == 0) return;
+    ui.writeRaw("\n");
+    ui.hint(localized(ui, "Scan to connect a device:", "Отсканируйте, чтобы подключить устройство:"));
+    ui.writeRaw(r.stdout);
+}
+
 fn printLinksFromConfig(
     ui: *Tui,
     allocator: std.mem.Allocator,
@@ -883,9 +897,11 @@ fn printLinksFromConfig(
     port: u16,
     tls_domain: []const u8,
     config_path: []const u8,
+    with_qr: bool,
 ) bool {
     var cfg_doc = toml.TomlDoc.load(allocator, config_path) catch return false;
     defer cfg_doc.deinit();
+    var qr_done = false;
 
     // dd links only make sense when the operator enabled the dd transport
     // (fake_tls_only = false). With the secure default the proxy rejects dd, so
@@ -956,6 +972,12 @@ fn printLinksFromConfig(
             tui_mod.Color.dim,   ee_link,
             tui_mod.Color.reset,
         });
+        // A scannable QR of the share link for the first user — point a phone
+        // camera at it to connect, no copy-paste. Best-effort (needs qrencode).
+        if (with_qr and !qr_done) {
+            printQrCode(ui, allocator, tme_link);
+            qr_done = true;
+        }
         if (dd_enabled) {
             var dd_buf: [128]u8 = undefined;
             const dd_secret = buildDdSecret(secret_hex, &dd_buf);
@@ -1043,7 +1065,7 @@ fn printSummary(
     ui.writeRaw("\n");
     ui.print("  {s}╭─ {s}{s}\n", .{ tui_mod.Color.gray, tui_mod.Color.bold, ui.str(.install_connection_link) });
 
-    if (!printLinksFromConfig(ui, allocator, public_ip, public_port, tls_domain, config_path)) {
+    if (!printLinksFromConfig(ui, allocator, public_ip, public_port, tls_domain, config_path, false)) {
         // Fallback when no config could be read. Fresh installs default to the
         // secure TLS-only posture (fake_tls_only = true), so only the FakeTLS
         // (ee) link is printed here. dd links are surfaced by printLinksFromConfig
