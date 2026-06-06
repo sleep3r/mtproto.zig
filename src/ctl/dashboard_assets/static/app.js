@@ -631,6 +631,7 @@ function renderUsers(users, perUserActive, proxyStats) {
     const tgData = encodeURIComponent(tg);
     const tmeData = encodeURIComponent(tme);
     const userName = esc(u.name || 'user');
+    const displayName = esc(u.label || u.name || 'user');
     const rowClass = isEnabled ? 'user-row' : 'user-row disabled';
     const sessions = Number(pua[u.name] || 0);
     const sessionsBadge = isEnabled
@@ -648,11 +649,11 @@ function renderUsers(users, perUserActive, proxyStats) {
       : '<button class="ui-btn user-direct-toggle" type="button" data-user="' + userName + '" data-direct="true" title="Switch to direct route">default</button>');
 
     return '<div class="' + rowClass + '">' +
-      '<div class="user-name">' + toggleSwitch + userName + sessionsBadge + '</div>' +
+      '<div class="user-name">' + toggleSwitch + displayName + sessionsBadge + '</div>' +
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
-      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + esc(userName) + '"' + (tme && isEnabled ? '' : ' disabled') + '>📲 Share</button>' +
+      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + '>📲 Share</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + '>Copy tg://</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + '>Copy t.me</button>' +
       '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
@@ -682,7 +683,7 @@ function renderUsers(users, perUserActive, proxyStats) {
   list.querySelectorAll('.user-share').forEach((btn) => {
     btn.addEventListener('click', () => {
       const link = decodeURIComponent(btn.dataset.link || '');
-      if (link) openShareModal(btn.dataset.name || '', link);
+      if (link) openShareModal(btn.dataset.label || btn.dataset.name || '', link);
     });
   });
 

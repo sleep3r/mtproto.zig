@@ -1324,6 +1324,7 @@ def _users_status() -> dict:
     domain_hex = tls_domain.encode("utf-8", errors="ignore").hex()
 
     direct_users = set(cfg.get("direct_users", set()))
+    labels = _load_labels()
     items = []
 
     users = cfg.get("users", {})
@@ -1345,6 +1346,7 @@ def _users_status() -> dict:
         items.append(
             {
                 "name": name,
+                "label": labels.get(name, ""),
                 "secret": secret_raw,
                 "direct": name in direct_users,
                 "enabled": True,
@@ -1362,6 +1364,7 @@ def _users_status() -> dict:
         items.append(
             {
                 "name": name,
+                "label": labels.get(name, ""),
                 "secret": secret_raw,
                 "direct": False,
                 "enabled": False,
@@ -2416,6 +2419,36 @@ async def api_routing_proxy_target(request: Request):
     )
 
 
+def _labels_path() -> Path:
+    """Sidecar file for human display labels (e.g. "Мама", "work 💼"). The proxy
+    never reads this — it only consumes [access.users] — so labels can be any
+    language without touching the config format the proxy parses."""
+    for p in _proxy_config_candidates():
+        if p.exists():
+            return p.parent / "user-labels.json"
+    return Path("/opt/mtproto-proxy/user-labels.json")
+
+
+def _load_labels() -> dict:
+    try:
+        with open(_labels_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_labels(labels: dict) -> None:
+    try:
+        path = _labels_path()
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(labels, f, ensure_ascii=False)
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
 @app.get("/api/qr")
 async def api_qr(text: str = ""):
     """Render a QR (SVG) for a connection link so it can be scanned from a phone.
@@ -2457,17 +2490,11 @@ async def api_user_add(request: Request):
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
-    name = str(body.get("name", "")).strip()
-    if not name or not re.match(r"^[a-zA-Z0-9_-]+$", name):
+    raw_name = str(body.get("name", "")).strip()
+    if not raw_name or len(raw_name) > 64:
         return JSONResponse(
-            {"ok": False, "error": "invalid name (use a-z, 0-9, _, -)"}, status_code=400
-        )
-
-    # Check if user already exists
-    cfg = _load_proxy_runtime_config()
-    if name in cfg.get("users", {}):
-        return JSONResponse(
-            {"ok": False, "error": "user already exists"}, status_code=409
+            {"ok": False, "error": "name is required (max 64 characters)"},
+            status_code=400,
         )
 
     secret = str(body.get("secret", "")).strip().lower()
@@ -2479,14 +2506,34 @@ async def api_user_add(request: Request):
             status_code=400,
         )
 
-    if not _add_user_to_config(name, secret):
+    # The display name can be any language ("Мама", "work laptop"); derive a stable
+    # ASCII key for the TOML [access.users] section and keep the original as a label.
+    cfg = _load_proxy_runtime_config()
+    existing = set(cfg.get("users", {}).keys()) | set(cfg.get("disabled_users", {}).keys())
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", raw_name).strip("_").lower()
+    if len(slug) < 2:
+        slug = "user_" + secrets.token_hex(3)
+    key = slug
+    n = 2
+    while key in existing:
+        key = f"{slug}_{n}"
+        n += 1
+    label = raw_name if raw_name != key else ""
+
+    if not _add_user_to_config(key, secret):
         return JSONResponse(
             {"ok": False, "error": "failed to write config"}, status_code=500
         )
+    if label:
+        labels = _load_labels()
+        labels[key] = label
+        _save_labels(labels)
 
     _users_cache["ts"] = 0
     _restart_proxy()
-    return JSONResponse({"ok": True, "name": name, "secret": secret, "restarted": True})
+    return JSONResponse(
+        {"ok": True, "name": key, "label": label, "secret": secret, "restarted": True}
+    )
 
 
 @app.post("/api/users/remove")
