@@ -637,11 +637,208 @@ pub const ProxyState = struct {
         drs_enabled: bool,
     };
 
+    fn buildUserSecrets(allocator: std.mem.Allocator, cfg: *const Config) ![]const obfuscation.UserSecret {
+        var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
+        errdefer secrets.deinit(allocator);
+
+        var it = @constCast(&cfg.users).iterator();
+        while (it.next()) |entry| {
+            try secrets.append(allocator, .{
+                .name = entry.key_ptr.*,
+                .secret = entry.value_ptr.*,
+            });
+        }
+
+        return try secrets.toOwnedSlice(allocator);
+    }
+
+    fn createUserMetrics(allocator: std.mem.Allocator, user_name: []const u8) !*UserMetrics {
+        const entry = try allocator.create(UserMetrics);
+        errdefer allocator.destroy(entry);
+
+        entry.* = .{
+            .name = try allocator.dupe(u8, user_name),
+            .connections_active = std.atomic.Value(u32).init(0),
+            .client_to_upstream_bytes_total = std.atomic.Value(u64).init(0),
+            .upstream_to_client_bytes_total = std.atomic.Value(u64).init(0),
+        };
+        return entry;
+    }
+
+    fn destroyUserMetrics(allocator: std.mem.Allocator, entry: *UserMetrics) void {
+        allocator.free(entry.name);
+        allocator.destroy(entry);
+    }
+
+    fn freeUserMetricsSlice(allocator: std.mem.Allocator, entries: []*UserMetrics) void {
+        for (entries) |entry| {
+            destroyUserMetrics(allocator, entry);
+        }
+        allocator.free(entries);
+    }
+
+    fn buildInitialUserMetrics(allocator: std.mem.Allocator, cfg: *const Config) ![]*UserMetrics {
+        var metrics: std.ArrayList(*UserMetrics) = .empty;
+        errdefer {
+            for (metrics.items) |entry| {
+                destroyUserMetrics(allocator, entry);
+            }
+            metrics.deinit(allocator);
+        }
+
+        var it = @constCast(&cfg.users).iterator();
+        while (it.next()) |entry| {
+            const metric = try createUserMetrics(allocator, entry.key_ptr.*);
+            errdefer destroyUserMetrics(allocator, metric);
+            try metrics.append(allocator, metric);
+        }
+
+        return try metrics.toOwnedSlice(allocator);
+    }
+
+    fn findMetricInSlice(entries: []*UserMetrics, user_name: []const u8) ?*UserMetrics {
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.name, user_name)) return entry;
+        }
+        return null;
+    }
+
+    fn collectRetiredUserMetrics(self: *ProxyState) void {
+        var idx: usize = 0;
+        while (idx < self.retired_user_metrics.items.len) {
+            const entry = self.retired_user_metrics.items[idx];
+            if (entry.connections_active.load(.monotonic) == 0) {
+                _ = self.retired_user_metrics.swapRemove(idx);
+                destroyUserMetrics(self.allocator, entry);
+                continue;
+            }
+            idx += 1;
+        }
+    }
+
+    fn retireOrDestroyUserMetrics(self: *ProxyState, entry: *UserMetrics) void {
+        if (entry.connections_active.load(.monotonic) == 0) {
+            destroyUserMetrics(self.allocator, entry);
+            return;
+        }
+        self.retired_user_metrics.appendAssumeCapacity(entry);
+    }
+
+    fn deinitAccessMaps(allocator: std.mem.Allocator, cfg: *Config) void {
+        var users = &cfg.users;
+        var user_it = users.iterator();
+        while (user_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+        }
+        users.deinit();
+
+        var direct_users = &cfg.direct_users;
+        var direct_it = direct_users.iterator();
+        while (direct_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+        }
+        direct_users.deinit();
+    }
+
+    fn moveAccessMapsFrom(self: *ProxyState, next: *Config) void {
+        deinitAccessMaps(self.allocator, &self.config);
+        self.config.users = next.users;
+        self.config.direct_users = next.direct_users;
+        next.users = std.StringHashMap([16]u8).init(self.allocator);
+        next.direct_users = std.StringHashMap(void).init(self.allocator);
+    }
+
+    fn accessMapsEqual(current: *const Config, next: *const Config) bool {
+        if (current.users.count() != next.users.count()) return false;
+        if (current.direct_users.count() != next.direct_users.count()) return false;
+
+        var user_it = @constCast(&current.users).iterator();
+        while (user_it.next()) |entry| {
+            const next_secret = next.users.get(entry.key_ptr.*) orelse return false;
+            if (!std.mem.eql(u8, entry.value_ptr.*[0..], next_secret[0..])) return false;
+        }
+
+        var direct_it = @constCast(&current.direct_users).iterator();
+        while (direct_it.next()) |entry| {
+            if (!next.direct_users.contains(entry.key_ptr.*)) return false;
+        }
+
+        return true;
+    }
+
+    fn reloadAccessUsers(self: *ProxyState, next: *Config) !usize {
+        if (accessMapsEqual(&self.config, next)) return 0;
+
+        const new_user_secrets = try buildUserSecrets(self.allocator, next);
+        errdefer self.allocator.free(new_user_secrets);
+
+        const new_metrics_slice = blk: {
+            var new_metrics: std.ArrayList(*UserMetrics) = .empty;
+            errdefer {
+                for (new_metrics.items) |entry| {
+                    if (findMetricInSlice(self.user_metrics, entry.name) == null) {
+                        destroyUserMetrics(self.allocator, entry);
+                    }
+                }
+                new_metrics.deinit(self.allocator);
+            }
+
+            var next_it = next.users.iterator();
+            while (next_it.next()) |entry| {
+                const user_name = entry.key_ptr.*;
+                if (findMetricInSlice(self.user_metrics, user_name)) |metrics| {
+                    try new_metrics.append(self.allocator, metrics);
+                } else {
+                    const metrics = try createUserMetrics(self.allocator, user_name);
+                    errdefer destroyUserMetrics(self.allocator, metrics);
+                    try new_metrics.append(self.allocator, metrics);
+                }
+            }
+
+            break :blk try new_metrics.toOwnedSlice(self.allocator);
+        };
+        errdefer self.allocator.free(new_metrics_slice);
+
+        var retired_metrics_needed: usize = 0;
+        for (self.user_metrics) |entry| {
+            if (findMetricInSlice(new_metrics_slice, entry.name) == null and entry.connections_active.load(.monotonic) != 0) {
+                retired_metrics_needed += 1;
+            }
+        }
+        try self.retired_user_metrics.ensureUnusedCapacity(self.allocator, retired_metrics_needed);
+
+        const old_user_secrets = self.user_secrets;
+        const old_user_metrics = self.user_metrics;
+
+        self.user_secrets = new_user_secrets;
+        self.user_metrics = new_metrics_slice;
+        self.moveAccessMapsFrom(next);
+
+        self.allocator.free(old_user_secrets);
+        for (old_user_metrics) |entry| {
+            if (findMetricInSlice(self.user_metrics, entry.name) == null) {
+                self.retireOrDestroyUserMetrics(entry);
+            }
+        }
+        self.allocator.free(old_user_metrics);
+        self.collectRetiredUserMetrics();
+        return 1;
+    }
+
+    pub fn reloadAccessUsersForTest(self: *ProxyState, next: *Config) !void {
+        _ = try self.reloadAccessUsers(next);
+    }
+
+    pub fn collectRetiredUserMetricsForTest(self: *ProxyState) void {
+        self.collectRetiredUserMetrics();
+    }
+
     allocator: std.mem.Allocator,
     config_path: []const u8,
     config: Config,
     user_secrets: []const obfuscation.UserSecret,
-    user_metrics: []UserMetrics,
+    user_metrics: []*UserMetrics,
+    retired_user_metrics: std.ArrayList(*UserMetrics),
     start_time_seconds: i64,
     connection_count: std.atomic.Value(u64),
     closed_count: std.atomic.Value(u64),
@@ -690,23 +887,11 @@ pub const ProxyState = struct {
     pub fn init(allocator: std.mem.Allocator, cfg: Config, config_path: []const u8) !ProxyState {
         if (cfg.users.count() == 0) return error.NoUsersConfigured;
 
-        var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
-        errdefer secrets.deinit(allocator);
-        var user_metrics: std.ArrayList(UserMetrics) = .empty;
-        errdefer user_metrics.deinit(allocator);
-        var it = @constCast(&cfg.users).iterator();
-        while (it.next()) |entry| {
-            try secrets.append(allocator, .{
-                .name = entry.key_ptr.*,
-                .secret = entry.value_ptr.*,
-            });
-            try user_metrics.append(allocator, .{
-                .name = entry.key_ptr.*,
-                .connections_active = std.atomic.Value(u32).init(0),
-                .client_to_upstream_bytes_total = std.atomic.Value(u64).init(0),
-                .upstream_to_client_bytes_total = std.atomic.Value(u64).init(0),
-            });
-        }
+        const user_secrets = try buildUserSecrets(allocator, &cfg);
+        errdefer allocator.free(user_secrets);
+
+        const user_metrics_owned = try buildInitialUserMetrics(allocator, &cfg);
+        errdefer freeUserMetricsSlice(allocator, user_metrics_owned);
 
         var resolved_addr: ?Address = null;
         if (cfg.mask) {
@@ -737,11 +922,6 @@ pub const ProxyState = struct {
         else
             null;
 
-        const user_secrets = try secrets.toOwnedSlice(allocator);
-        errdefer allocator.free(user_secrets);
-        const user_metrics_owned = try user_metrics.toOwnedSlice(allocator);
-        errdefer allocator.free(user_metrics_owned);
-
         const owned_config_path = try allocator.dupe(u8, config_path);
         errdefer allocator.free(owned_config_path);
 
@@ -751,6 +931,7 @@ pub const ProxyState = struct {
             .config = cfg,
             .user_secrets = user_secrets,
             .user_metrics = user_metrics_owned,
+            .retired_user_metrics = .empty,
             .start_time_seconds = realtimeSeconds(),
             .connection_count = std.atomic.Value(u64).init(0),
             .closed_count = std.atomic.Value(u64).init(0),
@@ -876,12 +1057,16 @@ pub const ProxyState = struct {
         }
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
-        self.allocator.free(self.user_metrics);
+        freeUserMetricsSlice(self.allocator, self.user_metrics);
+        for (self.retired_user_metrics.items) |entry| {
+            destroyUserMetrics(self.allocator, entry);
+        }
+        self.retired_user_metrics.deinit(self.allocator);
         self.config.deinit(self.allocator);
     }
 
     pub fn findUserMetrics(self: *ProxyState, user_name: []const u8) ?*UserMetrics {
-        for (self.user_metrics) |*entry| {
+        for (self.user_metrics) |entry| {
             if (std.mem.eql(u8, entry.name, user_name)) return entry;
         }
         return null;
@@ -1654,7 +1839,7 @@ const EventLoop = struct {
         var user_buf: [1024]u8 = undefined;
         var user_pos: usize = 0;
         var users_active_total: u32 = 0;
-        for (self.state.user_metrics) |*um| {
+        for (self.state.user_metrics) |um| {
             const uactive = um.connections_active.load(.monotonic);
             users_active_total +|= uactive;
             const name = um.name;
@@ -1891,6 +2076,18 @@ const EventLoop = struct {
 
         var applied: usize = 0;
         var static_changes: usize = 0;
+
+        const access_applied = self.state.reloadAccessUsers(&next) catch |err| {
+            log.err("SIGHUP: failed to apply access users: {any}", .{err});
+            return;
+        };
+        if (access_applied > 0) {
+            log.info(
+                "SIGHUP: access users reloaded users={d} direct_users={d} retired_metrics={d}",
+                .{ self.state.user_secrets.len, self.state.config.direct_users.count(), self.state.retired_user_metrics.items.len },
+            );
+            applied += access_applied;
+        }
 
         if (next.port != self.state.config.port) static_changes += 1;
         const bind_address_changed = blk: {
@@ -3112,6 +3309,7 @@ const EventLoop = struct {
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
+        self.state.collectRetiredUserMetrics();
 
         slot.desync_wait_enqueued = false;
         slot.phase = .idle;
@@ -3384,4 +3582,61 @@ test "handshakeInProgress - phases" {
     try std.testing.expect(!slot.handshakeInProgress());
     slot.phase = .closing;
     try std.testing.expect(!slot.handshakeInProgress());
+}
+
+test "ProxyState access reload keeps active metrics safe" {
+    const allocator = std.testing.allocator;
+
+    const initial_cfg = try Config.parse(allocator,
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "00000000000000000000000000000001"
+        \\removed = "00000000000000000000000000000002"
+        \\
+        \\[access.direct_users]
+        \\removed = true
+    );
+    var state = try ProxyState.init(allocator, initial_cfg, "/tmp/mtproto-test.toml");
+    defer state.deinit();
+
+    const alice_metrics = state.findUserMetrics("alice") orelse return error.TestExpectedEqual;
+    const removed_metrics = state.findUserMetrics("removed") orelse return error.TestExpectedEqual;
+    _ = removed_metrics.connections_active.fetchAdd(1, .monotonic);
+
+    var next_cfg = try Config.parse(allocator,
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "0000000000000000000000000000000a"
+        \\bob = "0000000000000000000000000000000b"
+        \\
+        \\[access.direct_users]
+        \\alice = true
+    );
+    defer next_cfg.deinit(allocator);
+
+    try state.reloadAccessUsersForTest(&next_cfg);
+
+    try std.testing.expectEqual(@as(usize, 2), state.user_secrets.len);
+    try std.testing.expect(state.config.userBypassesMiddleProxy("alice"));
+    try std.testing.expect(!state.config.userBypassesMiddleProxy("removed"));
+    try std.testing.expect(alice_metrics == state.findUserMetrics("alice").?);
+    try std.testing.expect(state.findUserMetrics("bob") != null);
+    try std.testing.expect(state.findUserMetrics("removed") == null);
+    try std.testing.expectEqual(@as(u32, 1), removed_metrics.connections_active.load(.monotonic));
+
+    _ = removed_metrics.connections_active.fetchSub(1, .monotonic);
+    state.collectRetiredUserMetricsForTest();
+    try std.testing.expectEqual(@as(usize, 0), state.retired_user_metrics.items.len);
+
+    var saw_alice_new_secret = false;
+    for (state.user_secrets) |entry| {
+        if (std.mem.eql(u8, entry.name, "alice")) {
+            saw_alice_new_secret = entry.secret[15] == 0x0a;
+        }
+    }
+    try std.testing.expect(saw_alice_new_secret);
 }
