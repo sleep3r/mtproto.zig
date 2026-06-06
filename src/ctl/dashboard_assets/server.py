@@ -27,7 +27,7 @@ except ModuleNotFoundError:
 
 import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
@@ -2384,6 +2384,36 @@ async def api_routing_proxy_target(request: Request):
             "restarted": True,
         }
     )
+
+
+@app.get("/api/qr")
+async def api_qr(text: str = ""):
+    """Render a QR (SVG) for a connection link so it can be scanned from a phone.
+
+    Only ever encodes our own proxy links — this bounds the input and keeps the
+    endpoint from being a generic QR oracle. The dashboard is localhost-only.
+    """
+    text = (text or "").strip()
+    if (
+        not text
+        or len(text) > 512
+        or not (text.startswith("https://t.me/proxy") or text.startswith("tg://proxy"))
+    ):
+        return PlainTextResponse("invalid link", status_code=400)
+    try:
+        # argv list (no shell) → the link cannot inject a command.
+        out = subprocess.run(
+            ["qrencode", "-t", "SVG", "-m", "2", "-o", "-", text],
+            capture_output=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return PlainTextResponse("qrencode not installed", status_code=503)
+    except Exception:
+        return PlainTextResponse("qr render failed", status_code=503)
+    if out.returncode != 0 or not out.stdout:
+        return PlainTextResponse("qr render failed", status_code=503)
+    return Response(content=out.stdout, media_type="image/svg+xml")
 
 
 # ── User Management API ──

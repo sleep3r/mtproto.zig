@@ -345,6 +345,45 @@ function setStatusHero(online, active) {
   }
 }
 
+// The "share with someone you love" moment: a scannable QR + one-tap send.
+function closeShareModal() {
+  const o = document.getElementById('shareModalOverlay');
+  if (o) o.remove();
+}
+function openShareModal(name, link) {
+  closeShareModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'shareModalOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeShareModal(); });
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--bg-card,#16181d);border:1px solid var(--border,#333);border-radius:14px;padding:22px;max-width:340px;text-align:center;color:var(--text,#eee);font-family:inherit;';
+  box.innerHTML =
+    '<div style="font-size:16px;font-weight:700;margin-bottom:4px;">Share with ' + esc(name || 'this person') + '</div>' +
+    '<div style="font-size:13px;color:var(--text-muted,#999);margin-bottom:14px;">Point their phone camera at this code to connect.</div>' +
+    '<img src="/api/qr?text=' + encodeURIComponent(link) + '" alt="QR code" style="width:240px;height:240px;background:#fff;border-radius:10px;padding:8px;box-sizing:border-box;" />' +
+    '<div style="display:flex;gap:8px;margin-top:16px;">' +
+    '<button class="ui-btn" id="shareCopyBtn" style="flex:1;">Copy link</button>' +
+    '<button class="ui-btn" id="shareSendBtn" style="flex:1;">Send</button>' +
+    '</div>' +
+    '<button class="ui-btn" id="shareCloseBtn" style="margin-top:10px;width:100%;">Close</button>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  document.getElementById('shareCopyBtn').addEventListener('click', async () => {
+    await copyText(link);
+    showToast('Link copied — send it to someone you love.', 'success');
+  });
+  document.getElementById('shareSendBtn').addEventListener('click', () => {
+    if (navigator.share) {
+      navigator.share({ title: 'Telegram proxy', text: 'Tap to connect to Telegram — I set this up for you:', url: link }).catch(() => {});
+    } else {
+      copyText(link);
+      showToast('Link copied — paste it to share.', 'success');
+    }
+  });
+  document.getElementById('shareCloseBtn').addEventListener('click', closeShareModal);
+}
+
 async function apiCall(url, body) {
   const r = await fetch(url, {
     method: 'POST',
@@ -397,10 +436,14 @@ function setupAddUserForm() {
 
     try {
       const data = await apiCall('/api/users/add', { name, secret: secret || undefined });
-      showToast(`User "${data.name}" created. Proxy restarted.`, 'success');
+      showToast(`Done! Here is ${data.name}'s connection — send it to them now.`, 'success');
       form.style.display = 'none';
       _users_cache_bust();
       await runPoll();
+      // End the create flow in the share moment: open the QR modal for the new user
+      // (names are restricted to [a-zA-Z0-9_-], so the selector needs no escaping).
+      const shareBtn = document.querySelector('.user-share[data-name="' + data.name + '"]');
+      if (shareBtn && !shareBtn.disabled) shareBtn.click();
     } catch (e) {
       status.textContent = e.message;
       status.className = 'form-status error';
@@ -604,6 +647,7 @@ function renderUsers(users, perUserActive, proxyStats) {
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
+      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + esc(userName) + '"' + (tme && isEnabled ? '' : ' disabled') + '>📲 Share</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + '>Copy tg://</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + '>Copy t.me</button>' +
       '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
@@ -626,6 +670,14 @@ function renderUsers(users, perUserActive, proxyStats) {
         btn.textContent = original;
         btn.classList.remove('active');
       }, 1100);
+    });
+  });
+
+  // Share buttons → QR modal (the "send it to someone you love" moment)
+  list.querySelectorAll('.user-share').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const link = decodeURIComponent(btn.dataset.link || '');
+      if (link) openShareModal(btn.dataset.name || '', link);
     });
   });
 
