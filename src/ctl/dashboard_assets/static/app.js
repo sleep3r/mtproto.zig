@@ -542,7 +542,7 @@ function renderUsers(users, perUserActive, proxyStats) {
   meta.textContent = metaText;
 
   if (!users?.links_ready) {
-    note.textContent = 'Public IP could not be detected. Set [server].public_ip in config.toml.';
+    note.textContent = "We couldn't detect your server's public IP, so connection links aren't ready yet. Add your server's IP in the config and the links will appear.";
   } else {
     note.textContent = users.server + ':' + users.port + ' · tls_domain=' + (users.tls_domain || '—');
   }
@@ -898,7 +898,7 @@ function renderRouting(routing) {
     $('routingStatus').textContent = 'Healthy';
   } else {
     badge.className = 'badge off';
-    $('routingStatus').textContent = 'Degraded';
+    $('routingStatus').textContent = 'Needs attention';
   }
 
   $('routingMiddle').textContent = routing.middle_proxy_enabled ? 'enabled' : 'disabled';
@@ -997,20 +997,27 @@ async function poll() {
   // Server
   $('srvUptime').textContent = d.uptime;
   const pi = d.proxy_info || {};
-  $('proxyUp').textContent = pi.uptime || '—';
+  $('proxyUp').textContent = pi.online ? ('Online · ' + (pi.uptime || '')) : 'Offline';
   $('proxyPid').textContent = pi.pid || '—';
   $('proxyRss').textContent = (pi.rss_mb || 0) + ' MB';
   $('statusBadge').className = pi.online ? 'badge' : 'badge off';
 
   // Proxy stats
   const p = d.proxy || {};
-  $('pxActive').textContent = p.active || 0;
+  const _act = p.active || 0;
+  // Celebrate the moment a real person first comes online through this proxy.
+  if (window._prevActive != null && window._prevActive === 0 && _act > 0) {
+    showToast('Someone just connected through your proxy.', 'success');
+  }
+  window._prevActive = _act;
+  $('pxActive').textContent = _act;
   $('pxMax').textContent = p.max || 0;
   $('pxHs').textContent = p.hs_inflight || 0;
   $('pxTotal').textContent = (p.total || 0).toLocaleString();
   const drp = p.rate_drops || 0;
   $('pxDrops').textContent = drp;
   $('pxDrops').style.color = drp > 0 ? 'var(--amber)' : 'var(--text-muted)';
+  $('pxDrops').title = "Blocked connection attempts. Some of these are normal — it's your proxy turning away scanners and abuse. A steady small number is healthy.";
   $('pxDropLbl').textContent = 'rate +' + drp + ' · cap +' + (p.cap_drops || 0) + ' · hs_t +' + (p.hs_timeout || 0);
 
 
@@ -1042,7 +1049,7 @@ async function poll() {
       $('maskStatus').textContent = 'Healthy';
     } else {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = 'Degraded';
+      $('maskStatus').textContent = 'Needs attention';
     }
 
     let modeText = masking.mode || '—';
@@ -1062,7 +1069,7 @@ async function poll() {
       if (masking.endpoint_ok === true) {
         endpointText += ' (OK)';
       } else if (masking.endpoint_ok === false) {
-        endpointText += ' (DOWN)';
+        endpointText += ' (not responding)';
       }
     }
     $('maskTarget').textContent = endpointText;
