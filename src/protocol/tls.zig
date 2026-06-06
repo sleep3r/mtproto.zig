@@ -138,8 +138,9 @@ pub fn buildServerHello(
     secret: []const u8,
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
+    cipher: ?u16,
 ) ![]u8 {
-    return buildServerHelloWithTemplate(allocator, &nginx_template, secret, client_digest, session_id);
+    return buildServerHelloWithTemplate(allocator, &nginx_template, secret, client_digest, session_id, cipher);
 }
 
 pub fn buildServerHelloWithTemplate(
@@ -148,6 +149,7 @@ pub fn buildServerHelloWithTemplate(
     secret: []const u8,
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
+    cipher: ?u16,
 ) ![]u8 {
     if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
 
@@ -155,6 +157,16 @@ pub fn buildServerHelloWithTemplate(
     const response = try allocator.alloc(u8, template.len);
     errdefer allocator.free(response);
     @memcpy(response, template);
+
+    // 1b. Echo a client-offered cipher suite. A real TLS server negotiates the
+    //     cipher from the ClientHello and naturally varies it; emitting a constant
+    //     0x1301 for every connection is a trivial passive JA3S/ServerHello
+    //     distinguisher. Telegram FakeTLS clients ignore the cipher (they validate
+    //     only the record framing + HMAC), so this is pure evasion upside with no
+    //     client-compat risk. Patched before the HMAC (step 4) which covers it.
+    if (cipher) |cs| {
+        std.mem.writeInt(u16, response[tmpl_cipher_offset..][0..2], cs, .big);
+    }
 
     // 2. Patch Session ID (echo from client). Template is fixed for 32-byte session IDs.
     if (session_id.len != 32) return error.BadSessionIdLength;
@@ -211,6 +223,9 @@ pub fn buildServerHelloWithTemplate(
 const tmpl_random_offset: usize = 11;
 /// Offset of Session ID (32 bytes) — echoed from client at runtime
 const tmpl_session_id_offset: usize = 44;
+/// Offset of the 2-byte cipher suite — immediately after the 32-byte session_id
+/// (44 + 32). Patched at runtime with a client-offered suite.
+const tmpl_cipher_offset: usize = tmpl_session_id_offset + 32;
 /// Offset of X25519 public key (32 bytes) — filled with random at runtime
 const tmpl_x25519_key_offset: usize = 95;
 /// Offset of the fake AppData ("encrypted certificate") body — overwritten with
@@ -371,6 +386,32 @@ pub fn isTlsHandshake(first_bytes: []const u8) bool {
 }
 
 /// Extract SNI from a TLS ClientHello.
+/// Return the first non-GREASE TLS 1.3 cipher suite the client offered
+/// (0x1301 AES-128-GCM / 0x1302 AES-256-GCM / 0x1303 CHACHA20), or null. Used to
+/// echo a client-offered cipher in the ServerHello instead of a constant, so the
+/// ServerHello's chosen cipher tracks the ClientHello like a real server's.
+pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return null; // ClientHello
+    pos += 4; // handshake type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > handshake.len) return null;
+    const session_id_len: usize = handshake[pos];
+    pos += 1 + session_id_len;
+    if (pos + 2 > handshake.len) return null;
+    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return null;
+    var i: usize = 0;
+    while (i + 2 <= cs_len) : (i += 2) {
+        const suite = std.mem.readInt(u16, handshake[pos + i ..][0..2], .big);
+        if ((suite & 0x0f0f) == 0x0a0a) continue; // GREASE (RFC 8701)
+        if (suite == 0x1301 or suite == 0x1302 or suite == 0x1303) return suite;
+    }
+    return null;
+}
+
 pub fn extractSni(handshake: []const u8) ?[]const u8 {
     if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
 
@@ -456,6 +497,7 @@ test "buildServerHello produces valid three-record Nginx template structure" {
         &digest,
         &digest,
         &session_id,
+        null,
     );
     defer allocator.free(response);
 
@@ -529,9 +571,9 @@ test "buildServerHello AppData: fixed length, per-connection-random body" {
     var digest = [_]u8{0xAA} ** 32;
     const session_id = [_]u8{0xBB} ** 32;
 
-    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id);
+    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id, null);
     defer allocator.free(r1);
-    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id);
+    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id, null);
     defer allocator.free(r2);
 
     // Same total size (fixed-length cert record — no random *size* fingerprint).
@@ -544,6 +586,50 @@ test "buildServerHello AppData: fixed length, per-connection-random body" {
     try std.testing.expect(!std.mem.eql(u8, r1[app_offset..], r2[app_offset..]));
 }
 
+test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
+    // Minimal ClientHello: record hdr, hs hdr, version, 32-byte random,
+    // session_id_len=0, cipher_suites_len=6 = [GREASE 0x0a0a, 0x1303, 0x1301].
+    var ch: [52]u8 = undefined;
+    ch[0] = 0x16;
+    ch[1] = 0x03;
+    ch[2] = 0x01;
+    ch[3] = 0x00;
+    ch[4] = 0x2f;
+    ch[5] = 0x01; // ClientHello
+    ch[6] = 0x00;
+    ch[7] = 0x00;
+    ch[8] = 0x2b;
+    ch[9] = 0x03;
+    ch[10] = 0x03; // version
+    @memset(ch[11..43], 0xAB); // random
+    ch[43] = 0x00; // session_id_len
+    ch[44] = 0x00;
+    ch[45] = 0x06; // cipher_suites_len
+    ch[46] = 0x0a;
+    ch[47] = 0x0a; // GREASE
+    ch[48] = 0x13;
+    ch[49] = 0x03; // CHACHA20
+    ch[50] = 0x13;
+    ch[51] = 0x01; // AES-128-GCM
+    try std.testing.expectEqual(@as(?u16, 0x1303), extractFirstTls13Cipher(&ch));
+    try std.testing.expect(extractFirstTls13Cipher(ch[0..40]) == null); // truncated
+}
+
+test "buildServerHello echoes the chosen cipher at the cipher offset" {
+    const allocator = std.testing.allocator;
+    var digest = [_]u8{0xAA} ** 32;
+    const session_id = [_]u8{0xBB} ** 32;
+    const resp = try buildServerHello(allocator, &digest, &digest, &session_id, 0x1303);
+    defer allocator.free(resp);
+    try std.testing.expectEqual(@as(u8, 0x13), resp[tmpl_cipher_offset]);
+    try std.testing.expectEqual(@as(u8, 0x03), resp[tmpl_cipher_offset + 1]);
+    // Default (null) keeps the template's 0x1301.
+    const resp2 = try buildServerHello(allocator, &digest, &digest, &session_id, null);
+    defer allocator.free(resp2);
+    try std.testing.expectEqual(@as(u8, 0x13), resp2[tmpl_cipher_offset]);
+    try std.testing.expectEqual(@as(u8, 0x01), resp2[tmpl_cipher_offset + 1]);
+}
+
 test "buildServerHello rejects non-32-byte session id" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0xAA} ** 32;
@@ -551,7 +637,7 @@ test "buildServerHello rejects non-32-byte session id" {
 
     try std.testing.expectError(
         error.BadSessionIdLength,
-        buildServerHello(allocator, &digest, &digest, &session_id),
+        buildServerHello(allocator, &digest, &digest, &session_id, null),
     );
 }
 

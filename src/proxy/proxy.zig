@@ -2538,12 +2538,17 @@ const EventLoop = struct {
         slot.validation_user_len = @intCast(ulen);
         @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
 
+        // Echo a client-offered cipher in the ServerHello (naturalistic, matches
+        // how a real server negotiates) instead of a constant. Falls back to the
+        // template default when the client offered no parseable TLS 1.3 suite.
+        const echoed_cipher = tls.extractFirstTls13Cipher(slot.clientHelloBuf()[0..slot.client_hello_len]);
         slot.server_hello = tls.buildServerHelloWithTemplate(
             self.state.allocator,
             self.state.tls_server_hello_template[0..],
             &slot.validation_secret,
             &slot.validation_digest,
             slot.validation_session_id[0..slot.validation_session_id_len],
+            echoed_cipher,
         ) catch {
             self.closeSlot(slot, "build server hello failed");
             return;
