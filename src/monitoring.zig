@@ -112,6 +112,24 @@ fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
         writeSimpleResponse(fd, "405 Method Not Allowed", "text/plain", "method not allowed\n");
         return;
     }
+    // Liveness: event loop has ticked recently (well above the ~37ms loop wait).
+    if (isGetPath(request, "/healthz")) {
+        if (state.loopAlive(5000)) {
+            writeSimpleResponse(fd, "200 OK", "text/plain", "ok\n");
+        } else {
+            writeSimpleResponse(fd, "503 Service Unavailable", "text/plain", "event loop stalled\n");
+        }
+        return;
+    }
+    // Readiness: serving and not draining (LB/k8s drain signal).
+    if (isGetPath(request, "/readyz")) {
+        if (state.isReady()) {
+            writeSimpleResponse(fd, "200 OK", "text/plain", "ready\n");
+        } else {
+            writeSimpleResponse(fd, "503 Service Unavailable", "text/plain", "draining\n");
+        }
+        return;
+    }
     if (!isGetMetrics(request)) {
         writeSimpleResponse(fd, "404 Not Found", "text/plain", "not found\n");
         return;
@@ -177,9 +195,14 @@ fn isGetRequest(request: []const u8) bool {
 }
 
 fn isGetMetrics(request: []const u8) bool {
-    if (!std.mem.startsWith(u8, request, "GET /metrics")) return false;
-    if (request.len < "GET /metrics".len + 1) return false;
-    const next = request["GET /metrics".len];
+    return isGetPath(request, "/metrics");
+}
+
+fn isGetPath(request: []const u8, comptime path: []const u8) bool {
+    const prefix = "GET " ++ path;
+    if (!std.mem.startsWith(u8, request, prefix)) return false;
+    if (request.len <= prefix.len) return false;
+    const next = request[prefix.len];
     return next == ' ' or next == '?' or next == '\r';
 }
 

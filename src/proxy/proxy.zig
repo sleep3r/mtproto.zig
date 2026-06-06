@@ -776,6 +776,11 @@ pub const ProxyState = struct {
     stats_mp_fallback: std.atomic.Value(u64),
     /// Per-reason connection close counters (RED errors + evasion signals).
     close_reasons: [CloseReason.count]std.atomic.Value(u64),
+    /// Monotonic ms of the last event-loop iteration — liveness heartbeat for
+    /// /healthz and the systemd watchdog. 0 until the loop starts ticking.
+    loop_heartbeat_ms: std.atomic.Value(i64),
+    /// True once graceful shutdown/drain has begun — drives /readyz.
+    shutting_down: std.atomic.Value(bool),
 
     middle_proxy_lock: CompatRwLock = .{},
     // Regular (non-media) primary endpoints per DC 1..5. Matches `proxy_for N`
@@ -897,6 +902,8 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
+            .loop_heartbeat_ms = std.atomic.Value(i64).init(0),
+            .shutting_down = std.atomic.Value(bool).init(false),
             .middle_proxy_updater_thread = null,
             .upstream = upblk: {
                 switch (cfg.upstream_mode) {
@@ -999,6 +1006,20 @@ pub const ProxyState = struct {
             if (std.mem.eql(u8, entry.name, user_name)) return entry;
         }
         return null;
+    }
+
+    /// Liveness: has the event loop iterated within threshold_ms? Returns true
+    /// during startup (heartbeat 0) so /healthz doesn't fail before the loop runs.
+    pub fn loopAlive(self: *const ProxyState, threshold_ms: i64) bool {
+        const hb = self.loop_heartbeat_ms.load(.monotonic);
+        if (hb == 0) return true;
+        return (nowMs() - hb) < threshold_ms;
+    }
+
+    /// Readiness: serving and not draining. (Not gated on middleproxy — it runs
+    /// on bundled defaults and may never refresh on a censored host.)
+    pub fn isReady(self: *const ProxyState) bool {
+        return !self.shutting_down.load(.acquire);
     }
 
     pub fn getMetricsSnapshot(self: *const ProxyState) MetricsSnapshot {
@@ -1580,6 +1601,8 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = nowNs();
 
         while (true) {
+            // Liveness heartbeat for /healthz + the systemd watchdog.
+            self.state.loop_heartbeat_ms.store(nowMs(), .monotonic);
             var current_wait_ms: i32 = event_loop_wait_ms;
             if (self.desync_wait_slots.items.len > 0) {
                 current_wait_ms = @min(current_wait_ms, desync_wait_poll_ms);
@@ -1985,6 +2008,7 @@ const EventLoop = struct {
         }
 
         self.shutting_down = true;
+        self.state.shutting_down.store(true, .release); // flip /readyz to draining
         self.shutdown_deadline_ns = now_ns + (@as(i128, @intCast(self.state.config.graceful_shutdown_timeout_sec)) * std.time.ns_per_s);
 
         self.modFd(self.listen_fd, false, false) catch |err| {
