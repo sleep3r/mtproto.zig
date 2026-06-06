@@ -597,7 +597,7 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
 | 7 | `health-readiness-endpoints` (WS6) | `/healthz` + `/readyz` on the metrics server (loop heartbeat + drain flag; not gated on middleproxy) | `6e5af77` |
 | 8 | `systemd-notify-watchdog` (WS6) | native dependency-free sd_notify; `Type=notify` + `WatchdogSec=30` on all proxy units + encoding test | `a474509`, `7ea731f` |
 | 9 | `systemd-seccomp-hardening` (WS5) | proxy unit: `SystemCallFilter=@system-service`, `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `ProtectKernel*`, `ProtectProc`, … (3 unit copies); tunnel unit gets the device/netlink-safe subset | `a474509`, `7ea731f` |
-| 10 | `verify-thirdparty-install-supplychain` (WS5) | `uv` pinned 0.11.19 + `.sha256` verify; Python deps pinned exact; `zapret` pinned tag v72.12 + commit check | `47da6f7` |
+| 10 | `verify-thirdparty-install-supplychain` (WS5) | `uv` pinned 0.11.19 + `.sha256` verify; Python deps pinned exact. **zapret is deliberately NOT frozen** — it's the DPI-bypass engine, so it clones the *latest release tag* (resolved at install, offline fallback) instead of raw HEAD, staying current with DPI evolution | `47da6f7`, `<this>` |
 | 11 | `mp-quickack-abridged-reversal` (WS7) | **confirmed bug fixed** vs reference: byte-reverse the abridged `RPC_SIMPLE_ACK` confirm; `relaySimpleAck` + golden test | `c91ac94` |
 | 12 | `safety-on-wire-parsers` (WS5) | proxy data plane built **ReleaseSafe** by default (`-Ddataplane_safety`, default on); mtbuddy/bench unchanged | `5090f60` |
 | 13 | `binary-exploit-mitigations` (WS5) | proxy built **PIE** (ASLR; verified `e_type=DYN`); full RELRO already default | `6fa730c` |

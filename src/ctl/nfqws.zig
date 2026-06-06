@@ -14,10 +14,13 @@ const Color = tui_mod.Color;
 const SummaryLine = tui_mod.SummaryLine;
 
 const ZAPRET_DIR = "/opt/zapret";
-/// Pinned zapret release: clone this tag (not HEAD) and verify the resolved
-/// commit before building+running it as root with NET_ADMIN. Bump deliberately.
-const ZAPRET_TAG = "v72.12";
-const ZAPRET_COMMIT = "5cc46a9815b00e97401b1459984dff44abfec411";
+/// zapret is the DPI-bypass engine — it must track DPI evolution, so we clone the
+/// LATEST release tag (resolved at install time), not a frozen commit and not raw
+/// HEAD (which can be a broken mid-development commit). This is deliberately NOT a
+/// supply-chain pin like uv / the Python deps: freezing the bypass engine freezes
+/// the bypass. ZAPRET_FALLBACK_TAG is used only when the latest tag can't be
+/// resolved (e.g. offline) so the install still succeeds with a known-good release.
+const ZAPRET_FALLBACK_TAG = "v72.12";
 const SERVICE_NAME = "nfqws-mtproto";
 const NFQUEUE_NUM = "200";
 const INSTALL_DIR = "/opt/mtproto-proxy";
@@ -142,27 +145,17 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     } else {
         const cc = chooseWorkingCCompiler(ui, allocator) orelse return;
 
-        ui.step("Cloning and building zapret (" ++ ZAPRET_TAG ++ ")...");
+        // Clone the newest release tag (falls back to a known-good one offline) so
+        // the bypass engine stays current with DPI changes, while avoiding raw HEAD.
+        var tag_buf: [64]u8 = undefined;
+        const tag = resolveLatestZapretTag(allocator, &tag_buf) orelse ZAPRET_FALLBACK_TAG;
+
+        var step_buf: [96]u8 = undefined;
+        ui.step(std.fmt.bufPrint(&step_buf, "Cloning and building zapret ({s})...", .{tag}) catch "Cloning and building zapret...");
         _ = sys.exec(allocator, &.{ "rm", "-rf", ZAPRET_DIR }) catch {};
         if (!runLogged(ui, allocator, &.{
-            "git", "clone", "--branch", ZAPRET_TAG, "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
+            "git", "clone", "--branch", tag, "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
         }, "Failed to clone zapret")) return;
-
-        // Supply-chain pin: refuse to build+run (as root, NET_ADMIN) unless the
-        // cloned tag resolves to the exact reviewed commit. Guards against a
-        // moved/retagged release.
-        const rev = sys.exec(allocator, &.{ "git", "-C", ZAPRET_DIR, "rev-parse", "HEAD" }) catch null;
-        if (rev) |r| {
-            defer r.deinit();
-            const got = std.mem.trim(u8, r.stdout, " \t\r\n");
-            if (!std.mem.eql(u8, got, ZAPRET_COMMIT)) {
-                ui.fail("zapret commit mismatch (" ++ ZAPRET_TAG ++ ") — refusing to build untrusted code");
-                return;
-            }
-        } else {
-            ui.fail("Could not verify zapret commit — refusing to build");
-            return;
-        }
 
         _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
         var make_cmd_buf: [128]u8 = undefined;
@@ -302,6 +295,30 @@ fn iptablesCommands() IptablesCommands {
         .iptables_save = sys.commandOrPath("iptables-save", &.{ "/usr/sbin/iptables-save", "/sbin/iptables-save" }),
         .ip6tables_save = sys.commandOrPath("ip6tables-save", &.{ "/usr/sbin/ip6tables-save", "/sbin/ip6tables-save" }),
     };
+}
+
+/// Resolve the newest zapret release tag (highest vX.Y) from the remote without
+/// the GitHub API (works wherever `git clone` does). Returns a slice into `buf`,
+/// or null if the remote is unreachable / no tag found (caller falls back to a
+/// known-good tag). The tag is passed to `git clone --branch` as a distinct argv
+/// element (no shell), and is additionally sanity-checked to be a vX.Y string.
+fn resolveLatestZapretTag(allocator: std.mem.Allocator, buf: []u8) ?[]const u8 {
+    const r = sys.exec(allocator, &.{
+        "bash",                                                                                                "-c",
+        "git ls-remote --tags --refs --sort=-v:refname https://github.com/bol-van/zapret.git 'v*' | head -n1",
+    }) catch return null;
+    defer r.deinit();
+    if (r.exit_code != 0) return null;
+    const line = std.mem.trim(u8, r.stdout, " \t\r\n");
+    const marker = "refs/tags/";
+    const idx = std.mem.indexOf(u8, line, marker) orelse return null;
+    const tag = line[idx + marker.len ..];
+    if (tag.len == 0 or tag.len > buf.len or tag[0] != 'v') return null;
+    for (tag) |ch| {
+        if (!((ch >= '0' and ch <= '9') or ch == '.' or ch == 'v')) return null;
+    }
+    @memcpy(buf[0..tag.len], tag);
+    return buf[0..tag.len];
 }
 
 fn chooseWorkingCCompiler(ui: *Tui, allocator: std.mem.Allocator) ?[]const u8 {
