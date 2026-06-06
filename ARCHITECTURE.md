@@ -111,10 +111,27 @@ in `server-random`. Two hard constraints follow:
    accepted residual.
 
 **Masking / active probes** are independent of the link: non-validating (no-secret)
-traffic is forwarded to the mask target, which should be the **real** `tls_domain:443`
-(`mask_port=443`) so a prober sees the genuine site + a CA-chained cert. A local
-self-signed nginx (`mask_port=8443`) serves a self-signed cert for a domain the
-operator does not own — a decisive active-probe tell — and should be avoided.
+traffic is transparently relayed to the mask target. Field-verified behavior
+(against a live tunnel-mode deployment):
+
+- Fronting the **real** domain (`mask_port=443` → `tls_domain:443`) makes a prober
+  see the genuine site + a CA-chained cert — **verified working** for a single-round
+  domain (probing the proxy fronting `rutube.ru` returned its real GlobalSign cert).
+  This requires the proxy to resolve the domain — see the DNS note below.
+- It only works for domains whose TLS 1.3 is **single-round x25519**. Our relay
+  carries a single ClientHello↔ServerHello exchange, **not** a `HelloRetryRequest`
+  multi-round. Fronting an HRR domain (e.g. `wb.ru`) yields an *incomplete* handshake
+  (no certificate) — worse than a complete one. This is the same reason such domains
+  are poor fronting targets (see `tls_domain` above).
+- A local **self-signed nginx** (`mask_port=8443`) serves a self-signed cert — an
+  active-probe tell — but completes a handshake. So when a deployment is locked to an
+  HRR domain (the link is immutable), local nginx is the **least-bad** fallback (a
+  complete self-signed handshake beats an incomplete real-domain one).
+
+> DNS note: real-domain fronting needs hostname resolution. Zig's std resolver throws
+> `ResolvConfParseFailed` on a `/etc/resolv.conf` with no trailing newline (common on
+> SolusVM/VPS images), which silently disables all hostname masking; `getAddressList`
+> falls back to `getent` (NSS) to tolerate that.
 
 ## MiddleProxy (media / ad-tag relay)
 
