@@ -200,7 +200,7 @@ sudo mtbuddy config doctor
 sudo mtbuddy config doctor --network
 sudo mtbuddy config print-effective
 
-# Print Telegram proxy links from config.toml (FakeTLS ee + secure dd; sensitive output)
+# Print Telegram proxy links from config.toml (FakeTLS ee by default; +dd when fake_tls_only=false; sensitive output)
 sudo mtbuddy links
 sudo mtbuddy links --server proxy.example.com --config /opt/mtproto-proxy/config.toml
 

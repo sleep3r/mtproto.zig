@@ -135,13 +135,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         _ = sys.execForward(&.{ "systemctl", "try-reload-or-restart", "nginx" }) catch {};
     }
 
-    // 6. Clear the TCPMSS=88 SYN/ACK clamp the installer set. The install rule
+    // 6. Clear the TCPMSS SYN/ACK clamp the installer set. The install rule
     //    carries `--sport <port>`, so a `-D` without it never matches. List the
     //    live rules and replay them as deletes (exact match), for BOTH IPv4 and
     //    IPv6, then re-persist rules.v4/v6 so the clamp doesn't return on reboot.
+    //    Match any `--set-mss <n>` (not just the default 88) so a custom
+    //    `--tcpmss <n>` clamp is also removed.
     const tcpmss_cleanup =
         \\for ipt in iptables ip6tables; do
-        \\  "$ipt" -t mangle -S OUTPUT 2>/dev/null | grep -- '--set-mss 88' | while read -r line; do
+        \\  "$ipt" -t mangle -S OUTPUT 2>/dev/null | grep -E -- '-j TCPMSS --set-mss [0-9]+' | while read -r line; do
         \\    rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
         \\    "$ipt" -t mangle $rule 2>/dev/null || true
         \\  done

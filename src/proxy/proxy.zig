@@ -707,7 +707,11 @@ pub const CloseReason = enum(u8) {
         if (has(reason, "connect") or has(reason, "upstream") or has(reason, "candidate") or has(reason, "relay ") or has(reason, "dc tail") or has(reason, "middleproxy")) return .upstream_error;
         if (has(reason, "epoll") or has(reason, "interest") or has(reason, "desync") or has(reason, "fd map")) return .epoll_error;
         if (has(reason, "read error")) return .client_error;
-        return .internal_error;
+        // Only reasons that actually signal an error map to internal_error; any
+        // other unmatched (benign/uncategorized) close lands in .other so the
+        // internal_error counter stays meaningful for operators.
+        if (has(reason, "error") or has(reason, "fail")) return .internal_error;
+        return .other;
     }
 };
 
@@ -724,6 +728,9 @@ test "CloseReason.classify buckets the evasion signals precisely" {
     try std.testing.expectEqual(CloseReason.client_eof, CloseReason.classify("client eof before tls header"));
     try std.testing.expectEqual(CloseReason.upstream_error, CloseReason.classify("connect failed"));
     try std.testing.expectEqual(CloseReason.shutdown, CloseReason.classify("shutdown"));
+    // Genuine errors → internal_error; benign/uncategorized reasons → other.
+    try std.testing.expectEqual(CloseReason.internal_error, CloseReason.classify("metrics thread error"));
+    try std.testing.expectEqual(CloseReason.other, CloseReason.classify("graceful drain"));
 }
 
 pub const ProxyState = struct {

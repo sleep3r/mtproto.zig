@@ -106,7 +106,7 @@ fn writeCurlProxyConfig(
     path_buf: []u8,
     content_buf: []u8,
 ) ![]const u8 {
-    const path = std.fmt.bufPrint(path_buf, "/tmp/.mtproxy-curl-{d}.conf", .{std.os.linux.getpid()}) catch
+    const path = std.fmt.bufPrint(path_buf, "/tmp/.mtproxy-curl-{d}.conf", .{std.posix.getpid()}) catch
         return error.CurlConfigPathTooLong;
 
     const header = std.fmt.bufPrint(content_buf, "proxy = \"{s}://{s}\"\nproxy-user = \"", .{ scheme, endpoint }) catch
