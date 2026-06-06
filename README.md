@@ -68,7 +68,7 @@ We chose Zig because it provides the raw performance and micro-footprint of C, b
 |---|---|
 | **Fake TLS 1.3** | Connections look like normal HTTPS to DPI |
 | **DRS** | Mimics Chrome/Firefox TLS record sizes |
-| **Active-probe masking** | If a censor probes your server, it gets a real TLS handshake from a local web backend (or the genuine site, when you own the domain) instead of a tell-tale silent proxy |
+| **Active-probe masking** | If a censor probes your server, it gets a real TLS handshake from a local web backend (a real cert if you own the domain, else self-signed) instead of a tell-tale silent proxy. Optional: front the real `tls_domain:443` for single-round-x25519 domains |
 | **TCPMSS=88** | Fragments ClientHello across 6 TCP packets, breaking DPI reassembly |
 | **nfqws TCP desync** | Sends fake packets + TTL-limited splits to confuse stateful DPI |
 | **Split-TLS** | 1-byte Application records to defeat passive signatures |
@@ -154,7 +154,7 @@ sudo mtbuddy --interactive
 |---|---|---|
 | `--port, -p` | `443` | Proxy listen port |
 | `--public-port` | — | Port advertised in generated Telegram links |
-| `--domain, -d` | `rutube.ru` | TLS masking domain |
+| `--domain, -d` | `rutube.ru` | TLS masking domain (⚠️ **immutable** — see note below) |
 | `--secret, -s` | auto | User secret (32 hex chars) |
 | `--user, -u` | `user` | Username in `config.toml` |
 | `--config, -c` | — | Use existing `config.toml` file |
@@ -170,6 +170,10 @@ sudo mtbuddy --interactive
 | `--ipv6-hop` | — | Enable IPv6 auto-hopping |
 | `--version, -v <tag>` | `latest` | Release version to install |
 | `--insecure` | — | Allow unsigned assets (not recommended) |
+
+> ⚠️ **Pick `--domain` once.** The tg:// links embed `tls_domain`, so changing it on a
+> live deployment (including via `mtbuddy setup masking --domain …`) **invalidates every
+> link you've already shared.** See [ARCHITECTURE.md](ARCHITECTURE.md) / [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ---
 
@@ -378,7 +382,7 @@ tag = ""                  # Optional: promotion tag from @MTProxybot
 tls_domain = "rutube.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host (Docker/remote Nginx)
-mask_port = 443           # 443 = forward probes to the real tls_domain (secure default); 8443 = local Nginx backend
+mask_port = 8443          # 8443 = local Nginx backend (what mtbuddy installs); 443 = front the real tls_domain (opt-in, single-round-x25519 domains only)
 fast_mode = true          # Recommended: delegates S2C AES to the DC, saves CPU/RAM
 drs = true                # Dynamic Record Sizing (mimics Chrome/Firefox)
 

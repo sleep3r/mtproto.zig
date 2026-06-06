@@ -68,7 +68,7 @@ Zig даёт производительность и минимальный foot
 |---|---|
 | **Fake TLS 1.3** | Соединения выглядят как обычный HTTPS |
 | **DRS** | Имитирует размеры TLS-record у Chrome/Firefox |
-| **Zero-RTT masking** | Активные пробы перенаправляются на реальный бэкенд — на сам домен фронтинга (`tls_domain:443`, безопасный дефолт) или на локальный Nginx, если домен ваш — так пробер видит настоящий сайт |
+| **Маскировка от активных проб** | Если цензор проверяет ваш сервер, он получает настоящий TLS-хендшейк от локального веб-бэкенда (реальный серт, если домен ваш, иначе self-signed), а не молчащий прокси. Опционально: фронтить реальный `tls_domain:443` для доменов с одноходовым x25519 |
 | **TCPMSS=88** | Дробит ClientHello на маленькие TCP-пакеты |
 | **nfqws TCP desync** | Fake packets + TTL-limited splits против stateful DPI |
 | **Split-TLS** | 1-байтовые Application records против пассивных сигнатур |
@@ -149,7 +149,7 @@ sudo mtbuddy --interactive
 |---|---|---|
 | `--port, -p` | `443` | Порт прокси |
 | `--public-port` | — | Порт, который будет указан в Telegram-ссылках |
-| `--domain, -d` | `rutube.ru` | Домен TLS-маскировки |
+| `--domain, -d` | `rutube.ru` | Домен TLS-маскировки (⚠️ **неизменен** — см. примечание ниже) |
 | `--secret, -s` | auto | User secret, 32 hex chars |
 | `--user, -u` | `user` | Имя пользователя в `config.toml` |
 | `--config, -c` | — | Использовать существующий `config.toml` |
@@ -164,6 +164,10 @@ sudo mtbuddy --interactive
 | `--ipv6-hop` | — | Включить IPv6 auto-hopping |
 | `--version, -v <tag>` | `latest` | Версия релиза |
 | `--insecure` | — | Разрешить unsigned assets (не рекомендуется) |
+
+> ⚠️ **Выберите `--domain` один раз.** tg://-ссылки вшивают `tls_domain`, поэтому смена
+> домена на живом сервере (в т.ч. через `mtbuddy setup masking --domain …`)
+> **инвалидирует все уже розданные ссылки.** См. [ARCHITECTURE.md](ARCHITECTURE.md) / [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ---
 
@@ -324,6 +328,8 @@ password = "secret"
 
 > **Важно:** через upstream маршрутизируется трафик к DC и refresh MiddleProxy metadata (`getProxyConfig` / `getProxySecret`). Mask/camouflage-соединения всегда идут напрямую.
 
+> **О зависимостях:** «ноль зависимостей» верно для дефолтного `auto`/`direct`. В режимах `socks5`, `http` или `tunnel` refresh метаданных MiddleProxy вызывает `curl`, поэтому `curl` должен быть установлен на хосте (штатный установщик ставит его сам).
+
 ---
 
 ## Конфигурация
@@ -360,7 +366,7 @@ tag = ""                  # Optional: promotion tag from @MTProxybot
 tls_domain = "rutube.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host для Docker/remote Nginx
-mask_port = 443           # 443 = пробы уходят на реальный tls_domain (безопасный дефолт); 8443 = локальный Nginx
+mask_port = 8443          # 8443 = локальный Nginx (так ставит mtbuddy); 443 = фронт реального tls_domain (опционально, только домены с одноходовым x25519)
 fast_mode = true
 drs = true
 
