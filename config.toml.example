@@ -53,6 +53,14 @@ port = 443
 # raising this does NOT increase idle memory — slots are created on demand.
 # max_connections = 65535
 
+# SO_REUSEPORT epoll worker threads. 1 (default) = the classic single-threaded
+# loop, behavior identical to before. 0 = auto (one per CPU). >1 spreads the
+# relay/crypto load across cores; the kernel load-balances connections across
+# workers, and max_connections stays the global total (split across workers).
+# Opt-in: validate under real load before relying on >1. NOTE: with workers > 1,
+# SIGHUP config reload is refused (restart to apply config changes).
+# workers = 1
+
 # Seconds to wait for the first byte from a new client before dropping.
 # Keep high (300) to accommodate mobile pre-warmed connection pools.
 # idle_timeout_sec = 300
