@@ -25,33 +25,34 @@
     <div class="header-right">
       <div class="badge" id="statusBadge"><div class="pulse-dot"></div><span id="proxyUp">—</span></div>
       <div class="badge data-badge syncing" id="dataBadge"><div class="pulse-dot"></div><span id="dataBadgeText">Syncing...</span></div>
+      <button id="langToggle" class="ui-btn" type="button" title="Language / Язык">RU</button>
       <div class="poll-controls">
-        <label for="pollInterval">Refresh</label>
+        <label for="pollInterval" data-i18n="header.refresh">Refresh</label>
         <select id="pollInterval" class="ui-select">
           <option value="1000">1s</option>
           <option value="3000" selected>3s</option>
           <option value="5000">5s</option>
           <option value="10000">10s</option>
         </select>
-        <button id="pollToggle" class="ui-btn" type="button">Pause</button>
+        <button id="pollToggle" class="ui-btn" type="button" data-i18n="btn.pause">Pause</button>
       </div>
       <div class="meta">PID <b id="proxyPid">—</b> · <b id="proxyRss">—</b></div>
-      <div class="meta">Uptime <b id="srvUptime">—</b></div>
-      <div class="meta">Last update <b id="lastUpdate">never</b></div>
+      <div class="meta"><span data-i18n="header.uptime">Uptime</span> <b id="srvUptime">—</b></div>
+      <div class="meta"><span data-i18n="header.lastUpdate">Last update</span> <b id="lastUpdate">never</b></div>
     </div>
   </div>
 
   <!-- Status hero: the one-glance "is everything OK?" answer -->
   <div id="statusHero" style="margin:0 0 16px;padding:14px 18px;border-radius:10px;display:flex;align-items:center;gap:12px;font-size:15px;font-weight:600;border:1px solid var(--border);background:rgba(127,127,127,0.06);">
     <span id="statusHeroIcon" style="font-size:20px;">•</span>
-    <span id="statusHeroText">Checking…</span>
+    <span id="statusHeroText" data-i18n="hero.checking">Checking…</span>
   </div>
 
   <!-- Metrics -->
   <div class="grid">
     <!-- CPU -->
     <div class="card col-3">
-      <div class="card-label">⬡ CPU</div>
+      <div class="card-label" data-i18n="card.cpu">⬡ CPU</div>
       <div class="gauge-container">
         <div class="gauge">
           <svg viewBox="0 0 36 36">
@@ -63,7 +64,7 @@
         </div>
         <div>
           <div class="card-value" style="color:var(--zig)" id="cpuVal">0<span style="font-size:18px;font-weight:400">%</span></div>
-          <div class="card-sub">utilization</div>
+          <div class="card-sub" data-i18n="card.cpuSub">utilization</div>
         </div>
       </div>
       <div class="spark-wrap"><canvas id="cpuSpark"></canvas></div>
@@ -71,7 +72,7 @@
 
     <!-- Memory -->
     <div class="card col-3">
-      <div class="card-label">◈ Memory</div>
+      <div class="card-label" data-i18n="card.memory">◈ Memory</div>
       <div class="gauge-container">
         <div class="gauge">
           <svg viewBox="0 0 36 36">
@@ -91,7 +92,7 @@
 
     <!-- Network -->
     <div class="card col-6">
-      <div class="card-label">◎ Network Throughput</div>
+      <div class="card-label" data-i18n="card.network">◎ Network Throughput</div>
       <div class="chart-wrap"><canvas id="netChart"></canvas></div>
       <div class="chart-legend">
         <span><div class="ldot" style="background:var(--green)"></div>RX <b id="rxRate">—</b></span>
@@ -105,15 +106,15 @@
   <div class="stat-row">
     <div class="stat-cell">
       <div class="val" style="color:var(--green)" id="pxActive">0</div>
-      <div class="lbl">Active / <span id="pxMax">0</span></div>
+      <div class="lbl"><span data-i18n="stats.activeOf">Active /</span> <span id="pxMax">0</span></div>
     </div>
     <div class="stat-cell">
       <div class="val" style="color:var(--cyan)" id="pxHs">0</div>
-      <div class="lbl">Handshakes</div>
+      <div class="lbl" data-i18n="stats.handshakes">Handshakes</div>
     </div>
     <div class="stat-cell">
       <div class="val" style="color:var(--text)" id="pxTotal">0</div>
-      <div class="lbl">Total Connections</div>
+      <div class="lbl" data-i18n="stats.total">Total Connections</div>
     </div>
     <div class="stat-cell">
       <div class="val" id="pxDrops" style="color:var(--text-muted)">0</div>
@@ -124,10 +125,10 @@
   <!-- Users -->
   <div class="users-card" id="usersCard" style="display:none">
     <div class="users-head">
-      <div class="title">👥 Users</div>
+      <div class="title" data-i18n="users.title">👥 Users</div>
       <div class="users-head-right">
         <div class="users-meta" id="usersMeta">—</div>
-        <button class="ui-btn add-user-btn" id="addUserBtn" type="button">+ Add User</button>
+        <button class="ui-btn add-user-btn" id="addUserBtn" type="button" data-i18n="users.add">+ Add User</button>
       </div>
     </div>
     <div class="users-note" id="usersNote">—</div>
@@ -136,16 +137,16 @@
     <div class="add-user-form" id="addUserForm" style="display:none">
       <div class="form-row">
         <div class="form-field">
-          <label>Who is this for?</label>
-          <input id="newUserName" class="ui-input" type="text" placeholder="e.g. Мама, dad, work 💼" autocomplete="off">
+          <label data-i18n="users.who">Who is this for?</label>
+          <input id="newUserName" class="ui-input" type="text" data-i18n-ph="users.namePh" placeholder="e.g. Мама, dad, work 💼" autocomplete="off">
         </div>
         <div class="form-field">
-          <label>Secret <span class="form-hint">(leave empty to auto-generate)</span></label>
-          <input id="newUserSecret" class="ui-input" type="text" placeholder="Leave blank — we'll create one for you" autocomplete="off">
+          <label><span data-i18n="users.secret">Secret</span> <span class="form-hint" data-i18n="users.secretHint">(leave empty to auto-generate)</span></label>
+          <input id="newUserSecret" class="ui-input" type="text" data-i18n-ph="users.secretPh" placeholder="Leave blank — we'll create one for you" autocomplete="off">
         </div>
         <div class="form-actions">
-          <button class="ui-btn active" id="addUserSubmit" type="button">Create</button>
-          <button class="ui-btn" id="addUserCancel" type="button">Cancel</button>
+          <button class="ui-btn active" id="addUserSubmit" type="button" data-i18n="btn.create">Create</button>
+          <button class="ui-btn" id="addUserCancel" type="button" data-i18n="btn.cancel">Cancel</button>
         </div>
       </div>
       <div class="form-status" id="addUserStatus"></div>
@@ -158,13 +159,13 @@
   <div class="tunnel-card" id="routingCard" style="display:none">
     <div class="tunnel-header">
       <div class="tunnel-icon">🧭</div>
-      <div class="tunnel-title">Routing &amp; Upstream</div>
+      <div class="tunnel-title" data-i18n="routing.title">Routing &amp; Upstream</div>
       <div class="badge" id="routingBadge"><div class="pulse-dot"></div><span id="routingStatus">—</span></div>
     </div>
     <div class="routing-controls">
       <button class="ui-btn" id="routingMiddleBtn" type="button">MiddleProxy: —</button>
       <div class="routing-upstream-ctl">
-        <label for="routingUpstreamSelect">Upstream</label>
+        <label for="routingUpstreamSelect" data-i18n="routing.upstream">Upstream</label>
         <select id="routingUpstreamSelect" class="ui-select">
           <option value="auto">auto</option>
           <option value="direct">direct</option>
@@ -172,23 +173,23 @@
           <option value="socks5">socks5</option>
           <option value="http">http</option>
         </select>
-        <button class="ui-btn active" id="routingUpstreamApply" type="button">Apply</button>
+        <button class="ui-btn active" id="routingUpstreamApply" type="button" data-i18n="btn.apply">Apply</button>
       </div>
       <div class="routing-extra-ctl" id="routingTunnelCtl" style="display:none">
-        <label for="routingTunnelIfaceSelect">Tunnel pin</label>
+        <label for="routingTunnelIfaceSelect" data-i18n="routing.tunnelPin">Tunnel pin</label>
         <select id="routingTunnelIfaceSelect" class="ui-select"></select>
-        <button class="ui-btn" id="routingTunnelIfaceApply" type="button">Pin</button>
+        <button class="ui-btn" id="routingTunnelIfaceApply" type="button" data-i18n="btn.pin">Pin</button>
       </div>
       <div class="routing-extra-ctl" id="routingProxyCtl" style="display:none">
-        <label id="routingProxyHostLabel" for="routingProxyHost">Proxy host</label>
+        <label id="routingProxyHostLabel" for="routingProxyHost" data-i18n="routing.proxyHost">Proxy host</label>
         <input id="routingProxyHost" class="ui-input routing-host" type="text" placeholder="127.0.0.1" autocomplete="off">
-        <label for="routingProxyPort">Port</label>
+        <label for="routingProxyPort" data-i18n="routing.port">Port</label>
         <input id="routingProxyPort" class="ui-input routing-port" type="number" min="1" max="65535" placeholder="1080" autocomplete="off">
-        <label for="routingProxyUser">User</label>
+        <label for="routingProxyUser" data-i18n="routing.user">User</label>
         <input id="routingProxyUser" class="ui-input routing-user" type="text" placeholder="optional" autocomplete="off">
-        <label for="routingProxyPass">Pass</label>
+        <label for="routingProxyPass" data-i18n="routing.pass">Pass</label>
         <input id="routingProxyPass" class="ui-input routing-pass" type="password" placeholder="optional" autocomplete="off">
-        <button class="ui-btn" id="routingProxyApply" type="button">Set target</button>
+        <button class="ui-btn" id="routingProxyApply" type="button" data-i18n="btn.setTarget">Set target</button>
       </div>
       <div class="routing-action-note" id="routingActionNote"></div>
     </div>
@@ -198,15 +199,15 @@
         <span class="tunnel-val" id="routingMiddle">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Upstream</span>
+        <span class="tunnel-lbl" data-i18n="routing.upstream">Upstream</span>
         <span class="tunnel-val" id="routingUpstream">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Target</span>
+        <span class="tunnel-lbl" data-i18n="routing.target">Target</span>
         <span class="tunnel-val" id="routingTarget">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Policy</span>
+        <span class="tunnel-lbl" data-i18n="routing.policy">Policy</span>
         <span class="tunnel-val" id="routingPolicy">—</span>
       </div>
     </div>
@@ -217,16 +218,16 @@
   <div class="tunnel-card" id="maskingCard" style="display:none">
     <div class="tunnel-header">
       <div class="tunnel-icon">🧰</div>
-      <div class="tunnel-title">Masking Health</div>
+      <div class="tunnel-title" data-i18n="mask.title">Masking Health</div>
       <div class="badge" id="maskBadge"><div class="pulse-dot"></div><span id="maskStatus">—</span></div>
     </div>
     <div class="tunnel-details">
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Mode</span>
+        <span class="tunnel-lbl" data-i18n="mask.mode">Mode</span>
         <span class="tunnel-val" id="maskMode">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Endpoint</span>
+        <span class="tunnel-lbl" data-i18n="mask.endpoint">Endpoint</span>
         <span class="tunnel-val" id="maskTarget">—</span>
       </div>
       <div class="tunnel-stat">
@@ -234,7 +235,7 @@
         <span class="tunnel-val" id="maskNginx">—</span>
       </div>
       <div class="tunnel-stat">
-        <span class="tunnel-lbl">Health Timer</span>
+        <span class="tunnel-lbl" data-i18n="mask.timer">Health Timer</span>
         <span class="tunnel-val" id="maskTimer">—</span>
       </div>
     </div>
@@ -243,18 +244,18 @@
   <!-- Live logs -->
   <div class="logs-card">
     <div class="logs-header">
-      <div class="title">▸ Live Logs</div>
+      <div class="title" data-i18n="logs.title">▸ Live Logs</div>
       <div class="ws-badge"><div class="ws-dot off" id="wsDot"></div><span id="wsLabel">connecting…</span></div>
     </div>
     <div class="logs-controls">
       <div class="log-filters">
-        <button class="ui-btn log-filter active" type="button" data-filter="error">Error</button>
-        <button class="ui-btn log-filter active" type="button" data-filter="warn">Warn</button>
-        <button class="ui-btn log-filter active" type="button" data-filter="stats">Stats</button>
+        <button class="ui-btn log-filter active" type="button" data-filter="error" data-i18n="logs.error">Error</button>
+        <button class="ui-btn log-filter active" type="button" data-filter="warn" data-i18n="logs.warn">Warn</button>
+        <button class="ui-btn log-filter active" type="button" data-filter="stats" data-i18n="logs.stats">Stats</button>
       </div>
-      <input id="logSearch" class="ui-input log-search" type="search" placeholder="Search logs">
+      <input id="logSearch" class="ui-input log-search" type="search" data-i18n-ph="logs.searchPh" placeholder="Search logs">
       <button class="ui-btn active" id="autoScrollBtn" type="button">Auto-scroll: on</button>
-      <button class="ui-btn" id="jumpLatestBtn" type="button">Jump to latest</button>
+      <button class="ui-btn" id="jumpLatestBtn" type="button" data-i18n="logs.jumpLatest">Jump to latest</button>
     </div>
     <div class="logs-body" id="logsBody"></div>
   </div>
@@ -267,21 +268,21 @@
   <!-- Delete confirmation modal -->
   <div class="modal-overlay" id="deleteModal" style="display:none">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
-      <div class="modal-title" id="deleteModalTitle">Delete User</div>
+      <div class="modal-title" id="deleteModalTitle" data-i18n="modal.deleteUser">Delete User</div>
       <div class="modal-body">
         Are you sure you want to delete <b id="deleteUserName"></b>?
-        <br><span class="form-hint">The proxy will be restarted to apply changes.</span>
+        <br><span class="form-hint" data-i18n="modal.restartNote">The proxy will be restarted to apply changes.</span>
       </div>
       <div class="modal-actions">
-        <button class="ui-btn danger" id="deleteConfirm" type="button">Delete</button>
-        <button class="ui-btn" id="deleteCancel" type="button">Cancel</button>
+        <button class="ui-btn danger" id="deleteConfirm" type="button" data-i18n="btn.delete">Delete</button>
+        <button class="ui-btn" id="deleteCancel" type="button" data-i18n="btn.cancel">Cancel</button>
       </div>
     </div>
   </div>
 
   <div class="modal-overlay" id="deleteTunnelModal" style="display:none">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteTunnelTitle">
-      <div class="modal-title" id="deleteTunnelTitle">Delete Tunnel</div>
+      <div class="modal-title" id="deleteTunnelTitle" data-i18n="modal.deleteTunnel">Delete Tunnel</div>
       <div class="modal-body">
         Delete <b id="deleteTunnelName"></b> from the tunnel pool?
         <br><span class="form-hint">The interface will be stopped, config files removed, and proxy routing refreshed.</span>
