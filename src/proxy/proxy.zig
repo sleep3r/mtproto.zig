@@ -729,7 +729,7 @@ test "CloseReason.classify buckets the evasion signals precisely" {
     try std.testing.expectEqual(CloseReason.upstream_error, CloseReason.classify("connect failed"));
     try std.testing.expectEqual(CloseReason.shutdown, CloseReason.classify("shutdown"));
     // Genuine errors → internal_error; benign/uncategorized reasons → other.
-    try std.testing.expectEqual(CloseReason.internal_error, CloseReason.classify("metrics thread error"));
+    try std.testing.expectEqual(CloseReason.internal_error, CloseReason.classify("config parse failure"));
     try std.testing.expectEqual(CloseReason.other, CloseReason.classify("graceful drain"));
 }
 
