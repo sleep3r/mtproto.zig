@@ -620,7 +620,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         masking.execute(ui, allocator, .{ .tls_domain = opts.tls_domain }) catch {
             ui.warn("Masking setup failed");
         };
-        summary_opts.enable_masking = sys.fileExists("/etc/nginx/sites-enabled/mtproto-masking") and sys.isServiceActive("nginx");
+        // Source of truth is the config (mask=true), not a local nginx site: the
+        // secure real-domain-fronting path enables masking WITHOUT a local nginx,
+        // and was previously mis-reported as "masking disabled".
+        summary_opts.enable_masking = configMaskEnabled(allocator);
         if (!summary_opts.enable_masking) {
             ui.warn("Masking setup did not complete; final summary will show it disabled.");
         }
@@ -1069,6 +1072,18 @@ fn commandAvailable(name: []const u8, candidates: []const []const u8) bool {
         if (sys.fileExists(candidate)) return true;
     }
     return false;
+}
+
+/// True when the installed config has masking enabled — via a local nginx backend
+/// OR real-domain fronting to tls_domain:443 (the secure default when no
+/// owned-domain cert is available, which never creates a local nginx site). The
+/// config (`mask = true`) is the source of truth; probing for an nginx site would
+/// wrongly report the real-domain-fronting path as "masking disabled".
+fn configMaskEnabled(allocator: std.mem.Allocator) bool {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return false;
+    defer doc.deinit();
+    const v = doc.get("censorship", "mask") orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, v, " \t\"'"), "true");
 }
 
 fn userExists(allocator: std.mem.Allocator, name: []const u8) bool {

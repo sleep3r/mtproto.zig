@@ -55,7 +55,7 @@ It also ships more evasion techniques than any of the above:
 |---|---|
 | **Fake TLS 1.3** | Connections look like normal HTTPS to DPI |
 | **DRS** | Mimics Chrome/Firefox TLS record sizes |
-| **Zero-RTT masking** | Local Nginx serves real TLS responses to active probes, defeating timing analysis |
+| **Zero-RTT masking** | Active probes are forwarded to a real backend — the fronted `tls_domain:443` (secure default) or a local Nginx when you own the domain — so probers see a genuine site |
 | **TCPMSS=88** | Fragments ClientHello across 6 TCP packets, breaking DPI reassembly |
 | **nfqws TCP desync** | Sends fake packets + TTL-limited splits to confuse stateful DPI |
 | **Split-TLS** | 1-byte Application records to defeat passive signatures |
@@ -360,7 +360,7 @@ tag = ""                  # Optional: promotion tag from @MTProxybot
 tls_domain = "wb.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host (Docker/remote Nginx)
-mask_port = 8443          # 8443 for local Nginx zero-RTT masking
+mask_port = 443           # 443 = forward probes to the real tls_domain (secure default); 8443 = local Nginx backend
 fast_mode = true          # Recommended: delegates S2C AES to the DC, saves CPU/RAM
 drs = true                # Dynamic Record Sizing (mimics Chrome/Firefox)
 

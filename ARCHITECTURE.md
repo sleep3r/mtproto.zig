@@ -30,8 +30,12 @@ deployment. This document is the in-repo architecture reference; the public stab
   on-demand, not embedded in idle slots.
 - **Shared state** (`ProxyState`) holds config, the middle-proxy snapshot (behind an RW lock), and all
   global counters as `std.atomic.Value` — already multi-core-safe for the planned SO_REUSEPORT worker
-  model (see ROADMAP WS1). Per-EventLoop state (pool, replay cache, flood guard, subnet limiter) is
-  shared-nothing.
+  model (see ROADMAP WS1). Per-EventLoop state (connection pool, flood guard, subnet limiter) is
+  shared-nothing. **Exception**: the replay cache lives in `ProxyState` (shared), and the flood
+  guard/subnet limiter are per-EventLoop — so for the planned multi-core worker model these three
+  guards need the `shared-state-multicore` work (shared striped-locked replay cache + per-IP steering)
+  before they are correct under N workers. They are *not* on the per-byte relay path, so contention is
+  bounded to the handshake.
 - **Background threads**: a middle-proxy metadata updater and the metrics server run as detached
   threads reading atomics/snapshots; they never touch the per-byte relay path.
 
@@ -88,11 +92,18 @@ Source: `src/ctl/`. Interactive TUI (raw terminal, arrow-key nav, EN/RU i18n).
 | `install.zig` / `update.zig` / `uninstall.zig` | Install / signed self-update / clean removal |
 | `tunnel.zig` | AmneziaWG tunnel + SO_MARK policy routing |
 | `dashboard.zig` | FastAPI dashboard installer (pinned+verified `uv` + pinned deps) |
-| `masking.zig` / `nfqws.zig` / `recovery.zig` | Masking backend / zapret desync (pinned tag) / recovery |
+| `masking.zig` / `nfqws.zig` / `recovery.zig` | Masking backend / zapret desync (latest release tag) / recovery |
 | `release.zig` / `links.zig` / `i18n.zig` | Unit/asset generation / tg:// link builder / localization |
 
-Third-party install artifacts are pinned and verified: `uv` (version + published `.sha256`), Python
-deps (exact versions), `zapret` (tag + commit check).
+Third-party install artifacts: `uv` is version-pinned and verified against its published `.sha256`,
+and the dashboard's Python deps are exact-version pinned. `zapret`/`nfqws` is treated differently — it
+is the **DPI-bypass engine and must stay current with DPI changes**, so it is *not* frozen: the
+installer clones the **latest release tag** (resolved via `git ls-remote`, with an offline fallback)
+and verifies the clone landed on the commit that tag advertised. This is a deliberate
+freshness-over-pinning trade-off for the evasion engine — it is **not** a signed-tag or in-repo-checksum
+supply-chain pin (it is built and run root-side, so operators should be aware). Stronger options
+(hardcoded `uv` SHA, `--require-hashes` Python lockfile, signed-release verification) are tracked in
+ROADMAP_1.0.md.
 
 ## Deployment layout (server)
 

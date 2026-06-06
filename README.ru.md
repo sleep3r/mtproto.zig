@@ -55,7 +55,7 @@ Zig даёт производительность и минимальный foot
 |---|---|
 | **Fake TLS 1.3** | Соединения выглядят как обычный HTTPS |
 | **DRS** | Имитирует размеры TLS-record у Chrome/Firefox |
-| **Zero-RTT masking** | Локальный Nginx отвечает на активные пробы TLS |
+| **Zero-RTT masking** | Активные пробы перенаправляются на реальный бэкенд — на сам домен фронтинга (`tls_domain:443`, безопасный дефолт) или на локальный Nginx, если домен ваш — так пробер видит настоящий сайт |
 | **TCPMSS=88** | Дробит ClientHello на маленькие TCP-пакеты |
 | **nfqws TCP desync** | Fake packets + TTL-limited splits против stateful DPI |
 | **Split-TLS** | 1-байтовые Application records против пассивных сигнатур |
@@ -346,7 +346,7 @@ tag = ""                  # Optional: promotion tag from @MTProxybot
 tls_domain = "wb.ru"
 mask = true
 # mask_target = "host.docker.internal" # Optional: custom masking backend host для Docker/remote Nginx
-mask_port = 8443
+mask_port = 443           # 443 = пробы уходят на реальный tls_domain (безопасный дефолт); 8443 = локальный Nginx
 fast_mode = true
 drs = true
 

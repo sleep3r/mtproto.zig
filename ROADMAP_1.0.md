@@ -32,10 +32,18 @@ domain the operator doesn't own** — both decisive active-probe distinguishers.
 ServerHello↔domain authenticity story is the moat.
 
 ### The 2026 threat reality (from research; sources in Appendix C)
-- **Russia TSPU** moved from blocklists to AI protocol-fingerprinting. On **2026-04-01** it shipped a
-  `TELEGRAM_TLS` JA3/JA4 signature — but that signature is on the **client ClientHello** (fixed
-  client-side by Telegram-Android PR #1949), **not** our ServerHello. Average **public-proxy lifetime
-  fell to <48h**; TSPU also does active TCP-stream MITM/injection and blocks Cloudflare ECH.
+
+> Provenance note: the **TSPU** specifics below (the `2026-04-01` `TELEGRAM_TLS` signature, <48h proxy
+> lifetime, TCP-stream MITM) are **community- and vendor-reported** (tgvpn.io, teleproxy, HRW) and
+> corroborated client-side by Telegram-Android PR #1949 — treat them as credible field reports, not
+> peer-reviewed measurements. The **GFW** and **Xue'24** claims below *are* from peer-reviewed
+> sources (USENIX). Plan against both, but weight them accordingly.
+
+- **Russia TSPU** reportedly moved from blocklists to AI protocol-fingerprinting. Around **2026-04-01**
+  it is reported to have shipped a `TELEGRAM_TLS` JA3/JA4 signature — but that signature is on the
+  **client ClientHello** (fixed client-side by Telegram-Android PR #1949), **not** our ServerHello.
+  Public-proxy lifetime is reported to have fallen to **<48h**; TSPU is also reported to do active
+  TCP-stream MITM/injection and to block Cloudflare ECH.
 - **GFW** runs a passive fully-encrypted-traffic classifier (first-packet popcount/entropy) — it
   **exempts TLS-looking flows**, so it threatens our opt-in `dd` transport, not FakeTLS.
 - **USENIX'24 (Xue et al.)** detects obfuscated proxies by **encapsulated-TLS-handshake / burst-shape
@@ -577,14 +585,14 @@ FakeTLS identity **proven undetectable in CI** and **measured in the field**, on
 
 ---
 
-# Implementation status — one-pass execution (2026-06)
+## Implementation status — one-pass execution (2026-06)
 
 This section tracks a focused execution pass that closed **everything realistically shippable in a
 single pass without standing up new external systems** (no external monitoring stack, no fleet control
 plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds clean
 (`zig build test` + `x86_64-linux+aes` + `aarch64-linux`) and is committed (no Claude co-author).
 
-## ✅ Done this pass (15 commits)
+### ✅ Done this pass (15 commits)
 
 | # | Item (roadmap ID) | What shipped | Commit |
 |---|---|---|---|
@@ -602,9 +610,9 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
 | 12 | `safety-on-wire-parsers` (WS5) | proxy data plane built **ReleaseSafe** by default (`-Ddataplane_safety`, default on); mtbuddy/bench unchanged | `5090f60` |
 | 13 | `binary-exploit-mitigations` (WS5) | proxy built **PIE** (ASLR; verified `e_type=DYN`); full RELRO already default | `6fa730c` |
 | 14 | `fuzz-targets-core` (WS4) | `std.testing.fuzz` (Smith) targets for TLS/socks5/http_connect parsers — deterministic in CI, coverage-guided under `--fuzz` | `7b64de6` |
-| 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | _this commit_ |
+| 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | *this commit* |
 
-## ⏸️ Investigated but deliberately NOT changed (with reason)
+### ⏸️ Investigated but deliberately NOT changed (with reason)
 
 - **`dc203-direct-fallback-fix` (WS7)** — *investigated, real-but-narrow, not changed.* The MP direct
   fallback IS wired (`mpHandshakeFallbackToDirect` → `fallbackToDirect`) and populated for the common
@@ -621,7 +629,7 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
   and the **quick-ack golden vector** (#11). The Python harness work (incl. the plaintext
   `dpi-mask-probe-byteidentity` mask-path check) needs a Linux e2e env — tracked under WS4.
 
-## ❌ Not attempted this pass — needs new systems / scale / live validation (per the brief)
+### ❌ Not attempted this pass — needs new systems / scale / live validation (per the brief)
 
 Explicitly out of scope for a single no-new-systems pass; these remain the headline roadmap work:
 - **WS1 multi-core**: `reuseport-workers` + `shared-state-multicore` (large coupled change; needs a
@@ -640,7 +648,7 @@ Explicitly out of scope for a single no-new-systems pass; these remain the headl
   use-after-free-avoiding refcount design), `dashboard-scrape-metrics`.
 - **WS9 fleet platform**: `fleet-identity`, `dns-fronting`, `ipv6hop-productize`, etc.
 
-## ⚠️ Needs validation before relying on (un-testable locally)
+### ⚠️ Needs validation before relying on (un-testable locally)
 
 - **systemd `Type=notify` + watchdog** (#8) and the **seccomp/RestrictAddressFamilies** hardening (#9)
   follow the spec and the sd_notify address encoding is unit-tested, but the systemd handshake and the

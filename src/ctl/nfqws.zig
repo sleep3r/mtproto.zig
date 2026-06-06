@@ -148,7 +148,9 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         // Clone the newest release tag (falls back to a known-good one offline) so
         // the bypass engine stays current with DPI changes, while avoiding raw HEAD.
         var tag_buf: [64]u8 = undefined;
-        const tag = resolveLatestZapretTag(allocator, &tag_buf) orelse ZAPRET_FALLBACK_TAG;
+        var sha_buf: [64]u8 = undefined;
+        const ref = resolveLatestZapretTag(allocator, &tag_buf, &sha_buf);
+        const tag = if (ref) |rf| rf.tag else ZAPRET_FALLBACK_TAG;
 
         var step_buf: [96]u8 = undefined;
         ui.step(std.fmt.bufPrint(&step_buf, "Cloning and building zapret ({s})...", .{tag}) catch "Cloning and building zapret...");
@@ -156,6 +158,22 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         if (!runLogged(ui, allocator, &.{
             "git", "clone", "--branch", tag, "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
         }, "Failed to clone zapret")) return;
+
+        // When we resolved the tag from the remote, verify the clone landed on the
+        // exact commit that remote advertised for it (guards against the clone
+        // returning a different commit than ls-remote saw). Built+run root-side, so
+        // refuse to build on mismatch. The offline fallback path has no SHA to check.
+        if (ref) |rf| {
+            const rev = sys.exec(allocator, &.{ "git", "-C", ZAPRET_DIR, "rev-parse", "HEAD" }) catch null;
+            if (rev) |rv| {
+                defer rv.deinit();
+                const got = std.mem.trim(u8, rv.stdout, " \t\r\n");
+                if (!std.mem.eql(u8, got, rf.sha)) {
+                    ui.fail("zapret clone commit does not match the resolved release tag — refusing to build");
+                    return;
+                }
+            }
+        }
 
         _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
         var make_cmd_buf: [128]u8 = undefined;
@@ -297,28 +315,41 @@ fn iptablesCommands() IptablesCommands {
     };
 }
 
-/// Resolve the newest zapret release tag (highest vX.Y) from the remote without
-/// the GitHub API (works wherever `git clone` does). Returns a slice into `buf`,
-/// or null if the remote is unreachable / no tag found (caller falls back to a
-/// known-good tag). The tag is passed to `git clone --branch` as a distinct argv
-/// element (no shell), and is additionally sanity-checked to be a vX.Y string.
-fn resolveLatestZapretTag(allocator: std.mem.Allocator, buf: []u8) ?[]const u8 {
+const ZapretRef = struct { tag: []const u8, sha: []const u8 };
+
+/// Resolve the newest zapret release tag (highest vX.Y) AND the commit it points
+/// to, from the remote without the GitHub API (works wherever `git clone` does).
+/// Returns slices into the caller buffers, or null if the remote is unreachable /
+/// no tag found (caller then falls back to a known-good tag, unverified). The tag
+/// is passed to `git clone --branch` as a distinct argv element (no shell) and is
+/// sanity-checked to a vX.Y string; the SHA lets the caller verify the clone
+/// landed on exactly the commit the remote advertised for that tag. This is a
+/// freshness-preserving consistency check, NOT a frozen pin or signature check.
+fn resolveLatestZapretTag(allocator: std.mem.Allocator, tag_buf: []u8, sha_buf: []u8) ?ZapretRef {
     const r = sys.exec(allocator, &.{
         "bash",                                                                                                "-c",
         "git ls-remote --tags --refs --sort=-v:refname https://github.com/bol-van/zapret.git 'v*' | head -n1",
     }) catch return null;
     defer r.deinit();
     if (r.exit_code != 0) return null;
+    // Output line: "<40-hex-sha>\trefs/tags/<tag>".
     const line = std.mem.trim(u8, r.stdout, " \t\r\n");
+    const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return null;
+    const sha = line[0..tab];
+    if (sha.len < 7 or sha.len > sha_buf.len) return null;
+    for (sha) |ch| {
+        if (!((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'))) return null;
+    }
     const marker = "refs/tags/";
     const idx = std.mem.indexOf(u8, line, marker) orelse return null;
     const tag = line[idx + marker.len ..];
-    if (tag.len == 0 or tag.len > buf.len or tag[0] != 'v') return null;
+    if (tag.len == 0 or tag.len > tag_buf.len or tag[0] != 'v') return null;
     for (tag) |ch| {
         if (!((ch >= '0' and ch <= '9') or ch == '.' or ch == 'v')) return null;
     }
-    @memcpy(buf[0..tag.len], tag);
-    return buf[0..tag.len];
+    @memcpy(tag_buf[0..tag.len], tag);
+    @memcpy(sha_buf[0..sha.len], sha);
+    return .{ .tag = tag_buf[0..tag.len], .sha = sha_buf[0..sha.len] };
 }
 
 fn chooseWorkingCCompiler(ui: *Tui, allocator: std.mem.Allocator) ?[]const u8 {

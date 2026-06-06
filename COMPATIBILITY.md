@@ -35,8 +35,13 @@ any surface below requires a MAJOR bump; backward-compatible additions are MINOR
   may be tightened in a MINOR release **only if** they do not break a documented egress mode.
 
 ### 6. Release artifacts & verification
-- Release binaries are minisign-signed against the pinned public key, and the `mtbuddy update` verify
-  flow (signature + SHA-256) is stable. The signing key has a documented rotation path.
+- Release binaries are minisign-signed against the public key pinned at build time (`build.zig`,
+  overridable for rebuilds via `-Dminisign_pubkey=…`), and the `mtbuddy update` verify flow
+  (signature + SHA-256 against that embedded key) is stable.
+- **Not yet provided**: an operator-facing key **rotation/revocation** procedure. Today a key change
+  ships only via a new signed release built with a new pinned key; there is no out-of-band revocation
+  channel. A documented rotation path + offline/SLSA signing is tracked under WS5
+  (`harden-signing-slsa`) in ROADMAP_1.0.md.
 
 ## NOT covered (may change in any release)
 
