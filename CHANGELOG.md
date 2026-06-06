@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0](https://github.com/sleep3r/mtproto.zig/compare/v0.27.0...v1.0.0) (2026-06-06)
+
+
+### Features
+
+* Горячая перезагрузка пользователей доступа по SIGHUP ([#302](https://github.com/sleep3r/mtproto.zig/issues/302)) ([3800a9b](https://github.com/sleep3r/mtproto.zig/commit/3800a9bf0d4527a4a974c84dea845f368860aea2))
+
+
+### Miscellaneous Chores
+
+* release 1.0.0 ([5992997](https://github.com/sleep3r/mtproto.zig/commit/59929972d27e4d439c165e618501b7872ccd6244))
+
 ## [0.27.0](https://github.com/sleep3r/mtproto.zig/compare/v0.26.0...v0.27.0) (2026-06-05)
 
 
