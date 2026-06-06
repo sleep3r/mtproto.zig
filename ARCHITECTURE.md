@@ -37,11 +37,15 @@ deployment. This document is the in-repo architecture reference; the public stab
 - **Connection slots** are pre-allocated per worker and reused; per-connection heavy buffers are
   allocated on-demand, not embedded in idle slots.
 - **Shared state** (`ProxyState`): global counters are `std.atomic.Value` (so `/metrics` aggregates
-  across workers for free); the **replay cache** and the **middle-proxy snapshot** are guarded by a
-  real cross-thread mutex (`std.Io.Mutex`, since Zig 0.16 has no `std.Thread.Mutex`), correct under N
-  workers (both are touched only on the handshake/routing path, not per-byte relay). The **flood guard**
-  and **subnet limiter** are intentionally **per-worker**, so each enforces ~1/N of the global limit
-  (acceptable; tighter global coordination is a future item).
+  across workers for free); the **replay cache**, the **middle-proxy snapshot**, and the **flood guard
+  + subnet rate limiter** are all guarded by a real cross-thread mutex (`std.Io.Mutex`, since Zig 0.16
+  has no `std.Thread.Mutex`), correct under N workers (all touched only on the handshake/accept/routing
+  path, not the per-byte relay). The flood/subnet guards are **shared (global)**, so an IP/subnet
+  spread across SO_REUSEPORT shards is still limited globally rather than ~N×threshold.
+- **Liveness across workers**: each worker writes its own slot in a shared `worker_heartbeats` array;
+  `/healthz` and the systemd watchdog require **every** active worker to be fresh, so a wedged
+  non-owner shard is surfaced (not masked by worker 0 staying alive). The per-worker connection pool is
+  sized `max_connections / workers` so total slot memory stays ~constant regardless of worker count.
 - **SIGHUP config reload is refused when `workers>1`** (logs a message): a live reload swaps and frees
   shared config strings (e.g. `tls_domain`) that the other worker threads read on the hot path, so a
   restart is required to apply config changes under multi-worker. Single-worker hot-reload is unchanged.

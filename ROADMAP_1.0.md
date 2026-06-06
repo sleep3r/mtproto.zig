@@ -609,13 +609,13 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
 | 7 | `health-readiness-endpoints` (WS6) | `/healthz` + `/readyz` on the metrics server (loop heartbeat + drain flag; not gated on middleproxy) | `6e5af77` |
 | 8 | `systemd-notify-watchdog` (WS6) | native dependency-free sd_notify; `Type=notify` + `WatchdogSec=30` on all proxy units + encoding test | `a474509`, `7ea731f` |
 | 9 | `systemd-seccomp-hardening` (WS5) | proxy unit: `SystemCallFilter=@system-service`, `RestrictAddressFamilies`, `MemoryDenyWriteExecute`, `ProtectKernel*`, `ProtectProc`, … (3 unit copies); tunnel unit gets the device/netlink-safe subset | `a474509`, `7ea731f` |
-| 10 | `verify-thirdparty-install-supplychain` (WS5) | `uv` pinned 0.11.19 + `.sha256` verify; Python deps pinned exact. **zapret is deliberately NOT frozen** — it's the DPI-bypass engine, so it clones the *latest release tag* (resolved at install, offline fallback) instead of raw HEAD, staying current with DPI evolution | `47da6f7`, `<this>` |
+| 10 | `verify-thirdparty-install-supplychain` (WS5) | `uv` pinned 0.11.19 + `.sha256` verify; Python deps pinned exact. **zapret is deliberately NOT frozen** — it's the DPI-bypass engine, so it clones the *latest release tag* (resolved at install, offline fallback) instead of raw HEAD, staying current with DPI evolution | `47da6f7`, `f6f97b1` |
 | 11 | `mp-quickack-abridged-reversal` (WS7) | **confirmed bug fixed** vs reference: byte-reverse the abridged `RPC_SIMPLE_ACK` confirm; `relaySimpleAck` + golden test | `c91ac94` |
 | 12 | `safety-on-wire-parsers` (WS5) | proxy data plane built **ReleaseSafe** by default (`-Ddataplane_safety`, default on); mtbuddy/bench unchanged | `5090f60` |
 | 13 | `binary-exploit-mitigations` (WS5) | proxy built **PIE** (ASLR; verified `e_type=DYN`); full RELRO already default | `6fa730c` |
 | 14 | `fuzz-targets-core` (WS4) | `std.testing.fuzz` (Smith) targets for TLS/socks5/http_connect parsers — deterministic in CI, coverage-guided under `--fuzz` | `7b64de6` |
-| 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | *this commit* |
-| 16 | `reuseport-workers` + `shared-state-multicore` (WS1) | **opt-in** `[server].workers` SO_REUSEPORT thread-per-worker model (default 1 = unchanged); replay cache + middle-proxy snapshot mutex-guarded (real `std.Io.Mutex`); SIGHUP reload refused under >1 worker; worker fd accounting; map + adversarial-review workflows (fixed a `tls_domain` use-after-free race + fd-accounting before commit) | `<this>` |
+| 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | `1fffb51` |
+| 16 | `reuseport-workers` + `shared-state-multicore` (WS1) | **opt-in** `[server].workers` SO_REUSEPORT thread-per-worker model (default 1 = unchanged); replay cache + middle-proxy snapshot mutex-guarded (real `std.Io.Mutex`); SIGHUP reload refused under >1 worker; worker fd accounting; map + adversarial-review workflows (fixed a `tls_domain` use-after-free race + fd-accounting before commit) | `972f72f` (+ review fixes) |
 
 ### ⏸️ Investigated but deliberately NOT changed (with reason)
 

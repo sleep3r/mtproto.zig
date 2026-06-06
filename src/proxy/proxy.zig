@@ -77,6 +77,9 @@ const log = std.log.scoped(.proxy);
 const tls_header_len = 5;
 /// Upper bound on SO_REUSEPORT epoll worker threads ([server].workers / 0=auto).
 const max_workers = 256;
+/// A worker not ticking within this window is treated as wedged: the signal owner
+/// then stops petting the systemd watchdog so the unit is restarted.
+const watchdog_stale_ms: i64 = 10_000;
 const event_loop_wait_ms: i32 = 37;
 /// How long after its first byte a non-TLS (dd) connection may take to deliver
 /// the full 64-byte obfuscated handshake before we treat it as a probe and serve
@@ -789,9 +792,17 @@ pub const ProxyState = struct {
     stats_mp_fallback: std.atomic.Value(u64),
     /// Per-reason connection close counters (RED errors + evasion signals).
     close_reasons: [CloseReason.count]std.atomic.Value(u64),
-    /// Monotonic ms of the last event-loop iteration — liveness heartbeat for
-    /// /healthz and the systemd watchdog. 0 until the loop starts ticking.
-    loop_heartbeat_ms: std.atomic.Value(i64),
+    /// Per-worker monotonic-ms liveness heartbeat (index = worker_id). /healthz and
+    /// the watchdog require EVERY active worker to be fresh, so a wedged non-owner
+    /// SO_REUSEPORT shard is detected (not masked by worker 0 staying alive). 0 until
+    /// a worker starts ticking.
+    worker_heartbeats: [max_workers]std.atomic.Value(i64),
+    /// Anti-flood + per-subnet rate guards are SHARED across workers (behind
+    /// guard_lock) so an IP/subnet spread across SO_REUSEPORT shards is still limited
+    /// globally, not ~N×threshold. Touched only on the accept/handshake path.
+    subnet_limiter: SubnetRateLimit,
+    flood_guard: *HandshakeFloodGuard,
+    guard_lock: CompatRwLock = .{},
     /// True once graceful shutdown/drain has begun — drives /readyz.
     shutting_down: std.atomic.Value(bool),
     /// $NOTIFY_SOCKET (set by systemd Type=notify); null when not run under
@@ -926,7 +937,9 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
-            .loop_heartbeat_ms = std.atomic.Value(i64).init(0),
+            .worker_heartbeats = [_]std.atomic.Value(i64){std.atomic.Value(i64).init(0)} ** max_workers,
+            .subnet_limiter = SubnetRateLimit.init(),
+            .flood_guard = try HandshakeFloodGuard.create(allocator),
             .shutting_down = std.atomic.Value(bool).init(false),
             .middle_proxy_updater_thread = null,
             .upstream = upblk: {
@@ -1019,6 +1032,7 @@ pub const ProxyState = struct {
             thread.join();
             self.middle_proxy_updater_thread = null;
         }
+        self.flood_guard.destroy(self.allocator);
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         self.allocator.free(self.user_metrics);
@@ -1032,18 +1046,54 @@ pub const ProxyState = struct {
         return null;
     }
 
-    /// Liveness: has the event loop iterated within threshold_ms? Returns true
-    /// during startup (heartbeat 0) so /healthz doesn't fail before the loop runs.
+    /// Liveness: have ALL active workers iterated within threshold_ms? Returns
+    /// false if ANY started worker has stalled, so a wedged non-owner SO_REUSEPORT
+    /// shard is surfaced (not masked by worker 0 staying alive). Lenient before a
+    /// worker first ticks (heartbeat 0) so /healthz doesn't fail during startup.
     pub fn loopAlive(self: *const ProxyState, threshold_ms: i64) bool {
-        const hb = self.loop_heartbeat_ms.load(.monotonic);
-        if (hb == 0) return true;
-        return (nowMs() - hb) < threshold_ms;
+        const now = nowMs();
+        const n = @min(self.effective_workers, max_workers);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const hb = self.worker_heartbeats[i].load(.monotonic);
+            if (hb == 0) continue; // not started ticking yet
+            if (now - hb >= threshold_ms) return false; // this worker stalled
+        }
+        return true;
     }
 
     /// Readiness: serving and not draining. (Not gated on middleproxy — it runs
     /// on bundled defaults and may never refresh on a censored host.)
     pub fn isReady(self: *const ProxyState) bool {
         return !self.shutting_down.load(.acquire);
+    }
+
+    // ── Shared anti-flood / subnet-rate guards (global across workers) ──
+    // Each call holds guard_lock so the shared tables stay consistent under N
+    // worker threads. Only on the accept/handshake path, so contention is bounded.
+
+    fn floodIsBlocked(self: *ProxyState, addr: Address, cfg: HandshakeFloodGuard.Settings) bool {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.flood_guard.isBlocked(addr, cfg);
+    }
+
+    fn floodRecord(self: *ProxyState, addr: Address, event: HandshakeFloodGuard.Event, cfg: HandshakeFloodGuard.Settings) bool {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.flood_guard.record(addr, event, cfg);
+    }
+
+    fn floodTop(self: *ProxyState, cfg: HandshakeFloodGuard.Settings, out: []HandshakeFloodGuard.TopEntry) usize {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.flood_guard.top(cfg, out);
+    }
+
+    fn subnetCheck(self: *ProxyState, addr: Address, max_per_sec: u8) bool {
+        self.guard_lock.lock();
+        defer self.guard_lock.unlock();
+        return self.subnet_limiter.check(addr, max_per_sec);
     }
 
     pub fn getMetricsSnapshot(self: *const ProxyState) MetricsSnapshot {
@@ -1198,7 +1248,7 @@ pub const ProxyState = struct {
 
         if (worker_count <= 1) {
             // Classic single-threaded path — byte-for-byte the previous behavior.
-            var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
+            var loop = try EventLoop.init(self, server.socket.handle, signal_controller.fd, 0, self.config.max_connections);
             defer loop.deinit();
             // Listener bound, epoll + metrics up: tell systemd we're ready
             // (Type=notify gate). No-op when not under systemd ($NOTIFY_SOCKET unset).
@@ -1206,6 +1256,11 @@ pub const ProxyState = struct {
             try loop.run();
             return;
         }
+
+        // Split the global connection budget across workers so total slot memory
+        // (and the RAM estimate) stays ~constant regardless of worker count; the
+        // global saturation cap still bounds total active connections. Floor at 64.
+        const per_worker_pool: u32 = @max(@as(u32, 64), self.config.max_connections / @as(u32, @intCast(worker_count)));
 
         // Multi-worker (SO_REUSEPORT): worker 0 runs on this (main) thread and owns
         // the signalfd; workers 1..N-1 are spawned threads, each with its OWN
@@ -1233,18 +1288,24 @@ pub const ProxyState = struct {
                 break;
             };
             setNonBlocking(extra.socket.handle);
-            extra_servers[extra_count] = extra;
-            extra_count += 1;
-            const t = std.Thread.spawn(.{}, ProxyState.eventLoopWorkerMain, .{ self, extra.socket.handle }) catch |err| {
+            // Spawn FIRST; only retain the listener (in extra_servers) once its
+            // worker exists. Otherwise a spawn failure would leave a listenerless
+            // socket in the SO_REUSEPORT group that the kernel still routes
+            // connections to but nobody accepts (they would hang).
+            const t = std.Thread.spawn(.{}, ProxyState.eventLoopWorkerMain, .{ self, extra.socket.handle, i, per_worker_pool }) catch |err| {
                 log.err("worker {d} thread spawn failed ({any}); continuing with {d} workers", .{ i, err, extra_count });
+                var dead = extra;
+                dead.deinit(io_ctx); // remove the listenerless socket from the reuseport group
                 break;
             };
+            extra_servers[extra_count] = extra;
+            extra_count += 1;
             threads[thread_count] = t;
             thread_count += 1;
         }
 
         // Worker 0 on the main thread owns the signalfd (signal handling + watchdog).
-        var loop0 = try EventLoop.init(self, server.socket.handle, signal_controller.fd);
+        var loop0 = try EventLoop.init(self, server.socket.handle, signal_controller.fd, 0, per_worker_pool);
         defer loop0.deinit();
         sd_notify.ready(self.notify_socket);
         loop0.run() catch |err| {
@@ -1257,15 +1318,15 @@ pub const ProxyState = struct {
     /// Worker thread entry: run a non-signal-owning EventLoop on its own
     /// SO_REUSEPORT listener. On any failure it sets the shared shutdown flag so
     /// the rest of the fleet drains rather than running degraded.
-    fn eventLoopWorkerMain(self: *ProxyState, listen_fd: posix.fd_t) void {
-        var loop = EventLoop.init(self, listen_fd, -1) catch |err| {
-            log.err("worker EventLoop.init failed: {any}", .{err});
+    fn eventLoopWorkerMain(self: *ProxyState, listen_fd: posix.fd_t, worker_id: usize, pool_capacity: u32) void {
+        var loop = EventLoop.init(self, listen_fd, -1, worker_id, pool_capacity) catch |err| {
+            log.err("worker {d} EventLoop.init failed: {any}", .{ worker_id, err });
             self.shutting_down.store(true, .release);
             return;
         };
         defer loop.deinit();
         loop.run() catch |err| {
-            log.err("worker event loop error: {any}", .{err});
+            log.err("worker {d} event loop error: {any}", .{ worker_id, err });
             self.shutting_down.store(true, .release);
         };
     }
@@ -1619,6 +1680,9 @@ const EventLoop = struct {
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
     signal_fd: posix.fd_t,
+    /// 0..N-1; worker 0 owns the signalfd + systemd watchdog. Indexes the shared
+    /// per-worker heartbeat slot.
+    worker_id: usize,
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
@@ -1631,8 +1695,6 @@ const EventLoop = struct {
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
-    subnet_limiter: SubnetRateLimit,
-    flood_guard: *HandshakeFloodGuard,
     // Snapshot of degradation counters for delta logging
     prev_dropped_cap: u64,
     prev_dropped_saturation: u64,
@@ -1646,19 +1708,17 @@ const EventLoop = struct {
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t) !EventLoop {
+    fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t, worker_id: usize, pool_capacity: u32) !EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
-
-        const flood_guard = try HandshakeFloodGuard.create(state.allocator);
-        errdefer flood_guard.destroy(state.allocator);
 
         var loop = EventLoop{
             .state = state,
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
             .signal_fd = signal_fd,
-            .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
+            .worker_id = worker_id,
+            .pool = try ConnectionPool.init(state.allocator, pool_capacity),
             .accept_paused = false,
             .accept_resume_ns = 0,
             .saturation_paused = false,
@@ -1668,8 +1728,6 @@ const EventLoop = struct {
             .stats_next_log_ns = nowNs() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
-            .subnet_limiter = SubnetRateLimit.init(),
-            .flood_guard = flood_guard,
             .prev_dropped_cap = 0,
             .prev_dropped_saturation = 0,
             .prev_dropped_rate_limit = 0,
@@ -1705,7 +1763,6 @@ const EventLoop = struct {
         self.desync_wait_slots.deinit(self.state.allocator);
 
         self.pool.deinit();
-        self.flood_guard.destroy(self.state.allocator);
         closeFd(self.epoll_fd);
     }
 
@@ -1715,13 +1772,15 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = nowNs();
 
         while (true) {
-            // Liveness heartbeat for /healthz (any alive worker keeps it green),
-            // and pet the systemd watchdog at half the configured interval — but
-            // ONLY from the signal-owning worker, so there is exactly one sd_notify.
+            // Per-worker liveness heartbeat (this worker's slot), and pet the
+            // systemd watchdog at half the configured interval — ONLY from the
+            // signal owner AND only while EVERY worker is alive, so a wedged
+            // non-owner shard stops the watchdog and triggers a restart.
             const tick_ms = nowMs();
-            self.state.loop_heartbeat_ms.store(tick_ms, .monotonic);
+            self.state.worker_heartbeats[@min(self.worker_id, max_workers - 1)].store(tick_ms, .monotonic);
             if (self.signal_fd >= 0 and self.state.watchdog_usec > 0 and
-                tick_ms - self.last_watchdog_ms >= @as(i64, @intCast(self.state.watchdog_usec / 2000)))
+                tick_ms - self.last_watchdog_ms >= @as(i64, @intCast(self.state.watchdog_usec / 2000)) and
+                self.state.loopAlive(watchdog_stale_ms))
             {
                 sd_notify.watchdog(self.state.notify_socket);
                 self.last_watchdog_ms = tick_ms;
@@ -1874,7 +1933,7 @@ const EventLoop = struct {
             accepted_this_round += 1;
 
             const flood_cfg = floodGuardSettings(&self.state.config);
-            if (self.flood_guard.isBlocked(client_addr, flood_cfg)) {
+            if (self.state.floodIsBlocked(client_addr, flood_cfg)) {
                 _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
                 closeFd(cfd);
                 continue;
@@ -1884,9 +1943,9 @@ const EventLoop = struct {
             setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
+            if (!self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
-                _ = self.flood_guard.record(client_addr, .rate_limit, flood_cfg);
+                _ = self.state.floodRecord(client_addr, .rate_limit, flood_cfg);
                 closeFd(cfd);
                 continue;
             }
@@ -2013,7 +2072,7 @@ const EventLoop = struct {
 
         var top_entries: [5]HandshakeFloodGuard.TopEntry = undefined;
         const flood_cfg = floodGuardSettings(&self.state.config);
-        const top_len = self.flood_guard.top(flood_cfg, top_entries[0..]);
+        const top_len = self.state.floodTop(flood_cfg, top_entries[0..]);
         if (top_len > 0 and (d_flood + d_rate + d_hs + d_hst > 0 or hs > 0)) {
             var top_buf: [1024]u8 = undefined;
             const top = formatFloodGuardTop(top_entries[0..top_len], &top_buf);
@@ -3465,7 +3524,7 @@ const EventLoop = struct {
                     continue;
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
-                    _ = self.flood_guard.record(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
+                    _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }
