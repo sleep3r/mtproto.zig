@@ -147,7 +147,8 @@ sudo mtbuddy --interactive
 | `--bind, -b` | — | Bind to specific IP (default: all interfaces) |
 | `--no-masking` | — | Disable Nginx masking |
 | `--no-nfqws` | — | Disable nfqws TCP desync |
-| `--no-tcpmss` | — | Disable TCPMSS=88 |
+| `--no-tcpmss` | — | Disable TCPMSS clamp |
+| `--tcpmss <n>` | `88` | TCPMSS clamp value (forces ClientHello fragmentation) |
 | `--no-dpi` | — | Disable all DPI modules |
 | `--middle-proxy` | — | Enable Telegram MiddleProxy relay |
 | `--ipv6-hop` | — | Enable IPv6 auto-hopping |

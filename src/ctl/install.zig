@@ -32,6 +32,12 @@ pub const InstallOpts = struct {
     tls_domain: []const u8 = "wb.ru",
     max_connections: u32 = 512,
     enable_tcpmss: bool = true,
+    /// TCPMSS --set-mss value on the SYN,ACK: forces the client's ClientHello to be
+    /// fragmented across TCP segments so the signatured extensions don't sit in one
+    /// packet for a stateless JA4 extractor. Default 88 (the long-deployed value);
+    /// configurable because 88 is itself anomalous vs the real ~1380 distribution —
+    /// retune empirically (segment boundary before ALPN/sig_algs) per host/ISP.
+    tcpmss_value: u16 = 88,
     enable_masking: bool = true,
     enable_nfqws: bool = true,
     enable_ipv6_hop: bool = false,
@@ -82,6 +88,7 @@ fn printInstallHelp(ui: *Tui) void {
     ui.writeRaw("    --no-masking               Disable local masking setup\n");
     ui.writeRaw("    --no-nfqws                 Disable nfqws setup\n");
     ui.writeRaw("    --no-tcpmss                Disable TCPMSS setup\n");
+    ui.writeRaw("    --tcpmss <n>               TCPMSS clamp value (default 88; forces ClientHello fragmentation)\n");
     ui.writeRaw("    --bind, -b <ip>            Bind proxy to a specific local address\n");
     ui.writeRaw("    --ipv6-hop                 Reminder to configure IPv6 auto-hopping (needs Cloudflare API; run `mtbuddy ipv6-hop`)\n");
     ui.writeRaw("    --version, -v <tag>        Install a specific release tag\n");
@@ -160,6 +167,12 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.enable_nfqws = false;
         } else if (std.mem.eql(u8, arg, "--no-tcpmss")) {
             opts.enable_tcpmss = false;
+        } else if (std.mem.eql(u8, arg, "--tcpmss")) {
+            if (args.next()) |val| {
+                if (std.fmt.parseInt(u16, val, 10)) |n| {
+                    if (n >= 40) opts.tcpmss_value = n;
+                } else |_| {}
+            }
         } else if (std.mem.eql(u8, arg, "--no-dpi")) {
             // Disable all DPI bypass modules at once
             opts.enable_masking = false;
@@ -585,18 +598,20 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     if (opts.enable_tcpmss) {
         var port_str_buf: [8]u8 = undefined;
         const port_str = std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port}) catch "443";
+        var mss_str_buf: [8]u8 = undefined;
+        const mss_str = std.fmt.bufPrint(&mss_str_buf, "{d}", .{opts.tcpmss_value}) catch "88";
 
         _ = sys.exec(allocator, &.{
             "iptables", "-t",      "mangle",  "-A",     "OUTPUT",
             "-p",       "tcp",     "--sport", port_str, "--tcp-flags",
             "SYN,ACK",  "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            "88",
+            mss_str,
         }) catch {};
         _ = sys.exec(allocator, &.{
             "ip6tables", "-t",      "mangle",  "-A",     "OUTPUT",
             "-p",        "tcp",     "--sport", port_str, "--tcp-flags",
             "SYN,ACK",   "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            "88",
+            mss_str,
         }) catch {};
         _ = sys.exec(allocator, &.{
             "bash",                                                                                                        "-c",
@@ -926,6 +941,8 @@ fn printSummary(
     const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch "443";
     var public_port_buf: [8]u8 = undefined;
     const public_port_str = std.fmt.bufPrint(&public_port_buf, "{d}", .{public_port}) catch "443";
+    var tcpmss_label_buf: [56]u8 = undefined;
+    const tcpmss_label = std.fmt.bufPrint(&tcpmss_label_buf, "TCPMSS={d} (ClientHello fragmentation)", .{opts.tcpmss_value}) catch "TCPMSS (ClientHello fragmentation)";
 
     ui.summaryBox(ui.str(.install_success_header), &.{
         .{ .label = ui.str(.install_status_cmd), .value = "systemctl status mtproto-proxy" },
@@ -941,7 +958,7 @@ fn printSummary(
         .{ .label = "", .style = .blank },
         .{ .label = ui.str(.install_dpi_active), .style = .highlight },
         .{
-            .label = if (opts.enable_tcpmss) "TCPMSS=88 (ClientHello fragmentation)" else "",
+            .label = if (opts.enable_tcpmss) tcpmss_label else "",
             .style = if (opts.enable_tcpmss) .success else .blank,
         },
         .{

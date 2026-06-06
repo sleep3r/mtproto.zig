@@ -566,6 +566,88 @@ test "buildServerHello produces valid three-record Nginx template structure" {
     ));
 }
 
+test "dpi-validation: ServerHello structural invariants (JA3S regression gate)" {
+    // Hermetic DPI-detectability gate (the local part of dpi-validation-ci): drive
+    // a realistic ClientHello, generate the ServerHello, and assert the
+    // evasion-relevant structure — so any future evasion change that drifts the
+    // fingerprint fails here instead of shipping silently. (The full version also
+    // diffs JA4S/record-geometry against a live reference domain; that needs a
+    // Linux host + ja4 tooling and is tracked in ROADMAP_1.0.md.)
+    const allocator = std.testing.allocator;
+    const isGrease = struct {
+        fn f(v: u16) bool {
+            return (v & 0x0f0f) == 0x0a0a;
+        }
+    }.f;
+
+    // ClientHello offering [GREASE, TLS_CHACHA20 0x1303, TLS_AES_128 0x1301].
+    var ch: [52]u8 = undefined;
+    ch[0] = constants.tls_record_handshake;
+    ch[1] = 0x03;
+    ch[2] = 0x01;
+    ch[3] = 0x00;
+    ch[4] = 0x2f;
+    ch[5] = 0x01; // ClientHello
+    ch[6] = 0x00;
+    ch[7] = 0x00;
+    ch[8] = 0x2b;
+    ch[9] = 0x03;
+    ch[10] = 0x03;
+    @memset(ch[11..43], 0xCD);
+    ch[43] = 0x00; // session_id_len
+    ch[44] = 0x00;
+    ch[45] = 0x06; // cipher_suites_len = 6
+    ch[46] = 0x0a;
+    ch[47] = 0x0a; // GREASE (must be skipped)
+    ch[48] = 0x13;
+    ch[49] = 0x03; // CHACHA20 — the first non-GREASE TLS1.3 suite
+    ch[50] = 0x13;
+    ch[51] = 0x01;
+
+    const echoed = extractFirstTls13Cipher(&ch);
+    try std.testing.expectEqual(@as(?u16, 0x1303), echoed);
+
+    var digest = [_]u8{0x42} ** 32;
+    const session_id = [_]u8{0xA5} ** 32;
+    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id, echoed);
+    defer allocator.free(r1);
+
+    // 1. Cipher in the ServerHello TRACKS the ClientHello (not a constant 0x1301).
+    try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, r1[tmpl_cipher_offset..][0..2], .big));
+
+    // 2. Extensions: supported_versions (0x2b) THEN key_share (0x33), x25519 group.
+    const ext_supported_versions = std.mem.readInt(u16, r1[81..][0..2], .big);
+    const ext_key_share = std.mem.readInt(u16, r1[87..][0..2], .big);
+    const key_share_group = std.mem.readInt(u16, r1[91..][0..2], .big);
+    try std.testing.expectEqual(@as(u16, 0x002b), ext_supported_versions);
+    try std.testing.expectEqual(@as(u16, 0x0033), ext_key_share);
+    try std.testing.expectEqual(@as(u16, 0x001d), key_share_group); // x25519
+
+    // 3. NO GREASE in the structural fields (a real server never emits GREASE).
+    try std.testing.expect(!isGrease(std.mem.readInt(u16, r1[tmpl_cipher_offset..][0..2], .big)));
+    try std.testing.expect(!isGrease(ext_supported_versions));
+    try std.testing.expect(!isGrease(ext_key_share));
+    try std.testing.expect(!isGrease(key_share_group));
+
+    // 4. Record geometry: ServerHello(122) + CCS(6) + AppData(2878), fixed.
+    try std.testing.expectEqual(@as(u16, 122), std.mem.readInt(u16, r1[3..5], .big));
+    try std.testing.expectEqual(fake_cert_payload_len, std.mem.readInt(u16, r1[136..][0..2], .big));
+
+    // 5. Differ where a real server differs, constant where it is constant: a second
+    //    ServerHello for the same client must keep cipher/extensions/structure
+    //    identical but vary random + key_share key + AppData ciphertext.
+    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id, echoed);
+    defer allocator.free(r2);
+    // constant structural prefix: record header + handshake header up to the random
+    try std.testing.expectEqualSlices(u8, r1[0..tmpl_random_offset], r2[0..tmpl_random_offset]);
+    // constant cipher + extension block (session_id..key_share group)
+    try std.testing.expectEqualSlices(u8, r1[tmpl_cipher_offset..tmpl_x25519_key_offset], r2[tmpl_cipher_offset..tmpl_x25519_key_offset]);
+    // variable: server-random (HMAC), x25519 key, AppData body
+    try std.testing.expect(!std.mem.eql(u8, r1[tmpl_random_offset..][0..32], r2[tmpl_random_offset..][0..32]));
+    try std.testing.expect(!std.mem.eql(u8, r1[tmpl_x25519_key_offset..][0..32], r2[tmpl_x25519_key_offset..][0..32]));
+    try std.testing.expect(!std.mem.eql(u8, r1[tmpl_appdata_offset..][0..fake_cert_payload_len], r2[tmpl_appdata_offset..][0..fake_cert_payload_len]));
+}
+
 test "buildServerHello AppData: fixed length, per-connection-random body" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0xAA} ** 32;

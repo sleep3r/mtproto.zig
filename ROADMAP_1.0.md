@@ -616,6 +616,7 @@ plane, no live-DPI lab). Branch: `feature/roadmap-1.0`. Every ✅ item builds cl
 | 14 | `fuzz-targets-core` (WS4) | `std.testing.fuzz` (Smith) targets for TLS/socks5/http_connect parsers — deterministic in CI, coverage-guided under `--fuzz` | `7b64de6` |
 | 15 | `stability-policy-architecture-md` (WS8) | `ARCHITECTURE.md` + `COMPATIBILITY.md` (SemVer-covered surfaces) + this checklist | `1fffb51` |
 | 16 | `reuseport-workers` + `shared-state-multicore` (WS1) | **opt-in** `[server].workers` SO_REUSEPORT thread-per-worker model (default 1 = unchanged); replay cache + middle-proxy snapshot mutex-guarded (real `std.Io.Mutex`); SIGHUP reload refused under >1 worker; worker fd accounting; map + adversarial-review workflows (fixed a `tls_domain` use-after-free race + fd-accounting before commit) | `972f72f` (+ review fixes) |
+| 17 | WS2 evasion (safe subset) | hermetic **DPI-validation structural test** (the local gate: cipher tracks ClientHello, no-GREASE, key_share group, record geometry, differ-where-random/constant-where-structural) + **configurable TCPMSS** (`--tcpmss <n>`, default 88). Runtime-rewriting rungs (probe/reality/transport/traffic, MLKEM key_share) deferred — need a DPI harness + Linux + real client to validate | *this commit* |
 
 ### ⏸️ Investigated but deliberately NOT changed (with reason)
 
@@ -641,9 +642,16 @@ Explicitly out of scope for a single no-new-systems pass; these remain the headl
   still need **real-load validation on Linux** (throughput scaling, even distribution, graceful
   shutdown) before `workers>1` becomes a default. The companion `load-throughput-relay-ci` gate (WS4)
   is the missing piece to validate it automatically.
-- **WS2 evasion (deeper rungs)**: `probe-real-template` / `reality-reflect` (runtime outbound TLS
-  scout), `evasion-profiles` + `transport-strategy-interface` (large hot-path refactor),
-  `traffic-shape-modeling`, `mss-clienthello-frag-tuning` (needs empirical MSS tuning).
+- **WS2 evasion (deeper rungs)** — the *safe subset is done* (row 17): a hermetic **DPI-validation
+  structural test** (cipher-tracks-ClientHello, no-GREASE, key_share group, record geometry,
+  differ-where-random/constant-where-structural — the local gate that makes future evasion changes
+  safe to iterate) and a **configurable TCPMSS** clamp. **Deferred** (can't be validated blind — they
+  change the moat and need a JA4S/record-geometry harness + a Linux host + a real Telegram client to
+  prove they *improve* detectability and don't break compat): `probe-real-template` / `reality-reflect`
+  (runtime outbound TLS scout / post-1.0 moonshot), `evasion-profiles` + `transport-strategy-interface`
+  (large hot-path refactor), `traffic-shape-modeling`, and the `key_share` MLKEM echo (resizes the
+  ServerHello → needs the dynamic-template rewrite + real-client validation; the new structural test
+  now guards that attempt).
 - **WS3 measured undetectability**: `dpi-validation-ci` (external JA4S/tshark tooling) and
   `geo-reachability-monitoring` (external vantage points).
 - **WS4**: `load-throughput-relay-ci`, `mp-golden-vectors` (full FakeMiddleProxy + reference oracle),
