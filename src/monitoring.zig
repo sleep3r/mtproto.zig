@@ -206,6 +206,13 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeCounter(writer, "mtproto_drops_handshake_budget_total", "connections dropped because handshake budget was exhausted", snapshot.drops_handshake_budget_total);
     try writeCounter(writer, "mtproto_handshake_timeouts_total", "connections dropped due to handshake timeout", snapshot.handshake_timeouts_total);
     try writeCounter(writer, "mtproto_middleproxy_fallback_total", "times middleproxy fell back to direct path", snapshot.middleproxy_fallback_total);
+    // Per-reason close breakdown (RED errors + evasion signal). A spike in
+    // tls_validation_failed / replay_detected / handshake_timeout vs baseline is
+    // how an operator sees a censor begin actively probing/blocking the node.
+    try writeMetricHeader(writer, "mtproto_connection_close_reason_total", "closed connections by reason", "counter");
+    inline for (std.meta.fields(proxy.CloseReason)) |f| {
+        try writer.print("mtproto_connection_close_reason_total{{reason=\"{s}\"}} {d}\n", .{ f.name, snapshot.close_reasons[f.value] });
+    }
     try writeCounter(writer, "mtproto_client_to_upstream_bytes_total", "bytes successfully written from client side toward upstream", snapshot.client_to_upstream_bytes_total);
     try writeCounter(writer, "mtproto_upstream_to_client_bytes_total", "bytes successfully written from upstream toward client side", snapshot.upstream_to_client_bytes_total);
     try writeGauge(writer, "mtproto_config_max_connections", "configured max_connections", snapshot.config_max_connections);

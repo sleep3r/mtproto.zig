@@ -650,6 +650,66 @@ const SignalController = struct {
     }
 };
 
+/// Bounded, low-cardinality classification of why a connection closed. The first
+/// five buckets are the evasion/probe signals a circumvention operator needs to
+/// SEE a censor start blocking (a spike in tls_validation_failed / replay /
+/// handshake_timeout vs baseline). Exported as mtproto_connection_close_reason_total{reason}.
+pub const CloseReason = enum(u8) {
+    tls_validation_failed,
+    sni_mismatch,
+    replay_detected,
+    handshake_budget,
+    handshake_timeout,
+    idle_timeout,
+    bad_handshake,
+    client_eof,
+    client_error,
+    upstream_error,
+    epoll_error,
+    internal_error,
+    shutdown,
+    other,
+
+    pub const count = @typeInfo(CloseReason).@"enum".fields.len;
+
+    /// Bucket a free-text closeSlot reason. Evasion signals matched precisely first.
+    pub fn classify(reason: []const u8) CloseReason {
+        const has = struct {
+            fn f(h: []const u8, n: []const u8) bool {
+                return std.mem.indexOf(u8, h, n) != null;
+            }
+        }.f;
+        if (has(reason, "tls validation failed")) return .tls_validation_failed;
+        if (has(reason, "sni")) return .sni_mismatch; // mismatch + missing sni
+        if (has(reason, "replay")) return .replay_detected;
+        if (has(reason, "budget")) return .handshake_budget;
+        if (has(reason, "idle")) return .idle_timeout;
+        if (has(reason, "timeout")) return .handshake_timeout;
+        if (has(reason, "shutdown") or has(reason, "closing")) return .shutdown;
+        if (has(reason, "bad ") or has(reason, "invalid") or has(reason, "unexpected") or has(reason, "alert")) return .bad_handshake;
+        if (has(reason, "eof")) return .client_eof;
+        if (has(reason, "connect") or has(reason, "upstream") or has(reason, "candidate") or has(reason, "relay ") or has(reason, "dc tail") or has(reason, "middleproxy")) return .upstream_error;
+        if (has(reason, "epoll") or has(reason, "interest") or has(reason, "desync") or has(reason, "fd map")) return .epoll_error;
+        if (has(reason, "read error")) return .client_error;
+        return .internal_error;
+    }
+};
+
+test "CloseReason.classify buckets the evasion signals precisely" {
+    try std.testing.expectEqual(CloseReason.tls_validation_failed, CloseReason.classify("tls validation failed"));
+    try std.testing.expectEqual(CloseReason.sni_mismatch, CloseReason.classify("tls sni mismatch"));
+    try std.testing.expectEqual(CloseReason.sni_mismatch, CloseReason.classify("tls missing sni"));
+    try std.testing.expectEqual(CloseReason.replay_detected, CloseReason.classify("replay detected, masking failed"));
+    try std.testing.expectEqual(CloseReason.handshake_budget, CloseReason.classify("handshake budget exhausted"));
+    try std.testing.expectEqual(CloseReason.handshake_timeout, CloseReason.classify("handshake timeout"));
+    try std.testing.expectEqual(CloseReason.handshake_timeout, CloseReason.classify("dd handshake decision timeout"));
+    try std.testing.expectEqual(CloseReason.idle_timeout, CloseReason.classify("idle pre-first-byte timeout"));
+    try std.testing.expectEqual(CloseReason.bad_handshake, CloseReason.classify("bad tls length"));
+    try std.testing.expectEqual(CloseReason.client_eof, CloseReason.classify("client eof before tls header"));
+    try std.testing.expectEqual(CloseReason.upstream_error, CloseReason.classify("connect failed"));
+    try std.testing.expectEqual(CloseReason.shutdown, CloseReason.classify("shutdown"));
+}
+
 pub const ProxyState = struct {
     pub const UserMetrics = struct {
         name: []const u8,
@@ -676,6 +736,7 @@ pub const ProxyState = struct {
         drops_handshake_budget_total: u64,
         handshake_timeouts_total: u64,
         middleproxy_fallback_total: u64,
+        close_reasons: [CloseReason.count]u64,
         client_to_upstream_bytes_total: u64,
         upstream_to_client_bytes_total: u64,
         config_port: u16,
@@ -713,6 +774,8 @@ pub const ProxyState = struct {
     stats_dropped_hs_budget: std.atomic.Value(u64),
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
+    /// Per-reason connection close counters (RED errors + evasion signals).
+    close_reasons: [CloseReason.count]std.atomic.Value(u64),
 
     middle_proxy_lock: CompatRwLock = .{},
     // Regular (non-media) primary endpoints per DC 1..5. Matches `proxy_for N`
@@ -819,6 +882,7 @@ pub const ProxyState = struct {
             .stats_dropped_flood_guard = std.atomic.Value(u64).init(0),
             .stats_dropped_hs_budget = std.atomic.Value(u64).init(0),
             .stats_hs_timeout = std.atomic.Value(u64).init(0),
+            .close_reasons = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** CloseReason.count,
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
@@ -940,6 +1004,8 @@ pub const ProxyState = struct {
     pub fn getMetricsSnapshot(self: *const ProxyState) MetricsSnapshot {
         const now = realtimeSeconds();
         const accepted_total = self.connection_count.load(.monotonic);
+        var close_reasons: [CloseReason.count]u64 = undefined;
+        for (&self.close_reasons, 0..) |*c, idx| close_reasons[idx] = c.load(.monotonic);
         return .{
             .start_time_seconds = self.start_time_seconds,
             .uptime_seconds = @max(@as(i64, 0), now - self.start_time_seconds),
@@ -958,6 +1024,7 @@ pub const ProxyState = struct {
             .drops_handshake_budget_total = self.stats_dropped_hs_budget.load(.monotonic),
             .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
             .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
+            .close_reasons = close_reasons,
             .client_to_upstream_bytes_total = self.client_to_upstream_bytes_total.load(.monotonic),
             .upstream_to_client_bytes_total = self.upstream_to_client_bytes_total.load(.monotonic),
             .config_port = self.config.port,
@@ -3413,6 +3480,8 @@ const EventLoop = struct {
             if (user_metrics) |entry| {
                 _ = entry.connections_active.fetchSub(1, .monotonic);
             }
+            // RED errors + evasion signal: bucket the close reason once per slot.
+            _ = self.state.close_reasons[@intFromEnum(CloseReason.classify(reason))].fetchAdd(1, .monotonic);
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
