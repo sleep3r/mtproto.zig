@@ -19,6 +19,12 @@
   <a href="README.md"><kbd>🇬🇧 English</kbd></a>
   ·
   <kbd><strong>🇷🇺 Русский</strong></kbd>
+  ·
+  <a href="README.zh.md"><kbd>🇨🇳 中文</kbd></a>
+  ·
+  <a href="README.fa.md"><kbd>🇮🇷 فارسی</kbd></a>
+  ·
+  <a href="README.vi.md"><kbd>🇻🇳 Tiếng Việt</kbd></a>
 </p>
 
 </div>
