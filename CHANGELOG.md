@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/sleep3r/mtproto.zig/compare/v1.0.0...v1.0.1) (2026-06-07)
+
+
+### Bug Fixes
+
+* **middleproxy:** hourly + reactive refresh, and a getent fallback on the metadata fetch ([#305](https://github.com/sleep3r/mtproto.zig/issues/305)) ([86ccf03](https://github.com/sleep3r/mtproto.zig/commit/86ccf034be72604628f9fc4632ce978d4a24eea2))
+
 ## [1.0.0](https://github.com/sleep3r/mtproto.zig/compare/v0.27.0...v1.0.0) (2026-06-06)
 
 
