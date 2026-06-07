@@ -46,8 +46,8 @@ any surface below requires a MAJOR bump; backward-compatible additions are MINOR
   (signature + SHA-256 against that embedded key) is stable.
 - **Not yet provided**: an operator-facing key **rotation/revocation** procedure. Today a key change
   ships only via a new signed release built with a new pinned key; there is no out-of-band revocation
-  channel. A documented rotation path + offline/SLSA signing is tracked under WS5
-  (`harden-signing-slsa`) in ROADMAP_1.0.md.
+  channel. A documented rotation path + offline/SLSA signing is a planned follow-up
+  (`harden-signing-slsa`).
 
 ## NOT covered (may change in any release)
 

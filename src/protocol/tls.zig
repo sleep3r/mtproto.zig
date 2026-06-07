@@ -669,7 +669,7 @@ test "dpi-validation: ServerHello structural invariants (JA3S regression gate)" 
     // evasion-relevant structure — so any future evasion change that drifts the
     // fingerprint fails here instead of shipping silently. (The full version also
     // diffs JA4S/record-geometry against a live reference domain; that needs a
-    // Linux host + ja4 tooling and is tracked in ROADMAP_1.0.md.)
+    // Linux host + ja4 tooling and is a follow-up.)
     const allocator = std.testing.allocator;
     const isGrease = struct {
         fn f(v: u16) bool {

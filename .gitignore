@@ -21,3 +21,7 @@ fix_tui.py
 bundle.sh
 codebase.txt
 .agent/skills/local-env/
+
+# Internal planning docs — kept local, not published
+ROADMAP_1.0.md
+PRODUCT_VISION.md

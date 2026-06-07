@@ -2,7 +2,7 @@
 
 A production MTProto proxy in Zig with FakeTLS fronting, active anti-replay, and Linux-first
 deployment. This document is the in-repo architecture reference; the public stability contract is in
-[COMPATIBILITY.md](COMPATIBILITY.md), and the forward-looking plan is in [ROADMAP_1.0.md](ROADMAP_1.0.md).
+[COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Build artifacts
 
@@ -177,8 +177,8 @@ installer clones the **latest release tag** (resolved via `git ls-remote`, with 
 and verifies the clone landed on the commit that tag advertised. This is a deliberate
 freshness-over-pinning trade-off for the evasion engine — it is **not** a signed-tag or in-repo-checksum
 supply-chain pin (it is built and run root-side, so operators should be aware). Stronger options
-(hardcoded `uv` SHA, `--require-hashes` Python lockfile, signed-release verification) are tracked in
-ROADMAP_1.0.md.
+(hardcoded `uv` SHA, `--require-hashes` Python lockfile, signed-release verification) are tracked as
+internal follow-ups.
 
 ## Deployment layout (server)
 

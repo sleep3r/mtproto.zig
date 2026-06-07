@@ -78,7 +78,7 @@ fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
     // download against uv's own published .sha256 from that same release before
     // installing it as a root binary. This closes the unverified-root-download
     // supply-chain hole. (Hardcoding the per-arch SHA in-repo, Dockerfile-style,
-    // is the stronger follow-up tracked in ROADMAP_1.0.md.)
+    // is the stronger follow-up.)
     const uv_url = std.fmt.allocPrint(
         allocator,
         "https://github.com/astral-sh/uv/releases/download/" ++ UV_VERSION ++ "/{s}",
@@ -194,7 +194,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     // drift / confusion for the root-privileged control-plane venv). fastapi
     // 0.115.6 requires starlette>=0.40,<0.42, satisfied by 0.41.3. The stronger
     // `uv pip install --require-hashes -r requirements.txt` (full transitive hash
-    // pinning) is the follow-up tracked in ROADMAP_1.0.md.
+    // pinning) is the follow-up.
     const pip_res = sys.exec(allocator, &.{
         "uv",                "pip",           "install",
         "--python",          VENV_PYTHON,     "fastapi==0.115.6",
