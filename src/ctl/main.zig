@@ -104,6 +104,22 @@ pub fn main(init: std.process.Init) !void {
 
     // ── CLI dispatch ──
     if (command) |cmd| {
+        // CLI convention: `-h`/`--help` after a subcommand shows help, never runs the
+        // action. The per-subcommand parsers silently ignore unknown flags, so without
+        // this guard `mtbuddy update --help` would DOWNLOAD + INSTALL instead of
+        // printing help (issue #310). Scan a copy so the real iterator stays intact.
+        var help_scan = remaining_args;
+        while (help_scan.next()) |a| {
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                if (std.mem.eql(u8, cmd, "install")) {
+                    install.printInstallHelp(&ui);
+                } else {
+                    printHelp(ui.lang);
+                }
+                return;
+            }
+        }
+
         if (std.mem.eql(u8, cmd, "install")) {
             return install.run(&ui, allocator, &remaining_args);
         } else if (std.mem.eql(u8, cmd, "uninstall")) {

@@ -10,6 +10,7 @@ const sys = @import("sys.zig");
 const release = @import("release.zig");
 const dashboard = @import("dashboard.zig");
 const recovery = @import("recovery.zig");
+const install = @import("install.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -156,6 +157,14 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
             "Артефакт mtbuddy недоступен; обновляем только бинарник прокси",
         ));
     }
+
+    // The service runs as User=mtproto. Older installs (pre-1.0 ran as root) never
+    // created that account, so an `update` that rewrites the unit would otherwise
+    // leave systemd failing the service with status=217/USER (issue #310). Ensure the
+    // user exists up front — before we stop the running service — and abort cleanly if
+    // we can't, so a missing account never takes the proxy down. Idempotent: a no-op
+    // when the user already exists.
+    if (!install.ensureServiceUser(ui, allocator)) return;
 
     // ── Backup current binary ──
     ui.step(ui.str(.update_backing_up));

@@ -72,7 +72,7 @@ fn shouldWarnIgnoredSecret(config_exists: bool, secret_provided: bool, config_pa
     return config_exists and secret_provided and !config_path_provided;
 }
 
-fn printInstallHelp(ui: *Tui) void {
+pub fn printInstallHelp(ui: *Tui) void {
     ui.writeRaw("\n");
     ui.writeRaw("  mtbuddy install [options]\n\n");
     ui.writeRaw("  Options:\n");
@@ -1140,7 +1140,7 @@ fn resolvePublicServer(ui: *Tui, allocator: std.mem.Allocator, config_path: []co
     return ip;
 }
 
-fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
+pub fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
     const groupadd_candidates = &[_][]const u8{ "/usr/sbin/groupadd", "/sbin/groupadd" };
     const useradd_candidates = &[_][]const u8{ "/usr/sbin/useradd", "/sbin/useradd" };
 
