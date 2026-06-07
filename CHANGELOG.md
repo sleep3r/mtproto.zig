@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/sleep3r/mtproto.zig/compare/v1.0.1...v1.0.2) (2026-06-07)
+
+
+### Bug Fixes
+
+* **cli:** honor --help on subcommands; create mtproto user on update ([#310](https://github.com/sleep3r/mtproto.zig/issues/310)) ([#311](https://github.com/sleep3r/mtproto.zig/issues/311)) ([8f1da4d](https://github.com/sleep3r/mtproto.zig/commit/8f1da4d2a62e4fde7433bb1e1ab6a8407d84e721))
+
 ## [1.0.1](https://github.com/sleep3r/mtproto.zig/compare/v1.0.0...v1.0.1) (2026-06-07)
 
 
