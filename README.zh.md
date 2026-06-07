@@ -14,18 +14,12 @@
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
 
-<p align="center">
-  <strong>🌐 语言</strong><br>
-  <a href="README.md"><kbd>🇬🇧 English</kbd></a>
-  ·
-  <a href="README.ru.md"><kbd>🇷🇺 Русский</kbd></a>
-  ·
-  <kbd><strong>🇨🇳 中文</strong></kbd>
-  ·
-  <a href="README.fa.md"><kbd>🇮🇷 فارسی</kbd></a>
-  ·
-  <a href="README.vi.md"><kbd>🇻🇳 Tiếng Việt</kbd></a>
-</p>
+<div align="center">
+
+| [🇬🇧 English](README.md) | [🇷🇺 Русский](README.ru.md) | **🇨🇳 中文** | [🇮🇷 فارسی](README.fa.md) | [🇻🇳 Tiếng Việt](README.vi.md) |
+| :-: | :-: | :-: | :-: | :-: |
+
+</div>
 
 </div>
 

@@ -14,18 +14,12 @@ A tiny Telegram proxy you run on your own server. It hides inside ordinary HTTPS
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#install)
 
-<p align="center">
-  <strong>🌐 Language</strong><br>
-  <kbd><strong>🇬🇧 English</strong></kbd>
-  ·
-  <a href="README.ru.md"><kbd>🇷🇺 Русский</kbd></a>
-  ·
-  <a href="README.zh.md"><kbd>🇨🇳 中文</kbd></a>
-  ·
-  <a href="README.fa.md"><kbd>🇮🇷 فارسی</kbd></a>
-  ·
-  <a href="README.vi.md"><kbd>🇻🇳 Tiếng Việt</kbd></a>
-</p>
+<div align="center">
+
+| **🇬🇧 English** | [🇷🇺 Русский](README.ru.md) | [🇨🇳 中文](README.zh.md) | [🇮🇷 فارسی](README.fa.md) | [🇻🇳 Tiếng Việt](README.vi.md) |
+| :-: | :-: | :-: | :-: | :-: |
+
+</div>
 
 </div>
 

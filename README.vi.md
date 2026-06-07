@@ -14,18 +14,12 @@ Một proxy Telegram nhỏ gọn mà bạn tự chạy trên máy chủ của ri
 [![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#cài-đặt)
 
-<p align="center">
-  <strong>🌐 Ngôn ngữ</strong><br>
-  <a href="README.md"><kbd>🇬🇧 English</kbd></a>
-  ·
-  <a href="README.ru.md"><kbd>🇷🇺 Русский</kbd></a>
-  ·
-  <a href="README.zh.md"><kbd>🇨🇳 中文</kbd></a>
-  ·
-  <a href="README.fa.md"><kbd>🇮🇷 فارسی</kbd></a>
-  ·
-  <kbd><strong>🇻🇳 Tiếng Việt</strong></kbd>
-</p>
+<div align="center">
+
+| [🇬🇧 English](README.md) | [🇷🇺 Русский](README.ru.md) | [🇨🇳 中文](README.zh.md) | [🇮🇷 فارسی](README.fa.md) | **🇻🇳 Tiếng Việt** |
+| :-: | :-: | :-: | :-: | :-: |
+
+</div>
 
 </div>
 
