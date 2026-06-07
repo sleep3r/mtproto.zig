@@ -96,7 +96,12 @@ const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.n
 const timer_scan_budget: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
-const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
+// Telegram rotates the middleproxy DC addresses / proxy secret well within a day
+// (observed ~10h in production: dc4 moved 91.108.4.139 -> .200, stalling every
+// middleproxy handshake until restart). A 24h cadence let the cache go stale, so
+// refresh hourly to stay ahead of the rotation. The fetch is cheap and best-effort
+// (keeps the current cache on failure), so the extra polls cost ~nothing.
+const middle_proxy_update_period_ns: u64 = 60 * 60 * std.time.ns_per_s;
 const tunnel_socket_mark: u32 = 200;
 const tunnel_route_table: u32 = 200;
 const tunnel_pool_state_path = "/run/mtproto-proxy/tunnel-pool.state";
