@@ -102,6 +102,11 @@ const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 // refresh hourly to stay ahead of the rotation. The fetch is cheap and best-effort
 // (keeps the current cache on failure), so the extra polls cost ~nothing.
 const middle_proxy_update_period_ns: u64 = 60 * 60 * std.time.ns_per_s;
+// Minimum gap between *reactive* middleproxy refreshes (those triggered by stalled
+// handshakes rather than the periodic timer), so a flood of failing handshakes — or a
+// genuine middleproxy-side outage that fresh metadata can't fix — can't spin the
+// updater into a refresh storm.
+const middle_proxy_reactive_cooldown_ns: u64 = 60 * std.time.ns_per_s;
 const tunnel_socket_mark: u32 = 200;
 const tunnel_route_table: u32 = 200;
 const tunnel_pool_state_path = "/run/mtproto-proxy/tunnel-pool.state";
@@ -213,6 +218,16 @@ const MiddleProxyHandshakeStep = enum {
     sending_rpc_handshake,
     waiting_rpc_handshake_response,
     done,
+
+    /// True while the RPC handshake with the middleproxy is in flight. A slot stuck
+    /// here is waiting on the middleproxy (its DC address / secret), so a timeout
+    /// here is evidence the cached metadata may have gone stale.
+    fn awaitingMiddleProxy(self: MiddleProxyHandshakeStep) bool {
+        return switch (self) {
+            .sending_rpc_nonce, .waiting_rpc_nonce_response, .sending_rpc_handshake, .waiting_rpc_handshake_response => true,
+            .none, .done => false,
+        };
+    }
 };
 
 const MiddleProxyFetchRoute = enum {
@@ -742,6 +757,17 @@ test "CloseReason.classify buckets the evasion signals precisely" {
     try std.testing.expectEqual(CloseReason.other, CloseReason.classify("graceful drain"));
 }
 
+test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates the reactive refresh" {
+    // Only the in-flight RPC-handshake steps should trigger a reactive refresh; a
+    // timeout in .none/.done is not a middleproxy-staleness signal.
+    try std.testing.expect(!MiddleProxyHandshakeStep.none.awaitingMiddleProxy());
+    try std.testing.expect(!MiddleProxyHandshakeStep.done.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_nonce.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_nonce_response.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_handshake.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_handshake_response.awaitingMiddleProxy());
+}
+
 pub const ProxyState = struct {
     pub const UserMetrics = struct {
         name: []const u8,
@@ -1073,6 +1099,9 @@ pub const ProxyState = struct {
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
     middle_proxy_updater_shutdown: std.atomic.Value(bool),
+    // Set by the data plane when a middleproxy handshake stalls; the updater thread
+    // consumes it to refresh ahead of the periodic timer (debounced by the cooldown).
+    middle_proxy_refresh_requested: std.atomic.Value(bool),
     middle_proxy_updater_thread: ?std.Thread,
     upstream: upstream_mod.Upstream,
     tunnel_info: tunnel_mod.Tunnel,
@@ -1158,6 +1187,7 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
+            .middle_proxy_refresh_requested = std.atomic.Value(bool).init(false),
             .worker_heartbeats = [_]std.atomic.Value(i64){std.atomic.Value(i64).init(0)} ** max_workers,
             .subnet_limiter = SubnetRateLimit.init(),
             .flood_guard = try HandshakeFloodGuard.create(allocator),
@@ -1723,14 +1753,32 @@ pub const ProxyState = struct {
         }
     }
 
+    /// Ask the background updater to refresh middleproxy metadata ahead of the
+    /// periodic timer — called from the data plane when a middleproxy handshake
+    /// stalls (a sign the cached DC/secret went stale). Idempotent and lock-free;
+    /// the updater debounces it via `middle_proxy_reactive_cooldown_ns`.
+    pub fn requestMiddleProxyRefresh(self: *ProxyState) void {
+        self.middle_proxy_refresh_requested.store(true, .release);
+    }
+
+    /// Sleep up to `total_ns`, returning early (false) once a reactive refresh has
+    /// been requested AND at least the cooldown has elapsed since this wait began
+    /// (i.e. since the last refresh). Requests arriving inside the cooldown are left
+    /// pending and honored as soon as it expires. Returns true on shutdown.
     fn waitForUpdaterDelay(self: *ProxyState, total_ns: u64) bool {
         const step_ns: u64 = std.time.ns_per_s;
-        var remaining = total_ns;
-        while (remaining > 0) {
+        var elapsed: u64 = 0;
+        while (elapsed < total_ns) {
             if (self.middle_proxy_updater_shutdown.load(.acquire)) return true;
-            const chunk = @min(remaining, step_ns);
+            if (elapsed >= middle_proxy_reactive_cooldown_ns and
+                self.middle_proxy_refresh_requested.swap(false, .acq_rel))
+            {
+                log.info("Middle-proxy reactive refresh: stalled handshake(s) suggest stale metadata", .{});
+                return false;
+            }
+            const chunk = @min(total_ns - elapsed, step_ns);
             sleepNs(chunk);
-            remaining -= chunk;
+            elapsed += chunk;
         }
         return self.middle_proxy_updater_shutdown.load(.acquire);
     }
@@ -3788,6 +3836,10 @@ const EventLoop = struct {
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
                     _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
+                    // A timeout while still waiting on the middleproxy RPC handshake
+                    // means the cached DC/secret likely went stale (Telegram rotates
+                    // them) — ask the updater to refresh ahead of its periodic timer.
+                    if (slot.mp_step.awaitingMiddleProxy()) self.state.requestMiddleProxyRefresh();
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }

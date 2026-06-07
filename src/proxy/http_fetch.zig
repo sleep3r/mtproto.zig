@@ -35,6 +35,18 @@ test "http fetch - curl config escaping backslash and double-quote" {
 }
 
 pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    return fetchUrlBytesStd(allocator, url) catch |err| {
+        // Zig's std resolver throws ResolvConfParseFailed on a /etc/resolv.conf whose
+        // last line lacks a trailing newline (SolusVM and several VPS images). curl
+        // resolves via NSS/getent, which tolerates it — retry there instead of failing
+        // the whole fetch (keeps the dependency-free std path for healthy hosts).
+        if (std.mem.eql(u8, @errorName(err), "ResolvConfParseFailed"))
+            return runCurlFetch(allocator, url, null);
+        return err;
+    };
+}
+
+fn fetchUrlBytesStd(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     const uri = try std.Uri.parse(url);
 
     var client: std.http.Client = .{
@@ -251,27 +263,39 @@ pub fn fetchUrlBytesViaInterface(
     url: []const u8,
     interface: []const u8,
 ) ![]u8 {
+    return runCurlFetch(allocator, url, interface);
+}
+
+/// Fetch `url` by shelling out to curl, optionally pinned to `interface`. curl
+/// resolves via NSS/getent, which tolerates the malformed `/etc/resolv.conf` (no
+/// trailing newline) that makes Zig's std resolver throw `ResolvConfParseFailed` —
+/// so this also serves as the std-fetch fallback on such hosts.
+fn runCurlFetch(allocator: std.mem.Allocator, url: []const u8, interface: ?[]const u8) ![]u8 {
     // curl requires --interface and its value as separate argv elements; the
     // `--interface=<iface>` form is a common shell idiom but not supported by
     // every curl version, hence the split.
-    const argv = [_][]const u8{
-        "curl",
-        "--silent",
-        "--fail",
-        "--show-error",
-        "--location",
-        "--max-time",
-        "10",
-        "--interface",
-        interface,
-        url,
-    };
+    var argv_buf: [10][]const u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "curl", "--silent", "--fail", "--show-error", "--location", "--max-time", "10" }) |a| {
+        argv_buf[n] = a;
+        n += 1;
+    }
+    if (interface) |iface| {
+        argv_buf[n] = "--interface";
+        n += 1;
+        argv_buf[n] = iface;
+        n += 1;
+    }
+    argv_buf[n] = url;
+    n += 1;
+    const argv = argv_buf[0..n];
+    const where = interface orelse "direct";
 
     var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer io_instance.deinit();
 
     const result = std.process.run(allocator, io_instance.io(), .{
-        .argv = &argv,
+        .argv = argv,
         .stdout_limit = std.Io.Limit.limited(1 * 1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(1 * 1024 * 1024),
     }) catch |err| {
@@ -285,7 +309,7 @@ pub fn fetchUrlBytesViaInterface(
         .exited => |code| {
             if (code != 0) {
                 log.warn("curl {s} via {s} exited with {d}: {s}", .{
-                    url,                                        interface, code,
+                    url,                                        where, code,
                     std.mem.trim(u8, result.stderr, " \t\r\n"),
                 });
                 allocator.free(result.stdout);
@@ -293,7 +317,7 @@ pub fn fetchUrlBytesViaInterface(
             }
         },
         else => {
-            log.warn("curl {s} via {s} terminated abnormally", .{ url, interface });
+            log.warn("curl {s} via {s} terminated abnormally", .{ url, where });
             allocator.free(result.stdout);
             return error.UnexpectedConnectFailure;
         },
