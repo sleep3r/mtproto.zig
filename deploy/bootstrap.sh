@@ -9,6 +9,8 @@
 # After bootstrap, mtbuddy lives at /usr/local/bin/mtbuddy and can be called directly.
 
 set -euo pipefail
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export PATH
 
 REPO="sleep3r/mtproto.zig"
 INSTALL_TO="/usr/local/bin/mtbuddy"
@@ -16,6 +18,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 PINNED_MINISIGN_PUBKEY="RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO"
 MINISIGN_PUBKEY="${MTPROTO_MINISIGN_PUBKEY:-$PINNED_MINISIGN_PUBKEY}"
+MINISIGN_BOOTSTRAP_VERSION="0.12"
+MINISIGN_BOOTSTRAP_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
 INSECURE_MODE="${MTPROTO_INSECURE:-0}"
 
 FORWARD_ARGS=()
@@ -46,9 +50,13 @@ install_minisign_if_needed() {
   step "Installing minisign for signature verification"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
-    apt-get -o DPkg::Lock::Timeout=600 update -qq || fail "apt-get update failed while installing minisign"
-    apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends minisign \
-      || fail "apt-get could not install minisign"
+    if apt-get -o DPkg::Lock::Timeout=600 update -qq \
+      && apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends minisign; then
+      :
+    else
+      step "apt could not install minisign, using pinned upstream binary"
+      install_minisign_from_upstream
+    fi
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y minisign || fail "dnf could not install minisign"
   elif command -v yum >/dev/null 2>&1; then
@@ -65,8 +73,6 @@ install_minisign_if_needed() {
     || fail "minisign is required for signature verification (use --insecure or MTPROTO_INSECURE=1 to bypass)"
   ok "minisign installed"
 }
-
-install_minisign_if_needed
 
 curl_try_download() {
   local out="$1"
@@ -91,6 +97,40 @@ curl_download() {
 
   return 1
 }
+
+verify_sha256_literal() {
+  local file="$1"
+  local expected="$2"
+  local actual
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    fail "Neither sha256sum nor shasum is available for checksum verification"
+  fi
+
+  [ "$actual" = "$expected" ] || fail "Checksum verification failed: $(basename "$file")"
+}
+
+install_minisign_from_upstream() {
+  local minisign_arch
+  case "$(uname -m)" in
+    x86_64) minisign_arch="x86_64" ;;
+    aarch64) minisign_arch="aarch64" ;;
+    *) fail "No pinned minisign bootstrap binary for architecture: $(uname -m)" ;;
+  esac
+
+  local archive="minisign-${MINISIGN_BOOTSTRAP_VERSION}-linux.tar.gz"
+  local url="https://github.com/jedisct1/minisign/releases/download/${MINISIGN_BOOTSTRAP_VERSION}/${archive}"
+  curl_download "$url" "$TMP/$archive" || fail "Download failed: $url"
+  verify_sha256_literal "$TMP/$archive" "$MINISIGN_BOOTSTRAP_SHA256"
+  tar xzf "$TMP/$archive" -C "$TMP" "minisign-linux/${minisign_arch}/minisign"
+  install -m 0755 "$TMP/minisign-linux/${minisign_arch}/minisign" /usr/local/bin/minisign
+}
+
+install_minisign_if_needed
 
 # ── detect arch ───────────────────────────────────────────────────
 cpu_supports_x86_64_v3() {

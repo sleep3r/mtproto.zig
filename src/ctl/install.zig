@@ -72,6 +72,10 @@ fn shouldWarnIgnoredSecret(config_exists: bool, secret_provided: bool, config_pa
     return config_exists and secret_provided and !config_path_provided;
 }
 
+fn shouldInstallMinisignPackage(signature_available: bool, insecure_mode: bool, minisign_on_path: bool) bool {
+    return signature_available and !insecure_mode and !minisign_on_path;
+}
+
 pub fn printInstallHelp(ui: *Tui) void {
     ui.writeRaw("\n");
     ui.writeRaw("  mtbuddy install [options]\n\n");
@@ -109,6 +113,13 @@ test "install - explicit secret warning only applies when existing config keeps 
     try std.testing.expect(!shouldWarnIgnoredSecret(false, true, false));
     try std.testing.expect(!shouldWarnIgnoredSecret(true, false, false));
     try std.testing.expect(!shouldWarnIgnoredSecret(true, true, true));
+}
+
+test "install - skips apt minisign package when verifier is already on PATH" {
+    try std.testing.expect(!shouldInstallMinisignPackage(true, false, true));
+    try std.testing.expect(shouldInstallMinisignPackage(true, false, false));
+    try std.testing.expect(!shouldInstallMinisignPackage(true, true, false));
+    try std.testing.expect(!shouldInstallMinisignPackage(false, false, false));
 }
 
 /// Run install in CLI (non-interactive) mode.
@@ -432,7 +443,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
             return;
         }
         if (!runRequiredWhileSpinning(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }, "apt-get update failed", &sp)) return;
-        const base_packages: []const []const u8 = if (signature_available and !insecure_mode)
+        const should_install_minisign_package = shouldInstallMinisignPackage(signature_available, insecure_mode, sys.commandExists("minisign"));
+        const base_packages: []const []const u8 = if (should_install_minisign_package)
             &.{
                 "env",                     "DEBIAN_FRONTEND=noninteractive",
                 "apt-get",                 "-o",
