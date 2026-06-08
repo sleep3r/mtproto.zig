@@ -560,7 +560,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         try doc.addKv("max_connections", max_conn_val);
         try doc.addKv("idle_timeout_sec", "120");
         try doc.addKv("handshake_timeout_sec", "15");
-        try doc.addKv("handshake_flood_guard_enabled", "true");
+        try doc.addKv("handshake_flood_guard_enabled", "false");
         try doc.addKv("handshake_flood_guard_threshold", "20");
         try doc.addKv("handshake_flood_guard_window_sec", "30");
         try doc.addKv("handshake_flood_guard_block_sec", "120");

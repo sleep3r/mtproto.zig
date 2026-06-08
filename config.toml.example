@@ -93,9 +93,10 @@ port = 443
 # unsafe_override_limits = false
 
 # Handshake flood guard: temporarily blocks source IPs that generate too many
-# failed/abandoned handshakes. Raise the threshold / window for carrier-NAT or
-# shared-office networks where many legitimate clients share one IP.
-# handshake_flood_guard_enabled = true
+# failed/abandoned handshakes. OFF by default — it false-positives on carrier-NAT,
+# VPN-egress and shared-office networks where many legitimate clients share one IP.
+# Turn on (and tune threshold/window) only on single-tenant / non-NAT hosts under abuse.
+# handshake_flood_guard_enabled = false
 # handshake_flood_guard_threshold = 20     # failed handshakes per window before block
 # handshake_flood_guard_window_sec = 30
 # handshake_flood_guard_block_sec = 120

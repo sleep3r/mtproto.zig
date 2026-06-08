@@ -356,7 +356,7 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"
 rate_limit_per_subnet = 0   # 0 = выключено (по умолчанию; не ложно-срабатывает на carrier-NAT). Для не-NAT хостов задайте напр. 30
-handshake_flood_guard_enabled = true
+handshake_flood_guard_enabled = false
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
 handshake_flood_guard_block_sec = 120
@@ -397,7 +397,7 @@ alice = true
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
 | `[server] tag` | — | 32-hex promotion tag от [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] rate_limit_per_subnet` | `0` | Лимит новых соединений/сек на /24 (IPv4) или /48 (IPv6). `0` = выключено (по умолчанию, NAT-friendly); для не-NAT хостов задайте напр. `30` |
-| `[server] handshake_flood_guard_enabled` | `true` | Временно отклонять IP, которые часто не проходят MTProto handshake |
+| `[server] handshake_flood_guard_enabled` | `false` | Временно отклонять IP, которые часто не проходят MTProto handshake (по умолчанию выключен — безопасно для NAT/VPN) |
 | `[server] handshake_flood_guard_threshold` | `20` | Число плохих handshake/rate/budget событий с одного IP до временного deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | Длительность временного deny для шумного IP |
@@ -415,7 +415,7 @@ alice = true
 >
 > **Транспорт `dd` («secure»/padded) по умолчанию отключён** (`[censorship].fake_tls_only = true`) — это обычный обфусцированный MTProto **без TLS-маскировки**, который DPI фингерпринтит напрямую как MTProto. По умолчанию прокси принимает только FakeTLS (`ee`), и `mtbuddy links` печатает только `ee`-ссылки. Чтобы раздавать `dd`-ссылки (сценарии с низким DPI / совместимость), задайте `fake_tls_only = false`. См. [THREAT_MODEL.md](THREAT_MODEL.md).
 >
-> Per-subnet rate limit **по умолчанию выключен** (`rate_limit_per_subnet = 0`), чтобы carrier-NAT/офисные сети (много легитимных клиентов за одним IP/подсетью) не получали ложных блокировок. Handshake flood guard остаётся включённым, но с выключенным subnet-лимитом он реагирует только на брошенные/незавершённые handshake — которые легитимные владельцы secret практически не создают. Если `flood_guard+` всё же блокирует реальных пользователей при burst, поднимите `handshake_flood_guard_threshold` / window / block или задайте `handshake_flood_guard_enabled = false`. `rate_limit_per_subnet` включайте только на single-tenant / не-NAT хостах.
+> Оба стража **по умолчанию выключены**, чтобы carrier-NAT, VPN-egress и офисные сети (много легитимных клиентов за одним IP/подсетью) не получали ложных блокировок скопом: per-subnet rate limit (`rate_limit_per_subnet = 0`) и exact-IP handshake flood guard (`handshake_flood_guard_enabled = false`). Доступ и так закрыт per-user secret, глобальным handshake-inflight бюджетом и `max_connections`. На single-tenant / не-NAT хосте под реальным абьюзом включите: задайте `rate_limit_per_subnet` (например `30`) и `handshake_flood_guard_enabled = true` (настройте `handshake_flood_guard_threshold` / window / block).
 
 ---
 

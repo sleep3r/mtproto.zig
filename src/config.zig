@@ -234,9 +234,14 @@ pub const Config = struct {
     /// secret, the global handshake-inflight budget, and max_connections. Set a
     /// value (e.g. 30) to re-enable for single-tenant / non-NAT deployments.
     rate_limit_per_subnet: u8 = 0,
-    /// Exact-IP handshake flood guard. Temporarily denies clients that repeatedly
-    /// hit handshake timeouts, subnet rate limits, or the handshake budget.
-    handshake_flood_guard_enabled: bool = true,
+    /// Exact-IP handshake flood guard: temporarily denies clients that repeatedly hit
+    /// handshake timeouts, subnet rate limits, or the handshake budget. Off by default
+    /// — like rate_limit_per_subnet it false-positives on carrier-NAT / VPN-egress /
+    /// shared IPs, where many legitimate clients share one source IP and get blocked
+    /// together. Access is already gated by the per-user secret, the handshake-inflight
+    /// budget, and max_connections. Set true (and tune threshold/window/block) on a
+    /// single-tenant / non-NAT host under real abuse.
+    handshake_flood_guard_enabled: bool = false,
     handshake_flood_guard_threshold: u16 = 20,
     handshake_flood_guard_window_sec: u16 = 30,
     handshake_flood_guard_block_sec: u16 = 120,
@@ -798,7 +803,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
     try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet); // Default 0 (disabled)
-    try std.testing.expect(cfg.handshake_flood_guard_enabled);
+    try std.testing.expect(!cfg.handshake_flood_guard_enabled);
     try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
     try std.testing.expectEqual(@as(u16, 30), cfg.handshake_flood_guard_window_sec);
     try std.testing.expectEqual(@as(u16, 120), cfg.handshake_flood_guard_block_sec);
@@ -1209,7 +1214,7 @@ test "parse config - rate_limit_per_subnet disabled" {
     try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet);
 }
 
-test "parse config - handshake flood guard defaults enabled" {
+test "parse config - handshake flood guard defaults disabled" {
     const content =
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
@@ -1218,7 +1223,7 @@ test "parse config - handshake flood guard defaults enabled" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expect(cfg.handshake_flood_guard_enabled);
+    try std.testing.expect(!cfg.handshake_flood_guard_enabled);
     try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
     try std.testing.expectEqual(@as(u16, 30), cfg.handshake_flood_guard_window_sec);
     try std.testing.expectEqual(@as(u16, 120), cfg.handshake_flood_guard_block_sec);

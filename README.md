@@ -372,7 +372,7 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
-handshake_flood_guard_enabled = true
+handshake_flood_guard_enabled = false
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
 handshake_flood_guard_block_sec = 120
@@ -429,7 +429,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] tag` | — | 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
 | `[server] rate_limit_per_subnet` | `0` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). `0` = disabled (default, NAT-friendly); set e.g. `30` for non-NAT hosts |
-| `[server] handshake_flood_guard_enabled` | `true` | Temporarily deny exact source IPs that repeatedly fail the MTProto handshake |
+| `[server] handshake_flood_guard_enabled` | `false` | Temporarily deny exact source IPs that repeatedly fail the MTProto handshake (off by default — NAT/VPN-safe) |
 | `[server] handshake_flood_guard_threshold` | `20` | Bad handshake/rate/budget events per source IP before temporary deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Rolling window for `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | Temporary deny duration for noisy source IPs |
@@ -457,7 +457,7 @@ alice = true   # bypass MiddleProxy for this user
 >
 > **The `dd` ("secure"/padded) transport is rejected by default** (`[censorship].fake_tls_only = true`) — it is plain obfuscated MTProto with **no TLS disguise**, directly fingerprintable as MTProto by DPI. By default the proxy accepts only FakeTLS (`ee`), and `mtbuddy links` prints only `ee` links. To hand out `dd` links (lower-DPI / compatibility scenarios), set `fake_tls_only = false`. See [THREAT_MODEL.md](THREAT_MODEL.md).
 >
-> The per-subnet new-connection rate limit is **off by default** (`rate_limit_per_subnet = 0`) so large carrier-NAT or shared-office networks (many legitimate clients behind one IP/subnet) aren't false-positived. The handshake flood guard stays on but, with the subnet limit off, it only acts on abandoned/incomplete handshakes — which legitimate secret-holders virtually never produce. If you still see `flood_guard+` blocking real users in bursts, raise `handshake_flood_guard_threshold` / window / block, or set `handshake_flood_guard_enabled = false`. Enable `rate_limit_per_subnet` only on single-tenant / non-NAT hosts.
+> Both abuse guards are **off by default** so large carrier-NAT, VPN-egress, or shared-office networks (many legitimate clients behind one source IP/subnet) aren't false-positived and blocked together: the per-subnet new-connection rate limit (`rate_limit_per_subnet = 0`) and the exact-IP handshake flood guard (`handshake_flood_guard_enabled = false`). Access is already gated by the per-user secret, the global handshake-inflight budget, and `max_connections`. On a single-tenant / non-NAT host under real abuse, turn them on: set `rate_limit_per_subnet` (e.g. `30`) and `handshake_flood_guard_enabled = true` (tune `handshake_flood_guard_threshold` / window / block).
 
 ---
 
