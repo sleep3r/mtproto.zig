@@ -8,6 +8,7 @@
 //!   sudo mtbuddy install --port 443 --domain rutube.ru --secret <hex> --user myuser --yes
 
 const std = @import("std");
+const builtin = @import("builtin");
 const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
@@ -74,6 +75,56 @@ fn shouldWarnIgnoredSecret(config_exists: bool, secret_provided: bool, config_pa
 
 fn shouldInstallMinisignPackage(signature_available: bool, insecure_mode: bool, minisign_on_path: bool) bool {
     return signature_available and !insecure_mode and !minisign_on_path;
+}
+
+// Pinned upstream minisign for hosts whose package manager has no minisign
+// (e.g. Ubuntu 20.04 focal). Kept in sync with deploy/bootstrap.sh.
+const minisign_bootstrap_version = "0.12";
+const minisign_bootstrap_sha256 = "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73";
+
+/// Install the pinned upstream minisign binary when apt has no minisign package.
+/// Mirrors deploy/bootstrap.sh: a SHA-256-verified tarball from the pinned
+/// jedisct1/minisign release, extracted for this CPU arch. Silent (runs under the
+/// deps spinner); returns true iff minisign is now resolvable on PATH.
+fn installMinisignFromUpstream(allocator: std.mem.Allocator) bool {
+    const arch_name: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        else => return false,
+    };
+    const archive = "/tmp/mtbuddy-minisign-" ++ minisign_bootstrap_version ++ "-linux.tar.gz";
+    const url = "https://github.com/jedisct1/minisign/releases/download/" ++
+        minisign_bootstrap_version ++ "/minisign-" ++ minisign_bootstrap_version ++ "-linux.tar.gz";
+
+    {
+        const r = sys.exec(allocator, &.{ "curl", "-fsSL", "--retry", "3", "--connect-timeout", "30", "-o", archive, url }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+    }
+    // Verify SHA-256 before trusting the binary — minisign can't verify itself.
+    {
+        const r = sys.exec(allocator, &.{ "sha256sum", archive }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+        const trimmed = std.mem.trim(u8, r.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+        const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+        if (!std.mem.eql(u8, trimmed[0..end], minisign_bootstrap_sha256)) return false;
+    }
+    const member = std.fmt.allocPrint(allocator, "minisign-linux/{s}/minisign", .{arch_name}) catch return false;
+    defer allocator.free(member);
+    {
+        const r = sys.exec(allocator, &.{ "tar", "xzf", archive, "-C", "/tmp", member }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+    }
+    const extracted = std.fmt.allocPrint(allocator, "/tmp/minisign-linux/{s}/minisign", .{arch_name}) catch return false;
+    defer allocator.free(extracted);
+    {
+        const r = sys.exec(allocator, &.{ "install", "-m", "0755", extracted, "/usr/local/bin/minisign" }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+    }
+    return sys.commandExists("minisign");
 }
 
 pub fn printInstallHelp(ui: *Tui) void {
@@ -443,36 +494,38 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
             return;
         }
         if (!runRequiredWhileSpinning(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }, "apt-get update failed", &sp)) return;
-        const should_install_minisign_package = shouldInstallMinisignPackage(signature_available, insecure_mode, sys.commandExists("minisign"));
-        const base_packages: []const []const u8 = if (should_install_minisign_package)
-            &.{
-                "env",                     "DEBIAN_FRONTEND=noninteractive",
-                "apt-get",                 "-o",
-                "DPkg::Lock::Timeout=600", "install",
-                "-y",                      "--no-install-recommends",
-                "iptables",                "xxd",
-                "curl",                    "openssl",
-                "tar",                     "passwd",
-                "minisign",
-            }
-        else
-            &.{
-                "env",                     "DEBIAN_FRONTEND=noninteractive",
-                "apt-get",                 "-o",
-                "DPkg::Lock::Timeout=600", "install",
-                "-y",                      "--no-install-recommends",
-                "iptables",                "xxd",
-                "curl",                    "openssl",
-                "tar",                     "passwd",
-            };
+        // minisign is acquired separately (below), not in this required base install:
+        // not every supported release ships it in apt (e.g. Ubuntu 20.04 focal), and
+        // bundling it here would abort the whole install on those hosts.
+        const base_packages: []const []const u8 = &.{
+            "env",                     "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",                 "-o",
+            "DPkg::Lock::Timeout=600", "install",
+            "-y",                      "--no-install-recommends",
+            "iptables",                "xxd",
+            "curl",                    "openssl",
+            "tar",                     "passwd",
+        };
         if (!runRequiredWhileSpinning(ui, allocator, base_packages, "Failed to install system dependencies", &sp)) return;
         // qrencode powers the optional terminal/dashboard QR; the feature degrades
         // gracefully without it (printQrCode no-ops), so install it best-effort and
         // never fail the whole install if it's unavailable.
         _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "--no-install-recommends", "qrencode" }) catch {};
+        // Acquire minisign for release-signature verification: prefer the apt package,
+        // fall back to the pinned, SHA-256-verified upstream binary when apt has none
+        // (Ubuntu 20.04 focal) — matching the bootstrap, so a bare `mtbuddy install`
+        // works there too.
+        var minisign_fallback_failed = false;
+        if (shouldInstallMinisignPackage(signature_available, insecure_mode, sys.commandExists("minisign"))) {
+            _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "--no-install-recommends", "minisign" }) catch {};
+            if (!sys.commandExists("minisign")) {
+                minisign_fallback_failed = !installMinisignFromUpstream(allocator);
+            }
+        }
         if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
             sp.stop(false, "");
             ui.fail("minisign is required for release signature verification");
+            if (minisign_fallback_failed) ui.info("apt has no minisign on this host and the pinned upstream fallback failed (check network / checksum), or re-run with --insecure.");
             return;
         }
         if (!requiredAccountToolsAvailable(ui)) {

@@ -4,7 +4,7 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DOCKERFILE="$ROOT/test/installer-e2e/Dockerfile"
 LOG_DIR="${MTPROTO_INSTALLER_E2E_LOG_DIR:-$ROOT/test/installer-e2e/logs}"
-IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:12 ubuntu:24.04}"
+IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:11 debian:12 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04}"
 VERSION="${MTPROTO_INSTALLER_E2E_VERSION:-latest}"
 PORT="${MTPROTO_INSTALLER_E2E_PORT:-443}"
 # Default to the shipped installer default (rutube.ru), not the domain the installer
