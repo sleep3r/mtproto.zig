@@ -17,6 +17,11 @@ const I18N = {
     'routing.title': 'Routing & Upstream', 'routing.upstream': 'Upstream', 'routing.tunnelPin': 'Tunnel pin',
     'routing.proxyHost': 'Proxy host', 'routing.port': 'Port', 'routing.user': 'User', 'routing.pass': 'Pass', 'routing.target': 'Target', 'routing.policy': 'Policy',
     'mask.title': 'Masking Health', 'mask.mode': 'Mode', 'mask.endpoint': 'Endpoint', 'mask.timer': 'Health Timer',
+    'egress.title': 'Tunnel Quality', 'egress.interface': 'Interface', 'egress.status': 'Status',
+    'egress.rtt': 'RTT', 'egress.loss': 'Loss', 'egress.handshake': 'Handshake', 'egress.quality': 'Quality',
+    'egress.good': 'Good', 'egress.degraded': 'Degraded', 'egress.poor': 'Poor', 'egress.up': 'Up', 'egress.down': 'Down', 'egress.unknown': 'Unknown',
+    'egress.primary': 'primary', 'egress.bottleneck': 'Tunnel is the bottleneck',
+    'egress.notMonitored': 'Not monitored (not in tunnel mode)',
     'logs.title': '▸ Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
     'modal.deleteUser': 'Delete User', 'modal.deleteTunnel': 'Delete Tunnel', 'modal.restartNote': 'The proxy will be restarted to apply changes.',
     'share.subtitle': 'Point their phone camera at this code to connect.', 'share.copyLink': 'Copy link', 'share.send': 'Send', 'share.with': 'Share with',
@@ -41,6 +46,11 @@ const I18N = {
     'routing.title': 'Маршрутизация и выход', 'routing.upstream': 'Выход', 'routing.tunnelPin': 'Туннель',
     'routing.proxyHost': 'Хост прокси', 'routing.port': 'Порт', 'routing.user': 'Логин', 'routing.pass': 'Пароль', 'routing.target': 'Цель', 'routing.policy': 'Политика',
     'mask.title': 'Маскировка', 'mask.mode': 'Режим', 'mask.endpoint': 'Эндпоинт', 'mask.timer': 'Таймер проверки',
+    'egress.title': 'Качество туннеля', 'egress.interface': 'Интерфейс', 'egress.status': 'Статус',
+    'egress.rtt': 'RTT', 'egress.loss': 'Потери', 'egress.handshake': 'Хендшейк', 'egress.quality': 'Качество',
+    'egress.good': 'Хорошо', 'egress.degraded': 'Деградация', 'egress.poor': 'Плохо', 'egress.up': 'Включён', 'egress.down': 'Отключён', 'egress.unknown': 'Неизвестно',
+    'egress.primary': 'основной', 'egress.bottleneck': 'Туннель — узкое место',
+    'egress.notMonitored': 'Не отслеживается (не режим туннеля)',
     'logs.title': '▸ Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
     'modal.deleteUser': 'Удалить пользователя', 'modal.deleteTunnel': 'Удалить туннель', 'modal.restartNote': 'Прокси будет перезапущен для применения изменений.',
     'share.subtitle': 'Наведите камеру их телефона на этот код, чтобы подключиться.', 'share.copyLink': 'Скопировать ссылку', 'share.send': 'Отправить', 'share.with': 'Поделиться с',
@@ -76,6 +86,7 @@ let lastSuccessAt = 0;
 let hasPollError = false;
 let lastData = null; // store last API response for tooltips
 let currentRouting = null;
+let lastEgress = null; // store last /api/egress response for re-render on lang toggle
 
 const tt = $('chartTooltip');
 function showTooltip(e, canvas, padLeft, dataArr, formatCb) {
@@ -1111,6 +1122,70 @@ function renderRouting(routing) {
   });
 }
 
+// ── Egress / tunnel quality ──
+function fmtHandshakeAge(sec) {
+  if (sec === null || sec === undefined) return '—';
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  return Math.floor(sec / 3600) + 'h';
+}
+
+function renderEgress(egress) {
+  lastEgress = egress;
+  const card = $('egressCard');
+  if (!card) return;
+
+  if (!egress || !egress.tunnels || egress.tunnels.length === 0) {
+    card.style.display = 'none';
+    return;
+  }
+
+  card.style.display = '';
+
+  const summary = egress.summary || {};
+  const summaryText = LANG === 'ru' ? summary.ru : summary.en;
+  const summaryEl = $('egressSummary');
+  if (summaryEl) summaryEl.textContent = summaryText || '—';
+
+  const list = $('egressList');
+  if (!list) return;
+
+  list.innerHTML = (egress.tunnels || []).map((tun) => {
+    const iface = esc(tun.interface || '—');
+    const isPrimary = tun.is_primary;
+    const quality = tun.quality || 'unknown';
+    const rttText = tun.rtt_ms !== null && tun.rtt_ms !== undefined
+      ? tun.rtt_ms.toFixed(1) + ' ms'
+      : '—';
+    const lossText = tun.packet_loss_pct !== null && tun.packet_loss_pct !== undefined
+      ? tun.packet_loss_pct.toFixed(1) + '%'
+      : '—';
+    const hsText = fmtHandshakeAge(tun.handshake_age_sec);
+
+    // Color code quality (good, degraded, poor, up, down, unknown)
+    const qualityClass = 'egress-quality-' + quality;
+    const qualityLabel = t('egress.' + quality) || quality;
+
+    // "Tunnel is the bottleneck" hint when quality is degraded/poor.
+    const isBottleneck = quality === 'degraded' || quality === 'poor';
+    const bottleneck = isBottleneck
+      ? '<div class="egress-bottleneck" title="' + t('egress.bottleneck') + '">⚠ ' + t('egress.bottleneck') + '</div>'
+      : '';
+
+    return '<div class="egress-row' + (isBottleneck ? ' is-bottleneck' : '') + '">' +
+      '<div class="egress-iface">' + iface +
+      (isPrimary ? '<span class="routing-tag">' + t('egress.primary') + '</span>' : '') +
+      '</div>' +
+      '<div class="egress-status ' + (tun.up ? 'on' : 'off') + '">' + (tun.up ? t('status.online') : t('status.offline')) + '</div>' +
+      '<div class="egress-quality ' + qualityClass + '">' + qualityLabel + '</div>' +
+      '<div class="egress-rtt" title="' + t('egress.rtt') + '">' + rttText + '</div>' +
+      '<div class="egress-loss" title="' + t('egress.loss') + '">' + lossText + '</div>' +
+      '<div class="egress-hs" title="' + t('egress.handshake') + '">' + hsText + '</div>' +
+      bottleneck +
+      '</div>';
+  }).join('');
+}
+
 // ── Polling ──
 async function poll() {
   const r = await fetch('/api/stats', { cache: 'no-store' });
@@ -1173,6 +1248,17 @@ async function poll() {
   }
 
   renderRouting(d.routing || null);
+
+  // Egress / tunnel quality
+  try {
+    const egressResp = await fetch('/api/egress', { cache: 'no-store' });
+    const egressData = await egressResp.json();
+    if (egressResp.ok && egressData.ok) {
+      renderEgress(egressData);
+    }
+  } catch (e) {
+    // Silent failure; egress monitoring is optional
+  }
 
   // Masking health
   const masking = d.masking;
@@ -1330,6 +1416,7 @@ if (langToggleBtn) {
     setLang(LANG === 'ru' ? 'en' : 'ru');
     updatePollControls();
     updateAutoScrollButton();
+    if (lastEgress) renderEgress(lastEgress);
   });
 }
 applyStaticI18n();

@@ -445,6 +445,9 @@ def _proxy_info() -> dict:
 _awg_cache = {"ts": 0, "data": None}
 AWG_CACHE_TTL = 10  # seconds
 
+_egress_cache = {"ts": 0, "data": None}
+EGRESS_CACHE_TTL = 12  # seconds (allows 2-3 quality checks per poll, avoiding hammering)
+
 
 def _awg_status() -> dict:
     """Check AmneziaWG tunnel status (host namespace)."""
@@ -820,6 +823,194 @@ def _probe_tunnel_interface(interface: str) -> dict:
     if r.returncode == 0:
         return {"ok": True, "reason": "Telegram probe ok"}
     return {"ok": False, "reason": "Telegram probe failed"}
+
+
+# ── Egress / tunnel quality probing ──────────────────────────────────────────
+# Surfaces whether the upstream VPN tunnel (awg0/wg0/…) is the bottleneck:
+# link state, last WireGuard/AmneziaWG handshake age, RTT and packet loss to a
+# Telegram DC reached *via that interface*. Everything degrades to None when the
+# deployment is not a tunnel or the tools are missing — never an error.
+
+# A Telegram DC IPv4 (DC2, the canonical core endpoint) so the probe traverses
+# the same path real proxy traffic would, rather than a generic public host.
+EGRESS_PROBE_IP = "149.154.167.51"
+
+
+def _tunnel_handshake_age(interface: str, tool_hint: str | None = None) -> int | None:
+    """Return the age in seconds of the most recent WG/AWG handshake on the
+    interface, or None if no handshake / tool unavailable.
+
+    Uses `<tool> show <iface> latest-handshakes` which reports a unix epoch per
+    peer; age = now - max(epoch). An epoch of 0 means "never" → None.
+    """
+    tools: list[str] = []
+    if tool_hint:
+        tools.append(tool_hint)
+    for name in ("awg", "wg"):
+        if name not in tools:
+            tools.append(name)
+
+    for tool in tools:
+        if not shutil.which(tool):
+            continue
+        try:
+            out = subprocess.check_output(
+                [tool, "show", interface, "latest-handshakes"],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+
+        best_epoch = 0
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                epoch = int(parts[-1])
+            except ValueError:
+                continue
+            if epoch > best_epoch:
+                best_epoch = epoch
+
+        if best_epoch <= 0:
+            return None
+        age = int(time.time()) - best_epoch
+        return age if age >= 0 else 0
+
+    return None
+
+
+def _tunnel_rtt(interface: str, gateway_ip: str = EGRESS_PROBE_IP, timeout: int = 3) -> float | None:
+    """Measure RTT to a DC via the specified interface using ping.
+
+    Returns RTT in milliseconds (float), or None if unavailable/timeout.
+    On error or tool unavailable, returns None silently (dashboard displays as "—").
+    """
+    if not shutil.which("ping"):
+        return None
+
+    try:
+        # Use -I to bind to specific interface, -c 1 for single packet, -W for timeout (ms)
+        result = subprocess.run(
+            ["ping", "-I", interface, "-c", "1", "-W", str(timeout * 1000), gateway_ip],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout + 1,
+        )
+        if result.returncode != 0:
+            return None
+
+        # Parse "time=X.XXX ms" from output
+        m = re.search(r"time=([\d.]+)\s*ms", result.stdout)
+        if m:
+            return float(m[1])
+    except Exception:
+        pass
+
+    return None
+
+
+def _tunnel_packet_loss(interface: str, gateway_ip: str = EGRESS_PROBE_IP, count: int = 10, timeout: int = 5) -> float | None:
+    """Measure packet loss % to DC via interface.
+
+    Sends `count` pings, returns loss as % (0-100), or None if unavailable.
+    """
+    if not shutil.which("ping"):
+        return None
+
+    try:
+        result = subprocess.run(
+            ["ping", "-I", interface, "-c", str(count), "-W", str(timeout * 1000), gateway_ip],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout + 1,
+        )
+
+        # Parse "X% packet loss" (works on Linux, macOS)
+        m = re.search(r"([\d.]+)%\s+(?:packet\s+)?loss", result.stdout)
+        if m:
+            return float(m[1])
+    except Exception:
+        pass
+
+    return None
+
+
+def _tunnel_egress_health(interface: str, tool_hint: str | None = None) -> dict:
+    """Comprehensive egress/tunnel health check.
+
+    Returns:
+    {
+        "interface": str,
+        "up": bool,                    # link is operational
+        "handshake_age_sec": int | None,  # age of last WG/AWG handshake
+        "rtt_ms": float | None,        # round-trip time in ms
+        "packet_loss_pct": float | None,  # 0-100
+        "quality": str,                # "good", "degraded", "poor", or "unknown"
+    }
+    """
+    result = {
+        "interface": interface,
+        "up": False,
+        "handshake_age_sec": None,
+        "rtt_ms": None,
+        "packet_loss_pct": None,
+        "quality": "unknown",
+    }
+
+    # Check if interface is up
+    try:
+        link_check = subprocess.run(
+            ["ip", "link", "show", "dev", interface],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        if link_check.returncode != 0:
+            result["quality"] = "down"
+            return result
+        result["up"] = True
+    except Exception:
+        result["quality"] = "unknown"
+        return result
+
+    # Last WireGuard/AmneziaWG handshake age (advisory; cross-checks RTT/loss)
+    result["handshake_age_sec"] = _tunnel_handshake_age(interface, tool_hint)
+
+    # Measure RTT and packet loss (non-blocking; silent failure if tools unavailable)
+    rtt = _tunnel_rtt(interface)
+    loss = _tunnel_packet_loss(interface, count=5, timeout=3)
+
+    result["rtt_ms"] = rtt
+    result["packet_loss_pct"] = loss
+
+    # Determine quality based on metrics
+    if loss is None and rtt is None:
+        # Tools not available, but interface is up
+        result["quality"] = "up"
+    elif loss is not None and loss > 0:
+        # Packet loss detected
+        if loss > 10:
+            result["quality"] = "poor"
+        else:
+            result["quality"] = "degraded"
+    elif rtt is not None:
+        # RTT-based heuristic (good = <100ms, degraded = 100-300ms, poor = >300ms)
+        if rtt > 300:
+            result["quality"] = "poor"
+        elif rtt > 100:
+            result["quality"] = "degraded"
+        else:
+            result["quality"] = "good"
+    else:
+        result["quality"] = "up"  # up but metrics unavailable
+
+    return result
 
 
 def _detect_tunnel_interface(interface: str, tool_hint: str | None = None) -> dict:
@@ -2232,6 +2423,87 @@ def api_stats():
             "users": _users_status(),
         }
     )
+
+
+@app.get("/api/egress")
+def api_egress():
+    """Return tunnel/egress health metrics for all active interfaces.
+
+    Returns:
+    {
+        "ok": true,
+        "primary_interface": str | None,
+        "tunnels": [
+            {
+                "interface": str,
+                "up": bool,
+                "handshake_age_sec": int | None,
+                "rtt_ms": float | None,
+                "packet_loss_pct": float | None,
+                "quality": str,  // "good", "degraded", "poor", "up", "down", "unknown"
+                "is_primary": bool,
+            }
+        ],
+        "summary": {"en": str, "ru": str},  // overall quality message
+    }
+    """
+    global _egress_cache
+    now = time.time()
+    if now - _egress_cache["ts"] < EGRESS_CACHE_TTL and _egress_cache["data"]:
+        return JSONResponse(_egress_cache["data"])
+
+    cfg = _load_proxy_runtime_config()
+    routing = _routing_status()
+
+    # Determine which interfaces to check
+    tunnels = []
+    primary_iface = routing.get("active_tunnel_interface") or routing.get("selected_tunnel_interface")
+
+    # Gather all tunnel interfaces to monitor
+    candidates = []
+    if routing.get("tunnels"):
+        for tun in routing["tunnels"]:
+            iface = tun.get("interface")
+            if iface and (tun.get("active") or tun.get("link_up") or tun.get("in_pool")):
+                if iface not in candidates:
+                    candidates.append(iface)
+
+    # If upstream_mode is tunnel, check health for all active/pool members
+    upstream_type = str(cfg.get("upstream_type", "auto") or "auto").lower().strip()
+    if upstream_type == "tunnel" and candidates:
+        for iface in candidates:
+            health = _tunnel_egress_health(iface, _tunnel_tool_hint(iface))
+            health["is_primary"] = (iface == primary_iface)
+            tunnels.append(health)
+
+    # Generate summary (bilingual; rendered client-side per LANG)
+    if not tunnels:
+        primary_iface = None
+        summary_en = "Tunnel monitoring not active (upstream mode is not 'tunnel')"
+        summary_ru = "Мониторинг туннеля не активен (режим upstream не 'tunnel')"
+    else:
+        good_count = sum(1 for t in tunnels if t["quality"] in ("good", "up"))
+        total_count = len(tunnels)
+
+        if good_count == total_count:
+            summary_en = f"All {total_count} tunnel(s) healthy"
+            summary_ru = f"Все {total_count} туннель(и) здоровы"
+        elif good_count > 0:
+            summary_en = f"{good_count}/{total_count} tunnel(s) healthy"
+            summary_ru = f"{good_count}/{total_count} туннель(и) здоровы"
+        else:
+            summary_en = "All tunnels degraded or down"
+            summary_ru = "Все туннели деградированы или отключены"
+
+    result = {
+        "ok": True,
+        "primary_interface": primary_iface,
+        "tunnels": tunnels,
+        "summary": {"en": summary_en, "ru": summary_ru},
+    }
+
+    _egress_cache.update(ts=now, data=result)
+    return JSONResponse(result)
 
 
 # ── Routing Management API ──

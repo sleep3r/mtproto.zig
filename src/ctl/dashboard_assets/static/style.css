@@ -1031,3 +1031,121 @@ body::after {
     width: 100%;
   }
 }
+
+/* Egress / Tunnel Quality */
+.egress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.egress-row {
+  display: grid;
+  grid-template-columns: 1fr 80px 100px 80px 70px 70px;
+  gap: 12px;
+  padding: 10px;
+  background: rgba(127, 127, 127, 0.04);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+
+.egress-row.is-bottleneck {
+  border-color: rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.05);
+}
+
+.egress-iface {
+  font-weight: 500;
+  word-break: break-all;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.egress-status {
+  padding: 4px 6px;
+  border-radius: 4px;
+  text-align: center;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.egress-status.on {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+
+.egress-status.off {
+  background: rgba(255, 80, 80, 0.15);
+  color: var(--red);
+}
+
+.egress-quality {
+  padding: 4px 6px;
+  border-radius: 4px;
+  text-align: center;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.egress-quality-good {
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--green);
+}
+
+.egress-quality-degraded {
+  background: rgba(240, 180, 40, 0.15);
+  color: var(--amber);
+}
+
+.egress-quality-poor {
+  background: rgba(255, 80, 80, 0.15);
+  color: var(--red);
+}
+
+.egress-quality-up {
+  background: rgba(52, 211, 153, 0.1);
+  color: var(--text-muted);
+}
+
+.egress-quality-down,
+.egress-quality-unknown {
+  background: rgba(127, 127, 127, 0.1);
+  color: var(--text-muted);
+}
+
+.egress-rtt,
+.egress-loss,
+.egress-hs {
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.egress-bottleneck {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--red);
+  margin-top: 2px;
+}
+
+@media (max-width: 1200px) {
+  .egress-row {
+    grid-template-columns: 1fr 70px;
+    gap: 8px;
+  }
+  .egress-quality,
+  .egress-rtt,
+  .egress-loss,
+  .egress-hs {
+    display: none;
+  }
+  .egress-bottleneck {
+    grid-column: 1 / -1;
+  }
+}
