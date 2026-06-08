@@ -76,6 +76,34 @@ test "config command recognizes network doctor flag" {
     try std.testing.expect(!isNetworkFlag("--config"));
 }
 
+test "doctor - classifyDcVerdict maps reachability to verdict" {
+    try std.testing.expectEqual(DcVerdict.reachable, classifyDcVerdict(2, 2));
+    try std.testing.expectEqual(DcVerdict.partial, classifyDcVerdict(1, 2));
+    try std.testing.expectEqual(DcVerdict.blackholed, classifyDcVerdict(0, 2));
+    // Defensive edge: an empty probe set is treated as a blackhole, not "all up".
+    try std.testing.expectEqual(DcVerdict.blackholed, classifyDcVerdict(0, 0));
+}
+
+test "doctor - parsePingRttMs extracts truncated milliseconds" {
+    const line = "64 bytes from 149.154.175.50: icmp_seq=1 ttl=53 time=42.7 ms";
+    try std.testing.expectEqual(@as(?u32, 42), parsePingRttMs(line));
+    // Integer time= (BusyBox-style) and no trailing space before unit.
+    try std.testing.expectEqual(@as(?u32, 7), parsePingRttMs("... time=7ms"));
+    // No time= token (host unreachable / ping blocked) -> null.
+    try std.testing.expectEqual(@as(?u32, null), parsePingRttMs("100% packet loss"));
+    try std.testing.expectEqual(@as(?u32, null), parsePingRttMs("time="));
+}
+
+test "doctor - isSafeInterfaceName rejects shell metacharacters" {
+    try std.testing.expect(isSafeInterfaceName("awg0"));
+    try std.testing.expect(isSafeInterfaceName("wg0"));
+    try std.testing.expect(isSafeInterfaceName("eth0.100"));
+    try std.testing.expect(!isSafeInterfaceName(""));
+    try std.testing.expect(!isSafeInterfaceName("awg0; rm -rf /"));
+    try std.testing.expect(!isSafeInterfaceName("$(reboot)"));
+    try std.testing.expect(!isSafeInterfaceName("a b"));
+}
+
 fn defaultConfigPath() []const u8 {
     if (sys.fileExists(installed_config_path)) return installed_config_path;
     return local_config_path;
@@ -208,6 +236,78 @@ fn doctor(ui: *Tui, allocator: std.mem.Allocator, path: []const u8, network: boo
     if (errors > 0) return error.ConfigDoctorFailed;
 }
 
+/// Well-known primary Telegram DC IPs (DC2 Amsterdam, DC4 Amsterdam). A
+/// non-blocking SYN to :443 either connects (path works) or times out (the
+/// route is an L3 blackhole, the shape of the current RU IP block). Picking two
+/// independent DCs avoids a single-DC maintenance window reading as "blocked".
+const telegram_dc_probes = [_]struct { label: []const u8, ip: []const u8 }{
+    .{ .label = "DC2", .ip = "149.154.167.50" },
+    .{ .label = "DC4", .ip = "149.154.175.50" },
+};
+
+/// Verdict for the direct-reachability probe. `classifyDcVerdict` maps the
+/// per-DC connect results to one of these so the messaging is a pure,
+/// unit-testable function of "how many DCs answered".
+const DcVerdict = enum { reachable, partial, blackholed };
+
+/// Classify direct DC reachability from connect results. Pure helper so the
+/// verdict wording can be tested without touching the network.
+///   all DCs up        -> reachable  ("DCs reachable directly")
+///   some up, some down -> partial   (asymmetric block / one DC in maintenance)
+///   none up           -> blackholed (SYN timeout on every DC == IP blackhole)
+fn classifyDcVerdict(reachable_count: usize, total: usize) DcVerdict {
+    if (total == 0 or reachable_count == 0) return .blackholed;
+    if (reachable_count == total) return .reachable;
+    return .partial;
+}
+
+/// Parse the round-trip time (in whole milliseconds, truncated) out of a line
+/// of `ping` output, e.g. "... time=42.5 ms" or "... time=42 ms". Returns null
+/// when no `time=` token is present (host unreachable, ping blocked, etc.).
+/// Pure helper, unit-tested against real ping wording.
+fn parsePingRttMs(output: []const u8) ?u32 {
+    const marker = "time=";
+    const idx = std.mem.indexOf(u8, output, marker) orelse return null;
+    var rest = output[idx + marker.len ..];
+    // Number runs up to the first non [0-9.] character (space before "ms").
+    var end: usize = 0;
+    while (end < rest.len) : (end += 1) {
+        const c = rest[end];
+        if (!((c >= '0' and c <= '9') or c == '.')) break;
+    }
+    if (end == 0) return null;
+    rest = rest[0..end];
+    const rtt_f = std.fmt.parseFloat(f64, rest) catch return null;
+    if (rtt_f < 0) return null;
+    return @intFromFloat(rtt_f);
+}
+
+/// Linux interface names are short and restricted; reject anything outside that
+/// set defensively so a config value can never smuggle arguments into the
+/// `ping`/`curl` argv (even though we never go through a shell).
+fn isSafeInterfaceName(iface: []const u8) bool {
+    if (iface.len == 0 or iface.len > 32) return false;
+    for (iface) |c| {
+        const ok_char = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-' or c == '.' or c == '@' or c == ':';
+        if (!ok_char) return false;
+    }
+    return true;
+}
+
+/// Scratch buffer for one-off "prefix + value" status lines. The doctor is
+/// single-threaded and every message is consumed by ui.ok/ui.warn before the
+/// next joinMsg call, so a shared static buffer is safe and avoids per-line
+/// allocations (and the leaks that `ui.ok(allocPrint(...) catch ...)` invites).
+var join_msg_buf: [160]u8 = undefined;
+
+/// Format "prefix"++"value" into the shared scratch buffer for a status line.
+fn joinMsg(prefix: []const u8, value: []const u8) []const u8 {
+    return std.fmt.bufPrint(&join_msg_buf, "{s}{s}", .{ prefix, value }) catch prefix;
+}
+
 fn runNetworkDoctor(
     ui: *Tui,
     allocator: std.mem.Allocator,
@@ -219,81 +319,202 @@ fn runNetworkDoctor(
     ui.section("Network probes");
 
     switch (cfg.upstream_mode) {
-        .socks5, .http => {
-            const host = cfg.upstream_proxy_host orelse {
-                ui.fail("upstream proxy host is missing");
-                errors.* += 1;
-                return;
-            };
-            if (cfg.upstream_proxy_port == 0) {
-                ui.fail("upstream proxy port is missing");
-                errors.* += 1;
-                return;
-            }
+        .socks5, .http => runNetworkDoctorProxy(ui, allocator, cfg, errors, warnings),
+        .tunnel => runNetworkDoctorTunnel(ui, allocator, cfg, errors, warnings),
+        .auto, .direct => runNetworkDoctorDirect(ui, allocator, cfg, errors, warnings),
+    }
 
-            if (probeTcpEndpoint(allocator, host, cfg.upstream_proxy_port, 3000)) {
-                ui.ok("upstream proxy TCP endpoint is reachable");
-            } else {
-                ui.fail("upstream proxy TCP endpoint is not reachable");
-                errors.* += 1;
-            }
+    // Cheap, always-useful: confirm a client link can actually be generated.
+    runNetworkDoctorLink(ui, cfg, warnings);
+}
 
-            const kind: http_fetch.ProxyKind = if (cfg.upstream_mode == .socks5) .socks5 else .http_connect;
-            const bytes = http_fetch.fetchUrlBytesViaProxy(allocator, middle_proxy_config_url, .{
-                .kind = kind,
-                .host = host,
-                .port = cfg.upstream_proxy_port,
-                .username = cfg.upstream_proxy_username,
-                .password = cfg.upstream_proxy_password,
-            }) catch null;
-            if (bytes) |body| {
-                allocator.free(body);
-                ui.ok("Telegram metadata fetch works through configured upstream");
-            } else {
-                ui.fail("Telegram metadata fetch through configured upstream failed");
-                errors.* += 1;
-            }
-        },
-        .tunnel => {
-            if (probeTunnelMetadata(allocator, cfg)) {
-                ui.ok("Telegram metadata fetch works through configured tunnel interface");
-            } else {
-                ui.warn("Telegram metadata fetch through tunnel interface failed");
-                warnings.* += 1;
-            }
-        },
-        .auto, .direct => {
-            if (probeTcpEndpoint(allocator, "149.154.175.50", 443, 3000)) {
-                ui.ok("Telegram DC1 TCP endpoint is reachable");
-            } else {
-                ui.fail("Telegram DC1 TCP endpoint is not reachable");
-                errors.* += 1;
-            }
+fn runNetworkDoctorProxy(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    errors: *usize,
+    warnings: *usize,
+) void {
+    _ = warnings;
+    const host = cfg.upstream_proxy_host orelse {
+        ui.fail("upstream proxy host is missing");
+        errors.* += 1;
+        return;
+    };
+    if (cfg.upstream_proxy_port == 0) {
+        ui.fail("upstream proxy port is missing");
+        errors.* += 1;
+        return;
+    }
 
-            // The direct std.http fetch has no explicit timeout; on a blackholed
-            // route it blocks on the OS TCP connect timeout (up to ~2 min). Warn
-            // the operator so a slow probe doesn't look like a hang.
-            ui.hint("Probing core.telegram.org directly (may take up to the OS connect timeout on a censored route)...");
-            const bytes = http_fetch.fetchUrlBytes(allocator, middle_proxy_config_url) catch null;
-            if (bytes) |body| {
-                allocator.free(body);
-                ui.ok("Telegram metadata fetch works directly");
-            } else {
-                ui.warn("Telegram metadata fetch failed directly");
-                warnings.* += 1;
-            }
-        },
+    if (probeTcpEndpoint(allocator, host, cfg.upstream_proxy_port, 3000)) {
+        ui.ok("upstream proxy TCP endpoint is reachable");
+    } else {
+        ui.fail("upstream proxy TCP endpoint is not reachable");
+        errors.* += 1;
+    }
+
+    const kind: http_fetch.ProxyKind = if (cfg.upstream_mode == .socks5) .socks5 else .http_connect;
+    const bytes = http_fetch.fetchUrlBytesViaProxy(allocator, middle_proxy_config_url, .{
+        .kind = kind,
+        .host = host,
+        .port = cfg.upstream_proxy_port,
+        .username = cfg.upstream_proxy_username,
+        .password = cfg.upstream_proxy_password,
+    }) catch null;
+    if (bytes) |body| {
+        allocator.free(body);
+        ui.ok("Telegram metadata fetch works through configured upstream");
+    } else {
+        ui.fail("Telegram metadata fetch through configured upstream failed");
+        errors.* += 1;
     }
 }
 
-fn probeTunnelMetadata(allocator: std.mem.Allocator, cfg: *const Config) bool {
-    var idx: usize = 0;
-    while (cfg.tunnelCandidateAt(idx)) |iface| : (idx += 1) {
-        const bytes = http_fetch.fetchUrlBytesViaInterface(allocator, middle_proxy_config_url, iface) catch continue;
-        allocator.free(bytes);
-        return true;
+/// "Am I blocked?" probe for direct/auto egress. Hits a couple of well-known DC
+/// IPs and prints a single clear verdict so an operator can tell an L3 blackhole
+/// (the current RU block: SYN times out) from a working path.
+fn runNetworkDoctorDirect(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    errors: *usize,
+    warnings: *usize,
+) void {
+    _ = cfg; // direct probe uses fixed DC IPs; config is irrelevant here.
+    ui.hint("Probing well-known Telegram DC IPs on :443 (SYN timeout vs connect)...");
+
+    var reachable_count: usize = 0;
+    for (telegram_dc_probes) |dc| {
+        if (probeTcpEndpoint(allocator, dc.ip, 443, 3000)) {
+            reachable_count += 1;
+            ui.ok(joinMsg("reached ", dc.ip));
+        } else {
+            ui.warn(joinMsg("no SYN-ACK from ", dc.ip));
+        }
     }
-    return false;
+
+    switch (classifyDcVerdict(reachable_count, telegram_dc_probes.len)) {
+        .reachable => ui.ok("Telegram DCs reachable directly"),
+        .partial => {
+            ui.warn("Some Telegram DCs reachable, some not (asymmetric block or DC maintenance)");
+            warnings.* += 1;
+        },
+        .blackholed => {
+            ui.fail("DC IPs look blackholed (SYN timeout) - egress via a tunnel/clean IP");
+            ui.hint("Set upstream=tunnel or upstream=socks5 to route around the IP block.");
+            errors.* += 1;
+            return;
+        },
+    }
+
+    // Confirm the full DC handshake, not just TCP: on a censored route this can
+    // block on the OS connect timeout, so warn the operator before it runs.
+    ui.hint("Fetching Telegram metadata directly (may take up to the OS connect timeout on a censored route)...");
+    const bytes = http_fetch.fetchUrlBytes(allocator, middle_proxy_config_url) catch null;
+    if (bytes) |body| {
+        allocator.free(body);
+        ui.ok("Telegram metadata fetch works directly");
+    } else {
+        ui.warn("Telegram metadata fetch failed directly (DPI/TLS interference or DNS)");
+        warnings.* += 1;
+    }
+}
+
+/// "Am I blocked?" probe for tunnel egress. Confirms a DC is reachable *through*
+/// the tunnel interface and reports the bound-interface RTT, so an operator can
+/// see the tunnel is actually carrying traffic (not just that it exists).
+fn runNetworkDoctorTunnel(
+    ui: *Tui,
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    errors: *usize,
+    warnings: *usize,
+) void {
+    _ = errors;
+    ui.hint("Probing a Telegram DC through the tunnel interface...");
+
+    const dc_ip = telegram_dc_probes[telegram_dc_probes.len - 1].ip; // 149.154.175.50
+
+    var idx: usize = 0;
+    var any_reachable = false;
+    while (cfg.tunnelCandidateAt(idx)) |iface| : (idx += 1) {
+        if (!isSafeInterfaceName(iface)) {
+            ui.warn(joinMsg("skipping interface with unexpected name: ", iface));
+            warnings.* += 1;
+            continue;
+        }
+
+        // L7 check: does a DC metadata fetch egress through this interface?
+        const reachable = blk: {
+            const bytes = http_fetch.fetchUrlBytesViaInterface(allocator, middle_proxy_config_url, iface) catch break :blk false;
+            allocator.free(bytes);
+            break :blk true;
+        };
+
+        if (reachable) {
+            any_reachable = true;
+            if (probeTunnelRtt(allocator, iface, dc_ip)) |rtt| {
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &buf,
+                    "reachable via tunnel {s} (RTT {d}ms)",
+                    .{ iface, rtt },
+                ) catch joinMsg("reachable via tunnel ", iface);
+                ui.ok(msg);
+            } else {
+                ui.ok(joinMsg("reachable via tunnel ", iface));
+                ui.hint("RTT unavailable (ICMP/ping blocked on this interface).");
+            }
+            break;
+        } else {
+            ui.warn(joinMsg("no Telegram egress via tunnel ", iface));
+        }
+    }
+
+    if (idx == 0) {
+        ui.warn("No tunnel interface configured to probe");
+        warnings.* += 1;
+        return;
+    }
+    if (!any_reachable) {
+        ui.fail("Telegram unreachable via tunnel (check the tunnel is up and routes Telegram)");
+        warnings.* += 1;
+    }
+}
+
+/// Report whether a client tg:// link can be produced from this config. Mirrors
+/// the inputs `links.zig` needs (a server host + at least one user + tls_domain)
+/// rather than re-deriving the secret encoding, which lives in links.zig. Skips
+/// gracefully when the link-building inputs are absent.
+fn runNetworkDoctorLink(ui: *Tui, cfg: *const Config, warnings: *usize) void {
+    if (cfg.users.count() == 0) {
+        ui.warn("No users configured - no tg:// link to generate");
+        warnings.* += 1;
+        return;
+    }
+    if (cfg.public_ip == null) {
+        ui.hint("public_ip not set; links will use the auto-detected egress IP at print time.");
+    }
+
+    var buf: [96]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "tg:// links available for {d} user(s) on port {d} (`mtbuddy links`)",
+        .{ cfg.users.count(), cfg.publicLinkPort() },
+    ) catch "tg:// links available (`mtbuddy links`)";
+    ui.ok(msg);
+}
+
+/// Measure RTT to `host` bound to `iface` via `ping`, returning whole ms or
+/// null on failure/timeout/blocked ICMP. Uses an argv array (no shell) so the
+/// interface name can never be interpreted as additional arguments.
+fn probeTunnelRtt(allocator: std.mem.Allocator, iface: []const u8, host: []const u8) ?u32 {
+    const result = sys.exec(allocator, &.{
+        "ping", "-I", iface, "-c", "1", "-W", "2", host,
+    }) catch return null;
+    defer result.deinit();
+    return parsePingRttMs(result.stdout);
 }
 
 fn probeTcpEndpoint(allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: i32) bool {
