@@ -372,7 +372,7 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
-handshake_flood_guard_enabled = true
+handshake_flood_guard_enabled = false
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
 handshake_flood_guard_block_sec = 120
@@ -429,7 +429,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] tag` | — | برچسب تبلیغاتیِ 32 کاراکتر hex از [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
 | `[server] rate_limit_per_subnet` | `0` | حداکثر اتصال‌های جدید در ثانیه به ازای هر /24 (IPv4) یا /48 (IPv6). `0` = غیرفعال (پیش‌فرض، سازگار با NAT)؛ برای هاست‌های بدون NAT مثلاً `30` تنظیم کنید |
-| `[server] handshake_flood_guard_enabled` | `true` | مسدودسازیِ موقت IPهای مبدأِ دقیقی که مکرراً در هندشیک MTProto ناموفق‌اند |
+| `[server] handshake_flood_guard_enabled` | `false` | مسدودسازیِ موقت IPهای مبدأِ دقیقی که مکرراً در هندشیک MTProto ناموفق‌اند (پیش‌فرض خاموش — امن برای NAT/VPN) |
 | `[server] handshake_flood_guard_threshold` | `20` | تعداد رویدادهای هندشیک/نرخ/بودجه‌ی نامعتبر به ازای هر IP مبدأ پیش از مسدودسازی موقت |
 | `[server] handshake_flood_guard_window_sec` | `30` | پنجره‌ی متحرک برای `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | مدت‌زمان مسدودسازی موقت برای IPهای مبدأِ پر سر و صدا |
@@ -457,7 +457,7 @@ alice = true   # bypass MiddleProxy for this user
 >
 > **ترابری `dd` («امن»/بالشتک‌دار) به‌صورت پیش‌فرض رد می‌شود** (`[censorship].fake_tls_only = true`) — این فقط MTProto مبهم‌سازی‌شده با **بدون استتار TLS** است که مستقیماً توسط DPI به‌عنوان MTProto قابل‌اثرانگشت‌گیری است. به‌صورت پیش‌فرض پراکسی فقط FakeTLS (`ee`) را می‌پذیرد و `mtbuddy links` فقط لینک‌های `ee` را چاپ می‌کند. برای ارائه‌ی لینک‌های `dd` (سناریوهای سازگاری / DPI ضعیف‌تر)، مقدار `fake_tls_only = false` را تنظیم کنید. به [THREAT_MODEL.md](THREAT_MODEL.md) مراجعه کنید.
 >
-> محدودیت نرخ اتصال جدید به ازای هر زیرشبکه **به‌صورت پیش‌فرض خاموش است** (`rate_limit_per_subnet = 0`) تا شبکه‌های بزرگ carrier-NAT یا دفاتر اشتراکی (با کلاینت‌های مشروع زیاد پشت یک IP/زیرشبکه) به‌اشتباه شناسایی نشوند. نگهبان سیلِ هندشیک روشن می‌ماند اما با خاموش بودن محدودیت زیرشبکه، فقط روی هندشیک‌های رهاشده/ناتمام عمل می‌کند — چیزی که دارندگان واقعیِ secret عملاً هرگز تولید نمی‌کنند. اگر همچنان می‌بینید `flood_guard+` کاربران واقعی را به‌صورت انفجاری مسدود می‌کند، مقدار `handshake_flood_guard_threshold` / پنجره / مدت مسدودسازی را افزایش دهید، یا `handshake_flood_guard_enabled = false` را تنظیم کنید. `rate_limit_per_subnet` را فقط روی هاست‌های تک‌مستأجر / بدون NAT فعال کنید.
+> هر دو نگهبانِ سوءاستفاده **به‌صورت پیش‌فرض خاموش‌اند** تا شبکه‌های بزرگ carrier-NAT، خروجی VPN یا دفاتر اشتراکی (با کلاینت‌های مشروع زیاد پشت یک IP/زیرشبکه) به‌اشتباه شناسایی و یکجا مسدود نشوند: محدودیت نرخ اتصال جدید به ازای هر زیرشبکه (`rate_limit_per_subnet = 0`) و نگهبان سیلِ هندشیکِ مبتنی بر IP دقیق (`handshake_flood_guard_enabled = false`). دسترسی پیشاپیش با secret هر کاربر، بودجهٔ سراسریِ هندشیک‌های در جریان و `max_connections` کنترل می‌شود. روی یک هاست تک‌مستأجر / بدون NAT که زیر سوءاستفادهٔ واقعی است، آن‌ها را روشن کنید: `rate_limit_per_subnet` را تنظیم کنید (مثلاً `30`) و `handshake_flood_guard_enabled = true` را قرار دهید (مقادیر `handshake_flood_guard_threshold` / پنجره / مدت مسدودسازی را تنظیم کنید).
 
 ---
 

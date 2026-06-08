@@ -372,7 +372,7 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
-handshake_flood_guard_enabled = true
+handshake_flood_guard_enabled = false
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
 handshake_flood_guard_block_sec = 120
@@ -429,7 +429,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] tag` | — | Thẻ quảng bá 32 ký tự hex từ [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
 | `[server] rate_limit_per_subnet` | `0` | Số kết nối mới tối đa/giây cho mỗi /24 (IPv4) hoặc /48 (IPv6). `0` = tắt (mặc định, thân thiện NAT); ví dụ đặt `30` cho các máy không NAT |
-| `[server] handshake_flood_guard_enabled` | `true` | Tạm thời từ chối các IP nguồn cụ thể liên tục thất bại trong bắt tay MTProto |
+| `[server] handshake_flood_guard_enabled` | `false` | Tạm thời từ chối các IP nguồn cụ thể liên tục thất bại trong bắt tay MTProto (mặc định tắt — an toàn cho NAT/VPN) |
 | `[server] handshake_flood_guard_threshold` | `20` | Số sự kiện bắt tay lỗi/vượt tốc độ/vượt ngân sách trên mỗi IP nguồn trước khi tạm từ chối |
 | `[server] handshake_flood_guard_window_sec` | `30` | Cửa sổ trượt cho `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | Thời lượng tạm từ chối đối với các IP nguồn gây nhiễu |
@@ -457,7 +457,7 @@ alice = true   # bypass MiddleProxy for this user
 >
 > **Lớp truyền tải `dd` ("secure"/padded) bị từ chối theo mặc định** (`[censorship].fake_tls_only = true`) — đó là MTProto được làm rối thông thường, **không có ngụy trang TLS**, có thể bị DPI nhận diện trực tiếp là MTProto. Theo mặc định proxy chỉ chấp nhận FakeTLS (`ee`), và `mtbuddy links` chỉ in các liên kết `ee`. Để phát các liên kết `dd` (cho các tình huống ít DPI / tương thích), hãy đặt `fake_tls_only = false`. Xem [THREAT_MODEL.md](THREAT_MODEL.md).
 >
-> Giới hạn tốc độ kết nối mới theo mỗi subnet **mặc định bị tắt** (`rate_limit_per_subnet = 0`) để các mạng carrier-NAT lớn hoặc mạng văn phòng dùng chung (nhiều client hợp lệ sau một IP/subnet) không bị nhận diện nhầm. Bộ chống lụt bắt tay vẫn bật, nhưng khi giới hạn subnet tắt, nó chỉ tác động lên các bắt tay bị bỏ dở/chưa hoàn tất — điều mà những người nắm secret hợp lệ gần như không bao giờ tạo ra. Nếu bạn vẫn thấy `flood_guard+` chặn người dùng thật theo từng đợt, hãy tăng `handshake_flood_guard_threshold` / cửa sổ / thời gian chặn, hoặc đặt `handshake_flood_guard_enabled = false`. Chỉ bật `rate_limit_per_subnet` trên các máy đơn người thuê / không NAT.
+> Cả hai bộ chống lạm dụng đều **mặc định bị tắt** để các mạng carrier-NAT lớn, mạng VPN-egress hoặc mạng văn phòng dùng chung (nhiều client hợp lệ sau một IP/subnet nguồn) không bị nhận diện nhầm và chặn cùng nhau: giới hạn tốc độ kết nối mới theo mỗi subnet (`rate_limit_per_subnet = 0`) và bộ chống lụt bắt tay theo IP chính xác (`handshake_flood_guard_enabled = false`). Quyền truy cập đã được kiểm soát bởi secret theo từng người dùng, ngân sách bắt tay đang chờ toàn cục và `max_connections`. Trên một máy đơn người thuê / không NAT khi thực sự bị lạm dụng, hãy bật chúng lên: đặt `rate_limit_per_subnet` (ví dụ `30`) và `handshake_flood_guard_enabled = true` (tinh chỉnh `handshake_flood_guard_threshold` / cửa sổ / thời gian chặn).
 
 ---
 

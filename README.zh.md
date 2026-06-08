@@ -372,7 +372,7 @@ handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
-handshake_flood_guard_enabled = true
+handshake_flood_guard_enabled = false
 handshake_flood_guard_threshold = 20
 handshake_flood_guard_window_sec = 30
 handshake_flood_guard_block_sec = 120
@@ -429,7 +429,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] tag` | — | 来自 [@MTProxybot](https://t.me/MTProxybot) 的 32 个十六进制字符推广标签 |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
 | `[server] rate_limit_per_subnet` | `0` | 每个 /24（IPv4）或 /48（IPv6）每秒最大新建连接数。`0` = 禁用（默认，对 NAT 友好）；非 NAT 主机可设为如 `30` |
-| `[server] handshake_flood_guard_enabled` | `true` | 临时拒绝那些反复 MTProto 握手失败的具体源 IP |
+| `[server] handshake_flood_guard_enabled` | `false` | 临时拒绝那些反复 MTProto 握手失败的具体源 IP（默认关闭 —— 对 NAT/VPN 安全） |
 | `[server] handshake_flood_guard_threshold` | `20` | 每个源 IP 触发临时拒绝前所允许的错误握手/限速/预算事件数 |
 | `[server] handshake_flood_guard_window_sec` | `30` | `handshake_flood_guard_threshold` 的滚动时间窗口 |
 | `[server] handshake_flood_guard_block_sec` | `120` | 对喧闹源 IP 的临时拒绝时长 |
@@ -457,7 +457,7 @@ alice = true   # bypass MiddleProxy for this user
 >
 > **`dd`（“安全”/填充）传输默认被拒绝**（`[censorship].fake_tls_only = true`）—— 它是纯粹混淆的 MTProto，**没有任何 TLS 伪装**，可被 DPI 直接识别为 MTProto 特征。默认情况下代理只接受 FakeTLS（`ee`），且 `mtbuddy links` 只打印 `ee` 链接。若要发放 `dd` 链接（低 DPI / 兼容性场景），请设置 `fake_tls_only = false`。参见 [THREAT_MODEL.md](THREAT_MODEL.md)。
 >
-> 每子网的新建连接速率限制**默认关闭**（`rate_limit_per_subnet = 0`），以免大型运营商 NAT 或共享办公网络（许多合法客户端共用一个 IP/子网）被误判。握手洪水防护保持开启，但在子网限制关闭的情况下，它只对被放弃/未完成的握手起作用 —— 而合法的密钥持有者几乎从不产生这类握手。如果你仍看到 `flood_guard+` 在突发流量中拦截真实用户，请调高 `handshake_flood_guard_threshold` / 窗口 / 拦截时长，或设置 `handshake_flood_guard_enabled = false`。只在单租户 / 非 NAT 主机上启用 `rate_limit_per_subnet`。
+> 两个滥用防护默认均关闭，以免大型运营商 NAT、VPN 出口或共享办公网络（许多合法客户端共用一个源 IP/子网）被误判并一起拦截：每子网的新建连接速率限制（`rate_limit_per_subnet = 0`）与精确 IP 的握手洪水防护（`handshake_flood_guard_enabled = false`）。访问本就已由每用户密钥、全局握手在途预算以及 `max_connections` 把关。在遭受真实滥用的单租户 / 非 NAT 主机上，请将它们开启：设置 `rate_limit_per_subnet`（如 `30`）并设 `handshake_flood_guard_enabled = true`（调整 `handshake_flood_guard_threshold` / 窗口 / 拦截时长）。
 
 ---
 
