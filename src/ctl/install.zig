@@ -1306,22 +1306,61 @@ fn warnIfPoorFrontingDomain(ui: *Tui, allocator: std.mem.Allocator, domain: []co
     }
     ui.step("Checking fronting-domain TLS suitability...");
     var cmd_buf: [512]u8 = undefined;
-    // Prints "Server Temp Key" iff the domain negotiates x25519 in a SINGLE round;
-    // an HRR / x25519-reject yields a handshake_failure and no temp key (exit != 0).
+    // Offer ONLY X25519 in a TLS 1.3 hello and capture the output (stderr merged, since
+    // OpenSSL splits these differently across versions). A domain that negotiates it in
+    // a single round prints "Server Temp Key: X25519..."; one that does an HRR / rejects
+    // x25519 still prints "CONNECTED" but no temp key; an unreachable domain prints
+    // neither — distinguishing "couldn't reach it" (connectivity) from "rejects x25519"
+    // (a real mismatch) matters. NOTE: the group MUST be uppercase "X25519" — OpenSSL
+    // 1.1.1 (Ubuntu 20.04 / focal) rejects lowercase "x25519" with "Error with command",
+    // which silently made this check mis-fire on every domain there.
     const cmd = std.fmt.bufPrint(
         &cmd_buf,
-        "echo | timeout 10 openssl s_client -connect {s}:443 -servername {s} -groups x25519 -tls1_3 2>/dev/null | grep -q 'Server Temp Key'",
+        "echo | timeout 10 openssl s_client -connect {s}:443 -servername {s} -groups X25519 -tls1_3 2>&1",
         .{ domain, domain },
     ) catch return;
     const r = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch return;
     defer r.deinit();
-    if (r.exit_code == 0) return; // good: single-round x25519
 
-    ui.warn("Could not confirm single-round x25519 for this fronting domain.");
+    if (std.mem.indexOf(u8, r.stdout, "Server Temp Key") != null) return; // good: single-round x25519
+
+    if (std.mem.indexOf(u8, r.stdout, "CONNECTED") == null) {
+        // Couldn't reach the domain from this host (e.g. no egress in a container, or
+        // the host can't route to it) — can't verify, but that's not the domain's
+        // fault. Note it softly; don't push the operator off a sound choice.
+        var b: [320]u8 = undefined;
+        if (std.fmt.bufPrint(&b, "Couldn't reach '{s}:443' from here to verify its TLS — skipping (connectivity, not a bad domain).", .{domain}) catch null) |m| ui.info(m);
+        return;
+    }
+
+    // Reachable, but x25519 was not negotiated in a single round → genuine mismatch risk.
+    var ex_buf: [128]u8 = undefined;
+    const examples = frontingExamples(domain, &ex_buf);
+    ui.warn("This fronting domain doesn't negotiate single-round x25519.");
     var msg_buf: [320]u8 = undefined;
-    if (std.fmt.bufPrint(&msg_buf, "  '{s}' may do a HelloRetryRequest / reject x25519 (like wb.ru), or be unreachable.", .{domain}) catch null) |m| ui.warn(m);
-    ui.warn("  If so, our FakeTLS ServerHello can't match it — a passive observer sees a mismatch.");
-    ui.hint("  Prefer a domain with single-round x25519 (e.g. rutube.ru, ozon.ru, vk.com). tls_domain is IMMUTABLE once links are shared — choose now.");
+    if (std.fmt.bufPrint(&msg_buf, "  '{s}' does a HelloRetryRequest or rejects x25519 (like wb.ru) — our FakeTLS ServerHello can't match it, so a passive observer sees a mismatch.", .{domain}) catch null) |m| ui.warn(m);
+    var hint_buf: [320]u8 = undefined;
+    if (std.fmt.bufPrint(&hint_buf, "  Prefer a single-round-x25519 domain (e.g. {s}). tls_domain is IMMUTABLE once links are shared — choose now.", .{examples}) catch null) |m| ui.hint(m);
+}
+
+/// Comma-separated recommended single-round-x25519 fronting domains, excluding
+/// `current` so we never suggest the very domain that just failed the check.
+fn frontingExamples(current: []const u8, buf: []u8) []const u8 {
+    const candidates = [_][]const u8{ "rutube.ru", "ozon.ru", "vk.com", "yandex.ru" };
+    var w: usize = 0;
+    for (candidates) |c| {
+        if (std.ascii.eqlIgnoreCase(c, current)) continue;
+        const piece = std.fmt.bufPrint(buf[w..], "{s}{s}", .{ if (w == 0) "" else ", ", c }) catch break;
+        w += piece.len;
+    }
+    return buf[0..w];
+}
+
+test "frontingExamples excludes the current domain" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("ozon.ru, vk.com, yandex.ru", frontingExamples("rutube.ru", &buf));
+    try std.testing.expectEqualStrings("ozon.ru, vk.com, yandex.ru", frontingExamples("RuTube.RU", &buf)); // case-insensitive
+    try std.testing.expectEqualStrings("rutube.ru, ozon.ru, vk.com, yandex.ru", frontingExamples("example.com", &buf));
 }
 
 fn commandAvailable(name: []const u8, candidates: []const []const u8) bool {
