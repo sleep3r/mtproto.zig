@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/sleep3r/mtproto.zig/compare/v1.0.3...v1.1.0) (2026-06-08)
+
+
+### Features
+
+* evasion + robustness + UX bundle (+ Ubuntu 20.04 installer fix) ([#316](https://github.com/sleep3r/mtproto.zig/issues/316)) ([a837d89](https://github.com/sleep3r/mtproto.zig/commit/a837d89ad186dccf5a8ed8c3ac3668d7e1f6b77e))
+
 ## [1.0.3](https://github.com/sleep3r/mtproto.zig/compare/v1.0.2...v1.0.3) (2026-06-08)
 
 
