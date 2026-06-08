@@ -423,6 +423,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] max_connections` | `512` | Giới hạn kết nối đồng thời, tự động giới hạn theo RAM và `RLIMIT_NOFILE` |
 | `[server] workers` | `1` | Số luồng worker epoll SO_REUSEPORT. `1` = đơn luồng; `0` = một luồng mỗi CPU; `N` phân tán tải chuyển tiếp/mã hóa qua các nhân. Việc nạp lại cấu hình bằng SIGHUP cần khởi động lại khi `>1` |
 | `[server] idle_timeout_sec` | `120` | Thời gian chờ kết nối nhàn rỗi |
+| `[server] idle_timeout_jitter_pct` | `15` | Jitter ±% trên mỗi kết nối cho thời gian chờ nhàn rỗi để một giá trị cố định không trở thành dấu vân tay (`0` để tắt) |
 | `[server] handshake_timeout_sec` | `15` | Thời gian chờ hoàn tất bắt tay |
 | `[server] graceful_shutdown_timeout_sec` | `15` | Thời gian chờ rút cạn khi SIGTERM trước khi buộc đóng |
 | `[server] middleproxy_buffer_kb` | `1024` | Bộ đệm ME cho mỗi kết nối (KiB). Dưới 1024 có thể gây tràn với lưu lượng media |
@@ -441,6 +442,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] port` | `9400` | Cổng metrics |
 | `[censorship] tls_domain` | `"google.com"` | Tên miền để giả mạo |
 | `[censorship] mask` | `true` | Chuyển tiếp các client chưa xác thực tới `tls_domain` |
+| `[censorship] unknown_sni_action` | `"mask"` | ClientHello với SNI không xác định: `mask` (chuyển tiếp), `reject` (cảnh báo TLS nghiêm trọng như một máy chủ từ chối), hoặc `drop` |
 | `[censorship] mask_target` | unset | Máy backend tùy chọn cho các client bị che giấu |
 | `[censorship] mask_port` | `443` | Cổng che giấu cục bộ (dùng `8443` cho Nginx zero-RTT) |
 | `[censorship] desync` | `true` | Split-TLS: các bản ghi Application 1 byte |
@@ -448,6 +450,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] fast_mode` | `false` | Ủy thác mã hóa S2C cho DC (khuyến nghị) |
 | `[access.users] <name>` | — | Secret 32 ký tự hex cho mỗi người dùng |
 | `[access.direct_users] <name>` | — | Bỏ qua ME cho người dùng này |
+| `[access.user_max_conns] <name>` | — | Giới hạn số kết nối đồng thời cho mỗi người dùng (cần khởi động lại để thay đổi) |
+| `[access.user_expirations] <name>` | — | Ngày hết hạn cho mỗi người dùng `"YYYY-MM-DD"` (cần khởi động lại để thay đổi) |
 
 </details>
 

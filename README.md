@@ -423,6 +423,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
 | `[server] workers` | `1` | SO_REUSEPORT epoll worker threads. `1` = single-threaded; `0` = one per CPU; `N` spreads relay/crypto load across cores. SIGHUP config reload requires a restart when `>1` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |
+| `[server] idle_timeout_jitter_pct` | `15` | Per-connection ±% jitter on the idle timeout so a constant value isn't a fingerprint (`0` disables) |
 | `[server] handshake_timeout_sec` | `15` | Handshake completion timeout |
 | `[server] graceful_shutdown_timeout_sec` | `15` | SIGTERM drain timeout before force-close |
 | `[server] middleproxy_buffer_kb` | `1024` | ME per-connection buffer (KiB). Below 1024 may cause overflow on media traffic |
@@ -441,6 +442,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] port` | `9400` | Metrics port |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
 | `[censorship] mask` | `true` | Forward unauthenticated clients to `tls_domain` |
+| `[censorship] unknown_sni_action` | `"mask"` | Unknown-SNI ClientHello: `mask` (forward), `reject` (fatal TLS alert like a rejecting server), or `drop` |
 | `[censorship] mask_target` | unset | Optional backend host for masked clients |
 | `[censorship] mask_port` | `443` | Local masking port (use `8443` for Nginx zero-RTT) |
 | `[censorship] desync` | `true` | Split-TLS: 1-byte Application records |
@@ -448,6 +450,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] fast_mode` | `false` | Delegate S2C encryption to DC (recommended) |
 | `[access.users] <name>` | — | 32 hex-char secret per user |
 | `[access.direct_users] <name>` | — | Bypass ME for this user |
+| `[access.user_max_conns] <name>` | — | Per-user concurrent-connection cap (restart to change) |
+| `[access.user_expirations] <name>` | — | Per-user expiry date `"YYYY-MM-DD"` (restart to change) |
 
 </details>
 

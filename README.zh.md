@@ -423,6 +423,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] max_connections` | `512` | 并发连接上限，会根据 RAM 和 `RLIMIT_NOFILE` 自动钳制 |
 | `[server] workers` | `1` | SO_REUSEPORT epoll 工作线程数。`1` = 单线程；`0` = 每个 CPU 一个；`N` 将中继/加密负载分散到多个核心。当 `>1` 时，SIGHUP 配置重载需要重启 |
 | `[server] idle_timeout_sec` | `120` | 连接空闲超时 |
+| `[server] idle_timeout_jitter_pct` | `15` | 对空闲超时施加每连接 ±% 的抖动，避免固定值成为指纹（`0` 表示禁用） |
 | `[server] handshake_timeout_sec` | `15` | 握手完成超时 |
 | `[server] graceful_shutdown_timeout_sec` | `15` | 强制关闭前 SIGTERM 排空超时 |
 | `[server] middleproxy_buffer_kb` | `1024` | ME 每连接缓冲区（KiB）。低于 1024 在媒体流量下可能导致溢出 |
@@ -441,6 +442,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] port` | `9400` | 指标端口 |
 | `[censorship] tls_domain` | `"google.com"` | 要冒充的域名 |
 | `[censorship] mask` | `true` | 将未认证的客户端转发到 `tls_domain` |
+| `[censorship] unknown_sni_action` | `"mask"` | 对未知 SNI 的 ClientHello 的处理方式：`mask`（转发）、`reject`（像拒绝连接的服务器那样返回致命 TLS 警报）或 `drop` |
 | `[censorship] mask_target` | unset | 被伪装客户端的可选后端主机 |
 | `[censorship] mask_port` | `443` | 本地伪装端口（Nginx zero-RTT 时使用 `8443`） |
 | `[censorship] desync` | `true` | Split-TLS：1 字节的 Application 记录 |
@@ -448,6 +450,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] fast_mode` | `false` | 将 S2C 加密委托给 DC（推荐） |
 | `[access.users] <name>` | — | 每个用户的 32 个十六进制字符密钥 |
 | `[access.direct_users] <name>` | — | 为该用户绕过 ME |
+| `[access.user_max_conns] <name>` | — | 每个用户的并发连接上限（更改需重启） |
+| `[access.user_expirations] <name>` | — | 每个用户的到期日期 `"YYYY-MM-DD"`（更改需重启） |
 
 </details>
 

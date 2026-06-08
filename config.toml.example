@@ -186,7 +186,7 @@ mask = true
 
 # What to do with a TLS ClientHello whose SNI doesn't match tls_domain:
 #   "mask"   — forward to the masking backend (default; active-probe defense)
-#   "reject" — emit a real `unrecognized_name` TLS alert like stock nginx, then close
+#   "reject" — send a fatal TLS alert (handshake_failure) like a rejecting server, then close
 #   "drop"   — close silently with no response
 # (Connections that DO present the right SNI but fail validation/replay always mask.)
 # unknown_sni_action = "mask"

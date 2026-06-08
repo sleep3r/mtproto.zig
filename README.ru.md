@@ -401,13 +401,17 @@ alice = true
 | `[server] handshake_flood_guard_threshold` | `20` | Число плохих handshake/rate/budget событий с одного IP до временного deny |
 | `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | Длительность временного deny для шумного IP |
+| `[server] idle_timeout_jitter_pct` | `15` | Джиттер ±% на idle-таймаут соединения, чтобы константа не была сигнатурой (`0` — выключить) |
 | `[censorship] tls_domain` | `"google.com"` | Домен для TLS-маскировки |
 | `[censorship] mask` | `true` | Forward invalid clients на `tls_domain` |
+| `[censorship] unknown_sni_action` | `"mask"` | ClientHello с чужим SNI: `mask` (forward), `reject` (фатальный TLS-alert, как отклоняющий сервер) или `drop` |
 | `[censorship] mask_target` | unset | Optional backend host для masked clients |
 | `[censorship] mask_port` | `443` | Local masking port (`8443` для Nginx zero-RTT) |
 | `[censorship] fast_mode` | `false` | Делегировать S2C encryption DC |
 | `[access.users] <name>` | — | 32-hex secret на пользователя |
 | `[access.direct_users] <name>` | — | Bypass MiddleProxy для пользователя |
+| `[access.user_max_conns] <name>` | — | Лимит одновременных соединений на пользователя (меняется рестартом) |
+| `[access.user_expirations] <name>` | — | Дата истечения доступа `"YYYY-MM-DD"` для пользователя (меняется рестартом) |
 
 > Secret можно сгенерировать через `mtbuddy secret` или `openssl rand -hex 16`.
 >

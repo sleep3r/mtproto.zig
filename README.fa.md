@@ -423,6 +423,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] max_connections` | `512` | سقف اتصال‌های هم‌زمان که به‌صورت خودکار بر اساس RAM و `RLIMIT_NOFILE` محدود می‌شود |
 | `[server] workers` | `1` | نخ‌های کارگرِ epoll با SO_REUSEPORT. `1` = تک‌نخی؛ `0` = یکی به ازای هر CPU؛ `N` بار رله/رمزنگاری را روی هسته‌ها پخش می‌کند. وقتی `>1` باشد، بارگذاری مجدد پیکربندی با SIGHUP نیازمند ری‌استارت است |
 | `[server] idle_timeout_sec` | `120` | مهلت بی‌کاریِ اتصال |
+| `[server] idle_timeout_jitter_pct` | `15` | لرزش ±٪ به ازای هر اتصال روی مهلت بی‌کاری تا یک مقدار ثابت به اثر انگشت تبدیل نشود (`0` غیرفعال می‌کند) |
 | `[server] handshake_timeout_sec` | `15` | مهلت تکمیل هندشیک |
 | `[server] graceful_shutdown_timeout_sec` | `15` | مهلت تخلیه‌ی SIGTERM پیش از بستن اجباری |
 | `[server] middleproxy_buffer_kb` | `1024` | بافر ME برای هر اتصال (KiB). کمتر از 1024 ممکن است در ترافیک رسانه‌ای باعث سرریز شود |
@@ -441,6 +442,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] port` | `9400` | پورت متریک‌ها |
 | `[censorship] tls_domain` | `"google.com"` | دامنه‌ای که جعل هویت می‌شود |
 | `[censorship] mask` | `true` | هدایت کلاینت‌های احراز هویت‌نشده به `tls_domain` |
+| `[censorship] unknown_sni_action` | `"mask"` | ClientHello با SNI ناشناخته: `mask` (هدایت)، `reject` (هشدار مرگبار TLS مانند سروری که رد می‌کند)، یا `drop` |
 | `[censorship] mask_target` | تنظیم‌نشده | هاست بک‌اند اختیاری برای کلاینت‌های استتارشده |
 | `[censorship] mask_port` | `443` | پورت استتار محلی (برای Nginx با zero-RTT از `8443` استفاده کنید) |
 | `[censorship] desync` | `true` | Split-TLS: رکوردهای Application یک‌بایتی |
@@ -448,6 +450,8 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] fast_mode` | `false` | واگذاری رمزنگاریِ S2C به DC (توصیه‌شده) |
 | `[access.users] <name>` | — | secret‏ 32 کاراکتر hex برای هر کاربر |
 | `[access.direct_users] <name>` | — | دور زدن ME برای این کاربر |
+| `[access.user_max_conns] <name>` | — | سقف اتصال‌های هم‌زمان به ازای هر کاربر (برای تغییر، ری‌استارت لازم است) |
+| `[access.user_expirations] <name>` | — | تاریخ انقضای هر کاربر `"YYYY-MM-DD"` (برای تغییر، ری‌استارت لازم است) |
 
 </details>
 
