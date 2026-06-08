@@ -40,14 +40,24 @@ fn parseUnknownSniAction(value: []const u8) ?UnknownSniAction {
     return null;
 }
 
-/// Parse "YYYY-MM-DD" into Unix seconds at 00:00 UTC of that day (Hinnant's
-/// days_from_civil). Returns null on malformed input.
+/// Parse "YYYY-MM-DD" into the Unix-seconds instant the user EXPIRES — i.e. 00:00 UTC
+/// of the day AFTER the named date, so the user stays valid through the whole named
+/// UTC date (end-of-day inclusive). Returns null on any malformed / impossible date.
+/// (Hinnant's days_from_civil.)
 fn parseExpiryToUnix(value: []const u8) ?i64 {
     if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
+    // Digits only — std.fmt.parseInt would otherwise accept '+'/'-' signs.
+    for ([_][]const u8{ value[0..4], value[5..7], value[8..10] }) |field| {
+        for (field) |c| if (c < '0' or c > '9') return null;
+    }
     const y = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
     const m = std.fmt.parseInt(i64, value[5..7], 10) catch return null;
     const d = std.fmt.parseInt(i64, value[8..10], 10) catch return null;
-    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    if (y < 1970 or y > 9999 or m < 1 or m > 12) return null;
+    // Reject impossible days (e.g. Feb 31) instead of silently rolling them forward.
+    const leap = (@mod(y, 4) == 0 and @mod(y, 100) != 0) or @mod(y, 400) == 0;
+    const month_days = [_]i64{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (d < 1 or d > month_days[@intCast(m - 1)]) return null;
     const ym = y - @as(i64, @intFromBool(m <= 2));
     const era = @divFloor(if (ym >= 0) ym else ym - 399, 400);
     const yoe = ym - era * 400;
@@ -55,7 +65,7 @@ fn parseExpiryToUnix(value: []const u8) ?i64 {
     const doy = @divTrunc(153 * mp + 2, 5) + d - 1;
     const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
     const days = era * 146097 + doe - 719468;
-    return days * 86400;
+    return (days + 1) * 86400; // +1 day → expiry at 00:00 UTC the following day
 }
 
 fn parseUpstreamMode(value: []const u8) ?UpstreamMode {
@@ -237,10 +247,12 @@ pub const Config = struct {
     /// Section: [access.direct_users] (alias: [access.admins])
     direct_users: std.StringHashMap(void),
     /// Optional per-user concurrent-connection caps. Section [access.user_max_conns]
-    /// (name = N). null/absent = no cap. Hot-reloadable with the access-user reload.
+    /// (name = N). null/absent = no cap. Read at startup; changing it needs a restart
+    /// (a SIGHUP reload does not pick it up).
     user_max_conns: ?std.StringHashMap(u32) = null,
-    /// Optional per-user expiry (Unix seconds). Section [access.user_expirations]
-    /// (name = "YYYY-MM-DD"). null/absent = never expires. Hot-reloadable.
+    /// Optional per-user expiry. Section [access.user_expirations] (name = "YYYY-MM-DD",
+    /// end-of-day inclusive). null/absent = never expires. Read at startup; changing it
+    /// needs a restart.
     user_expirations: ?std.StringHashMap(i64) = null,
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
@@ -1356,10 +1368,15 @@ test "parse config - defaults for new knobs" {
 }
 
 test "parseExpiryToUnix" {
-    try std.testing.expectEqual(@as(i64, 1609459200), parseExpiryToUnix("2021-01-01").?); // 2021-01-01 00:00 UTC
-    try std.testing.expectEqual(@as(i64, 1640908800), parseExpiryToUnix("2021-12-31").?); // 2021-12-31 00:00 UTC
+    // End-of-day inclusive: expiry is 00:00 UTC of the FOLLOWING day.
+    try std.testing.expectEqual(@as(i64, 1609545600), parseExpiryToUnix("2021-01-01").?); // → 2021-01-02 00:00 UTC
+    try std.testing.expectEqual(@as(i64, 1640995200), parseExpiryToUnix("2021-12-31").?); // → 2022-01-01 00:00 UTC
+    try std.testing.expectEqual(@as(i64, 1583020800), parseExpiryToUnix("2020-02-29").?); // leap day valid
     try std.testing.expect(parseExpiryToUnix("not-a-date") == null);
-    try std.testing.expect(parseExpiryToUnix("2021-13-01") == null);
+    try std.testing.expect(parseExpiryToUnix("2021-13-01") == null); // bad month
+    try std.testing.expect(parseExpiryToUnix("2021-02-29") == null); // 2021 not a leap year
+    try std.testing.expect(parseExpiryToUnix("2021-04-31") == null); // April has 30 days
+    try std.testing.expect(parseExpiryToUnix("2021--1-01") == null); // signed field rejected
     try std.testing.expect(parseExpiryToUnix("2021-1-1") == null); // wrong length
 }
 

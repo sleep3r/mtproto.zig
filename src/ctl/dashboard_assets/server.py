@@ -893,9 +893,10 @@ def _tunnel_rtt(interface: str, gateway_ip: str = EGRESS_PROBE_IP, timeout: int 
         return None
 
     try:
-        # Use -I to bind to specific interface, -c 1 for single packet, -W for timeout (ms)
+        # -I binds the interface, -c 1 a single packet. On Linux iputils, -W is the
+        # per-reply wait in SECONDS (not ms) — passing timeout*1000 means "wait 3000s".
         result = subprocess.run(
-            ["ping", "-I", interface, "-c", "1", "-W", str(timeout * 1000), gateway_ip],
+            ["ping", "-I", interface, "-c", "1", "-W", "2", gateway_ip],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -923,12 +924,15 @@ def _tunnel_packet_loss(interface: str, gateway_ip: str = EGRESS_PROBE_IP, count
         return None
 
     try:
+        # -i 0.2 sends the `count` packets in ~count*0.2s (default 1s interval would
+        # blow the subprocess timeout before the summary prints); -W is per-reply wait
+        # in SECONDS on Linux iputils (not ms). Subprocess timeout covers send + waits.
         result = subprocess.run(
-            ["ping", "-I", interface, "-c", str(count), "-W", str(timeout * 1000), gateway_ip],
+            ["ping", "-I", interface, "-c", str(count), "-i", "0.2", "-W", "2", gateway_ip],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=timeout + 1,
+            timeout=count * 0.3 + 3,
         )
 
         # Parse "X% packet loss" (works on Linux, macOS)

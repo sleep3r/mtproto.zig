@@ -278,7 +278,8 @@ fn parsePingRttMs(output: []const u8) ?u32 {
     if (end == 0) return null;
     rest = rest[0..end];
     const rtt_f = std.fmt.parseFloat(f64, rest) catch return null;
-    if (rtt_f < 0) return null;
+    // Reject out-of-range values so @intFromFloat can't panic on a garbage RTT.
+    if (rtt_f < 0 or rtt_f > @as(f64, std.math.maxInt(u32))) return null;
     return @intFromFloat(rtt_f);
 }
 
@@ -394,6 +395,7 @@ fn runNetworkDoctorDirect(
         }
     }
 
+    var blackholed = false;
     switch (classifyDcVerdict(reachable_count, telegram_dc_probes.len)) {
         .reachable => ui.ok("Telegram DCs reachable directly"),
         .partial => {
@@ -401,10 +403,14 @@ fn runNetworkDoctorDirect(
             warnings.* += 1;
         },
         .blackholed => {
-            ui.fail("DC IPs look blackholed (SYN timeout) - egress via a tunnel/clean IP");
-            ui.hint("Set upstream=tunnel or upstream=socks5 to route around the IP block.");
-            errors.* += 1;
-            return;
+            // A SYN timeout on every DC IP is *suggestive* of an L3 blackhole, but it
+            // also fires on IPv6-only paths, a local firewall, or transient loss — so
+            // don't hard-fail here. Warn, and let the metadata fetch below arbitrate
+            // (only escalate to an error if that fails too).
+            ui.warn("No SYN-ACK from any probed DC IP (possible L3 blackhole, IPv6-only path, or local firewall)");
+            ui.hint("If the metadata fetch below also fails, egress via a tunnel/clean IP (upstream=tunnel/socks5).");
+            warnings.* += 1;
+            blackholed = true;
         },
     }
 
@@ -415,6 +421,9 @@ fn runNetworkDoctorDirect(
     if (bytes) |body| {
         allocator.free(body);
         ui.ok("Telegram metadata fetch works directly");
+    } else if (blackholed) {
+        ui.fail("DC IPs unreachable (SYN timeout) AND metadata fetch failed - egress via a tunnel/clean IP");
+        errors.* += 1;
     } else {
         ui.warn("Telegram metadata fetch failed directly (DPI/TLS interference or DNS)");
         warnings.* += 1;
@@ -437,6 +446,7 @@ fn runNetworkDoctorTunnel(
     const dc_ip = telegram_dc_probes[telegram_dc_probes.len - 1].ip; // 149.154.175.50
 
     var idx: usize = 0;
+    var probed: usize = 0;
     var any_reachable = false;
     while (cfg.tunnelCandidateAt(idx)) |iface| : (idx += 1) {
         if (!isSafeInterfaceName(iface)) {
@@ -444,6 +454,7 @@ fn runNetworkDoctorTunnel(
             warnings.* += 1;
             continue;
         }
+        probed += 1;
 
         // L7 check: does a DC metadata fetch egress through this interface?
         const reachable = blk: {
@@ -472,13 +483,16 @@ fn runNetworkDoctorTunnel(
         }
     }
 
-    if (idx == 0) {
+    // NOTE: rely on `probed`, not `idx`. A `break` on the first reachable interface
+    // skips the `: (idx += 1)` continuation, so idx stays 0 on the happy path — using
+    // it here would print a bogus "no interface" warning exactly when it worked.
+    if (probed == 0) {
         ui.warn("No tunnel interface configured to probe");
         warnings.* += 1;
-        return;
-    }
-    if (!any_reachable) {
-        ui.fail("Telegram unreachable via tunnel (check the tunnel is up and routes Telegram)");
+    } else if (!any_reachable) {
+        // Glyph matches the counter: a tunnel that can't reach Telegram is a warning
+        // (the proxy may still reach DCs another way), not a hard error.
+        ui.warn("Telegram unreachable via tunnel (check the tunnel is up and routes Telegram)");
         warnings.* += 1;
     }
 }

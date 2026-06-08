@@ -1249,16 +1249,13 @@ async function poll() {
 
   renderRouting(d.routing || null);
 
-  // Egress / tunnel quality
-  try {
-    const egressResp = await fetch('/api/egress', { cache: 'no-store' });
-    const egressData = await egressResp.json();
-    if (egressResp.ok && egressData.ok) {
-      renderEgress(egressData);
-    }
-  } catch (e) {
-    // Silent failure; egress monitoring is optional
-  }
+  // Egress / tunnel quality — fire-and-forget so a slow server-side ping/wg probe
+  // never blocks rendering of the already-fetched masking/users data or stalls the
+  // poll cycle. The card updates whenever this resolves.
+  fetch('/api/egress', { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((egressData) => { if (egressData && egressData.ok) renderEgress(egressData); })
+    .catch(() => {}); // silent; egress monitoring is optional
 
   // Masking health
   const masking = d.masking;

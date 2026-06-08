@@ -206,12 +206,14 @@ pub fn buildServerHelloWithTemplate(
     return response;
 }
 
-/// A TLS `unrecognized_name` alert record — what stock nginx (ssl_reject_handshake)
-/// emits for a ClientHello whose SNI it doesn't serve. Send this, then close, so a
-/// rejected probe sees a genuine-looking server response instead of a silent drop.
+/// A TLS **fatal** `handshake_failure` alert record — what a server sends when it
+/// refuses to complete the handshake (e.g. nginx `ssl_reject_handshake on`). Send
+/// this, then close, so a rejected probe sees a real server-style teardown. A *fatal*
+/// alert legitimately precedes connection close; a warning-level alert followed by an
+/// immediate close would itself be anomalous (a distinguisher), so this is fatal.
 /// Bytes: record type 0x15 (alert), TLS 1.2 version 0x0303, length 2,
-/// level 1 (warning), description 112 (unrecognized_name, RFC 6066).
-pub const unrecognized_name_alert = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x70 };
+/// level 2 (fatal), description 40 (handshake_failure, RFC 8446 §6).
+pub const reject_handshake_alert = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
 
 // ============= Nginx/OpenSSL TLS 1.3 Template =============
 //
@@ -1125,11 +1127,11 @@ fn buildTlsAuthClientHello(
     return out[0..total_len];
 }
 
-test "unrecognized_name_alert wire format" {
-    // record type 0x15 (alert), TLS 1.2 version, length 2, level 1 (warning),
-    // description 112 (unrecognized_name).
-    try std.testing.expectEqual(@as(usize, 7), unrecognized_name_alert.len);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x70 }, &unrecognized_name_alert);
+test "reject_handshake_alert wire format" {
+    // record type 0x15 (alert), TLS 1.2 version, length 2, level 2 (fatal),
+    // description 40 (handshake_failure).
+    try std.testing.expectEqual(@as(usize, 7), reject_handshake_alert.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 }, &reject_handshake_alert);
 }
 
 test "extractSni - fragmented and overlong records" {

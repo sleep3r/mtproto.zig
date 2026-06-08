@@ -3365,19 +3365,21 @@ const EventLoop = struct {
                 }
             }
         }
-        const user_metrics = self.state.findUserMetrics(result.user);
-        if (self.state.config.user_max_conns) |maxc| {
-            if (maxc.get(result.user)) |cap| {
-                const active = if (user_metrics) |e| e.connections_active.load(.monotonic) else 0;
-                if (active >= cap) {
-                    self.closeSlot(slot, "user connection limit");
-                    return;
+        if (self.state.findUserMetrics(result.user)) |entry| {
+            // Optimistic atomic admission: increment first, then roll back + reject if
+            // we exceeded the per-user cap. Avoids a load-then-add TOCTOU where two
+            // SO_REUSEPORT workers both pass a non-atomic check and overshoot the cap.
+            const prev = entry.connections_active.fetchAdd(1, .monotonic);
+            if (self.state.config.user_max_conns) |maxc| {
+                if (maxc.get(result.user)) |cap| {
+                    if (prev >= cap) {
+                        _ = entry.connections_active.fetchSub(1, .monotonic);
+                        self.closeSlot(slot, "user connection limit");
+                        return;
+                    }
                 }
             }
-        }
-        slot.user_metrics = user_metrics;
-        if (slot.user_metrics) |entry| {
-            _ = entry.connections_active.fetchAdd(1, .monotonic);
+            slot.user_metrics = entry;
         }
 
         slot.dc_abs = @intCast(dc_abs);
@@ -3425,9 +3427,9 @@ const EventLoop = struct {
         switch (self.state.config.unknown_sni_action) {
             .mask => self.startMasking(slot, client_hello) catch self.closeSlot(slot, reason),
             .reject => {
-                // Best-effort raw write of the 7-byte alert before close (mirrors
+                // Best-effort raw write of the 7-byte fatal alert before close (mirrors
                 // queue_io's syscall use); a partial/EAGAIN write is fine here.
-                const alert: []const u8 = &tls.unrecognized_name_alert;
+                const alert: []const u8 = &tls.reject_handshake_alert;
                 _ = posix.system.write(slot.client_fd, alert.ptr, alert.len);
                 self.closeSlot(slot, reason);
             },
