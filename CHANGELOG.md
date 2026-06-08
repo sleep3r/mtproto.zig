@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.3](https://github.com/sleep3r/mtproto.zig/compare/v1.0.2...v1.0.3) (2026-06-08)
+
+
+### Bug Fixes
+
+* **config:** handshake flood guard off by default (NAT/VPN-safe) ([#314](https://github.com/sleep3r/mtproto.zig/issues/314)) ([77e398a](https://github.com/sleep3r/mtproto.zig/commit/77e398a3d4b2d8acd491d67fe0c3a77d0ae1d7a2))
+* **config:** handshake flood guard off by default (NAT/VPN-safe) ([#314](https://github.com/sleep3r/mtproto.zig/issues/314)) ([b1eae56](https://github.com/sleep3r/mtproto.zig/commit/b1eae5633c8600afdef4465ed56e7210503df033))
+
 ## [1.0.2](https://github.com/sleep3r/mtproto.zig/compare/v1.0.1...v1.0.2) (2026-06-07)
 
 
