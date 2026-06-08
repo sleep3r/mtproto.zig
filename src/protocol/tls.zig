@@ -206,6 +206,13 @@ pub fn buildServerHelloWithTemplate(
     return response;
 }
 
+/// A TLS `unrecognized_name` alert record — what stock nginx (ssl_reject_handshake)
+/// emits for a ClientHello whose SNI it doesn't serve. Send this, then close, so a
+/// rejected probe sees a genuine-looking server response instead of a silent drop.
+/// Bytes: record type 0x15 (alert), TLS 1.2 version 0x0303, length 2,
+/// level 1 (warning), description 112 (unrecognized_name, RFC 6066).
+pub const unrecognized_name_alert = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x70 };
+
 // ============= Nginx/OpenSSL TLS 1.3 Template =============
 //
 // Pre-built at comptime to match the fingerprint of Nginx 1.25+ with OpenSSL 3.x.
@@ -1116,6 +1123,13 @@ fn buildTlsAuthClientHello(
     out[digest_pos + 31] = computed[31] ^ ts_bytes[3];
 
     return out[0..total_len];
+}
+
+test "unrecognized_name_alert wire format" {
+    // record type 0x15 (alert), TLS 1.2 version, length 2, level 1 (warning),
+    // description 112 (unrecognized_name).
+    try std.testing.expectEqual(@as(usize, 7), unrecognized_name_alert.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x70 }, &unrecognized_name_alert);
 }
 
 test "extractSni - fragmented and overlong records" {

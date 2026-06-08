@@ -23,6 +23,41 @@ pub const UpstreamMode = enum {
     http,
 };
 
+/// Action for a TLS ClientHello whose SNI doesn't match tls_domain.
+pub const UnknownSniAction = enum {
+    /// Forward to the masking backend (current default; no wire change).
+    mask,
+    /// Emit a real `unrecognized_name` TLS alert (like stock nginx), then close.
+    reject,
+    /// Close silently with no response.
+    drop,
+};
+
+fn parseUnknownSniAction(value: []const u8) ?UnknownSniAction {
+    if (std.mem.eql(u8, value, "mask")) return .mask;
+    if (std.mem.eql(u8, value, "reject")) return .reject;
+    if (std.mem.eql(u8, value, "drop")) return .drop;
+    return null;
+}
+
+/// Parse "YYYY-MM-DD" into Unix seconds at 00:00 UTC of that day (Hinnant's
+/// days_from_civil). Returns null on malformed input.
+fn parseExpiryToUnix(value: []const u8) ?i64 {
+    if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
+    const y = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(i64, value[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(i64, value[8..10], 10) catch return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    const ym = y - @as(i64, @intFromBool(m <= 2));
+    const era = @divFloor(if (ym >= 0) ym else ym - 399, 400);
+    const yoe = ym - era * 400;
+    const mp: i64 = if (m > 2) m - 3 else m + 9;
+    const doy = @divTrunc(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400;
+}
+
 fn parseUpstreamMode(value: []const u8) ?UpstreamMode {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "direct") or std.mem.eql(u8, value, "none")) return .direct;
@@ -171,6 +206,10 @@ pub const Config = struct {
     workers: u16 = 1,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
+    /// Per-connection random jitter (± percent, 0-100) applied to the effective idle
+    /// timeout, so a constant timeout isn't itself a behavioral fingerprint. Computed
+    /// once per slot. 0 disables jitter.
+    idle_timeout_jitter_pct: u8 = 15,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
     /// Graceful shutdown drain timeout on SIGTERM.
@@ -197,6 +236,12 @@ pub const Config = struct {
     /// Users that always bypass MiddleProxy and connect to DC directly.
     /// Section: [access.direct_users] (alias: [access.admins])
     direct_users: std.StringHashMap(void),
+    /// Optional per-user concurrent-connection caps. Section [access.user_max_conns]
+    /// (name = N). null/absent = no cap. Hot-reloadable with the access-user reload.
+    user_max_conns: ?std.StringHashMap(u32) = null,
+    /// Optional per-user expiry (Unix seconds). Section [access.user_expirations]
+    /// (name = "YYYY-MM-DD"). null/absent = never expires. Hot-reloadable.
+    user_expirations: ?std.StringHashMap(i64) = null,
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
     /// Optional backend host for masked clients. When unset, mask_port=443 uses
@@ -211,6 +256,11 @@ pub const Config = struct {
     /// is plain, DPI-fingerprintable MTProto. Set to false ONLY if you need to
     /// hand out dd links (lower-DPI / compatibility scenarios).
     fake_tls_only: bool = true,
+    /// What to do with a TLS ClientHello whose SNI doesn't match tls_domain:
+    /// `mask` (default — forward to the masking backend, current behavior),
+    /// `reject` (emit a real `unrecognized_name` TLS alert like stock nginx, then
+    /// close), or `drop` (silent close). Default keeps the wire unchanged.
+    unknown_sni_action: UnknownSniAction = .mask,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
     /// Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes
@@ -425,6 +475,8 @@ pub const Config = struct {
         var lines = std.mem.splitScalar(u8, content, '\n');
         var in_users_section = false;
         var in_direct_users_section = false;
+        var in_user_max_conns_section = false;
+        var in_user_expirations_section = false;
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
@@ -445,6 +497,8 @@ pub const Config = struct {
             if (line[0] == '[') {
                 in_users_section = std.mem.eql(u8, line, "[access.users]");
                 in_direct_users_section = std.mem.eql(u8, line, "[access.direct_users]") or std.mem.eql(u8, line, "[access.admins]");
+                in_user_max_conns_section = std.mem.eql(u8, line, "[access.user_max_conns]");
+                in_user_expirations_section = std.mem.eql(u8, line, "[access.user_expirations]");
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
@@ -495,6 +549,23 @@ pub const Config = struct {
                     if (!cfg.direct_users.contains(key)) {
                         const name = try allocator.dupe(u8, key);
                         try cfg.direct_users.put(name, {});
+                    }
+                } else if (in_user_max_conns_section) {
+                    const cap = std.fmt.parseInt(u32, value, 10) catch continue;
+                    if (cap == 0) continue; // 0 == no limit
+                    if (cfg.user_max_conns == null) cfg.user_max_conns = std.StringHashMap(u32).init(allocator);
+                    if (cfg.user_max_conns.?.getKey(key)) |_| {
+                        try cfg.user_max_conns.?.put(key, cap);
+                    } else {
+                        try cfg.user_max_conns.?.put(try allocator.dupe(u8, key), cap);
+                    }
+                } else if (in_user_expirations_section) {
+                    const ts = parseExpiryToUnix(value) orelse continue;
+                    if (cfg.user_expirations == null) cfg.user_expirations = std.StringHashMap(i64).init(allocator);
+                    if (cfg.user_expirations.?.getKey(key)) |_| {
+                        try cfg.user_expirations.?.put(key, ts);
+                    } else {
+                        try cfg.user_expirations.?.put(try allocator.dupe(u8, key), ts);
                     }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
@@ -584,6 +655,9 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "handshake_flood_guard_block_sec")) {
                         const parsed = std.fmt.parseInt(u16, value, 10) catch cfg.handshake_flood_guard_block_sec;
                         cfg.handshake_flood_guard_block_sec = @max(@as(u16, 1), parsed);
+                    } else if (std.mem.eql(u8, key, "idle_timeout_jitter_pct")) {
+                        const parsed = std.fmt.parseInt(u8, value, 10) catch cfg.idle_timeout_jitter_pct;
+                        cfg.idle_timeout_jitter_pct = @min(@as(u8, 100), parsed);
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
                         cfg.unsafe_override_limits = std.mem.eql(u8, value, "true");
                     }
@@ -614,6 +688,8 @@ pub const Config = struct {
                         cfg.drs = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "unknown_sni_action")) {
+                        if (parseUnknownSniAction(value)) |action| cfg.unknown_sni_action = action;
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
@@ -677,6 +753,19 @@ pub const Config = struct {
             allocator.free(entry.key_ptr.*);
         }
         direct_users.deinit();
+
+        if (self.user_max_conns) |maxc| {
+            var m = @constCast(&maxc);
+            var mit = m.iterator();
+            while (mit.next()) |entry| allocator.free(entry.key_ptr.*);
+            m.deinit();
+        }
+        if (self.user_expirations) |exps| {
+            var e = @constCast(&exps);
+            var eit = e.iterator();
+            while (eit.next()) |entry| allocator.free(entry.key_ptr.*);
+            e.deinit();
+        }
 
         // Free tls_domain only when it does not point to the compile-time default.
         if (self.tls_domain.ptr != default_tls_domain.ptr) {
@@ -1227,6 +1316,51 @@ test "parse config - handshake flood guard defaults disabled" {
     try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
     try std.testing.expectEqual(@as(u16, 30), cfg.handshake_flood_guard_window_sec);
     try std.testing.expectEqual(@as(u16, 120), cfg.handshake_flood_guard_block_sec);
+}
+
+test "parse config - evasion/UX knobs (sni action, idle jitter, per-user limits)" {
+    const content =
+        \\[server]
+        \\idle_timeout_jitter_pct = 25
+        \\[censorship]
+        \\unknown_sni_action = reject
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\[access.user_max_conns]
+        \\alice = 3
+        \\bob = 0
+        \\[access.user_expirations]
+        \\alice = "2026-12-31"
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 25), cfg.idle_timeout_jitter_pct);
+    try std.testing.expectEqual(UnknownSniAction.reject, cfg.unknown_sni_action);
+    try std.testing.expectEqual(@as(u32, 3), cfg.user_max_conns.?.get("alice").?);
+    // 0 == "no limit" → not stored
+    try std.testing.expect(cfg.user_max_conns.?.get("bob") == null);
+    try std.testing.expect(cfg.user_expirations.?.get("alice").? > 0);
+}
+
+test "parse config - defaults for new knobs" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
+    try std.testing.expectEqual(UnknownSniAction.mask, cfg.unknown_sni_action);
+    try std.testing.expect(cfg.user_max_conns == null);
+    try std.testing.expect(cfg.user_expirations == null);
+}
+
+test "parseExpiryToUnix" {
+    try std.testing.expectEqual(@as(i64, 1609459200), parseExpiryToUnix("2021-01-01").?); // 2021-01-01 00:00 UTC
+    try std.testing.expectEqual(@as(i64, 1640908800), parseExpiryToUnix("2021-12-31").?); // 2021-12-31 00:00 UTC
+    try std.testing.expect(parseExpiryToUnix("not-a-date") == null);
+    try std.testing.expect(parseExpiryToUnix("2021-13-01") == null);
+    try std.testing.expect(parseExpiryToUnix("2021-1-1") == null); // wrong length
 }
 
 test "parse config - handshake flood guard custom values" {

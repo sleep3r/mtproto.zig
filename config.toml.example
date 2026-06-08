@@ -65,6 +65,10 @@ port = 443
 # Keep high (300) to accommodate mobile pre-warmed connection pools.
 # idle_timeout_sec = 300
 
+# Per-connection random jitter (± percent) applied to the idle timeout, so a
+# constant timeout isn't itself a behavioral fingerprint. 0 disables. Default 15.
+# idle_timeout_jitter_pct = 15
+
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # handshake_timeout_sec = 60
 
@@ -180,6 +184,13 @@ tls_domain = "rutube.ru"
 # Forward unauthenticated / invalid connections to tls_domain (active probing defense).
 mask = true
 
+# What to do with a TLS ClientHello whose SNI doesn't match tls_domain:
+#   "mask"   — forward to the masking backend (default; active-probe defense)
+#   "reject" — emit a real `unrecognized_name` TLS alert like stock nginx, then close
+#   "drop"   — close silently with no response
+# (Connections that DO present the right SNI but fail validation/replay always mask.)
+# unknown_sni_action = "mask"
+
 # Reject the non-TLS "direct obfuscated" (dd / secure) transport. ENABLED by
 # default (true): only FakeTLS (ee) clients are accepted and any non-TLS first
 # bytes are masked immediately. This is the secure default for a TLS-camouflage
@@ -224,3 +235,14 @@ user2 = "ffeeddccbbaa99887766554433221100"
 # Names here must match keys from [access.users].
 # Value must be true/1/yes to enable.
 # user1 = true
+
+[access.user_max_conns]
+# Optional per-user concurrent-connection caps (name = N, names match [access.users]).
+# Absent / 0 = no cap. Read at startup; changing them requires a restart.
+# Handy for sharing one proxy with family/friends without one device hogging it.
+# user1 = 3
+
+[access.user_expirations]
+# Optional per-user expiry (name = "YYYY-MM-DD", UTC midnight). Absent = never expires.
+# After the date the user's new connections are refused. Read at startup; restart to change.
+# user1 = "2026-12-31"

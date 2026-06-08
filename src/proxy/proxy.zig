@@ -279,6 +279,21 @@ const acceptClient = socket_utils.acceptClient;
 const localSocketAddress = socket_utils.localSocketAddress;
 const setNonBlocking = socket_utils.setNonBlocking;
 const secondsToMs = socket_utils.secondsToMs;
+
+/// Per-connection idle timeout in ms with ±jitter_pct random jitter, so a constant
+/// idle timeout isn't a behavioral fingerprint. `seed` varies per connection. Floored
+/// to half the base (and >= 5s) so jitter never makes the timeout pathologically short.
+fn jitteredIdleTimeoutMs(base_sec: u32, jitter_pct: u8, seed: u64) i64 {
+    const base_ms = secondsToMs(base_sec);
+    if (jitter_pct == 0) return base_ms;
+    const pct: i64 = @min(@as(i64, jitter_pct), 100);
+    const range = @divTrunc(base_ms * pct, 100);
+    if (range <= 0) return base_ms;
+    const span: u64 = @intCast(2 * range + 1);
+    const offset = @as(i64, @intCast(seed % span)) - range;
+    const floor_ms = @max(secondsToMs(5), @divTrunc(base_ms, 2));
+    return @max(floor_ms, base_ms + offset);
+}
 const setTcpNoDelay = socket_utils.setTcpNoDelay;
 const configureRelaySocket = socket_utils.configureRelaySocket;
 const formatAddress = socket_utils.formatAddress;
@@ -402,6 +417,9 @@ const ConnectionSlot = struct {
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
     last_activity_ms: i64 = 0,
+    /// Per-connection idle timeout in ms, with random jitter applied once at setup
+    /// so a constant idle timeout isn't itself a behavioral fingerprint. 0 until set.
+    idle_timeout_ms: i64 = 0,
     desync_deadline_ns: i128 = 0,
 
     // Initial TLS handshake reassembly
@@ -766,6 +784,24 @@ test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates the reactive refresh" {
     try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_nonce_response.awaitingMiddleProxy());
     try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_handshake.awaitingMiddleProxy());
     try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_handshake_response.awaitingMiddleProxy());
+}
+
+test "jitteredIdleTimeoutMs stays within bounds and respects the floor" {
+    const base_sec: u32 = 120;
+    const base_ms = secondsToMs(base_sec);
+    // jitter 0 → exactly the base timeout
+    try std.testing.expectEqual(base_ms, jitteredIdleTimeoutMs(base_sec, 0, 0xdeadbeef));
+    // jitter 15% → within [base/2, base + 15%] and never below 5s, across many seeds
+    const max_ms = base_ms + @divTrunc(base_ms * 15, 100);
+    var i: u64 = 0;
+    while (i < 2000) : (i += 1) {
+        const v = jitteredIdleTimeoutMs(base_sec, 15, i *% 2654435761);
+        try std.testing.expect(v >= @divTrunc(base_ms, 2));
+        try std.testing.expect(v >= secondsToMs(5));
+        try std.testing.expect(v <= max_ms);
+    }
+    // not every connection gets the same value (jitter actually varies)
+    try std.testing.expect(jitteredIdleTimeoutMs(base_sec, 15, 1) != jitteredIdleTimeoutMs(base_sec, 15, 2));
 }
 
 pub const ProxyState = struct {
@@ -2257,6 +2293,11 @@ const EventLoop = struct {
             slot.handshake_pos = 0;
             slot.created_at_ms = nowMs();
             slot.last_activity_ms = slot.created_at_ms;
+            slot.idle_timeout_ms = jitteredIdleTimeoutMs(
+                self.state.config.idle_timeout_sec,
+                self.state.config.idle_timeout_jitter_pct,
+                slot.conn_id ^ @as(u64, @bitCast(slot.created_at_ms)),
+            );
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
 
             if (self.addFd(cfd, true, false)) |_| {
@@ -3065,17 +3106,13 @@ const EventLoop = struct {
 
         const maybe_sni = tls.extractSni(client_hello);
         if (maybe_sni == null) {
-            self.startMasking(slot, client_hello) catch {
-                self.closeSlot(slot, "tls missing sni");
-            };
+            self.handleInvalidSni(slot, client_hello, "tls missing sni");
             return;
         }
 
         const sni = maybe_sni.?;
         if (!std.ascii.eqlIgnoreCase(sni, self.state.config.tls_domain)) {
-            self.startMasking(slot, client_hello) catch {
-                self.closeSlot(slot, "tls sni mismatch");
-            };
+            self.handleInvalidSni(slot, client_hello, "tls sni mismatch");
             return;
         }
 
@@ -3317,7 +3354,28 @@ const EventLoop = struct {
             return;
         }
 
-        slot.user_metrics = self.state.findUserMetrics(result.user);
+        // Per-user limits (read at startup; changing them needs a restart). Checked
+        // BEFORE assigning slot.user_metrics so a rejected connection never touches
+        // the active-connection counter (closeSlot decrements only when it's set).
+        if (self.state.config.user_expirations) |exps| {
+            if (exps.get(result.user)) |expiry_ts| {
+                if (realtimeSeconds() >= expiry_ts) {
+                    self.closeSlot(slot, "user expired");
+                    return;
+                }
+            }
+        }
+        const user_metrics = self.state.findUserMetrics(result.user);
+        if (self.state.config.user_max_conns) |maxc| {
+            if (maxc.get(result.user)) |cap| {
+                const active = if (user_metrics) |e| e.connections_active.load(.monotonic) else 0;
+                if (active >= cap) {
+                    self.closeSlot(slot, "user connection limit");
+                    return;
+                }
+            }
+        }
+        slot.user_metrics = user_metrics;
         if (slot.user_metrics) |entry| {
             _ = entry.connections_active.fetchAdd(1, .monotonic);
         }
@@ -3356,6 +3414,25 @@ const EventLoop = struct {
         self.startConnectUpstream(slot, candidates[0], .dc) catch {
             self.closeSlot(slot, "upstream connect start failed");
         };
+    }
+
+    /// Handle a ClientHello whose SNI is missing or doesn't match tls_domain,
+    /// per `unknown_sni_action`: `mask` forwards to the masking backend (default,
+    /// active-probe defense), `reject` emits a real `unrecognized_name` TLS alert
+    /// like stock nginx and closes, `drop` closes silently. Validation-failed /
+    /// replay cases (SNI matched) keep masking — they're not handled here.
+    fn handleInvalidSni(self: *EventLoop, slot: *ConnectionSlot, client_hello: []const u8, reason: []const u8) void {
+        switch (self.state.config.unknown_sni_action) {
+            .mask => self.startMasking(slot, client_hello) catch self.closeSlot(slot, reason),
+            .reject => {
+                // Best-effort raw write of the 7-byte alert before close (mirrors
+                // queue_io's syscall use); a partial/EAGAIN write is fine here.
+                const alert: []const u8 = &tls.unrecognized_name_alert;
+                _ = posix.system.write(slot.client_fd, alert.ptr, alert.len);
+                self.closeSlot(slot, reason);
+            },
+            .drop => self.closeSlot(slot, reason),
+        }
     }
 
     fn startMasking(self: *EventLoop, slot: *ConnectionSlot, buffered: []const u8) !void {
@@ -3816,7 +3893,7 @@ const EventLoop = struct {
 
             if (slot.handshakeInProgress()) {
                 if (slot.first_byte_at_ms == 0) {
-                    if (now_ms - slot.created_at_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
+                    if (now_ms - slot.created_at_ms > (if (slot.idle_timeout_ms > 0) slot.idle_timeout_ms else secondsToMs(self.state.config.idle_timeout_sec))) {
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
@@ -3844,7 +3921,7 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
-                if (now_ms - slot.last_activity_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
+                if (now_ms - slot.last_activity_ms > (if (slot.idle_timeout_ms > 0) slot.idle_timeout_ms else secondsToMs(self.state.config.idle_timeout_sec))) {
                     self.closeSlot(slot, "relay idle timeout");
                     continue;
                 }
