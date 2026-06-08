@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/sleep3r/mtproto.zig/compare/v1.1.0...v1.1.1) (2026-06-08)
+
+
+### Bug Fixes
+
+* **install:** fronting-domain x25519 check works on OpenSSL 1.1.1 + clearer output ([#319](https://github.com/sleep3r/mtproto.zig/issues/319)) ([28e40fb](https://github.com/sleep3r/mtproto.zig/commit/28e40fb97a817a91a1e3522d46c00fedeaab21a6))
+
 ## [1.1.0](https://github.com/sleep3r/mtproto.zig/compare/v1.0.3...v1.1.0) (2026-06-08)
 
 
