@@ -92,7 +92,27 @@ fn installMinisignFromUpstream(allocator: std.mem.Allocator) bool {
         .aarch64 => "aarch64",
         else => return false,
     };
-    const archive = "/tmp/mtbuddy-minisign-" ++ minisign_bootstrap_version ++ "-linux.tar.gz";
+    // Do the whole download → verify → extract → install inside a private, owner-only
+    // (0700, root) `mktemp -d` directory — like deploy/bootstrap.sh. Fixed /tmp paths
+    // would let a local user pre-create or race-swap the archive/extracted binary
+    // between the SHA check and `install`, substituting an attacker-controlled minisign
+    // (the release-signature trust anchor). A 0700 root dir no other user can write to
+    // closes both the symlink-clobber and the verify-vs-use TOCTOU.
+    const tmpdir = blk: {
+        const r = sys.exec(allocator, &.{ "mktemp", "-d", "/tmp/mtbuddy-minisign.XXXXXX" }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) break :blk null;
+        const t = std.mem.trim(u8, r.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+        if (t.len == 0) break :blk null;
+        break :blk allocator.dupe(u8, t) catch null;
+    } orelse return false;
+    defer {
+        _ = sys.exec(allocator, &.{ "rm", "-rf", tmpdir }) catch {};
+        allocator.free(tmpdir);
+    }
+
+    const archive = std.fmt.allocPrint(allocator, "{s}/minisign.tar.gz", .{tmpdir}) catch return false;
+    defer allocator.free(archive);
     const url = "https://github.com/jedisct1/minisign/releases/download/" ++
         minisign_bootstrap_version ++ "/minisign-" ++ minisign_bootstrap_version ++ "-linux.tar.gz";
 
@@ -113,11 +133,11 @@ fn installMinisignFromUpstream(allocator: std.mem.Allocator) bool {
     const member = std.fmt.allocPrint(allocator, "minisign-linux/{s}/minisign", .{arch_name}) catch return false;
     defer allocator.free(member);
     {
-        const r = sys.exec(allocator, &.{ "tar", "xzf", archive, "-C", "/tmp", member }) catch return false;
+        const r = sys.exec(allocator, &.{ "tar", "xzf", archive, "-C", tmpdir, "--no-same-owner", member }) catch return false;
         defer r.deinit();
         if (r.exit_code != 0) return false;
     }
-    const extracted = std.fmt.allocPrint(allocator, "/tmp/minisign-linux/{s}/minisign", .{arch_name}) catch return false;
+    const extracted = std.fmt.allocPrint(allocator, "{s}/minisign-linux/{s}/minisign", .{ tmpdir, arch_name }) catch return false;
     defer allocator.free(extracted);
     {
         const r = sys.exec(allocator, &.{ "install", "-m", "0755", extracted, "/usr/local/bin/minisign" }) catch return false;

@@ -134,6 +134,12 @@ verify_install_once() {
     test "$(readlink -f /usr/bin/mtbuddy)" = /usr/local/bin/mtbuddy
     command -v mtbuddy >/dev/null
 
+    # The release is downloaded with signature verification, so minisign MUST have been
+    # acquired (apt package, or the pinned upstream fallback on hosts like Ubuntu 20.04
+    # whose apt has no minisign). A missing minisign here would mean the install fell
+    # through to an unsigned / fail-open path.
+    command -v minisign >/dev/null
+
     test -x /opt/mtproto-proxy/mtproto-proxy
     test -f /opt/mtproto-proxy/config.toml
     test -x /opt/zapret/nfq/nfqws
