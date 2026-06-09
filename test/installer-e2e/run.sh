@@ -335,6 +335,48 @@ ip -4 route get 149.154.175.50 mark 200 | grep -F " dev awg1" >/dev/null
 CONTAINER_SCRIPT
 }
 
+# Uninstall must remove every artifact AND do it without spewing expected-failure noise
+# (stop/disable of absent units, flushing an absent table 200, deleting an absent netns).
+verify_uninstall() {
+  local container="$1"
+
+  run_script_in_container "$container" <<'CONTAINER_SCRIPT'
+set -Eeuo pipefail
+
+out="$(mtbuddy uninstall --yes 2>&1)"
+printf '%s\n' "$out"
+
+fail=0
+# No leftover artifacts (proxy, egress, tunnel pool, the binary itself).
+for f in \
+  /opt/mtproto-proxy \
+  /etc/systemd/system/mtproto-proxy.service \
+  /etc/systemd/system/mtproto-singbox-egress.service \
+  /etc/systemd/system/mtproto-tunnel-pool.timer \
+  /etc/systemd/system/mtproto-tunnel-pool.service \
+  /etc/systemd/system/mtproto-proxy.service.d \
+  /usr/local/bin/setup_tunnel.sh \
+  /usr/local/bin/sing-box \
+  /usr/local/bin/mtproto-singbox-route.sh \
+  /usr/local/bin/mtbuddy ; do
+  if [ -e "$f" ]; then echo "FAIL: leftover $f"; fail=1; fi
+done
+
+# No mtproto unit files registered with systemd anymore.
+if systemctl list-unit-files 2>/dev/null | grep -qE "mtproto-(proxy|singbox|tunnel-pool|mask)"; then
+  echo "FAIL: mtproto unit files still registered"; fail=1
+fi
+
+# The output must be clean — no expected-failure noise from a normal uninstall.
+if printf '%s\n' "$out" | grep -qE "Failed to (stop|disable)|Unit .* not loaded|RTNETLINK|FIB table does not exist|Cannot remove namespace"; then
+  echo "FAIL: noisy uninstall output (expected-failure messages leaked)"; fail=1
+fi
+
+[ "$fail" -eq 0 ] || exit 1
+echo "uninstall: clean, no leftovers"
+CONTAINER_SCRIPT
+}
+
 verify_install() {
   local container="$1"
   local attempt
@@ -429,6 +471,10 @@ run_case() {
 
   echo "::group::Tunnel pool failover to a healthy tunnel ($base_image)"
   verify_tunnel_pool_failover "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-pool-failover.log"
+  echo "::endgroup::"
+
+  echo "::group::Uninstall removes everything cleanly ($base_image)"
+  verify_uninstall "$container" 2>&1 | tee "$LOG_DIR/$safe.uninstall.log"
   echo "::endgroup::"
 
   dump_container_debug "$container" "$safe"
