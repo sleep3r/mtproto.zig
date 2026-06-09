@@ -458,6 +458,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         return;
     }
 
+    // A sing-box egress (`setup egress`) and this WG tunnel pool both own fwmark 200 /
+    // table 200 — retire the sing-box egress so the two don't fight over the route.
+    if (sys.fileExists("/etc/systemd/system/mtproto-singbox-egress.service")) {
+        ui.warn("Retiring the existing sing-box egress — it can't share table 200 with a WG tunnel.");
+        sys.execSilent(allocator, &.{ "systemctl", "disable", "--now", "mtproto-singbox-egress.service" });
+        sys.execSilent(allocator, &.{ "rm", "-f", "/etc/systemd/system/mtproto-singbox-egress.service", "/etc/mtproto-proxy/singbox-egress.json", "/usr/local/bin/mtproto-singbox-route.sh", "/etc/systemd/system/mtproto-proxy.service.d/egress.conf" });
+        sys.execSilent(allocator, &.{ "systemctl", "daemon-reload" });
+    }
+
     // ── Install AmneziaWG ──
     if (sys.commandExists("awg") and sys.commandExists("awg-quick")) {
         ui.ok("AmneziaWG already installed");
@@ -1693,9 +1702,16 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    fi
         \\)
         \\
+        \\previous="$(ip -4 route show table "$TABLE" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
         \\pinned="$(read_tunnel_key pinned_interface || true)"
         \\candidates=()
         \\add_unique "$pinned"
+        \\# Sticky: after the pin, prefer the currently-active tunnel if it's still in the
+        \\# pool, so a healthy active tunnel isn't dropped for an earlier-listed one — that
+        \\# would flap (reset every connection) whenever the first pool entry is reachable.
+        \\for iface in "${pool[@]}"; do
+        \\    [[ "$iface" == "$previous" ]] && add_unique "$previous"
+        \\done
         \\for iface in "${pool[@]}"; do
         \\    add_unique "$iface"
         \\done
@@ -1706,7 +1722,6 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    exit 1
         \\}
         \\
-        \\previous="$(ip -4 route show table "$TABLE" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
         \\selected=""
         \\selected_reason=""
         \\selected_status="healthy"

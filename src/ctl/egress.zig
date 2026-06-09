@@ -1,17 +1,19 @@
 //! egress.zig — `mtbuddy setup egress <share-link>...`
 //!
-//! Provision an upstream egress for the proxy from VPN share-links, dispatching by
-//! URI scheme onto the two egress shapes the proxy already supports:
+//! Provision an upstream egress for the proxy from VPN share-links, dispatching by URI
+//! scheme onto the `type = tunnel` egress shape (transparent L3, policy-routed — the same
+//! abstraction as AmneziaWG):
 //!
-//!   wireguard://                         -> native L3 tunnel (reuses tunnel.zig:
-//!                                           kernel WG/AmneziaWG + policy routing + pool)
-//!   vless:// vmess:// trojan:// ss://     -> a local Xray client exposing a SOCKS5
-//!                                           inbound; the proxy egresses via
-//!                                           upstream.type = socks5. Multiple links ->
-//!                                           an Xray balancer + observatory (failover),
-//!                                           mirroring the tunnel pool.
+//!   wireguard://                         -> native kernel WG/AmneziaWG tunnel (reuses
+//!                                           tunnel.zig: policy routing + pool)
+//!   vless:// vmess:// trojan:// ss://     -> a local sing-box client in TUN mode (sbx0);
+//!                                           the proxy's SO_MARK'd DC traffic is policy-
+//!                                           routed through it (fwmark 200 -> table 200 ->
+//!                                           sbx0). >1 link -> a sing-box urltest failover
+//!                                           pool. VLESS-Reality camouflages the hop as TLS.
 //!
-//! The proxy relay is unchanged: the SOCKS5 upstream client already exists. This module
+//! The proxy relay is unchanged (it just SO_MARKs, as for any tunnel). The two providers
+//! are mutually exclusive on table 200 — setting one up retires the other. This module
 //! lives entirely in mtbuddy (ctl).
 
 const std = @import("std");
@@ -125,6 +127,7 @@ pub const XrayLink = struct {
     password: ?[]const u8 = null, // trojan / ss
     method: ?[]const u8 = null, // ss cipher
     alter_id: u16 = 0, // vmess aid
+    cipher: []const u8 = "auto", // vmess scy (auto|none|zero|aes-128-gcm|chacha20-poly1305)
     // transport / security
     network: []const u8 = "tcp", // tcp | ws | grpc | http
     security: []const u8 = "none", // none | tls | reality
@@ -212,6 +215,9 @@ fn parseVmess(a: std.mem.Allocator, link: []const u8) !XrayLink {
         .id = try a.dupe(u8, id),
     };
     if (jsonStr(o, "aid")) |s| l.alter_id = std.fmt.parseInt(u16, std.mem.trim(u8, s, " "), 10) catch 0;
+    if (jsonStr(o, "scy")) |s| if (s.len > 0) {
+        l.cipher = try a.dupe(u8, s);
+    };
     if (jsonStr(o, "net")) |s| l.network = try a.dupe(u8, s);
     if (jsonStr(o, "host")) |s| l.host = try a.dupe(u8, s);
     if (jsonStr(o, "path")) |s| l.path = try a.dupe(u8, s);
@@ -275,12 +281,15 @@ pub fn parseXrayLink(a: std.mem.Allocator, link_in: []const u8) !XrayLink {
 
 // ── Xray client config generation ───────────────────────────────────────────────
 
-/// JSON-escape + quote a string (returns including the surrounding quotes).
+/// JSON-escape + quote a string (returns including the surrounding quotes). Control
+/// characters below 0x20 are emitted as \u00XX — a raw control byte (reachable via a
+/// percent-decoded link field) would otherwise produce JSON sing-box rejects.
 fn js(a: std.mem.Allocator, s: []const u8) []const u8 {
-    var buf = a.alloc(u8, s.len * 2 + 2) catch return "\"\"";
+    var buf = a.alloc(u8, s.len * 6 + 2) catch return "\"\"";
     var w: usize = 0;
     buf[w] = '"';
     w += 1;
+    const hex = "0123456789abcdef";
     for (s) |c| switch (c) {
         '"', '\\' => {
             buf[w] = '\\';
@@ -301,6 +310,15 @@ fn js(a: std.mem.Allocator, s: []const u8) []const u8 {
             buf[w] = '\\';
             buf[w + 1] = 't';
             w += 2;
+        },
+        0...8, 11, 12, 14...31 => {
+            buf[w + 0] = '\\';
+            buf[w + 1] = 'u';
+            buf[w + 2] = '0';
+            buf[w + 3] = '0';
+            buf[w + 4] = hex[c >> 4];
+            buf[w + 5] = hex[c & 0xf];
+            w += 6;
         },
         else => {
             buf[w] = c;
@@ -341,7 +359,7 @@ fn sbOutbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
             const flow = if (l.flow) |f| try std.fmt.allocPrint(a, ",\"flow\":{s}", .{js(a, f)}) else "";
             break :blk std.fmt.allocPrint(a, "{{\"type\":\"vless\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s}{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), flow, tls, tr });
         },
-        .vmess => std.fmt.allocPrint(a, "{{\"type\":\"vmess\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s},\"alter_id\":{d},\"security\":\"auto\"{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), l.alter_id, tls, tr }),
+        .vmess => std.fmt.allocPrint(a, "{{\"type\":\"vmess\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s},\"alter_id\":{d},\"security\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), l.alter_id, js(a, l.cipher), tls, tr }),
         .trojan => std.fmt.allocPrint(a, "{{\"type\":\"trojan\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"password\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.password.?), tls, tr }),
         .shadowsocks => std.fmt.allocPrint(a, "{{\"type\":\"shadowsocks\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"method\":{s},\"password\":{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.method.?), js(a, l.password.?) }),
         else => error.UnsupportedScheme,
@@ -378,6 +396,35 @@ pub fn genSingboxConfig(a: std.mem.Allocator, links: []const XrayLink) ![]const 
 const Family = enum { wireguard, xray };
 fn schemeFamily(s: Scheme) Family {
     return if (s == .wireguard) .wireguard else .xray;
+}
+
+// Ciphers sing-box accepts for shadowsocks. An unknown one makes sing-box reject the
+// WHOLE config, so we reject the link up front with a clear message instead.
+const supported_ss_methods = [_][]const u8{
+    "aes-128-gcm",             "aes-192-gcm",
+    "aes-256-gcm",             "chacha20-ietf-poly1305",
+    "xchacha20-ietf-poly1305", "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305",
+    "none",
+};
+
+/// Reject links whose transport/cipher our generator can't faithfully emit — better a
+/// clear error than silently degrading an unsupported transport to plain TCP (which the
+/// server rejects) or emitting an unknown SS cipher (which sing-box refuses to load).
+/// Returns an error message in `buf`, or null when the link is supported.
+fn validateLink(l: XrayLink, buf: []u8) ?[]const u8 {
+    const net = l.network;
+    if (!(net.len == 0 or std.mem.eql(u8, net, "tcp") or std.mem.eql(u8, net, "ws") or std.mem.eql(u8, net, "grpc"))) {
+        return std.fmt.bufPrint(buf, "unsupported transport '{s}' for {s} — only tcp/ws/grpc are supported", .{ net, l.address }) catch "unsupported transport";
+    }
+    if (l.scheme == .shadowsocks) {
+        const m = l.method orelse "";
+        for (supported_ss_methods) |sm| {
+            if (std.mem.eql(u8, m, sm)) return null;
+        }
+        return std.fmt.bufPrint(buf, "unsupported shadowsocks cipher '{s}' for {s}", .{ m, l.address }) catch "unsupported shadowsocks cipher";
+    }
+    return null;
 }
 
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
@@ -488,7 +535,23 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
             ui.fail("Failed to parse a share-link");
             return;
         };
+        var vbuf: [256]u8 = undefined;
+        if (validateLink(parsed[i], &vbuf)) |msg| {
+            ui.fail(msg);
+            return;
+        }
         ui.stepOk("Parsed egress", parsed[i].address);
+    }
+
+    // A sing-box tunnel and the AmneziaWG tunnel pool both own fwmark 200 / table 200 —
+    // the pool's 30s timer does `ip route flush table 200` and would silently steal the
+    // route from sbx0. They must be mutually exclusive, so retire any existing pool first.
+    if (sys.fileExists("/etc/systemd/system/mtproto-tunnel-pool.timer")) {
+        ui.warn("Retiring the existing AmneziaWG tunnel pool — it can't share table 200 with the sing-box egress.");
+        _ = sys.exec(allocator, &.{ "systemctl", "disable", "--now", "mtproto-tunnel-pool.timer" }) catch {};
+        _ = sys.exec(allocator, &.{ "systemctl", "stop", "mtproto-tunnel-pool.service" }) catch {};
+        _ = sys.exec(allocator, &.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.timer", "/etc/systemd/system/mtproto-tunnel-pool.service", "/usr/local/bin/setup_tunnel.sh", "/run/mtproto-proxy/tunnel-pool.state" }) catch {};
+        _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
     }
 
     if (!sys.commandExists("sing-box") and !sys.fileExists(SB_BIN)) {
@@ -515,6 +578,7 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
     // (fwmark 200 → table 200 → sbx0) — the same mechanism the AmneziaWG tunnel uses.
     const route_script = "#!/bin/bash\n" ++
         "for i in $(seq 1 60); do ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 && break; sleep 0.25; done\n" ++
+        "ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 || { echo 'mtproto egress: " ++ TUN_IFACE ++ " never appeared (sing-box failed to start the tun?)' >&2; exit 1; }\n" ++
         "ip rule add fwmark " ++ TUN_FWMARK ++ " lookup " ++ TUN_TABLE ++ " 2>/dev/null || true\n" ++
         "ip route replace default dev " ++ TUN_IFACE ++ " table " ++ TUN_TABLE ++ "\n";
     sys.writeFileMode(SB_ROUTE_SCRIPT, route_script, 0o755) catch {
@@ -548,6 +612,11 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
     ui.ok("sing-box tunnel egress up (tun " ++ TUN_IFACE ++ ")");
 
     if (sys.fileExists(CONFIG_PATH)) {
+        // Order mtproto-proxy after the egress so sbx0 + its route exist before the proxy
+        // marks DC sockets — otherwise a reboot races and DC connects fail until retry.
+        _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/systemd/system/mtproto-proxy.service.d" }) catch {};
+        sys.writeFile("/etc/systemd/system/mtproto-proxy.service.d/egress.conf", "[Unit]\nAfter=" ++ SB_SERVICE_NAME ++ "\nWants=" ++ SB_SERVICE_NAME ++ "\n") catch {};
+        _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
         wireUpstreamTunnel(allocator, link_texts) catch {
             ui.warn("tunnel is up, but updating config.toml failed — set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE ++ " manually");
             return;
@@ -563,6 +632,10 @@ fn wireUpstreamTunnel(allocator: std.mem.Allocator, link_texts: []const []const 
     var doc = try toml.TomlDoc.load(allocator, CONFIG_PATH);
     defer doc.deinit();
     try doc.set("upstream", "type", "tunnel");
+    // Point both the plural pool list (which the proxy reads first) and the singular key
+    // at sbx0, and clear any pinned awg interface, so no stale awg name shadows sbx0.
+    try doc.set("upstream.tunnel", "interfaces", "[\"" ++ TUN_IFACE ++ "\"]");
+    try doc.set("upstream.tunnel", "pinned_interface", "");
     try doc.set("upstream.tunnel", "interface", TUN_IFACE);
     // Persist the links so a reinstall reproduces the egress (config is 0600).
     var arr: std.ArrayListUnmanaged(u8) = .empty;
@@ -634,6 +707,14 @@ fn installSingbox(allocator: std.mem.Allocator) bool {
     }
     const extracted = std.fmt.allocPrint(allocator, "{s}/sing-box-{s}-linux-{s}/sing-box", .{ td, ver, arch }) catch return false;
     defer allocator.free(extracted);
+    // Verify the downloaded artifact actually runs as sing-box before installing it. The
+    // transport is TLS (authenticity); this catches a corrupt/truncated download or a
+    // wrong-arch binary. sing-box publishes no checksums/signatures to verify against.
+    {
+        const r = sys.exec(allocator, &.{ extracted, "version" }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0 or std.mem.indexOf(u8, r.stdout, "sing-box") == null) return false;
+    }
     {
         const r = sys.exec(allocator, &.{ "install", "-m", "0755", extracted, SB_BIN }) catch return false;
         defer r.deinit();
@@ -714,6 +795,28 @@ test "percentDecode + queryParam" {
     try std.testing.expectEqualStrings("German WG-1", percentDecode(&buf, "German%20WG-1"));
     try std.testing.expectEqualStrings("1420", queryParam("publickey=X&address=Y&mtu=1420", "mtu").?);
     try std.testing.expect(queryParam("a=1&b=2", "c") == null);
+}
+
+test "validateLink rejects unsupported transport and ss cipher" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(validateLink(.{ .scheme = .vless, .address = "h", .port = 1, .network = "ws" }, &buf) == null);
+    try std.testing.expect(validateLink(.{ .scheme = .shadowsocks, .address = "h", .port = 1, .method = "aes-256-gcm" }, &buf) == null);
+    try std.testing.expect(validateLink(.{ .scheme = .vless, .address = "h", .port = 1, .network = "quic" }, &buf) != null);
+    try std.testing.expect(validateLink(.{ .scheme = .shadowsocks, .address = "h", .port = 1, .method = "rc4-md5-is-unsupported" }, &buf) != null);
+}
+
+test "vmess scy maps to cipher and is emitted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"v\":\"2\",\"ps\":\"x\",\"add\":\"1.2.3.4\",\"port\":\"443\",\"id\":\"95e0edb9-4a0b-4312-a71f-1d4b8b6db79b\",\"aid\":\"0\",\"net\":\"tcp\",\"scy\":\"zero\",\"tls\":\"\"}";
+    var b64: [512]u8 = undefined;
+    const enc = std.base64.standard.Encoder.encode(&b64, json);
+    const link = try std.fmt.allocPrint(a, "vmess://{s}", .{enc});
+    const l = try parseXrayLink(a, link);
+    try std.testing.expectEqualStrings("zero", l.cipher);
+    const cfg = try genSingboxConfig(a, &.{l});
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"security\":\"zero\"") != null);
 }
 
 test "detectScheme" {

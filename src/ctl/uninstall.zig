@@ -116,8 +116,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     const userdel = sys.commandOrPath("userdel", &.{ "/usr/sbin/userdel", "/sbin/userdel" });
     _ = sys.execForward(&.{ userdel, "mtproto" }) catch {};
 
-    // 4. Cleanup tunnel routing artifacts (new + legacy)
-    _ = sys.execForward(&.{ "ip", "-4", "rule", "del", "fwmark", "200", "table", "200" }) catch {};
+    // 4. Cleanup tunnel routing artifacts (new + legacy). Loop the rule delete: the
+    //    sing-box egress adds an unprioritized `fwmark 200 lookup 200` rule while the awg
+    //    pool adds a prioritized one, so several matching rules may exist.
+    _ = sys.execForward(&.{ "bash", "-c", "while ip -4 rule del fwmark 200 table 200 2>/dev/null; do :; done; while ip -4 rule del fwmark 200 lookup 200 2>/dev/null; do :; done" }) catch {};
     _ = sys.execForward(&.{ "ip", "-4", "route", "flush", "table", "200" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_tunnel.sh" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_netns.sh" }) catch {};
