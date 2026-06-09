@@ -228,10 +228,10 @@ sudo mtbuddy setup tunnel 'vpn://...'
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 
 # Egress from a VPN share-link — clean, hard-to-block upstream for the proxy→Telegram hop.
-#   vless:// vmess:// trojan:// ss://  -> local Xray client -> SOCKS5 upstream (VLESS-Reality
-#                                        camouflages the egress hop as real TLS).
-#   wireguard://                       -> native L3 tunnel (same as `setup tunnel`).
-#   multiple links                     -> a leastPing failover pool.
+#   vless:// vmess:// trojan:// ss://  -> local sing-box TUN tunnel (type=tunnel, exactly like
+#                                        AmneziaWG; VLESS-Reality camouflages the hop as real TLS).
+#   wireguard://                       -> native kernel WG tunnel (same as `setup tunnel`).
+#   multiple links                     -> a urltest failover pool.
 sudo mtbuddy setup egress 'vless://...@host:443?security=reality&pbk=...&sni=...&flow=xtls-rprx-vision'
 sudo mtbuddy setup egress 'wireguard://<privkey>@host:51820?publickey=...&address=10.0.0.2/32'
 

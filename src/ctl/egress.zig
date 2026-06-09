@@ -24,13 +24,16 @@ const Tui = tui_mod.Tui;
 
 const INSTALL_DIR = "/opt/mtproto-proxy";
 const CONFIG_PATH = INSTALL_DIR ++ "/config.toml";
-const XRAY_CONFIG_DIR = "/etc/mtproto-proxy";
-const XRAY_CONFIG_PATH = XRAY_CONFIG_DIR ++ "/xray-egress.json";
-const XRAY_SERVICE_NAME = "mtproto-xray-egress.service";
-const XRAY_SERVICE_PATH = "/etc/systemd/system/" ++ XRAY_SERVICE_NAME;
-const XRAY_BIN = "/usr/local/bin/xray";
-const SOCKS_HOST = "127.0.0.1";
-const SOCKS_PORT: u16 = 10808;
+const SB_CONFIG_DIR = "/etc/mtproto-proxy";
+const SB_CONFIG_PATH = SB_CONFIG_DIR ++ "/singbox-egress.json";
+const SB_SERVICE_NAME = "mtproto-singbox-egress.service";
+const SB_SERVICE_PATH = "/etc/systemd/system/" ++ SB_SERVICE_NAME;
+const SB_ROUTE_SCRIPT = "/usr/local/bin/mtproto-singbox-route.sh";
+const SB_BIN = "/usr/local/bin/sing-box";
+const TUN_IFACE = "sbx0"; // sing-box tun interface; mirrors awg0 as a tunnel egress
+const TUN_ADDR = "172.19.0.1/30";
+const TUN_TABLE = "200"; // same policy-routing table the AmneziaWG tunnel uses
+const TUN_FWMARK = "200"; // proxy SO_MARK for tunnel egress
 
 // ── URI helpers ───────────────────────────────────────────────────────────────
 
@@ -309,54 +312,65 @@ fn js(a: std.mem.Allocator, s: []const u8) []const u8 {
     return buf[0..w];
 }
 
-fn streamSettings(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
-    if (l.scheme == .shadowsocks) return "";
+fn sbTls(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
     const sni = l.sni orelse l.host orelse l.address;
     const fp = l.fingerprint orelse "chrome";
-    var sec: []const u8 = ",\"security\":\"none\"";
     if (std.mem.eql(u8, l.security, "reality")) {
-        sec = try std.fmt.allocPrint(a, ",\"security\":\"reality\",\"realitySettings\":{{\"serverName\":{s},\"fingerprint\":{s},\"publicKey\":{s},\"shortId\":{s},\"spiderX\":\"/\"}}", .{ js(a, sni), js(a, fp), js(a, l.public_key orelse ""), js(a, l.short_id orelse "") });
+        return std.fmt.allocPrint(a, ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"utls\":{{\"enabled\":true,\"fingerprint\":{s}}},\"reality\":{{\"enabled\":true,\"public_key\":{s},\"short_id\":{s}}}}}", .{ js(a, sni), js(a, fp), js(a, l.public_key orelse ""), js(a, l.short_id orelse "") });
     } else if (std.mem.eql(u8, l.security, "tls")) {
-        sec = try std.fmt.allocPrint(a, ",\"security\":\"tls\",\"tlsSettings\":{{\"serverName\":{s},\"fingerprint\":{s},\"allowInsecure\":false}}", .{ js(a, sni), js(a, fp) });
+        return std.fmt.allocPrint(a, ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"utls\":{{\"enabled\":true,\"fingerprint\":{s}}}}}", .{ js(a, sni), js(a, fp) });
     }
-    var trans: []const u8 = "";
-    if (std.mem.eql(u8, l.network, "ws")) {
-        trans = try std.fmt.allocPrint(a, ",\"wsSettings\":{{\"path\":{s},\"headers\":{{\"Host\":{s}}}}}", .{ js(a, l.path orelse "/"), js(a, l.host orelse sni) });
-    } else if (std.mem.eql(u8, l.network, "grpc")) {
-        trans = try std.fmt.allocPrint(a, ",\"grpcSettings\":{{\"serviceName\":{s}}}", .{js(a, l.path orelse "")});
-    }
-    return std.fmt.allocPrint(a, ",\"streamSettings\":{{\"network\":{s}{s}{s}}}", .{ js(a, l.network), sec, trans });
+    return "";
 }
 
-fn outbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
-    const stream = try streamSettings(a, l);
+fn sbTransport(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
+    const sni = l.sni orelse l.host orelse l.address;
+    if (std.mem.eql(u8, l.network, "ws")) {
+        return std.fmt.allocPrint(a, ",\"transport\":{{\"type\":\"ws\",\"path\":{s},\"headers\":{{\"Host\":{s}}}}}", .{ js(a, l.path orelse "/"), js(a, l.host orelse sni) });
+    } else if (std.mem.eql(u8, l.network, "grpc")) {
+        return std.fmt.allocPrint(a, ",\"transport\":{{\"type\":\"grpc\",\"service_name\":{s}}}", .{js(a, l.path orelse "")});
+    }
+    return "";
+}
+
+fn sbOutbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
+    const tls = try sbTls(a, l);
+    const tr = try sbTransport(a, l);
     return switch (l.scheme) {
         .vless => blk: {
             const flow = if (l.flow) |f| try std.fmt.allocPrint(a, ",\"flow\":{s}", .{js(a, f)}) else "";
-            break :blk std.fmt.allocPrint(a, "{{\"protocol\":\"vless\",\"tag\":{s},\"settings\":{{\"vnext\":[{{\"address\":{s},\"port\":{d},\"users\":[{{\"id\":{s},\"encryption\":\"none\"{s}}}]}}]}}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), flow, stream });
+            break :blk std.fmt.allocPrint(a, "{{\"type\":\"vless\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s}{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), flow, tls, tr });
         },
-        .vmess => std.fmt.allocPrint(a, "{{\"protocol\":\"vmess\",\"tag\":{s},\"settings\":{{\"vnext\":[{{\"address\":{s},\"port\":{d},\"users\":[{{\"id\":{s},\"alterId\":{d},\"security\":\"auto\"}}]}}]}}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), l.alter_id, stream }),
-        .trojan => std.fmt.allocPrint(a, "{{\"protocol\":\"trojan\",\"tag\":{s},\"settings\":{{\"servers\":[{{\"address\":{s},\"port\":{d},\"password\":{s}}}]}}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.password.?), stream }),
-        .shadowsocks => std.fmt.allocPrint(a, "{{\"protocol\":\"shadowsocks\",\"tag\":{s},\"settings\":{{\"servers\":[{{\"address\":{s},\"port\":{d},\"method\":{s},\"password\":{s}}}]}}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.method.?), js(a, l.password.?) }),
+        .vmess => std.fmt.allocPrint(a, "{{\"type\":\"vmess\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s},\"alter_id\":{d},\"security\":\"auto\"{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), l.alter_id, tls, tr }),
+        .trojan => std.fmt.allocPrint(a, "{{\"type\":\"trojan\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"password\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.password.?), tls, tr }),
+        .shadowsocks => std.fmt.allocPrint(a, "{{\"type\":\"shadowsocks\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"method\":{s},\"password\":{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.method.?), js(a, l.password.?) }),
         else => error.UnsupportedScheme,
     };
 }
 
-/// Build a full Xray client config: a SOCKS5 inbound on 127.0.0.1:`socks_port` and one
-/// outbound per link. With >1 link, add a leastPing balancer + observatory so a dead
-/// egress fails over to a healthy one (the Xray analogue of the tunnel pool).
-pub fn genXrayConfig(a: std.mem.Allocator, links: []const XrayLink, socks_port: u16) ![]const u8 {
-    var obs: std.ArrayListUnmanaged(u8) = .empty;
+/// Build a sing-box config: a TUN inbound (`sbx0`; auto_route off — only the proxy's
+/// SO_MARK'd traffic is policy-routed into it, so the rest of the host is untouched) and
+/// one outbound per link. >1 link adds a `urltest` selector (health-based failover — the
+/// analogue of the tunnel pool). VLESS-Reality camouflages the egress hop as real TLS.
+pub fn genSingboxConfig(a: std.mem.Allocator, links: []const XrayLink) ![]const u8 {
+    var outs: std.ArrayListUnmanaged(u8) = .empty;
     for (links, 0..) |l, i| {
         const tag = try std.fmt.allocPrint(a, "egress-{d}", .{i});
-        if (i != 0) try obs.append(a, ',');
-        try obs.appendSlice(a, try outbound(a, l, tag));
+        if (i != 0) try outs.append(a, ',');
+        try outs.appendSlice(a, try sbOutbound(a, l, tag));
     }
-    const routing = if (links.len > 1)
-        ",\"routing\":{\"balancers\":[{\"tag\":\"egress\",\"selector\":[\"egress-\"],\"strategy\":{\"type\":\"leastPing\"}}],\"rules\":[{\"type\":\"field\",\"network\":\"tcp,udp\",\"balancerTag\":\"egress\"}]},\"observatory\":{\"subjectSelector\":[\"egress-\"],\"probeUrl\":\"https://www.gstatic.com/generate_204\",\"probeInterval\":\"10s\"}"
-    else
-        "";
-    return std.fmt.allocPrint(a, "{{\"log\":{{\"loglevel\":\"warning\"}},\"inbounds\":[{{\"tag\":\"socks-in\",\"listen\":\"127.0.0.1\",\"port\":{d},\"protocol\":\"socks\",\"settings\":{{\"udp\":true,\"auth\":\"noauth\"}}}}],\"outbounds\":[{s},{{\"protocol\":\"freedom\",\"tag\":\"direct\"}}]{s}}}", .{ socks_port, obs.items, routing });
+    var final_tag: []const u8 = "egress-0";
+    var selector: []const u8 = "";
+    if (links.len > 1) {
+        var tags: std.ArrayListUnmanaged(u8) = .empty;
+        for (0..links.len) |i| {
+            if (i != 0) try tags.append(a, ',');
+            try tags.appendSlice(a, try std.fmt.allocPrint(a, "\"egress-{d}\"", .{i}));
+        }
+        selector = try std.fmt.allocPrint(a, ",{{\"type\":\"urltest\",\"tag\":\"egress\",\"outbounds\":[{s}],\"url\":\"https://www.gstatic.com/generate_204\",\"interval\":\"10s\"}}", .{tags.items});
+        final_tag = "egress";
+    }
+    return std.fmt.allocPrint(a, "{{\"log\":{{\"level\":\"warn\"}},\"inbounds\":[{{\"type\":\"tun\",\"tag\":\"tun-in\",\"interface_name\":\"{s}\",\"address\":[\"{s}\"],\"auto_route\":false,\"stack\":\"system\"}}],\"outbounds\":[{s},{{\"type\":\"direct\",\"tag\":\"direct\"}}{s}],\"route\":{{\"auto_detect_interface\":true,\"final\":\"{s}\"}}}}", .{ TUN_IFACE, TUN_ADDR, outs.items, selector, final_tag });
 }
 
 // ── CLI + provisioning ──────────────────────────────────────────────────────────
@@ -394,7 +408,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
     if (fam0 == .wireguard) {
         return setupWireguard(ui, allocator, links.items);
     }
-    return setupXray(ui, allocator, links.items);
+    return setupSingboxTunnel(ui, allocator, links.items);
 }
 
 /// wireguard:// links -> native L3 tunnel. Convert each link to a WG/AmneziaWG .conf
@@ -463,7 +477,7 @@ pub fn convertWireguardLink(a: std.mem.Allocator, link_in: []const u8) ![]const 
     return aw.written();
 }
 
-fn setupXray(ui: *Tui, allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
+fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -477,71 +491,79 @@ fn setupXray(ui: *Tui, allocator: std.mem.Allocator, link_texts: []const []const
         ui.stepOk("Parsed egress", parsed[i].address);
     }
 
-    if (!sys.commandExists("xray") and !sys.fileExists(XRAY_BIN)) {
-        ui.step("Installing Xray-core...");
-        if (!installXray(allocator)) {
-            ui.fail("Failed to install Xray-core (download/unzip). Check network and retry.");
+    if (!sys.commandExists("sing-box") and !sys.fileExists(SB_BIN)) {
+        ui.step("Installing sing-box...");
+        if (!installSingbox(allocator)) {
+            ui.fail("Failed to install sing-box (download/extract). Check network and retry.");
             return;
         }
-        ui.ok("Xray-core installed");
+        ui.ok("sing-box installed");
     }
-    const xray_bin: []const u8 = if (sys.fileExists(XRAY_BIN)) XRAY_BIN else "xray";
+    const sb_bin: []const u8 = if (sys.fileExists(SB_BIN)) SB_BIN else "sing-box";
 
-    const cfg = genXrayConfig(a, parsed, SOCKS_PORT) catch {
-        ui.fail("Failed to generate Xray config");
+    const cfg = genSingboxConfig(a, parsed) catch {
+        ui.fail("Failed to generate sing-box config");
         return;
     };
-    _ = sys.exec(allocator, &.{ "mkdir", "-p", XRAY_CONFIG_DIR }) catch {};
-    sys.writeFileMode(XRAY_CONFIG_PATH, cfg, 0o600) catch {
-        ui.fail("Failed to write " ++ XRAY_CONFIG_PATH);
+    _ = sys.exec(allocator, &.{ "mkdir", "-p", SB_CONFIG_DIR }) catch {};
+    sys.writeFileMode(SB_CONFIG_PATH, cfg, 0o600) catch {
+        ui.fail("Failed to write " ++ SB_CONFIG_PATH);
+        return;
+    };
+
+    // Policy-routing helper: wait for the tun, then route the proxy's SO_MARK'd egress
+    // (fwmark 200 → table 200 → sbx0) — the same mechanism the AmneziaWG tunnel uses.
+    const route_script = "#!/bin/bash\n" ++
+        "for i in $(seq 1 60); do ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 && break; sleep 0.25; done\n" ++
+        "ip rule add fwmark " ++ TUN_FWMARK ++ " lookup " ++ TUN_TABLE ++ " 2>/dev/null || true\n" ++
+        "ip route replace default dev " ++ TUN_IFACE ++ " table " ++ TUN_TABLE ++ "\n";
+    sys.writeFileMode(SB_ROUTE_SCRIPT, route_script, 0o755) catch {
+        ui.fail("Failed to write the routing helper");
         return;
     };
 
     const unit = try std.fmt.allocPrint(a,
         \\[Unit]
-        \\Description=mtproto-proxy Xray egress (SOCKS5 bridge for upstream)
+        \\Description=mtproto-proxy sing-box tunnel egress
         \\After=network-online.target
         \\Wants=network-online.target
         \\
         \\[Service]
         \\ExecStart={s} run -c {s}
+        \\ExecStartPost=+{s}
         \\Restart=on-failure
         \\RestartSec=3
-        \\NoNewPrivileges=yes
-        \\ProtectSystem=strict
-        \\ProtectHome=yes
-        \\PrivateTmp=yes
+        \\AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
         \\
         \\[Install]
         \\WantedBy=multi-user.target
         \\
-    , .{ xray_bin, XRAY_CONFIG_PATH });
-    sys.writeFile(XRAY_SERVICE_PATH, unit) catch {
+    , .{ sb_bin, SB_CONFIG_PATH, SB_ROUTE_SCRIPT });
+    sys.writeFile(SB_SERVICE_PATH, unit) catch {
         ui.fail("Failed to write the systemd unit");
         return;
     };
     _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
-    _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", XRAY_SERVICE_NAME }) catch {};
-    ui.ok("Xray egress service up (SOCKS5 " ++ SOCKS_HOST ++ ":10808)");
+    _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", SB_SERVICE_NAME }) catch {};
+    ui.ok("sing-box tunnel egress up (tun " ++ TUN_IFACE ++ ")");
 
     if (sys.fileExists(CONFIG_PATH)) {
-        wireUpstreamSocks(allocator, link_texts) catch {
-            ui.warn("Xray bridge is up, but updating config.toml failed — set [upstream] type=socks5, [upstream.socks5] host=127.0.0.1 port=10808 manually");
+        wireUpstreamTunnel(allocator, link_texts) catch {
+            ui.warn("tunnel is up, but updating config.toml failed — set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE ++ " manually");
             return;
         };
         _ = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
-        ui.ok("upstream set to socks5 via the Xray egress; mtproto-proxy restarted");
+        ui.ok("upstream set to tunnel via " ++ TUN_IFACE ++ "; mtproto-proxy restarted");
     } else {
-        ui.warn("mtproto-proxy not installed here — the Xray bridge is up; point [upstream] type=socks5 host=127.0.0.1 port=10808 at it");
+        ui.warn("mtproto-proxy not installed here — the sing-box tunnel is up on " ++ TUN_IFACE ++ "; set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE);
     }
 }
 
-fn wireUpstreamSocks(allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
+fn wireUpstreamTunnel(allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
     var doc = try toml.TomlDoc.load(allocator, CONFIG_PATH);
     defer doc.deinit();
-    try doc.set("upstream", "type", "socks5");
-    try doc.set("upstream.socks5", "host", SOCKS_HOST);
-    try doc.set("upstream.socks5", "port", "10808");
+    try doc.set("upstream", "type", "tunnel");
+    try doc.set("upstream.tunnel", "interface", TUN_IFACE);
     // Persist the links so a reinstall reproduces the egress (config is 0600).
     var arr: std.ArrayListUnmanaged(u8) = .empty;
     defer arr.deinit(allocator);
@@ -557,20 +579,35 @@ fn wireUpstreamSocks(allocator: std.mem.Allocator, link_texts: []const []const u
     try doc.save(CONFIG_PATH);
 }
 
-/// Download + install the static Xray-core binary for this arch (SHA-less; the zip is
-/// fetched over TLS from the pinned GitHub release path). Uses a private temp dir.
-fn installXray(allocator: std.mem.Allocator) bool {
-    const asset: []const u8 = switch (builtin.cpu.arch) {
-        .x86_64 => "Xray-linux-64.zip",
-        .aarch64 => "Xray-linux-arm64-v8a.zip",
+/// Download + install the static sing-box binary for this arch. The release asset name
+/// carries the version, so resolve the latest tag from the API first. Private temp dir.
+fn installSingbox(allocator: std.mem.Allocator) bool {
+    const arch: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => "amd64",
+        .aarch64 => "arm64",
         else => return false,
     };
-    if (!sys.commandExists("unzip") or !sys.commandExists("curl")) {
+    if (!sys.commandExists("curl") or !sys.commandExists("tar")) {
         _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
-        _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends", "unzip", "curl" }) catch {};
+        _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends", "curl", "tar" }) catch {};
     }
+    const ver = blk: {
+        const r = sys.exec(allocator, &.{ "curl", "-fsSL", "--connect-timeout", "30", "https://api.github.com/repos/SagerNet/sing-box/releases/latest" }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) break :blk null;
+        // Tolerate whitespace + the optional leading 'v': `"tag_name": "v1.13.13"`.
+        const key = "\"tag_name\"";
+        const ki = std.mem.indexOf(u8, r.stdout, key) orelse break :blk null;
+        const after = r.stdout[ki + key.len ..];
+        const q1 = std.mem.indexOfScalar(u8, after, '"') orelse break :blk null;
+        var vstart = q1 + 1;
+        if (vstart < after.len and after[vstart] == 'v') vstart += 1;
+        const q2 = std.mem.indexOfScalarPos(u8, after, vstart, '"') orelse break :blk null;
+        break :blk allocator.dupe(u8, after[vstart..q2]) catch null;
+    } orelse return false;
+    defer allocator.free(ver);
     const td = blk: {
-        const r = sys.exec(allocator, &.{ "mktemp", "-d", "/tmp/mtbuddy-xray.XXXXXX" }) catch return false;
+        const r = sys.exec(allocator, &.{ "mktemp", "-d", "/tmp/mtbuddy-singbox.XXXXXX" }) catch return false;
         defer r.deinit();
         if (r.exit_code != 0) break :blk null;
         const t = std.mem.trim(u8, r.stdout, " \t\r\n");
@@ -581,28 +618,28 @@ fn installXray(allocator: std.mem.Allocator) bool {
         _ = sys.exec(allocator, &.{ "rm", "-rf", td }) catch {};
         allocator.free(td);
     }
-    const url = std.fmt.allocPrint(allocator, "https://github.com/XTLS/Xray-core/releases/latest/download/{s}", .{asset}) catch return false;
+    const url = std.fmt.allocPrint(allocator, "https://github.com/SagerNet/sing-box/releases/download/v{s}/sing-box-{s}-linux-{s}.tar.gz", .{ ver, ver, arch }) catch return false;
     defer allocator.free(url);
-    const zip = std.fmt.allocPrint(allocator, "{s}/xray.zip", .{td}) catch return false;
-    defer allocator.free(zip);
+    const tgz = std.fmt.allocPrint(allocator, "{s}/sb.tar.gz", .{td}) catch return false;
+    defer allocator.free(tgz);
     {
-        const r = sys.exec(allocator, &.{ "curl", "-fsSL", "--retry", "3", "--connect-timeout", "30", "-o", zip, url }) catch return false;
+        const r = sys.exec(allocator, &.{ "curl", "-fsSL", "--retry", "3", "--connect-timeout", "30", "-o", tgz, url }) catch return false;
         defer r.deinit();
         if (r.exit_code != 0) return false;
     }
     {
-        const r = sys.exec(allocator, &.{ "unzip", "-o", zip, "xray", "-d", td }) catch return false;
+        const r = sys.exec(allocator, &.{ "tar", "xzf", tgz, "-C", td, "--no-same-owner" }) catch return false;
         defer r.deinit();
         if (r.exit_code != 0) return false;
     }
-    const extracted = std.fmt.allocPrint(allocator, "{s}/xray", .{td}) catch return false;
+    const extracted = std.fmt.allocPrint(allocator, "{s}/sing-box-{s}-linux-{s}/sing-box", .{ td, ver, arch }) catch return false;
     defer allocator.free(extracted);
     {
-        const r = sys.exec(allocator, &.{ "install", "-m", "0755", extracted, XRAY_BIN }) catch return false;
+        const r = sys.exec(allocator, &.{ "install", "-m", "0755", extracted, SB_BIN }) catch return false;
         defer r.deinit();
         if (r.exit_code != 0) return false;
     }
-    return sys.fileExists(XRAY_BIN);
+    return sys.fileExists(SB_BIN);
 }
 
 test "parse vless reality link" {
@@ -648,23 +685,24 @@ test "parse shadowsocks sip002 link" {
     try std.testing.expectEqualStrings("g7ZGM4sBp5FuzPgvKQgYgA", l.password.?);
 }
 
-test "genXrayConfig is valid JSON; balancer only for a pool" {
+test "genSingboxConfig is valid JSON; urltest only for a pool" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const vless = try parseXrayLink(a, "vless://95e0edb9-4a0b-4312-a71f-1d4b8b6db79b@154.59.110.32:443?type=tcp&security=reality&pbk=PBK&sni=www.microsoft.com&sid=SID&flow=xtls-rprx-vision#v");
     const ss = try parseXrayLink(a, "ss://YWVzLTI1Ni1nY206ZzdaR000c0JwNUZ1elBndktRZ1lnQQ==@154.59.110.32:9443#s");
 
-    const one = try genXrayConfig(a, &.{vless}, 10808);
+    const one = try genSingboxConfig(a, &.{vless});
     _ = try std.json.parseFromSlice(std.json.Value, a, one, .{}); // well-formed JSON
     try std.testing.expect(std.mem.indexOf(u8, one, "\"reality\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, one, "\"port\":10808") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"type\":\"tun\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"sbx0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, one, "xtls-rprx-vision") != null);
-    try std.testing.expect(std.mem.indexOf(u8, one, "\"balancers\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"urltest\"") == null);
 
-    const pool = try genXrayConfig(a, &.{ vless, ss }, 10808);
+    const pool = try genSingboxConfig(a, &.{ vless, ss });
     _ = try std.json.parseFromSlice(std.json.Value, a, pool, .{});
-    try std.testing.expect(std.mem.indexOf(u8, pool, "\"balancers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pool, "\"urltest\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pool, "egress-0") != null);
     try std.testing.expect(std.mem.indexOf(u8, pool, "egress-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, pool, "shadowsocks") != null);

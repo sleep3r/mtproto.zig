@@ -78,7 +78,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         "mtproto-mask-health.service",
         "mtproto-tunnel-pool.timer",
         "mtproto-tunnel-pool.service",
-        "mtproto-xray-egress.service",
+        "mtproto-singbox-egress.service",
     };
     for (services) |svc| {
         _ = sys.execForward(&.{ "systemctl", "stop", svc }) catch {};
@@ -89,10 +89,11 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         _ = sys.execForward(&.{ "rm", "-f", path }) catch {};
     }
 
-    // Xray egress provider artifacts (the SOCKS5 bridge for upstream.type=socks5).
-    _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-xray-egress.service" }) catch {};
-    _ = sys.execForward(&.{ "rm", "-f", "/etc/mtproto-proxy/xray-egress.json" }) catch {};
-    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/xray" }) catch {};
+    // sing-box tunnel egress provider artifacts (upstream.type=tunnel via sbx0).
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-singbox-egress.service" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/mtproto-proxy/singbox-egress.json" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtproto-singbox-route.sh" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/sing-box" }) catch {};
 
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-mask-health.timer" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.timer" }) catch {};

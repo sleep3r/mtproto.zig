@@ -174,13 +174,14 @@ port = 443
 # username = ""
 # password = ""
 
-# ── Xray egress (VLESS-Reality / VMess / Trojan / Shadowsocks) ──
+# ── VPN-link egress (VLESS-Reality / VMess / Trojan / Shadowsocks) ──
 # Don't hand-edit this — run:  sudo mtbuddy setup egress "<share-link>" [<link>...]
-# It parses the share-link(s), runs a local Xray client that exposes a SOCKS5 inbound
-# on 127.0.0.1:10808, points [upstream] type=socks5 at it, and records the link(s)
-# here so a reinstall reproduces the egress. >1 link = a leastPing failover pool.
-# wireguard:// links go to the native L3 tunnel instead (mtbuddy setup egress also
-# accepts those, or use `mtbuddy setup tunnel`).
+# It parses the share-link(s), runs a local sing-box client in TUN mode (interface
+# sbx0), and policy-routes the proxy's marked DC traffic through it — i.e. it's just a
+# `type = tunnel` egress, exactly like AmneziaWG, only the backend is VLESS-Reality/etc.
+# instead of WireGuard. The link(s) are recorded here so a reinstall reproduces the
+# egress. >1 link = a urltest failover pool. wireguard:// links use the native kernel
+# WG tunnel (or `mtbuddy setup tunnel`).
 # [upstream.xray]
 # links = ["vless://...@host:443?security=reality&pbk=...&sni=...&sid=...&flow=xtls-rprx-vision"]
 
