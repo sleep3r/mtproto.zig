@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/sleep3r/mtproto.zig/compare/v1.2.0...v1.3.0) (2026-06-09)
+
+
+### Features
+
+* **egress:** interactive share-link egress + split egress/tunnel into sharelink/wg/singbox modules ([#326](https://github.com/sleep3r/mtproto.zig/issues/326)) ([729c67d](https://github.com/sleep3r/mtproto.zig/commit/729c67d809b4f9705e46ace1509c2ef2cfa9a1b0))
+
 ## [1.2.0](https://github.com/sleep3r/mtproto.zig/compare/v1.1.1...v1.2.0) (2026-06-09)
 
 
