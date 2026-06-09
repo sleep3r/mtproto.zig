@@ -427,21 +427,16 @@ fn validateLink(l: XrayLink, buf: []u8) ?[]const u8 {
     return null;
 }
 
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
-    var links: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer links.deinit(allocator);
-    while (args.next()) |arg| {
-        if (arg.len > 0 and arg[0] != '-') links.append(allocator, arg) catch {};
-    }
-    if (links.items.len == 0) {
-        ui.fail("Usage: mtbuddy setup egress <share-link> [<share-link>...]");
-        ui.hint("vless:// vmess:// trojan:// ss://  ->  Xray SOCKS5 bridge (upstream.type=socks5)");
-        ui.hint("wireguard://                       ->  native L3 tunnel");
-        return;
-    }
+fn trL(ui: *Tui, en: []const u8, ru: []const u8) []const u8 {
+    return if (ui.lang == .ru) ru else en;
+}
+
+/// Validate the links are one provider family, then dispatch: wireguard:// -> native WG
+/// tunnel, everything else -> the sing-box TUN tunnel. Shared by `run` and `runInteractive`.
+fn dispatchLinks(ui: *Tui, allocator: std.mem.Allocator, link_list: []const []const u8) !void {
     // One egress = one provider family. Reject a mix of wireguard:// and Xray links.
-    const fam0 = schemeFamily(detectScheme(links.items[0]));
-    for (links.items) |l| {
+    const fam0 = schemeFamily(detectScheme(link_list[0]));
+    for (link_list) |l| {
         const s = detectScheme(l);
         if (s == .unknown) {
             ui.fail("Unrecognized share-link scheme (want vless/vmess/trojan/ss/wireguard)");
@@ -453,9 +448,51 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
         }
     }
     if (fam0 == .wireguard) {
-        return setupWireguard(ui, allocator, links.items);
+        return setupWireguard(ui, allocator, link_list);
     }
-    return setupSingboxTunnel(ui, allocator, links.items);
+    return setupSingboxTunnel(ui, allocator, link_list);
+}
+
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
+    var links: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer links.deinit(allocator);
+    while (args.next()) |arg| {
+        if (arg.len > 0 and arg[0] != '-') links.append(allocator, arg) catch {};
+    }
+    if (links.items.len == 0) {
+        ui.fail("Usage: mtbuddy setup egress <share-link> [<share-link>...]");
+        ui.hint("vless:// vmess:// trojan:// ss://  ->  sing-box TUN tunnel (upstream.type=tunnel)");
+        ui.hint("wireguard://                       ->  native kernel WG tunnel");
+        return;
+    }
+    return dispatchLinks(ui, allocator, links.items);
+}
+
+/// Interactive entry: prompt for a share-link (or several, for a failover pool), then run
+/// the same dispatch as `run`. Reached from the interactive "Setup tunnel" VPN-type chooser.
+pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
+    ui.info(trL(ui, "VPN share-link egress — paste a link. Several links (space/newline/comma-separated) form a failover pool.", "Egress из VPN-ссылки — вставь ссылку. Несколько ссылок (через пробел/перенос/запятую) образуют failover-пул."));
+    var buf: [16 * 1024]u8 = undefined;
+    const input = ui.input(
+        trL(ui, "Share-link(s)", "Ссылка(и)"),
+        trL(ui, "vless:// vmess:// trojan:// ss://  (sing-box tunnel)  |  wireguard://  (native tunnel)", "vless:// vmess:// trojan:// ss://  (sing-box-туннель)  |  wireguard://  (нативный туннель)"),
+        null,
+        &buf,
+    ) catch return;
+
+    var links: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer links.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, input, " \t\r\n,");
+    while (it.next()) |tok| links.append(allocator, tok) catch {};
+    if (links.items.len == 0) {
+        ui.fail(trL(ui, "No share-link provided.", "Ссылка не введена."));
+        return;
+    }
+    if (!(ui.confirm(trL(ui, "Proceed?", "Продолжить?"), true) catch false)) {
+        ui.info(trL(ui, "Aborting.", "Отмена."));
+        return;
+    }
+    return dispatchLinks(ui, allocator, links.items);
 }
 
 /// wireguard:// links -> native L3 tunnel. Convert each link to a WG/AmneziaWG .conf

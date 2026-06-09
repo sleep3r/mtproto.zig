@@ -115,8 +115,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         return;
     }
 
-    try chooseInteractiveVpnType(ui);
-
+    // VPN type was already chosen in the interactive menu (AmneziaWG vs share-link); this
+    // path is the AmneziaWG flow.
     if (selection.action == .replace) {
         ui.warn(i18n.get(ui.lang, .tunnel_pool_replace_warn));
     }
@@ -140,14 +140,6 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 
 fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
     return if (lang == .ru) ru else en;
-}
-
-fn chooseInteractiveVpnType(ui: *Tui) !void {
-    const items = [_][]const u8{
-        i18n.get(ui.lang, .tunnel_vpn_amneziawg),
-    };
-    _ = try ui.menu(i18n.get(ui.lang, .tunnel_vpn_type_prompt), &items);
-    ui.stepOk(i18n.get(ui.lang, .tunnel_vpn_type_prompt), i18n.get(ui.lang, .tunnel_vpn_amneziawg));
 }
 
 fn chooseInteractiveTunnelTarget(ui: *Tui, allocator: std.mem.Allocator) !InteractiveTunnelSelection {
