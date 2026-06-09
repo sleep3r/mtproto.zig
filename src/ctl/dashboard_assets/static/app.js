@@ -1242,7 +1242,6 @@ async function poll() {
   $('txTotal').textContent = fmtT(d.net_tx_total);
 
   // Server
-  $('srvUptime').textContent = d.uptime;
   const pi = d.proxy_info || {};
   $('proxyUp').textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : (t('status.online') + ' · ' + (pi.uptime || '')));
   $('proxyPid').textContent = pi.pid || '—';

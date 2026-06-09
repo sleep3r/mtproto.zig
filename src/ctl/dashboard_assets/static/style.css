@@ -695,7 +695,7 @@ body::before, body::after { content: none; }
 
 
 /* ═══════════════════ PAPER-LAYOUT CSS (section build) ═══════════════════ */
-<![CDATA[/* ───────────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────
    TOPBAR — bus-bar (h56, border-bottom steel, full-bleed band)
    The band itself spans the viewport; its contents are padded by the
    48px-ish gutter so brand sits flush-left and telemetry flush-right.
@@ -866,7 +866,7 @@ body::before, body::after { content: none; }
   .telemetry { white-space: normal; }
   #statusHeroText { font-size: 30px; line-height: 34px; }
   .footer-inner { flex-direction: column; align-items: flex-start; gap: 10px; }
-}]]>
+}
 
 /* ════════════════════════════════════════════════════════════════════════
    KPI BAND  — Paper "Bahnhof Console" v2
@@ -1321,7 +1321,7 @@ body::before, body::after { content: none; }
   .user-actions .ui-btn, .add-user-btn { transition: none !important; }
 }
 
-<![CDATA[/* ============================================================================
+/* ============================================================================
    LIVE LOGS  — Paper "Bahnhof Console" 1:1
    Section is an open (transparent) block; masthead rule, sunk well.
    ========================================================================== */
@@ -1476,7 +1476,7 @@ body::before, body::after { content: none; }
 @media (prefers-reduced-motion: reduce) {
   .logs-body { scroll-behavior: auto; }
   .log-line.fresh { animation: none; }
-}]]>
+}
 
 /* ════════════════════════════════════════════════════════════════════════
    RIGHT RAIL — Routing & Upstream · Tunnel Quality · Masking
