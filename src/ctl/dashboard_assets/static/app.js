@@ -36,7 +36,7 @@ const I18N = {
     'btn.create': 'Create', 'btn.cancel': 'Cancel', 'btn.apply': 'Apply', 'btn.pin': 'Pin', 'btn.setTarget': 'Set target', 'btn.delete': 'Delete', 'btn.close': 'Close',
     'routing.title': 'Routing & Upstream', 'routing.upstream': 'Upstream', 'routing.tunnelPin': 'Tunnel pin',
     'routing.proxyHost': 'Proxy host', 'routing.port': 'Port', 'routing.user': 'User', 'routing.pass': 'Pass', 'routing.target': 'Target', 'routing.policy': 'Policy',
-    'mask.title': 'Masking Health', 'mask.mode': 'Mode', 'mask.endpoint': 'Endpoint', 'mask.timer': 'Health Timer',
+    'mask.title': 'Masking', 'mask.mode': 'Mode', 'mask.endpoint': 'Endpoint', 'mask.timer': 'Health Timer',
     'egress.title': 'Tunnel Quality', 'egress.interface': 'Interface', 'egress.status': 'Status',
     'egress.rtt': 'RTT', 'egress.loss': 'Loss', 'egress.handshake': 'Handshake', 'egress.quality': 'Quality',
     'egress.good': 'Good', 'egress.degraded': 'Degraded', 'egress.poor': 'Poor', 'egress.up': 'Up', 'egress.down': 'Down', 'egress.unknown': 'Unknown',
@@ -89,7 +89,7 @@ const I18N = {
     'autoscroll.on': 'Автопрокрутка: вкл', 'autoscroll.off': 'Автопрокрутка: выкл', 'btn.pause': 'Пауза', 'btn.resume': 'Продолжить',
   },
 };
-let LANG = localStorage.getItem('dashLang') || ((navigator.language || '').toLowerCase().startsWith('ru') ? 'ru' : 'en');
+let LANG = localStorage.getItem('dashLang') || 'en';
 function t(k) { return (I18N[LANG] && I18N[LANG][k]) || (I18N.en && I18N.en[k]) || k; }
 function applyStaticI18n() {
   document.documentElement.setAttribute('lang', LANG);
@@ -158,6 +158,18 @@ function hideTooltip() { tt.classList.remove('visible'); }
 const logFilters = { error: true, warn: true, stats: true };
 let logSearchTerm = '';
 const appRoot = document.querySelector('.app');
+
+function formatHistoryWindowLabel() {
+  const seconds = Math.round((MH * pollIntervalMs) / 1000);
+  if (seconds >= 240) return 'LAST ' + Math.round(seconds / 60) + 'M';
+  if (seconds >= 90) return 'LAST ' + Math.round(seconds / 60) + ' MIN';
+  return 'LAST ' + seconds + 'S';
+}
+
+function updateNetworkWindowLabel() {
+  const el = document.querySelector('.net-window');
+  if (el) el.textContent = formatHistoryWindowLabel();
+}
 
 // ── Gauges ──
 function setGauge(arcId, pctId, val) {
@@ -433,17 +445,18 @@ function setStatusHero(online, active, state) {
   // descriptive sub-line beneath (the right-side figures are filled in poll()).
   el.style.background = '';
   if (icon) icon.textContent = '';
-  let color, verdict, subline;
+  let color, signalColor, verdict, subline;
   if (!online) {
-    color = 'var(--signal-stop)'; verdict = t('hero.vOffline'); subline = t('hero.offline');
+    color = 'var(--signal-stop)'; signalColor = color; verdict = t('hero.vOffline'); subline = t('hero.offline');
   } else if (state === 'stalled') {
-    color = 'var(--signal-caution)'; verdict = t('hero.vStalled'); subline = t('hero.stalled');
+    color = 'var(--signal-caution)'; signalColor = color; verdict = t('hero.vStalled'); subline = t('hero.stalled');
   } else if (active > 0) {
-    color = 'var(--accent)'; verdict = t('hero.vBusy').replace('{n}', active); subline = t('hero.busy').replace('{n}', active);
+    color = 'var(--accent)'; signalColor = 'var(--signal-go)'; verdict = t('hero.vBusy').replace('{n}', active); subline = t('hero.busy').replace('{n}', active);
   } else {
-    color = 'var(--signal-go)'; verdict = t('hero.vIdle'); subline = t('hero.idle');
+    color = 'var(--signal-go)'; signalColor = color; verdict = t('hero.vIdle'); subline = t('hero.idle');
   }
   el.style.color = color;
+  el.style.setProperty('--hero-signal-color', signalColor);
   txt.textContent = verdict;
   if (sub) sub.textContent = subline;
 }
@@ -817,6 +830,19 @@ function setRoutingAction(msg, cls) {
   note.className = 'routing-action-note' + (cls ? (' ' + cls) : '');
 }
 
+function setMiddleProxyButton(enabled, pending) {
+  const middleBtn = $('routingMiddleBtn');
+  if (!middleBtn) return;
+  const on = Boolean(enabled);
+  const label = middleBtn.querySelector('.routing-toggle-text');
+  if (label) label.textContent = on ? 'On' : 'Off';
+  else middleBtn.textContent = on ? 'On' : 'Off';
+  middleBtn.classList.toggle('active', on);
+  middleBtn.classList.toggle('is-pending', Boolean(pending));
+  middleBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  middleBtn.setAttribute('aria-busy', pending ? 'true' : 'false');
+}
+
 function setupRoutingControls() {
   const middleBtn = $('routingMiddleBtn');
   const upstreamSelect = $('routingUpstreamSelect');
@@ -830,24 +856,47 @@ function setupRoutingControls() {
   const proxyApply = $('routingProxyApply');
   if (!middleBtn || !upstreamSelect || !upstreamApply) return;
 
-  middleBtn.addEventListener('click', async () => {
-    if (!currentRouting) return;
+  async function commitMiddleProxyToggle() {
+    if (!currentRouting || middleBtn.dataset.pending === '1') return;
 
-    const target = !Boolean(currentRouting.middle_proxy_enabled);
-    middleBtn.disabled = true;
-    setRoutingAction('Updating middle proxy mode…');
+    const previous = Boolean(currentRouting.middle_proxy_enabled);
+    const target = !previous;
+    middleBtn.dataset.pending = '1';
+    middleBtn.dataset.target = target ? '1' : '0';
+    currentRouting.middle_proxy_enabled = target;
+    setMiddleProxyButton(target, true);
+    setRoutingAction('');
 
     try {
       const data = await apiCall('/api/routing/middle', { enabled: target });
+      currentRouting.middle_proxy_enabled = Boolean(data.enabled);
+      setMiddleProxyButton(currentRouting.middle_proxy_enabled, false);
       setRoutingAction('MiddleProxy ' + (data.enabled ? 'enabled' : 'disabled') + '. Proxy restarted.', 'ok');
       showToast('MiddleProxy ' + (data.enabled ? 'enabled' : 'disabled') + '. Proxy restarted.', 'success');
       await runPoll();
     } catch (e) {
+      currentRouting.middle_proxy_enabled = previous;
+      setMiddleProxyButton(previous, false);
       setRoutingAction('Failed: ' + e.message, 'error');
       showToast('Failed: ' + e.message, 'error');
     } finally {
-      middleBtn.disabled = false;
+      delete middleBtn.dataset.pending;
+      delete middleBtn.dataset.target;
+      setMiddleProxyButton(Boolean(currentRouting && currentRouting.middle_proxy_enabled), false);
     }
+  }
+
+  middleBtn.addEventListener('pointerdown', (event) => {
+    if (event.button !== undefined && event.button !== 0) return;
+    event.preventDefault();
+    middleBtn.focus({ preventScroll: true });
+    void commitMiddleProxyToggle();
+  });
+
+  middleBtn.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    void commitMiddleProxyToggle();
   });
 
   upstreamApply.addEventListener('click', async () => {
@@ -878,6 +927,9 @@ function setupRoutingControls() {
       upstreamApply.disabled = false;
       upstreamSelect.disabled = false;
     }
+  });
+  upstreamSelect.addEventListener('change', () => {
+    if (!upstreamApply.disabled) upstreamApply.click();
   });
 
   if (tunnelIfaceApply && tunnelIfaceSelect) {
@@ -910,6 +962,9 @@ function setupRoutingControls() {
         tunnelIfaceApply.disabled = false;
         tunnelIfaceSelect.disabled = false;
       }
+    });
+    tunnelIfaceSelect.addEventListener('change', () => {
+      if (!tunnelIfaceApply.disabled) tunnelIfaceApply.click();
     });
   }
 
@@ -981,9 +1036,9 @@ function renderRouting(routing) {
 
   const middleBtn = $('routingMiddleBtn');
   if (middleBtn) {
-    const enabled = Boolean(routing.middle_proxy_enabled);
-    middleBtn.textContent = enabled ? 'On' : 'Off';
-    middleBtn.classList.toggle('active', enabled);
+    const pending = middleBtn.dataset.pending === '1';
+    const pendingTarget = middleBtn.dataset.target === '1';
+    setMiddleProxyButton(pending ? pendingTarget : Boolean(routing.middle_proxy_enabled), pending);
   }
 
   const upstreamSelect = $('routingUpstreamSelect');
@@ -1001,7 +1056,12 @@ function renderRouting(routing) {
       const choices = Array.isArray(routing.tunnel_pool)
         ? routing.tunnel_pool
         : [];
-      const selectedIface = String(routing.pinned_tunnel_interface || '');
+      const selectedIface = String(
+        routing.pinned_tunnel_interface ||
+        routing.active_tunnel_interface ||
+        routing.selected_tunnel_interface ||
+        ''
+      );
       const seen = new Set();
       const options = [''];
 
@@ -1082,14 +1142,28 @@ function renderRouting(routing) {
 
   $('routingMiddle').textContent = routing.middle_proxy_enabled ? 'enabled' : 'disabled';
   $('routingUpstream').textContent = upstreamType || '—';
-  $('routingTarget').textContent = routing.upstream_target || '—';
+  const tunnelTarget = routing.primary_tunnel && routing.primary_tunnel.endpoint
+    ? routing.primary_tunnel.endpoint
+    : '';
+  $('routingTarget').textContent = (upstreamType === 'tunnel' && tunnelTarget)
+    ? tunnelTarget
+    : (routing.upstream_target || '—');
 
   const policy = routing.policy || {};
+  const poolTotal = Array.isArray(routing.tunnel_pool)
+    ? routing.tunnel_pool.length
+    : Number(routing.detected_tunnels || 0);
+  const poolHealthy = Number(
+    routing.healthy_tunnels != null
+      ? routing.healthy_tunnels
+      : (routing.active_tunnels != null ? routing.active_tunnels : 0)
+  );
+  const poolTxt = poolTotal > 0 ? (poolHealthy + '/' + poolTotal) : routing.pool_status;
   const policyTxt = (policy.rule_ok ? 'rule ok' : 'rule missing') +
-    ' · ' +
-    (policy.route_ok ? ('route ok' + (policy.route_dev ? (' (' + policy.route_dev + ')') : '')) : 'route missing') +
-    (routing.pool_status ? (' · pool ' + routing.pool_status) : '');
-  $('routingPolicy').textContent = policyTxt;
+    (poolTxt
+      ? (' · pool ' + poolTxt)
+      : (' · ' + (policy.route_ok ? 'route ok' : 'route missing')));
+  $('routingPolicy').innerHTML = '<span class="signal-sq"></span>' + esc(policyTxt);
 
   const list = $('routingTunnelsList');
   const tunnels = Array.isArray(routing.tunnels) ? routing.tunnels : [];
@@ -1156,27 +1230,34 @@ function fmtHandshakeAge(sec) {
   return Math.floor(sec / 3600) + 'h';
 }
 
-function renderEgress(egress) {
-  lastEgress = egress;
+function renderEgress(egress, opts) {
+  const options = opts || {};
+  if (!options.transient) lastEgress = egress;
   const card = $('egressCard');
   if (!card) return;
 
   if (!egress || !egress.tunnels || egress.tunnels.length === 0) {
-    card.style.display = 'none';
+    if (!options.transient) card.style.display = 'none';
     return;
   }
 
   card.style.display = '';
 
-  const summary = egress.summary || {};
-  const summaryText = LANG === 'ru' ? summary.ru : summary.en;
+  const tunnels = egress.tunnels || [];
+  const degradedCount = tunnels.filter((tun) => tun && (tun.quality === 'degraded' || tun.quality === 'poor')).length;
+  const downCount = tunnels.filter((tun) => tun && tun.quality === 'down').length;
+  const summaryText = tunnels.length
+    ? (tunnels.length + ' · ' + (degradedCount
+      ? (degradedCount + ' degraded')
+      : (downCount ? (downCount + ' down') : 'healthy')))
+    : '—';
   const summaryEl = $('egressSummary');
   if (summaryEl) summaryEl.textContent = summaryText || '—';
 
   const list = $('egressList');
   if (!list) return;
 
-  list.innerHTML = (egress.tunnels || []).map((tun) => {
+  list.innerHTML = tunnels.map((tun) => {
     const iface = esc(tun.interface || '—');
     const isPrimary = tun.is_primary;
     const quality = tun.quality || 'unknown';
@@ -1214,6 +1295,30 @@ function renderEgress(egress) {
   }).join('');
 }
 
+function renderEgressFromRouting(routing) {
+  if (lastEgress && Array.isArray(lastEgress.tunnels) && lastEgress.tunnels.length) return;
+  const tunnels = routing && Array.isArray(routing.tunnels) ? routing.tunnels : [];
+  if (!tunnels.length) return;
+
+  const fallbackEgress = {
+    ok: true,
+    primary_interface: routing.active_tunnel_interface || routing.selected_tunnel_interface || '',
+    tunnels: tunnels.map((tun) => {
+      const iface = String(tun.interface || '—');
+      return {
+        interface: iface,
+        up: Boolean(tun.link_up || tun.active || tun.healthy),
+        handshake_age_sec: null,
+        rtt_ms: null,
+        packet_loss_pct: null,
+        quality: tun.healthy ? 'good' : ((tun.link_up || tun.active) ? 'up' : 'down'),
+        is_primary: iface === (routing.active_tunnel_interface || routing.selected_tunnel_interface || ''),
+      };
+    }),
+  };
+  renderEgress(fallbackEgress, { transient: true });
+}
+
 // ── Polling ──
 async function poll() {
   const r = await fetch('/api/stats', { cache: 'no-store' });
@@ -1243,10 +1348,16 @@ async function poll() {
 
   // Server
   const pi = d.proxy_info || {};
-  $('proxyUp').textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : (t('status.online') + ' · ' + (pi.uptime || '')));
-  $('proxyPid').textContent = pi.pid || '—';
-  $('proxyRss').textContent = (pi.rss_mb || 0) + ' MB';
-  $('statusBadge').className = pi.online ? 'badge' : 'badge off';
+  const proxyUpEl = $('proxyUp');
+  if (proxyUpEl) proxyUpEl.textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : t('status.online'));
+  const pidEl = $('proxyPid');
+  if (pidEl) pidEl.textContent = pi.pid || '—';
+  const rssEl = $('proxyRss');
+  if (rssEl) rssEl.textContent = (pi.rss_mb || 0) + ' MB';
+  const uptimeEl = $('proxyUptime');
+  if (uptimeEl) uptimeEl.textContent = pi.uptime || d.uptime || '—';
+  const statusBadgeEl = $('statusBadge');
+  if (statusBadgeEl) statusBadgeEl.className = pi.online ? 'badge' : 'badge off';
 
   // Proxy stats
   const p = d.proxy || {};
@@ -1281,6 +1392,7 @@ async function poll() {
   }
 
   renderRouting(d.routing || null);
+  renderEgressFromRouting(d.routing || null);
 
   // Egress / tunnel quality — fire-and-forget so a slow server-side ping/wg probe
   // never blocks rendering of the already-fetched masking/users data or stalls the
@@ -1299,48 +1411,41 @@ async function poll() {
     mc.style.display = '';
 
     const maskBadge = $('maskBadge');
+    const maskStatus = $('maskStatus');
+    const maskModeName = masking.enabled ? 'FakeTLS' : t('status.disabled');
     if (!masking.enabled) {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = t('status.disabled');
+      maskStatus.textContent = maskModeName;
     } else if (masking.mode === 'remote') {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = t('status.remoteMode');
+      maskStatus.textContent = maskModeName;
     } else if (masking.healthy) {
       maskBadge.className = 'badge';
-      $('maskStatus').textContent = t('status.healthy');
+      maskStatus.textContent = maskModeName;
     } else {
       maskBadge.className = 'badge off';
-      $('maskStatus').textContent = t('status.needsAttention');
+      maskStatus.textContent = maskModeName;
     }
 
-    let modeText = masking.mode || '—';
-    if (masking.mode === 'remote') {
-      modeText = 'remote (' + (masking.tls_domain || '—') + ':443)';
-    } else if (masking.mode === 'custom') {
-      modeText = 'custom';
-    } else if (masking.mode === 'local' && masking.using_netns) {
-      modeText = 'local (netns)';
-    } else if (masking.mode === 'local') {
-      modeText = 'local';
-    }
-    $('maskMode').textContent = modeText;
+    const protectedText = LANG === 'ru' ? 'Защищено' : 'Protected';
+    const disabledText = LANG === 'ru' ? 'Выключено' : 'Disabled';
+    const activeText = LANG === 'ru' ? 'Активен' : 'Active';
+    const downText = LANG === 'ru' ? 'Отключён' : 'Down';
+    const timerOkText = LANG === 'ru' ? 'OK · каждые 30с' : 'OK · every 30s';
+    const modeText = masking.enabled
+      ? '<span class="signal-sq"></span>' + protectedText
+      : '<span class="signal-sq"></span>' + disabledText;
+    $('maskMode').innerHTML = modeText;
 
-    let endpointText = masking.target || '—';
-    if (masking.mode === 'local' || masking.mode === 'custom') {
-      if (masking.endpoint_ok === true) {
-        endpointText += ' (' + t('status.endpointOk') + ')';
-      } else if (masking.endpoint_ok === false) {
-        endpointText += ' (' + t('status.endpointDown') + ')';
-      }
-    }
+    let endpointText = masking.tls_domain ? (masking.tls_domain + ':443') : (masking.target || '—');
     $('maskTarget').textContent = endpointText;
 
-    const nginxState = (masking.nginx_active ? 'active' : 'down') + ' / ' +
-      (masking.nginx_enabled ? 'enabled' : 'disabled');
-    $('maskNginx').textContent = nginxState;
+    const nginxState = masking.nginx_active
+      ? '<span class="signal-sq"></span>' + activeText
+      : '<span class="signal-sq"></span>' + downText;
+    $('maskNginx').innerHTML = nginxState;
 
-    const timerState = (masking.health_timer_active ? 'active' : 'down') + ' / ' +
-      (masking.health_timer_enabled ? 'enabled' : 'disabled');
+    const timerState = masking.health_timer_active ? timerOkText : downText;
     $('maskTimer').textContent = timerState;
   }
 
@@ -1357,11 +1462,12 @@ function setStaleMode(stale) {
 }
 
 function updateFreshness() {
+  const lastUpdateEl = $('lastUpdate');
   if (!lastSuccessAt) {
-    $('lastUpdate').textContent = 'never';
+    if (lastUpdateEl) lastUpdateEl.textContent = 'never';
   } else {
     const age = Math.floor((Date.now() - lastSuccessAt) / 1000);
-    $('lastUpdate').textContent = age <= 0 ? 'just now' : age + 's ago';
+    if (lastUpdateEl) lastUpdateEl.textContent = age <= 0 ? 'just now' : age + 's ago';
   }
 
   if (pollingPaused) {
@@ -1404,6 +1510,7 @@ async function runPoll() {
     await poll();
     hasPollError = false;
     lastSuccessAt = Date.now();
+    appRoot.classList.remove('is-loading');
   } catch (e) {
     hasPollError = true;
     console.error(e);
@@ -1435,6 +1542,7 @@ $('pollInterval').addEventListener('change', (ev) => {
   const v = Number(ev.target.value);
   if (!v || v === pollIntervalMs) return;
   pollIntervalMs = v;
+  updateNetworkWindowLabel();
   restartPollingLoop();
   updateFreshness();
 });
@@ -1455,6 +1563,7 @@ if (langToggleBtn) {
 }
 applyStaticI18n();
 
+updateNetworkWindowLabel();
 updatePollControls();
 updateFreshness();
 setupAddUserForm();
@@ -1482,8 +1591,14 @@ function jumpToLatest() {
 }
 
 function updateAutoScrollButton() {
-  autoScrollBtn.textContent = autoScrollEnabled ? t('autoscroll.on') : t('autoscroll.off');
+  if (!autoScrollBtn) return;
+  const label = autoScrollBtn.querySelector('.log-ctl-label');
+  if (label) label.textContent = 'Auto-scroll';
+  else autoScrollBtn.textContent = 'Auto-scroll';
   autoScrollBtn.classList.toggle('active', autoScrollEnabled);
+  autoScrollBtn.setAttribute('aria-pressed', autoScrollEnabled ? 'true' : 'false');
+  autoScrollBtn.setAttribute('aria-label', autoScrollEnabled ? 'Auto-scroll on' : 'Auto-scroll off');
+  autoScrollBtn.title = autoScrollEnabled ? 'Auto-scroll on' : 'Auto-scroll off';
 }
 
 function shouldShowLine(el) {
@@ -1520,13 +1635,15 @@ logSearchInput.addEventListener('input', () => {
   applyAllLogFilters();
 });
 
-autoScrollBtn.addEventListener('click', () => {
-  autoScrollEnabled = !autoScrollEnabled;
-  if (autoScrollEnabled) jumpToLatest();
-  updateAutoScrollButton();
-});
+if (autoScrollBtn) {
+  autoScrollBtn.addEventListener('click', () => {
+    autoScrollEnabled = !autoScrollEnabled;
+    if (autoScrollEnabled) jumpToLatest();
+    updateAutoScrollButton();
+  });
+}
 
-jumpLatestBtn.addEventListener('click', jumpToLatest);
+if (jumpLatestBtn) jumpLatestBtn.addEventListener('click', jumpToLatest);
 updateAutoScrollButton();
 
 function addLine(d, anim) {

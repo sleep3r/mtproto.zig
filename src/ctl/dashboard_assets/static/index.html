@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MTProto Proxy — Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260610">
+  <link rel="stylesheet" href="/style.css?v=20260610-paper12">
 </head>
 <body>
-<div class="app">
+<div class="app is-loading">
 <!-- ============================================================= -->
 <!-- TOPBAR (bus-bar) -->
 <!-- ============================================================= -->
@@ -24,9 +24,6 @@
   </div>
 
   <div class="topbar-right">
-    <!-- proxy online/offline status: signal-square + word -->
-    <div class="badge" id="statusBadge"><span class="sig-sq"></span><span id="proxyUp">—</span></div>
-
     <!-- data freshness badge (not in Paper mock but id is required) -->
     <div class="badge data-badge syncing" id="dataBadge"><span class="sig-sq"></span><span id="dataBadgeText">Syncing...</span></div>
 
@@ -45,8 +42,6 @@
       <button id="pollToggle" class="ui-btn poll-toggle icon-btn" type="button" aria-label="Pause polling">Pause</button>
     </div>
 
-    <!-- telemetry crawl: mono, text-low -->
-    <div class="meta telemetry">PID <b id="proxyPid">—</b> · RSS <b id="proxyRss">—</b> · UPD <b id="lastUpdate">never</b></div>
   </div>
 </div>
 
@@ -65,12 +60,16 @@
     </div>
     <div class="hero-figures">
       <div class="hero-fig">
-        <span class="hero-fig-label" data-i18n="hero.connected">CONNECTED</span>
-        <span class="hero-fig-val" id="heroConnected">0</span>
+        <span class="hero-fig-label">PID</span>
+        <span class="hero-fig-val mono" id="proxyPid">—</span>
       </div>
       <div class="hero-fig hero-fig-div">
-        <span class="hero-fig-label" data-i18n="hero.uptimeLbl">UPTIME</span>
-        <span class="hero-fig-val mono" id="heroUptime">—</span>
+        <span class="hero-fig-label">RSS</span>
+        <span class="hero-fig-val mono" id="proxyRss">—</span>
+      </div>
+      <div class="hero-fig hero-fig-div">
+        <span class="hero-fig-label">UPTIME</span>
+        <span class="hero-fig-val mono" id="proxyUptime">—</span>
       </div>
     </div>
   </div>
@@ -149,7 +148,7 @@
   <div class="kpi-network">
     <div class="instrument-masthead">
       <span class="card-label" data-i18n="card.network">Network Throughput</span>
-      <span class="card-label net-window">LAST 60S</span>
+      <span class="card-label net-window">LAST 5M</span>
     </div>
     <div class="net-legend">
       <span class="net-legend-item">
@@ -218,7 +217,7 @@
 <div class="body-grid">
   <div class="body-left">
 <!-- Users -->
-  <div class="users-card" id="usersCard" style="display:none">
+  <div class="users-card" id="usersCard">
     <!-- MASTHEAD: eyebrow flush-left · flex:1 hairline rule · right-aligned mono meta (no icon, no button here) -->
     <div class="users-head section-masthead">
       <div class="title" data-i18n="users.title">Users</div>
@@ -270,7 +269,7 @@
     </div>
   </div>
 
-  <!-- Controls: level filter chips + search + auto-scroll + jump-latest -->
+  <!-- Controls: level filter chips + search + auto-scroll -->
   <div class="logs-controls">
     <div class="log-filters">
       <button class="ui-btn log-filter active" type="button" data-filter="error" data-i18n="logs.error">Error</button>
@@ -281,8 +280,14 @@
       <!--ICON:search-->
       <input id="logSearch" class="log-search" type="search" data-i18n-ph="logs.searchPh" placeholder="Search logs" autocomplete="off">
     </div>
-    <button class="ui-btn log-ctl-btn active" id="autoScrollBtn" type="button"><!--ICON:autoscroll--><span class="log-ctl-label">Auto-scroll: on</span></button>
-    <button class="ui-btn log-ctl-btn" id="jumpLatestBtn" type="button"><!--ICON:jump-latest--><span class="log-ctl-label" data-i18n="logs.jumpLatest">Jump to latest</span></button>
+    <button class="ui-btn log-ctl-btn active" id="autoScrollBtn" type="button" aria-pressed="true" aria-label="Auto-scroll on">
+      <svg class="auto-scroll-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter" aria-hidden="true">
+        <polyline points="6,5 12,11 18,5"></polyline>
+        <polyline points="6,11 12,17 18,11"></polyline>
+        <path d="M5 20 H19"></path>
+      </svg>
+      <span class="log-ctl-label">Auto-scroll</span>
+    </button>
   </div>
 
   <!-- Sunk well: JS appends .log-line rows via addLine() -->
@@ -291,12 +296,25 @@
 </section>
   </div>
   <div class="body-rail">
-<!-- ════════════════ RIGHT RAIL ════════════════ -->
+	<!-- ════════════════ RIGHT RAIL ════════════════ -->
 <!-- These three sections live inside the Body row's right column:
      <div class="body-row"> ... <div class="right-rail"> [PASTE HERE] </div> </div>
      The .right-rail wrapper is owned by the Body-layout section; only the three
-     cards below belong to THIS part. Each card is an open "section" (no glass box):
-     a masthead (eyebrow + hairline rule + optional right meta/badge) then content. -->
+	     cards below belong to THIS part. Each card is an open "section" (no glass box):
+	     a masthead (eyebrow + hairline rule + optional right meta/badge) then content. -->
+
+<div class="rail-section rail-loading" id="railLoading" aria-hidden="true">
+  <div class="masthead">
+    <div class="loading-chip loading-title"></div>
+    <div class="masthead-rule"></div>
+  </div>
+  <div class="loading-rows">
+    <div class="loading-row"><span></span><b></b></div>
+    <div class="loading-row"><span></span><b></b></div>
+    <div class="loading-row"><span></span><b></b></div>
+    <div class="loading-bar"></div>
+  </div>
+</div>
 
 <!-- ── ROUTING & UPSTREAM ── -->
 <div class="rail-section" id="routingCard" style="display:none">
@@ -310,7 +328,12 @@
   <div class="routing-controls">
     <div class="ctl-row">
       <span class="ctl-label">MiddleProxy</span>
-      <button class="ui-btn routing-toggle-btn" id="routingMiddleBtn" type="button">MiddleProxy: —</button>
+      <div class="ctl-right">
+        <button class="ui-btn routing-toggle-btn" id="routingMiddleBtn" type="button" aria-pressed="false">
+          <span class="routing-toggle-text">Off</span>
+          <span class="routing-toggle-track" aria-hidden="true"><span class="routing-toggle-knob"></span></span>
+        </button>
+      </div>
     </div>
     <div class="ctl-row routing-upstream-ctl">
       <label class="ctl-label" for="routingUpstreamSelect" data-i18n="routing.upstream">Upstream</label>
@@ -350,11 +373,11 @@
 
   <!-- Detail rows (label-caps left, value right) -->
   <div class="detail-rows">
-    <div class="detail-row">
+    <div class="detail-row routing-summary-dup">
       <span class="detail-label">MiddleProxy</span>
       <span class="detail-val" id="routingMiddle">—</span>
     </div>
-    <div class="detail-row">
+    <div class="detail-row routing-summary-dup">
       <span class="detail-label" data-i18n="routing.upstream">Upstream</span>
       <span class="detail-val" id="routingUpstream">—</span>
     </div>
@@ -451,6 +474,6 @@
 </div>
 
 </div>
-<script src="/app.js?v=20260610"></script>
+<script src="/app.js?v=20260610-paper12"></script>
 </body>
 </html>

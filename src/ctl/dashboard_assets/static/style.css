@@ -67,7 +67,7 @@
   --font-text: 'Inter', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
 
-  --gutter: 32px;
+  --gutter: 48px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -86,7 +86,7 @@ body::before, body::after { content: none; }
 
 .app {
   position: relative; z-index: 1;
-  max-width: 1360px; margin: 0 auto; padding: 0 var(--gutter);
+  max-width: 1440px; margin: 0 auto; padding: 0;
 }
 
 /* All live numerals align in columns. */
@@ -1803,3 +1803,655 @@ body::before, body::after { content: none; }
    primary button (amber is reserved for the hero + true primary actions) ── */
 #routingMiddleBtn { min-width: 52px; text-align: center; }
 #routingMiddleBtn.active { color: var(--signal-go) !important; border-color: var(--signal-go) !important; background: var(--signal-go-fill) !important; }
+
+/* ── Final Paper parity pass: the Paper artboard is 1440px with 48px gutters.
+   Keep the topbar and major sections in the same lanes as the reference while
+   preserving all live dashboard IDs and controls. ── */
+#dataBadge { display: none !important; }
+
+#statusHero {
+  margin: 0 !important;
+}
+
+#statusHeroIcon {
+  background: var(--hero-signal-color, currentColor) !important;
+}
+
+.topbar,
+.hero-section,
+.footer {
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+}
+
+.kpi-band {
+  box-sizing: border-box;
+  padding: 40px var(--gutter) 0 !important;
+  margin: 0 !important;
+  width: 100% !important;
+}
+
+.stat-row {
+  margin: 40px var(--gutter) 0 !important;
+  width: auto !important;
+}
+
+.body-grid {
+  box-sizing: border-box;
+  margin: 48px var(--gutter) 0 !important;
+  width: auto !important;
+  gap: 36px !important;
+}
+
+.body-left {
+  flex: 1 1 auto !important;
+  width: calc(100% - 307px) !important;
+}
+
+.body-rail {
+  flex: 0 0 271px !important;
+  width: 271px !important;
+}
+
+.users-note { display: none !important; }
+
+#routingTunnelsList { display: none !important; }
+
+.body-left > .users-card,
+.body-left > .logs-card {
+  margin: 0 !important;
+}
+
+.rail-section {
+  gap: 6px !important;
+  margin-bottom: 0 !important;
+}
+.rail-section:last-child { margin-bottom: 0 !important; }
+
+.routing-controls .ui-btn.active {
+  color: var(--text-mid) !important;
+  border-color: var(--border-steel) !important;
+  background: transparent !important;
+}
+
+.gauge {
+  width: 104px !important;
+  height: 104px !important;
+}
+
+.chart-wrap { height: 150px !important; }
+
+.kpi-network {
+  gap: 12px !important;
+  background: var(--well-rx) !important;
+}
+
+.egress-row {
+  border: 0 !important;
+  border-bottom: 1px solid var(--border-hair) !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+  padding: 12px 2px !important;
+}
+.egress-row:last-child { border-bottom: 0 !important; }
+
+@media (max-width: 1040px) {
+  .body-grid { flex-direction: column; }
+  .body-left,
+  .body-rail {
+    width: 100% !important;
+    flex: 1 1 auto !important;
+  }
+}
+
+@media (max-width: 680px) {
+  :root { --gutter: 18px; }
+  .app { padding: 0 !important; }
+  .stat-row {
+    margin-left: var(--gutter) !important;
+    margin-right: var(--gutter) !important;
+  }
+}
+
+/* ── Paper rail correction: match the selected Paper frame, not the wide
+   stacked inspector-like block. Controls stay live; the commit buttons become
+   auto-applied by JS so the surface reads like the mock. ── */
+@media (min-width: 861px) {
+  .body-grid {
+    flex-direction: row !important;
+    align-items: flex-start !important;
+  }
+
+  .body-left {
+    flex: 1 1 auto !important;
+    width: calc(100% - 452px) !important;
+  }
+
+  .body-rail {
+    flex: 0 0 416px !important;
+    width: 416px !important;
+    gap: 48px !important;
+  }
+}
+
+@media (max-width: 860px) {
+  .body-grid { flex-direction: column !important; }
+  .body-left,
+  .body-rail {
+    width: 100% !important;
+    flex: 1 1 auto !important;
+  }
+}
+
+#routingCard .masthead,
+#egressCard .masthead,
+#maskingCard .masthead {
+  padding-bottom: 18px !important;
+}
+
+#routingCard .masthead-eyebrow,
+#egressCard .masthead-eyebrow,
+#maskingCard .masthead-eyebrow {
+  font-size: 13px !important;
+  letter-spacing: 0.17em !important;
+}
+
+#routingCard .ctl-row {
+  min-height: 88px;
+  padding: 20px 0 !important;
+}
+
+#routingCard .ctl-row:first-child {
+  min-height: 70px;
+}
+
+#routingUpstreamApply,
+#routingTunnelIfaceApply {
+  display: none !important;
+}
+
+#routingCard .ctl-right {
+  justify-content: flex-end !important;
+  flex-wrap: nowrap !important;
+}
+
+#routingUpstreamSelect {
+  width: 132px;
+}
+
+#routingTunnelIfaceSelect {
+  width: 108px;
+}
+
+#routingMiddleBtn {
+  min-width: 100px !important;
+  height: 30px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  gap: 14px !important;
+  color: var(--text-hi) !important;
+  font-family: var(--font-text) !important;
+  font-size: 13px !important;
+  font-weight: 620 !important;
+}
+
+#routingMiddleBtn.active {
+  color: var(--text-hi) !important;
+  border-color: transparent !important;
+  background: transparent !important;
+}
+
+#routingCard .detail-row,
+#maskingCard .detail-row {
+  min-height: 72px;
+  padding: 0 !important;
+}
+
+#routingCard .detail-val,
+#maskingCard .detail-val {
+  font-size: 13px !important;
+}
+
+#routingTarget,
+#routingPolicy,
+#maskTarget {
+  max-width: 260px;
+}
+
+#maskBadge {
+  color: var(--text-low) !important;
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+#maskBadge .signal-sq {
+  display: none !important;
+}
+
+#maskMode .signal-sq,
+#maskNginx .signal-sq {
+  background: var(--signal-go);
+}
+
+/* ── Paper component truth pass: values below come from the Paper JSX for
+   Right-col (MP-0) and Logs-controls (L3-0). ── */
+@media (min-width: 861px) {
+  .body-grid {
+    flex-direction: row !important;
+    align-items: flex-start !important;
+    gap: 36px !important;
+  }
+
+  .body-left {
+    flex: 1 1 auto !important;
+    width: calc(100% - 307px) !important;
+  }
+
+  .body-rail {
+    flex: 0 0 271px !important;
+    width: 271px !important;
+    gap: 48px !important;
+  }
+}
+
+#routingBadge {
+  display: none !important;
+}
+
+#routingCard .routing-summary-dup {
+  display: none !important;
+}
+
+#routingCard .routing-controls,
+#routingCard .detail-rows {
+  align-items: stretch !important;
+  border-bottom: 0 !important;
+  gap: 0 !important;
+  padding: 0 !important;
+  flex-wrap: nowrap !important;
+  width: 100% !important;
+}
+
+#routingCard.rail-section {
+  gap: 0 !important;
+}
+
+#routingCard .masthead,
+#egressCard .masthead,
+#maskingCard .masthead {
+  padding-bottom: 12px !important;
+  gap: 14px !important;
+}
+
+#routingCard .ctl-row,
+#routingCard .detail-row,
+#maskingCard .detail-row {
+  box-sizing: border-box !important;
+  display: flex !important;
+  min-height: 0 !important;
+  padding: 11px 2px !important;
+  width: 100% !important;
+}
+
+#routingCard .ctl-label,
+#routingCard .detail-label,
+#maskingCard .detail-label {
+  font-size: 10.5px !important;
+  letter-spacing: 0.17em !important;
+  line-height: 14px !important;
+}
+
+#routingCard .detail-val,
+#maskingCard .detail-val {
+  font-size: 12.5px !important;
+  line-height: 16px !important;
+}
+
+#routingCard .ctl-right {
+  margin-left: auto !important;
+  flex-wrap: nowrap !important;
+  justify-content: flex-end !important;
+}
+
+#routingCard .routing-action-note {
+  display: none !important;
+}
+
+#routingCard .routing-summary-dup,
+#routingCard .ctl-row[style*="display:none"],
+#routingCard .ctl-row[style*="display: none"] {
+  display: none !important;
+}
+
+#routingUpstreamSelect {
+  width: 86px !important;
+  height: 28px !important;
+}
+
+#routingTunnelIfaceSelect {
+  width: 71px !important;
+  height: 28px !important;
+}
+
+#routingMiddleBtn {
+  min-width: 0 !important;
+  width: auto !important;
+  height: 28px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  gap: 10px !important;
+  font-family: var(--font-text) !important;
+  font-size: 13px !important;
+  font-weight: 560 !important;
+  line-height: 16px !important;
+  color: var(--text-hi) !important;
+  cursor: pointer !important;
+  touch-action: manipulation !important;
+}
+
+#routingMiddleBtn .routing-toggle-text,
+#routingMiddleBtn .routing-toggle-track,
+#routingMiddleBtn .routing-toggle-knob {
+  pointer-events: none !important;
+}
+
+#routingMiddleBtn .routing-toggle-text {
+  display: inline-block !important;
+  min-width: 19px !important;
+  text-align: right !important;
+}
+
+#routingMiddleBtn .routing-toggle-track {
+  box-sizing: border-box !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  width: 36px !important;
+  height: 20px !important;
+  padding: 2px !important;
+  border-radius: 3px !important;
+  border: 1px solid var(--border-steel) !important;
+  background: var(--surface-2) !important;
+  transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease !important;
+}
+
+#routingMiddleBtn .routing-toggle-knob {
+  display: block !important;
+  width: 14px !important;
+  height: 14px !important;
+  border-radius: 1px !important;
+  background: var(--text-low) !important;
+  transform: translateX(0) !important;
+  transition: transform 120ms var(--ease-out), background 120ms ease !important;
+}
+
+#routingMiddleBtn.active .routing-toggle-track {
+  border-color: var(--signal-go) !important;
+  background: var(--signal-go-fill) !important;
+}
+
+#routingMiddleBtn.active .routing-toggle-knob {
+  background: var(--signal-go) !important;
+  transform: translateX(16px) !important;
+}
+
+#routingMiddleBtn.is-pending .routing-toggle-track {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--signal-go) 18%, transparent) !important;
+}
+
+#routingTarget,
+#maskTarget {
+  max-width: 165px !important;
+}
+
+#routingPolicy {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  max-width: 170px !important;
+  overflow: visible !important;
+  color: var(--text-mid) !important;
+  font-size: 12px !important;
+}
+
+#routingPolicy .signal-sq {
+  margin-right: 0 !important;
+  background: var(--signal-go) !important;
+}
+
+.logs-controls {
+  flex-wrap: nowrap !important;
+}
+
+.log-search-box {
+  flex: 1 1 0 !important;
+  min-width: 0 !important;
+}
+
+#jumpLatestBtn {
+  display: none !important;
+}
+
+.log-filter.active[data-filter="error"],
+.log-filter.active[data-filter="warn"],
+.log-filter.active[data-filter="stats"] {
+  border-color: transparent !important;
+}
+
+.log-ctl-btn.active {
+  color: var(--text-mid) !important;
+  border-color: var(--border-steel) !important;
+  background: transparent !important;
+}
+
+.log-ctl-btn.active svg {
+  color: var(--text-mid) !important;
+}
+
+/* ── Paper cleanup pass: section mastheads end in hairlines only, and live
+   controls expose their state visually instead of hiding it in JS. ── */
+#egressSummary,
+#maskBadge {
+  display: none !important;
+}
+
+#egressCard .masthead-rule,
+#maskingCard .masthead-rule {
+  min-width: 0 !important;
+}
+
+#egressCard .egress-list {
+  align-items: stretch !important;
+  width: 100% !important;
+  margin-top: 0 !important;
+}
+
+#egressCard .egress-row {
+  align-items: stretch !important;
+  width: 100% !important;
+}
+
+#egressCard .egress-row-top {
+  justify-content: flex-start !important;
+  width: 100% !important;
+}
+
+#egressCard .egress-iface {
+  flex: 0 1 auto !important;
+  margin: 0 !important;
+}
+
+#egressCard .egress-quality {
+  margin-left: auto !important;
+}
+
+#autoScrollBtn {
+  min-width: 106px !important;
+}
+
+#autoScrollBtn .auto-scroll-icon {
+  display: block !important;
+  flex-shrink: 0 !important;
+}
+
+#autoScrollBtn:not(.active) {
+  color: var(--text-low) !important;
+  border-color: var(--border-hair) !important;
+  background: transparent !important;
+}
+
+.log-ctl-btn.active {
+  color: var(--signal-go) !important;
+  border-color: color-mix(in srgb, var(--signal-go) 58%, transparent) !important;
+  background: var(--signal-go-fill) !important;
+}
+
+.log-ctl-btn.active svg {
+  color: var(--signal-go) !important;
+}
+
+/* ── First-load skeleton: keep the dashboard structure visible while the first
+   /api/stats response is still in flight. It mirrors the existing dense rows,
+   then disappears without affecting later live rendering. ── */
+.loading-chip,
+.loading-row span,
+.loading-row b,
+.loading-bar,
+.app.is-loading #usersMeta,
+.app.is-loading #usersNote,
+.app.is-loading #usersList::before {
+  background:
+    linear-gradient(90deg, var(--surface-2) 0%, var(--surface-3) 42%, var(--surface-2) 84%) 0 0 / 220% 100%;
+  animation: skeletonSweep 1400ms ease-in-out infinite;
+}
+
+@keyframes skeletonSweep {
+  0% { background-position: 120% 0; }
+  100% { background-position: -120% 0; }
+}
+
+.app:not(.is-loading) #railLoading {
+  display: none !important;
+}
+
+.app.is-loading #usersCard {
+  display: flex !important;
+}
+
+.app.is-loading #usersMeta {
+  width: 140px;
+  height: 12px;
+  color: transparent !important;
+}
+
+.app.is-loading #usersNote {
+  width: 58%;
+  height: 12px;
+  color: transparent !important;
+}
+
+.app.is-loading #usersList {
+  min-height: 138px;
+}
+
+.app.is-loading #usersList::before {
+  content: '';
+  display: block;
+  height: 138px;
+  border-bottom: 1px solid var(--border-hair);
+  background-image:
+    linear-gradient(90deg, var(--surface-2) 0%, var(--surface-3) 42%, var(--surface-2) 84%),
+    linear-gradient(var(--surface-3), var(--surface-3)),
+    linear-gradient(var(--surface-3), var(--surface-3)),
+    linear-gradient(var(--surface-3), var(--surface-3)),
+    linear-gradient(var(--border-hair), var(--border-hair)),
+    linear-gradient(var(--border-hair), var(--border-hair)),
+    linear-gradient(var(--border-hair), var(--border-hair));
+  background-size:
+    220% 100%,
+    92px 14px,
+    88px 14px,
+    44% 14px,
+    100% 1px,
+    100% 1px,
+    100% 1px;
+  background-position:
+    120% 0,
+    2px 18px,
+    306px 18px,
+    426px 18px,
+    0 45px,
+    0 91px,
+    0 137px;
+  background-repeat: no-repeat;
+}
+
+.app.is-loading .add-user-wrap {
+  display: none !important;
+}
+
+#railLoading {
+  gap: 0 !important;
+}
+
+#railLoading .masthead {
+  padding-bottom: 12px !important;
+}
+
+#railLoading .loading-title {
+  width: 148px;
+  height: 13px;
+}
+
+#railLoading .loading-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+#railLoading .loading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border-hair);
+}
+
+#railLoading .loading-row span {
+  width: 104px;
+  height: 11px;
+}
+
+#railLoading .loading-row b {
+  width: 72px;
+  height: 14px;
+}
+
+#railLoading .loading-bar {
+  height: 3px;
+  margin: 16px 2px 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-chip,
+  .loading-row span,
+  .loading-row b,
+  .loading-bar,
+  .app.is-loading #usersMeta,
+  .app.is-loading #usersNote,
+  .app.is-loading #usersList::before {
+    animation: none !important;
+  }
+}
