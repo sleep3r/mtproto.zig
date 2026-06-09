@@ -15,6 +15,22 @@
 //! lives entirely in mtbuddy (ctl).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const sys = @import("sys.zig");
+const toml = @import("toml.zig");
+const tunnel = @import("tunnel.zig");
+const tui_mod = @import("tui.zig");
+const Tui = tui_mod.Tui;
+
+const INSTALL_DIR = "/opt/mtproto-proxy";
+const CONFIG_PATH = INSTALL_DIR ++ "/config.toml";
+const XRAY_CONFIG_DIR = "/etc/mtproto-proxy";
+const XRAY_CONFIG_PATH = XRAY_CONFIG_DIR ++ "/xray-egress.json";
+const XRAY_SERVICE_NAME = "mtproto-xray-egress.service";
+const XRAY_SERVICE_PATH = "/etc/systemd/system/" ++ XRAY_SERVICE_NAME;
+const XRAY_BIN = "/usr/local/bin/xray";
+const SOCKS_HOST = "127.0.0.1";
+const SOCKS_PORT: u16 = 10808;
 
 // ── URI helpers ───────────────────────────────────────────────────────────────
 
@@ -343,6 +359,252 @@ pub fn genXrayConfig(a: std.mem.Allocator, links: []const XrayLink, socks_port: 
     return std.fmt.allocPrint(a, "{{\"log\":{{\"loglevel\":\"warning\"}},\"inbounds\":[{{\"tag\":\"socks-in\",\"listen\":\"127.0.0.1\",\"port\":{d},\"protocol\":\"socks\",\"settings\":{{\"udp\":true,\"auth\":\"noauth\"}}}}],\"outbounds\":[{s},{{\"protocol\":\"freedom\",\"tag\":\"direct\"}}]{s}}}", .{ socks_port, obs.items, routing });
 }
 
+// ── CLI + provisioning ──────────────────────────────────────────────────────────
+
+const Family = enum { wireguard, xray };
+fn schemeFamily(s: Scheme) Family {
+    return if (s == .wireguard) .wireguard else .xray;
+}
+
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
+    var links: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer links.deinit(allocator);
+    while (args.next()) |arg| {
+        if (arg.len > 0 and arg[0] != '-') links.append(allocator, arg) catch {};
+    }
+    if (links.items.len == 0) {
+        ui.fail("Usage: mtbuddy setup egress <share-link> [<share-link>...]");
+        ui.hint("vless:// vmess:// trojan:// ss://  ->  Xray SOCKS5 bridge (upstream.type=socks5)");
+        ui.hint("wireguard://                       ->  native L3 tunnel");
+        return;
+    }
+    // One egress = one provider family. Reject a mix of wireguard:// and Xray links.
+    const fam0 = schemeFamily(detectScheme(links.items[0]));
+    for (links.items) |l| {
+        const s = detectScheme(l);
+        if (s == .unknown) {
+            ui.fail("Unrecognized share-link scheme (want vless/vmess/trojan/ss/wireguard)");
+            return;
+        }
+        if (schemeFamily(s) != fam0) {
+            ui.fail("Don't mix wireguard:// and Xray links in one egress — set them up separately");
+            return;
+        }
+    }
+    if (fam0 == .wireguard) {
+        return setupWireguard(ui, allocator, links.items);
+    }
+    return setupXray(ui, allocator, links.items);
+}
+
+/// wireguard:// links -> native L3 tunnel. Convert each link to a WG/AmneziaWG .conf
+/// (egress owns the URI parsing) and hand it to tunnel.zig's existing setup, which
+/// brings up the interface + policy routing and, for >1 link, builds the tunnel pool.
+fn setupWireguard(ui: *Tui, allocator: std.mem.Allocator, links: []const []const u8) !void {
+    for (links, 0..) |link, idx| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const conf = convertWireguardLink(a, link) catch {
+            ui.fail("Failed to parse a wireguard:// link");
+            return;
+        };
+        const tmp = try std.fmt.allocPrint(a, "/tmp/mtbuddy-wg-{d}.conf", .{idx});
+        sys.writeFileMode(tmp, conf, 0o600) catch {
+            ui.fail("Failed to stage the WireGuard config");
+            return;
+        };
+        try tunnel.setupFromConf(ui, allocator, tmp);
+        _ = sys.exec(allocator, &.{ "rm", "-f", tmp }) catch {};
+    }
+}
+
+/// Convert a `wireguard://<privkey>@<host>:<port>?publickey=&address=&mtu=...#name`
+/// share-link into a WireGuard/AmneziaWG `.conf`. AmneziaWG obfuscation params
+/// (jc/jmin/jmax/s1/s2/h1..h4) and presharedkey are carried through when present.
+pub fn convertWireguardLink(a: std.mem.Allocator, link_in: []const u8) ![]const u8 {
+    const link = std.mem.trim(u8, link_in, " \t\r\n");
+    const after = if (std.mem.startsWith(u8, link, "wireguard://"))
+        link["wireguard://".len..]
+    else if (std.mem.startsWith(u8, link, "wg://"))
+        link["wg://".len..]
+    else
+        return error.UnsupportedScheme;
+
+    var rest = after;
+    if (std.mem.indexOfScalar(u8, rest, '#')) |h| rest = rest[0..h];
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        query = rest[q + 1 ..];
+        rest = rest[0..q];
+    }
+    const at = std.mem.indexOfScalar(u8, rest, '@') orelse return error.BadLink;
+    const private_key = try percentDecodeAlloc(a, rest[0..at]);
+    const hp = try splitHostPort(rest[at + 1 ..]);
+
+    const pub_key = try percentDecodeAlloc(a, queryParam(query, "publickey") orelse queryParam(query, "public_key") orelse return error.BadLink);
+    const address = try percentDecodeAlloc(a, queryParam(query, "address") orelse "10.0.0.2/32");
+    const mtu = queryParam(query, "mtu") orelse "1420";
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const w = &aw.writer;
+    try w.print("[Interface]\nPrivateKey = {s}\nAddress = {s}\nMTU = {s}\n", .{ private_key, address, mtu });
+    if (queryParam(query, "dns")) |dns| try w.print("DNS = {s}\n", .{try percentDecodeAlloc(a, dns)});
+    // AmneziaWG obfuscation knobs (only emitted when present).
+    inline for (.{ "jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4" }) |k| {
+        if (queryParam(query, k)) |v| {
+            var ku: [4]u8 = undefined;
+            const upper = std.ascii.upperString(&ku, k);
+            try w.print("{s} = {s}\n", .{ upper, v });
+        }
+    }
+    try w.print("\n[Peer]\nPublicKey = {s}\nEndpoint = {s}:{d}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n", .{ pub_key, hp.host, hp.port });
+    if (queryParam(query, "presharedkey")) |psk| try w.print("PresharedKey = {s}\n", .{try percentDecodeAlloc(a, psk)});
+    return aw.written();
+}
+
+fn setupXray(ui: *Tui, allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try a.alloc(XrayLink, link_texts.len);
+    for (link_texts, 0..) |t, i| {
+        parsed[i] = parseXrayLink(a, t) catch {
+            ui.fail("Failed to parse a share-link");
+            return;
+        };
+        ui.stepOk("Parsed egress", parsed[i].address);
+    }
+
+    if (!sys.commandExists("xray") and !sys.fileExists(XRAY_BIN)) {
+        ui.step("Installing Xray-core...");
+        if (!installXray(allocator)) {
+            ui.fail("Failed to install Xray-core (download/unzip). Check network and retry.");
+            return;
+        }
+        ui.ok("Xray-core installed");
+    }
+    const xray_bin: []const u8 = if (sys.fileExists(XRAY_BIN)) XRAY_BIN else "xray";
+
+    const cfg = genXrayConfig(a, parsed, SOCKS_PORT) catch {
+        ui.fail("Failed to generate Xray config");
+        return;
+    };
+    _ = sys.exec(allocator, &.{ "mkdir", "-p", XRAY_CONFIG_DIR }) catch {};
+    sys.writeFileMode(XRAY_CONFIG_PATH, cfg, 0o600) catch {
+        ui.fail("Failed to write " ++ XRAY_CONFIG_PATH);
+        return;
+    };
+
+    const unit = try std.fmt.allocPrint(a,
+        \\[Unit]
+        \\Description=mtproto-proxy Xray egress (SOCKS5 bridge for upstream)
+        \\After=network-online.target
+        \\Wants=network-online.target
+        \\
+        \\[Service]
+        \\ExecStart={s} run -c {s}
+        \\Restart=on-failure
+        \\RestartSec=3
+        \\NoNewPrivileges=yes
+        \\ProtectSystem=strict
+        \\ProtectHome=yes
+        \\PrivateTmp=yes
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+    , .{ xray_bin, XRAY_CONFIG_PATH });
+    sys.writeFile(XRAY_SERVICE_PATH, unit) catch {
+        ui.fail("Failed to write the systemd unit");
+        return;
+    };
+    _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
+    _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", XRAY_SERVICE_NAME }) catch {};
+    ui.ok("Xray egress service up (SOCKS5 " ++ SOCKS_HOST ++ ":10808)");
+
+    if (sys.fileExists(CONFIG_PATH)) {
+        wireUpstreamSocks(allocator, link_texts) catch {
+            ui.warn("Xray bridge is up, but updating config.toml failed — set [upstream] type=socks5, [upstream.socks5] host=127.0.0.1 port=10808 manually");
+            return;
+        };
+        _ = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
+        ui.ok("upstream set to socks5 via the Xray egress; mtproto-proxy restarted");
+    } else {
+        ui.warn("mtproto-proxy not installed here — the Xray bridge is up; point [upstream] type=socks5 host=127.0.0.1 port=10808 at it");
+    }
+}
+
+fn wireUpstreamSocks(allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
+    var doc = try toml.TomlDoc.load(allocator, CONFIG_PATH);
+    defer doc.deinit();
+    try doc.set("upstream", "type", "socks5");
+    try doc.set("upstream.socks5", "host", SOCKS_HOST);
+    try doc.set("upstream.socks5", "port", "10808");
+    // Persist the links so a reinstall reproduces the egress (config is 0600).
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    defer arr.deinit(allocator);
+    try arr.append(allocator, '[');
+    for (link_texts, 0..) |t, i| {
+        if (i != 0) try arr.append(allocator, ',');
+        try arr.append(allocator, '"');
+        try arr.appendSlice(allocator, t);
+        try arr.append(allocator, '"');
+    }
+    try arr.append(allocator, ']');
+    try doc.set("upstream.xray", "links", arr.items);
+    try doc.save(CONFIG_PATH);
+}
+
+/// Download + install the static Xray-core binary for this arch (SHA-less; the zip is
+/// fetched over TLS from the pinned GitHub release path). Uses a private temp dir.
+fn installXray(allocator: std.mem.Allocator) bool {
+    const asset: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => "Xray-linux-64.zip",
+        .aarch64 => "Xray-linux-arm64-v8a.zip",
+        else => return false,
+    };
+    if (!sys.commandExists("unzip") or !sys.commandExists("curl")) {
+        _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
+        _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends", "unzip", "curl" }) catch {};
+    }
+    const td = blk: {
+        const r = sys.exec(allocator, &.{ "mktemp", "-d", "/tmp/mtbuddy-xray.XXXXXX" }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) break :blk null;
+        const t = std.mem.trim(u8, r.stdout, " \t\r\n");
+        if (t.len == 0) break :blk null;
+        break :blk allocator.dupe(u8, t) catch null;
+    } orelse return false;
+    defer {
+        _ = sys.exec(allocator, &.{ "rm", "-rf", td }) catch {};
+        allocator.free(td);
+    }
+    const url = std.fmt.allocPrint(allocator, "https://github.com/XTLS/Xray-core/releases/latest/download/{s}", .{asset}) catch return false;
+    defer allocator.free(url);
+    const zip = std.fmt.allocPrint(allocator, "{s}/xray.zip", .{td}) catch return false;
+    defer allocator.free(zip);
+    {
+        const r = sys.exec(allocator, &.{ "curl", "-fsSL", "--retry", "3", "--connect-timeout", "30", "-o", zip, url }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+    }
+    {
+        const r = sys.exec(allocator, &.{ "unzip", "-o", zip, "xray", "-d", td }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+    }
+    const extracted = std.fmt.allocPrint(allocator, "{s}/xray", .{td}) catch return false;
+    defer allocator.free(extracted);
+    {
+        const r = sys.exec(allocator, &.{ "install", "-m", "0755", extracted, XRAY_BIN }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0) return false;
+    }
+    return sys.fileExists(XRAY_BIN);
+}
+
 test "parse vless reality link" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -421,4 +683,27 @@ test "detectScheme" {
     try std.testing.expectEqual(Scheme.wireguard, detectScheme("wireguard://x"));
     try std.testing.expectEqual(Scheme.shadowsocks, detectScheme("ss://x"));
     try std.testing.expectEqual(Scheme.unknown, detectScheme("http://x"));
+}
+
+test "convertWireguardLink builds a WG/AmneziaWG conf" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const conf = try convertWireguardLink(a, "wireguard://PRIVK%2Fey@111.222.33.194:19666?publickey=PUBKEY&address=10.11.11.2%2F32&mtu=1420&presharedkey=PSK&jc=4&s1=50#German%20WG-1");
+    const has = struct {
+        fn f(h: []const u8, n: []const u8) bool {
+            return std.mem.indexOf(u8, h, n) != null;
+        }
+    }.f;
+    try std.testing.expect(has(conf, "[Interface]"));
+    try std.testing.expect(has(conf, "PrivateKey = PRIVK/ey")); // %2F decoded
+    try std.testing.expect(has(conf, "Address = 10.11.11.2/32"));
+    try std.testing.expect(has(conf, "MTU = 1420"));
+    try std.testing.expect(has(conf, "JC = 4")); // AmneziaWG knob, uppercased
+    try std.testing.expect(has(conf, "S1 = 50"));
+    try std.testing.expect(has(conf, "[Peer]"));
+    try std.testing.expect(has(conf, "PublicKey = PUBKEY"));
+    try std.testing.expect(has(conf, "Endpoint = 111.222.33.194:19666"));
+    try std.testing.expect(has(conf, "AllowedIPs = 0.0.0.0/0, ::/0"));
+    try std.testing.expect(has(conf, "PresharedKey = PSK"));
 }

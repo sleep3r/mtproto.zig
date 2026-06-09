@@ -22,6 +22,7 @@ const nfqws = @import("nfqws.zig");
 const tunnel = @import("tunnel.zig");
 const recovery = @import("recovery.zig");
 const dashboard = @import("dashboard.zig");
+const egress = @import("egress.zig");
 const ipv6hop = @import("ipv6hop.zig");
 const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
@@ -134,6 +135,8 @@ pub fn main(init: std.process.Init) !void {
                     return nfqws.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "tunnel")) {
                     return tunnel.run(&ui, allocator, &remaining_args);
+                } else if (std.mem.eql(u8, sub, "egress")) {
+                    return egress.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "recovery")) {
                     return recovery.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "dashboard")) {
@@ -145,11 +148,11 @@ pub fn main(init: std.process.Init) !void {
                         Color.reset,
                         sub,
                     });
-                    ui.hint(tr(ui.lang, "Available: masking, nfqws, tunnel, recovery, dashboard", "Доступно: masking, nfqws, tunnel, recovery, dashboard"));
+                    ui.hint(tr(ui.lang, "Available: masking, nfqws, tunnel, egress, recovery, dashboard", "Доступно: masking, nfqws, tunnel, egress, recovery, dashboard"));
                     return;
                 }
             } else {
-                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|tunnel|recovery|dashboard>", "Использование: mtbuddy setup <masking|nfqws|tunnel|recovery|dashboard>"));
+                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|tunnel|egress|recovery|dashboard>", "Использование: mtbuddy setup <masking|nfqws|tunnel|egress|recovery|dashboard>"));
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {

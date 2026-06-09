@@ -174,6 +174,16 @@ port = 443
 # username = ""
 # password = ""
 
+# ── Xray egress (VLESS-Reality / VMess / Trojan / Shadowsocks) ──
+# Don't hand-edit this — run:  sudo mtbuddy setup egress "<share-link>" [<link>...]
+# It parses the share-link(s), runs a local Xray client that exposes a SOCKS5 inbound
+# on 127.0.0.1:10808, points [upstream] type=socks5 at it, and records the link(s)
+# here so a reinstall reproduces the egress. >1 link = a leastPing failover pool.
+# wireguard:// links go to the native L3 tunnel instead (mtbuddy setup egress also
+# accepts those, or use `mtbuddy setup tunnel`).
+# [upstream.xray]
+# links = ["vless://...@host:443?security=reality&pbk=...&sni=...&sid=...&flow=xtls-rprx-vision"]
+
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
 # Choose a popular, high-traffic domain that negotiates single-round x25519 (most big

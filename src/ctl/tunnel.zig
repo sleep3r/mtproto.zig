@@ -89,6 +89,13 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
     try execute(ui, allocator, opts);
 }
 
+/// Set up a tunnel directly from a WireGuard/AmneziaWG `.conf` path — same flow as
+/// `setup tunnel <conf>`. Used by the egress provider after it converts a
+/// wireguard:// share-link into a `.conf`.
+pub fn setupFromConf(ui: *Tui, allocator: std.mem.Allocator, conf_path: []const u8) !void {
+    try execute(ui, allocator, .{ .awg_source = conf_path });
+}
+
 /// Run in interactive mode.
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     ui.section(i18n.get(ui.lang, .menu_setup_tunnel));
