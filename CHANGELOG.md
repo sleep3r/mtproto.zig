@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/sleep3r/mtproto.zig/compare/v1.1.1...v1.2.0) (2026-06-09)
+
+
+### Features
+
+* **egress:** VPN-link tunnel egress + tunnel-pool failover fix + fronting x25519 helper ([#324](https://github.com/sleep3r/mtproto.zig/issues/324)) ([f8bca07](https://github.com/sleep3r/mtproto.zig/commit/f8bca0756de67a335db97df4d5aaaf48cacf5553))
+
 ## [1.1.1](https://github.com/sleep3r/mtproto.zig/compare/v1.1.0...v1.1.1) (2026-06-08)
 
 
