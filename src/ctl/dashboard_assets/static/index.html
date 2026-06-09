@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>⚡ MTProto Proxy — Dashboard</title>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260422">
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20260609">
 </head>
 <body>
 <div class="app">
@@ -57,13 +57,12 @@
         <div class="gauge">
           <svg viewBox="0 0 36 36">
             <circle class="track" cx="18" cy="18" r="15"/>
-            <circle class="fill" id="cpuArc" cx="18" cy="18" r="15"
-              stroke="var(--zig)" stroke-dasharray="94.2" stroke-dashoffset="94.2"/>
+            <circle class="fill" id="cpuArc" cx="18" cy="18" r="15"/>
           </svg>
           <div class="pct" style="color:var(--zig)" id="cpuPct">0%</div>
         </div>
         <div>
-          <div class="card-value" style="color:var(--zig)" id="cpuVal">0<span style="font-size:18px;font-weight:400">%</span></div>
+          <div class="card-value" style="color:var(--text)" id="cpuVal">0<span style="font-size:18px;font-weight:400">%</span></div>
           <div class="card-sub" data-i18n="card.cpuSub">utilization</div>
         </div>
       </div>
@@ -77,13 +76,12 @@
         <div class="gauge">
           <svg viewBox="0 0 36 36">
             <circle class="track" cx="18" cy="18" r="15"/>
-            <circle class="fill" id="memArc" cx="18" cy="18" r="15"
-              stroke="var(--purple)" stroke-dasharray="94.2" stroke-dashoffset="94.2"/>
+            <circle class="fill" id="memArc" cx="18" cy="18" r="15"/>
           </svg>
           <div class="pct" style="color:var(--purple)" id="memPct">0%</div>
         </div>
         <div>
-          <div class="card-value" style="color:var(--purple)" id="memVal">0<span style="font-size:14px;font-weight:400"> MB</span></div>
+          <div class="card-value" style="color:var(--text)" id="memVal">0<span style="font-size:14px;font-weight:400"> MB</span></div>
           <div class="card-sub" id="memSub">— / — MB</div>
         </div>
       </div>
@@ -95,7 +93,7 @@
       <div class="card-label" data-i18n="card.network">◎ Network Throughput</div>
       <div class="chart-wrap"><canvas id="netChart"></canvas></div>
       <div class="chart-legend">
-        <span><div class="ldot" style="background:var(--green)"></div>RX <b id="rxRate">—</b></span>
+        <span><div class="ldot" style="background:var(--blue)"></div>RX <b id="rxRate">—</b></span>
         <span><div class="ldot" style="background:var(--zig)"></div>TX <b id="txRate">—</b></span>
         <span style="margin-left:auto">↓<b id="rxTotal">—</b> ↑<b id="txTotal">—</b></span>
       </div>
@@ -309,6 +307,6 @@
   </div>
 </div>
 
-<script src="/app.js?v=20260524"></script>
+<script src="/app.js?v=20260609"></script>
 </body>
 </html>

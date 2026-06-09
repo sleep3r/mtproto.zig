@@ -132,7 +132,15 @@ const appRoot = document.querySelector('.app');
 
 // ── Gauges ──
 function setGauge(arcId, pctId, val) {
-  $(arcId).style.strokeDashoffset = 94.2 - (94.2 * val / 100);
+  // 270° arc (gap at the bottom) on a r=15 circle: full circumference ≈ 94.25,
+  // 270° ≈ 70.69. The arc is rotated -via CSS- so the gap sits at 6 o'clock.
+  const ARC = 70.69;
+  const v = Math.max(0, Math.min(100, Number(val) || 0));
+  $(arcId).style.strokeDasharray = (ARC * v / 100).toFixed(2) + ' 94.25';
+  // Signal-threshold colour ramp — the full-saturation amber stays reserved for
+  // the status hero, so the dial earns its colour from the value band instead.
+  const col = v < 60 ? 'var(--signal-go)' : (v < 85 ? 'var(--signal-caution)' : 'var(--signal-stop)');
+  $(arcId).style.stroke = col;
   $(pctId).textContent = val + '%';
 }
 
@@ -151,6 +159,8 @@ window.addEventListener('resize', resizeCanvas);
 
 function drawNetChart() {
   if (!lastData || !lastData.net_history) return;
+  resizeCanvas();   // self-size each draw (like the sparklines) so the chart is
+                    // robust to first-paint timing and container width changes
   const data = lastData.net_history;
   const w = canvas.width / 2, h = canvas.height / 2;
   ctx.clearRect(0, 0, w, h);
@@ -178,7 +188,7 @@ function drawNetChart() {
   for (let i = 0; i <= 4; i++) {
     const frac = i / 4;
     const y = PAD_TOP + ch * (1 - frac);
-    ctx.strokeStyle = 'rgba(247,164,29,0.05)';
+    ctx.strokeStyle = 'rgba(39,47,56,0.8)';
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     ctx.moveTo(PAD, y);
@@ -229,12 +239,12 @@ function drawNetChart() {
   }
 
   drawLine('tx', 'rgb(247,164,29)');
-  drawLine('rx', 'rgb(52,211,153)');
+  drawLine('rx', 'rgb(92,130,201)');
 }
 
 canvas.addEventListener('mousemove', e => {
   showTooltip(e, canvas, 42, lastData?.net_history, item => 
-    `<div class="tooltip-val" style="color:var(--green)">RX: ${fmt(item.rx)}</div><div class="tooltip-val" style="color:var(--zig)">TX: ${fmt(item.tx)}</div>`
+    `<div class="tooltip-val" style="color:var(--blue)">RX: ${fmt(item.rx)}</div><div class="tooltip-val" style="color:var(--zig)">TX: ${fmt(item.tx)}</div>`
   );
 });
 canvas.addEventListener('mouseleave', hideTooltip);
@@ -279,7 +289,7 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   for (const tv of ticks) {
     const frac = tv / peak;
     const y = PAD_TOP + ch * (1 - frac);
-    x.strokeStyle = 'rgba(247,164,29,0.05)';
+    x.strokeStyle = 'rgba(39,47,56,0.8)';
     x.lineWidth = 0.5;
     x.beginPath();
     x.moveTo(PAD, y);
@@ -317,12 +327,12 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
 
 const cpuCanvas = $('cpuSpark');
 if (cpuCanvas) {
-  cpuCanvas.addEventListener('mousemove', e => showTooltip(e, cpuCanvas, 32, lastData?.cpu_history, item => `<div class="tooltip-val" style="color:var(--zig)">Util: ${item.v}%</div>`));
+  cpuCanvas.addEventListener('mousemove', e => showTooltip(e, cpuCanvas, 32, lastData?.cpu_history, item => `<div class="tooltip-val" style="color:var(--text)">Util: ${item.v}%</div>`));
   cpuCanvas.addEventListener('mouseleave', hideTooltip);
 }
 const memCanvas = $('memSpark');
 if (memCanvas) {
-  memCanvas.addEventListener('mousemove', e => showTooltip(e, memCanvas, 32, lastData?.mem_history, item => `<div class="tooltip-val" style="color:var(--purple)">Mem: ${item.v}%</div>`));
+  memCanvas.addEventListener('mousemove', e => showTooltip(e, memCanvas, 32, lastData?.mem_history, item => `<div class="tooltip-val" style="color:var(--text)">Mem: ${item.v}%</div>`));
   memCanvas.addEventListener('mouseleave', hideTooltip);
 }
 
@@ -723,7 +733,7 @@ function renderUsers(users, perUserActive, proxyStats) {
       : '<button class="ui-btn user-direct-toggle" type="button" data-user="' + userName + '" data-direct="true" title="Switch to direct route">default</button>');
 
     return '<div class="' + rowClass + '">' +
-      '<div class="user-name">' + toggleSwitch + displayName + sessionsBadge + '</div>' +
+      '<div class="user-name">' + toggleSwitch + '<span class="user-name-text">' + displayName + '</span>' + sessionsBadge + '</div>' +
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
@@ -1203,8 +1213,8 @@ async function poll() {
   $('memSub').textContent = d.mem_used + ' / ' + d.mem_total + ' MB';
 
   // Sparklines
-  if (d.cpu_history) drawSpark('cpuSpark', d.cpu_history, 'rgb(247,164,29)', 100, '%');
-  if (d.mem_history) drawSpark('memSpark', d.mem_history, 'rgb(167,139,250)', 100, '%');
+  if (d.cpu_history) drawSpark('cpuSpark', d.cpu_history, 'rgb(154,163,174)', 100, '%');
+  if (d.mem_history) drawSpark('memSpark', d.mem_history, 'rgb(154,163,174)', 100, '%');
 
   // Network
   drawNetChart();
