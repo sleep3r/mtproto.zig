@@ -8,6 +8,7 @@
 const std = @import("std");
 const tui_mod = @import("tui.zig");
 const sys = @import("sys.zig");
+const fronting_domain = @import("fronting_domain.zig");
 const Config = @import("proxy_config").Config;
 const http_fetch = @import("proxy_http_fetch");
 const net_helpers = @import("proxy_net_helpers");
@@ -318,6 +319,10 @@ fn runNetworkDoctor(
 ) void {
     ui.writeRaw("\n");
     ui.section("Network probes");
+
+    if (fronting_domain.warnIfPoorFrontingDomain(ui, allocator, cfg.tls_domain) == .mismatch) {
+        warnings.* += 1;
+    }
 
     switch (cfg.upstream_mode) {
         .socks5, .http => runNetworkDoctorProxy(ui, allocator, cfg, errors, warnings),

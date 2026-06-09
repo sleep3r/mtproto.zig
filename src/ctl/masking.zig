@@ -9,6 +9,7 @@ const tui_mod = @import("tui.zig");
 const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
 const toml = @import("toml.zig");
+const fronting_domain = @import("fronting_domain.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -63,6 +64,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         ui.fail(i18n.get(ui.lang, .error_not_root));
         return;
     }
+
+    _ = fronting_domain.warnIfPoorFrontingDomain(ui, allocator, opts.tls_domain);
 
     // ── Install Nginx ──
     if (sys.commandExists("nginx")) {
