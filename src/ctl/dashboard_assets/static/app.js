@@ -2,17 +2,37 @@
 
 const $ = id => document.getElementById(id);
 
+// ── Icon set (inline SVG, currentColor, 24×24, butt caps / miter joins, angular
+// Zig-echo geometry) — replaces every emoji used as an icon. ──
+const ICON = {
+  'qr-share': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M3 3 H9 V9 H3 Z"/><path d="M15 3 H21 V9 H15 Z"/><path d="M3 15 H9 V21 H3 Z"/><path d="M15 15 H18 V18 H15 Z"/><path d="M21 15 V21 H18"/><path d="M15 21 H15.01"/></svg>',
+  'copy': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M9 9 H20 V20 H9 Z"/><path d="M5 15 H4 V4 H15 V5"/></svg>',
+  'delete': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M4 6 H20"/><path d="M9 6 V4 H15 V6"/><path d="M6 6 L7 20 H17 L18 6"/><path d="M10 10 V16 M14 10 V16"/></svg>',
+  'plus': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 5 V19 M5 12 H19"/></svg>',
+  'chevron-down': '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><polyline points="7,10 12,15 17,10"/></svg>',
+  'pause': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M8 5 V19 M16 5 V19"/></svg>',
+  'play': '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5 L19 12 L7 19 Z"/></svg>',
+  'search': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M5 5 H15 V15 H5 Z"/><path d="M15 15 L20 20"/></svg>',
+  'autoscroll': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><polyline points="6,5 12,11 18,5"/><polyline points="6,11 12,17 18,11"/><path d="M5 20 H19"/></svg>',
+  'jump-latest': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 4 V16"/><polyline points="6,11 12,17 18,11"/><path d="M5 20 H19"/></svg>',
+  'arrow-down': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 4 V18"/><polyline points="6,12 12,18 18,12"/></svg>',
+  'arrow-up': '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 20 V6"/><polyline points="6,12 12,6 18,12"/></svg>',
+  'warning': '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="butt" stroke-linejoin="miter"><path d="M12 3 L22 20 H2 Z"/><path d="M12 10 V15"/><path d="M12 17.5 V17.6"/></svg>',
+  'send-plane': '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M21 3 L3 11 L10 13 L12 20 Z"/><path d="M21 3 L10 13"/></svg>',
+  'lang-globe': '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"><path d="M4 6 H20 V18 H4 Z"/><path d="M4 12 H20"/><path d="M12 6 C9 9 9 15 12 18 C15 15 15 9 12 6 Z"/></svg>'
+};
+
 // ── i18n (EN/RU) ──────────────────────────────────────────────
 // Prose, labels and buttons are translated; technical proper nouns (MiddleProxy,
 // socks5, Nginx, RX/TX) stay as-is — that's normal bilingual UI, not code-switching.
 const I18N = {
   en: {
     'header.refresh': 'Refresh', 'header.uptime': 'Uptime', 'header.lastUpdate': 'Last update',
-    'card.cpu': '⬡ CPU', 'card.cpuSub': 'utilization', 'card.memory': '◈ Memory', 'card.network': '◎ Network Throughput',
+    'card.cpu': 'CPU', 'card.cpuSub': 'utilization', 'card.memory': 'Memory', 'card.network': 'Network Throughput',
     'stats.activeOf': 'Active /', 'stats.handshakes': 'Handshakes', 'stats.total': 'Total Connections',
-    'users.title': '👥 Users', 'users.add': '+ Add User', 'users.who': 'Who is this for?',
+    'users.title': 'Users', 'users.add': '+ Add User', 'users.who': 'Who is this for?',
     'users.secret': 'Secret', 'users.secretHint': '(leave empty to auto-generate)',
-    'users.namePh': 'e.g. Мама, dad, work 💼', 'users.secretPh': "Leave blank — we'll create one for you",
+    'users.namePh': 'e.g. Мама, dad, work', 'users.secretPh': "Leave blank — we'll create one for you",
     'btn.create': 'Create', 'btn.cancel': 'Cancel', 'btn.apply': 'Apply', 'btn.pin': 'Pin', 'btn.setTarget': 'Set target', 'btn.delete': 'Delete', 'btn.close': 'Close',
     'routing.title': 'Routing & Upstream', 'routing.upstream': 'Upstream', 'routing.tunnelPin': 'Tunnel pin',
     'routing.proxyHost': 'Proxy host', 'routing.port': 'Port', 'routing.user': 'User', 'routing.pass': 'Pass', 'routing.target': 'Target', 'routing.policy': 'Policy',
@@ -22,7 +42,7 @@ const I18N = {
     'egress.good': 'Good', 'egress.degraded': 'Degraded', 'egress.poor': 'Poor', 'egress.up': 'Up', 'egress.down': 'Down', 'egress.unknown': 'Unknown',
     'egress.primary': 'primary', 'egress.bottleneck': 'Tunnel is the bottleneck',
     'egress.notMonitored': 'Not monitored (not in tunnel mode)',
-    'logs.title': '▸ Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
+    'logs.title': 'Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
     'modal.deleteUser': 'Delete User', 'modal.deleteTunnel': 'Delete Tunnel', 'modal.restartNote': 'The proxy will be restarted to apply changes.',
     'share.subtitle': 'Point their phone camera at this code to connect.', 'share.copyLink': 'Copy link', 'share.send': 'Send', 'share.with': 'Share with',
     'status.online': 'Online', 'status.offline': 'Offline', 'status.stuck': 'Stuck',
@@ -37,11 +57,11 @@ const I18N = {
   },
   ru: {
     'header.refresh': 'Обновление', 'header.uptime': 'Аптайм', 'header.lastUpdate': 'Обновлено',
-    'card.cpu': '⬡ CPU', 'card.cpuSub': 'загрузка', 'card.memory': '◈ Память', 'card.network': '◎ Сетевой трафик',
+    'card.cpu': 'CPU', 'card.cpuSub': 'загрузка', 'card.memory': 'Память', 'card.network': 'Сетевой трафик',
     'stats.activeOf': 'Активно /', 'stats.handshakes': 'Подключаются', 'stats.total': 'Всего подключений',
-    'users.title': '👥 Пользователи', 'users.add': '+ Добавить', 'users.who': 'Для кого это?',
+    'users.title': 'Пользователи', 'users.add': '+ Добавить', 'users.who': 'Для кого это?',
     'users.secret': 'Секрет', 'users.secretHint': '(пусто — сгенерируем сами)',
-    'users.namePh': 'напр. Мама, папа, работа 💼', 'users.secretPh': 'Оставьте пустым — создадим сами',
+    'users.namePh': 'напр. Мама, папа, работа', 'users.secretPh': 'Оставьте пустым — создадим сами',
     'btn.create': 'Создать', 'btn.cancel': 'Отмена', 'btn.apply': 'Применить', 'btn.pin': 'Закрепить', 'btn.setTarget': 'Задать', 'btn.delete': 'Удалить', 'btn.close': 'Закрыть',
     'routing.title': 'Маршрутизация и выход', 'routing.upstream': 'Выход', 'routing.tunnelPin': 'Туннель',
     'routing.proxyHost': 'Хост прокси', 'routing.port': 'Порт', 'routing.user': 'Логин', 'routing.pass': 'Пароль', 'routing.target': 'Цель', 'routing.policy': 'Политика',
@@ -51,7 +71,7 @@ const I18N = {
     'egress.good': 'Хорошо', 'egress.degraded': 'Деградация', 'egress.poor': 'Плохо', 'egress.up': 'Включён', 'egress.down': 'Отключён', 'egress.unknown': 'Неизвестно',
     'egress.primary': 'основной', 'egress.bottleneck': 'Туннель — узкое место',
     'egress.notMonitored': 'Не отслеживается (не режим туннеля)',
-    'logs.title': '▸ Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
+    'logs.title': 'Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
     'modal.deleteUser': 'Удалить пользователя', 'modal.deleteTunnel': 'Удалить туннель', 'modal.restartNote': 'Прокси будет перезапущен для применения изменений.',
     'share.subtitle': 'Наведите камеру их телефона на этот код, чтобы подключиться.', 'share.copyLink': 'Скопировать ссылку', 'share.send': 'Отправить', 'share.with': 'Поделиться с',
     'status.online': 'Онлайн', 'status.offline': 'Офлайн', 'status.stuck': 'Завис',
@@ -141,7 +161,7 @@ function setGauge(arcId, pctId, val) {
   // the status hero, so the dial earns its colour from the value band instead.
   const col = v < 60 ? 'var(--signal-go)' : (v < 85 ? 'var(--signal-caution)' : 'var(--signal-stop)');
   $(arcId).style.stroke = col;
-  $(pctId).textContent = val + '%';
+  $(pctId).textContent = val;   // unit "%" is a separate .gauge-unit element
 }
 
 // ── Network chart ──
@@ -411,25 +431,22 @@ function showToast(msg, type) {
 function setStatusHero(online, active, state) {
   const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText');
   if (!el) return;
+  // Paper hero: fixed surface-1 panel; only the signal square (#statusHeroIcon,
+  // background:currentColor) + verdict text take the state colour, which they
+  // inherit from the hero's color. No translucent bg, no glyph.
+  el.style.background = '';
+  if (icon) icon.textContent = '';
   if (!online) {
-    el.style.background = 'rgba(255,80,80,0.10)';
-    el.style.color = 'var(--red,#ff6b6b)';
-    icon.textContent = '✖';
+    el.style.color = 'var(--signal-stop)';
     txt.textContent = t('hero.offline');
   } else if (state === 'stalled') {
-    el.style.background = 'rgba(240,180,40,0.12)';
-    el.style.color = 'var(--amber,#f0b428)';
-    icon.textContent = '!';
+    el.style.color = 'var(--signal-caution)';
     txt.textContent = t('hero.stalled');
   } else if (active > 0) {
-    el.style.background = 'rgba(80,220,120,0.10)';
-    el.style.color = 'var(--green,#46d369)';
-    icon.textContent = '✓';
+    el.style.color = 'var(--accent)';
     txt.textContent = t('hero.busy').replace('{n}', active);
   } else {
-    el.style.background = 'rgba(80,220,120,0.08)';
-    el.style.color = 'var(--green,#46d369)';
-    icon.textContent = '✓';
+    el.style.color = 'var(--signal-go)';
     txt.textContent = t('hero.idle');
   }
 }
@@ -737,10 +754,10 @@ function renderUsers(users, perUserActive, proxyStats) {
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
       '<div class="user-actions">' +
-      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + '>📲 Share</button>' +
-      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + '>Copy tg://</button>' +
-      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + '>Copy t.me</button>' +
-      '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">✕</button>' +
+      '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + ' title="Share via QR">' + ICON['qr-share'] + '</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + ' title="Copy tg:// link">tg://</button>' +
+      '<button class="ui-btn user-copy" type="button" data-link="' + tmeData + '"' + (tme && isEnabled ? '' : ' disabled') + ' title="Copy t.me link">t.me</button>' +
+      '<button class="ui-btn danger user-delete" type="button" data-user="' + userName + '" title="Delete user">' + ICON['delete'] + '</button>' +
       '</div>' +
       '</div>';
   }).join('');
@@ -1109,18 +1126,20 @@ function renderRouting(routing) {
     const canDelete = inPool || t.config_present || t.link_up || iface.startsWith('awg') || iface.startsWith('wg');
 
     return '<div class="routing-row">' +
-      '<div class="routing-iface">' + esc(iface) +
-      (isSelected ? '<span class="routing-tag">active</span>' : '') +
-      (isPinned ? '<span class="routing-tag">pinned</span>' : '') +
+      '<div class="routing-row-top">' +
+        '<div class="routing-iface"><span class="routing-iface-name">' + esc(iface) + '</span>' +
+        (isSelected ? '<span class="routing-tag">active</span>' : '') +
+        (isPinned ? '<span class="routing-tag">pinned</span>' : '') +
+        '</div>' +
+        '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
       '</div>' +
-      '<div class="routing-state ' + stateClass + '">' + esc(state) + '</div>' +
-      '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +
-      '<div class="routing-xfer">' + esc(xfer) + '</div>' +
-      '<div class="routing-actions">' +
+      '<div class="routing-row-bottom">' +
+        '<div class="routing-meta" title="' + esc(meta.join(' · ')) + '">' + esc(meta.join(' · ')) + '</div>' +
+        '<div class="routing-xfer">' + esc(xfer) + '</div>' +
+      '</div>' +
       (canDelete
-        ? '<button class="ui-btn danger routing-delete" type="button" data-iface="' + esc(iface) + '" aria-label="Delete tunnel ' + esc(iface) + '">Delete</button>'
+        ? '<div class="routing-actions"><button class="ui-btn danger routing-delete" type="button" data-iface="' + esc(iface) + '" aria-label="Delete tunnel ' + esc(iface) + '">' + ICON['delete'] + '</button></div>'
         : '') +
-      '</div>' +
       '</div>';
   }).join('');
 
@@ -1175,22 +1194,24 @@ function renderEgress(egress) {
     // Color code quality (good, degraded, poor, up, down, unknown)
     const qualityClass = 'egress-quality-' + quality;
     const qualityLabel = t('egress.' + quality) || quality;
+    const _barPct = { good: 22, degraded: 72, poor: 92, up: 10, down: 100, unknown: 8 };
+    const barPct = _barPct[quality] != null ? _barPct[quality] : 8;
 
     // "Tunnel is the bottleneck" hint when quality is degraded/poor.
     const isBottleneck = quality === 'degraded' || quality === 'poor';
     const bottleneck = isBottleneck
-      ? '<div class="egress-bottleneck" title="' + t('egress.bottleneck') + '">⚠ ' + t('egress.bottleneck') + '</div>'
+      ? '<div class="egress-bottleneck" title="' + t('egress.bottleneck') + '">' + ICON['warning'] + '<span>' + t('egress.bottleneck') + '</span></div>'
       : '';
 
-    return '<div class="egress-row' + (isBottleneck ? ' is-bottleneck' : '') + '">' +
-      '<div class="egress-iface">' + iface +
-      (isPrimary ? '<span class="routing-tag">' + t('egress.primary') + '</span>' : '') +
+    return '<div class="egress-row' + (isBottleneck ? ' is-bottleneck' : '') + ' q-' + quality + '">' +
+      '<div class="egress-row-top">' +
+        '<div class="egress-iface q-' + quality + '"><span class="signal-sq"></span><span class="egress-iface-name">' + iface + '</span>' +
+        (isPrimary ? '<span class="routing-tag">' + t('egress.primary') + '</span>' : '') +
+        '</div>' +
+        '<div class="egress-quality ' + qualityClass + '">' + qualityLabel + '</div>' +
       '</div>' +
-      '<div class="egress-status ' + (tun.up ? 'on' : 'off') + '">' + (tun.up ? t('status.online') : t('status.offline')) + '</div>' +
-      '<div class="egress-quality ' + qualityClass + '">' + qualityLabel + '</div>' +
-      '<div class="egress-rtt" title="' + t('egress.rtt') + '">' + rttText + '</div>' +
-      '<div class="egress-loss" title="' + t('egress.loss') + '">' + lossText + '</div>' +
-      '<div class="egress-hs" title="' + t('egress.handshake') + '">' + hsText + '</div>' +
+      '<div class="egress-metrics"><div class="egress-stats">' + rttText + ' · ' + lossText + ' loss · hs ' + hsText + '</div></div>' +
+      '<div class="egress-bar"><div class="egress-bar-fill q-' + quality + '" style="width:' + barPct + '%"></div></div>' +
       bottleneck +
       '</div>';
   }).join('');
@@ -1366,8 +1387,12 @@ function updateFreshness() {
 }
 
 function updatePollControls() {
-  $('pollToggle').textContent = pollingPaused ? t('btn.resume') : t('btn.pause');
-  $('pollToggle').classList.toggle('active', !pollingPaused);
+  const btn = $('pollToggle');
+  // .icon-btn hides text (font-size:0); show a play/pause SVG instead.
+  btn.innerHTML = pollingPaused ? ICON.play : ICON.pause;
+  btn.title = pollingPaused ? t('btn.resume') : t('btn.pause');
+  btn.setAttribute('aria-label', btn.title);
+  btn.classList.toggle('active', !pollingPaused);
 }
 
 async function runPoll() {

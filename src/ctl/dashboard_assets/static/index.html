@@ -3,132 +3,218 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>⚡ MTProto Proxy — Dashboard</title>
+  <title>MTProto Proxy — Dashboard</title>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260609b">
+  <link rel="stylesheet" href="/style.css?v=20260610">
 </head>
 <body>
 <div class="app">
-
-  <!-- Header -->
-  <div class="header">
-    <div class="header-left">
-      <div class="zig-logo">
-        <img src="/logo.svg" alt="Zig" width="44" height="44">
-      </div>
-      <h1>
-        <span class="accent">MTProto</span>Proxy
-        <span class="dim">dashboard</span>
-        <span class="version-pill" id="dashboardVersion"></span>
-      </h1>
-    </div>
-    <div class="header-right">
-      <div class="badge" id="statusBadge"><div class="pulse-dot"></div><span id="proxyUp">—</span></div>
-      <div class="badge data-badge syncing" id="dataBadge"><div class="pulse-dot"></div><span id="dataBadgeText">Syncing...</span></div>
-      <button id="langToggle" class="ui-btn" type="button" title="Language / Язык">RU</button>
-      <div class="poll-controls">
-        <label for="pollInterval" data-i18n="header.refresh">Refresh</label>
-        <select id="pollInterval" class="ui-select">
-          <option value="1000">1s</option>
-          <option value="3000" selected>3s</option>
-          <option value="5000">5s</option>
-          <option value="10000">10s</option>
-        </select>
-        <button id="pollToggle" class="ui-btn" type="button" data-i18n="btn.pause">Pause</button>
-      </div>
-      <div class="meta">PID <b id="proxyPid">—</b> · <b id="proxyRss">—</b></div>
-      <div class="meta"><span data-i18n="header.uptime">Uptime</span> <b id="srvUptime">—</b></div>
-      <div class="meta"><span data-i18n="header.lastUpdate">Last update</span> <b id="lastUpdate">never</b></div>
+<!-- ============================================================= -->
+<!-- TOPBAR (bus-bar) -->
+<!-- ============================================================= -->
+<div class="topbar">
+  <div class="topbar-brand">
+    <span class="zig-logo">
+      <img src="/logo.svg" alt="Zig" width="28" height="28">
+    </span>
+    <div class="topbar-wordmark">
+      <span class="wm"><span class="accent">MTProto</span><span class="dim">Proxy</span></span>
+      <span class="version-pill" id="dashboardVersion"></span>
     </div>
   </div>
 
-  <!-- Status hero: the one-glance "is everything OK?" answer -->
-  <div id="statusHero" style="margin:0 0 16px;padding:14px 18px;border-radius:10px;display:flex;align-items:center;gap:12px;font-size:15px;font-weight:600;border:1px solid var(--border);background:rgba(127,127,127,0.06);">
-    <span id="statusHeroIcon" style="font-size:20px;">•</span>
-    <span id="statusHeroText" data-i18n="hero.checking">Checking…</span>
-  </div>
+  <div class="topbar-right">
+    <!-- proxy online/offline status: signal-square + word -->
+    <div class="badge" id="statusBadge"><span class="sig-sq"></span><span id="proxyUp">—</span></div>
 
-  <!-- Metrics -->
-  <div class="grid">
-    <!-- CPU -->
-    <div class="card col-3">
-      <div class="card-label" data-i18n="card.cpu">⬡ CPU</div>
+    <!-- data freshness badge (not in Paper mock but id is required) -->
+    <div class="badge data-badge syncing" id="dataBadge"><span class="sig-sq"></span><span id="dataBadgeText">Syncing...</span></div>
+
+    <!-- language toggle (EN/RU). JS sets textContent to the OTHER lang -->
+    <button id="langToggle" class="ui-btn lang-toggle" type="button" title="Language / Язык">RU</button>
+
+    <!-- poll controls: REFRESH eyebrow + interval select + pause/resume -->
+    <div class="poll-controls">
+      <label for="pollInterval" data-i18n="header.refresh">Refresh</label>
+      <select id="pollInterval" class="ui-select poll-select">
+        <option value="1000">1s</option>
+        <option value="3000" selected>3s</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+      </select>
+      <button id="pollToggle" class="ui-btn poll-toggle icon-btn" type="button" aria-label="Pause polling">Pause</button>
+    </div>
+
+    <!-- telemetry crawl: mono, text-low -->
+    <div class="meta telemetry">PID <b id="proxyPid">—</b> · RSS <b id="proxyRss">—</b> · UP <b id="srvUptime">—</b> · UPD <b id="lastUpdate">never</b></div>
+  </div>
+</div>
+
+<!-- ============================================================= -->
+<!-- STATUS HERO (sodium-lamp verdict) -->
+<!-- ============================================================= -->
+<div class="hero-section">
+  <div id="statusHero">
+    <div class="hero-verdict">
+      <div class="hero-verdict-top">
+        <span id="statusHeroIcon"></span>
+        <span id="statusHeroText" data-i18n="hero.checking">Checking…</span>
+        <span class="hero-cursor" aria-hidden="true"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     KPI BAND — Paper "Gauges-group" (CPU + MEM, hairline-divided) + Network well.
+     NOTE (Paper 1:1): NOT one outer surface container. It is a flex row, gap 24:
+       (a) .kpi-gauges  = grow 2  → CPU instrument | MEM instrument (hairline between)
+       (b) .kpi-network = grow 1.8 → the sunk well (#0C0F13), its own steel/hair border.
+     Horizontal gutters come from .app (max-width 1360, 32px padding); no px-48 here.
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="kpi-band">
+
+  <!-- CPU + MEMORY instruments share the open board, divided by a hairline -->
+  <div class="kpi-gauges">
+
+    <!-- CPU instrument -->
+    <div class="instrument" id="cpuInstrument">
+      <div class="instrument-masthead">
+        <span class="card-label" data-i18n="card.cpu">CPU</span>
+        <span class="instrument-meta">peak <span id="cpuPeak">—</span></span>
+      </div>
       <div class="gauge-container">
         <div class="gauge">
-          <svg viewBox="0 0 36 36">
+          <svg class="gauge-arc" viewBox="0 0 36 36" aria-hidden="true">
             <circle class="track" cx="18" cy="18" r="15"/>
             <circle class="fill" id="cpuArc" cx="18" cy="18" r="15"/>
           </svg>
-          <div class="pct" style="color:var(--zig)" id="cpuPct">0%</div>
-        </div>
-        <div>
-          <div class="card-value" style="color:var(--text)" id="cpuVal">0<span style="font-size:18px;font-weight:400">%</span></div>
-          <div class="card-sub" data-i18n="card.cpuSub">utilization</div>
+          <svg class="gauge-ticks" viewBox="0 0 36 36" aria-hidden="true">
+            <line x1="6.61" y1="29.39" x2="5.62" y2="30.38"/>
+            <line x1="18" y1="2.5" x2="18" y2="1.1"/>
+            <line x1="29.39" y1="29.39" x2="30.38" y2="30.38"/>
+          </svg>
+          <div class="gauge-readout">
+            <div class="pct" id="cpuPct">0%</div>
+            <div class="gauge-unit">%</div>
+          </div>
+          <!-- preserved JS targets; kept off-screen so the Paper single-number dial reads clean -->
+          <div class="gauge-val-hidden card-value" id="cpuVal">0<span style="font-size:18px;font-weight:400">%</span></div>
         </div>
       </div>
       <div class="spark-wrap"><canvas id="cpuSpark"></canvas></div>
     </div>
 
-    <!-- Memory -->
-    <div class="card col-3">
-      <div class="card-label" data-i18n="card.memory">◈ Memory</div>
+    <!-- MEMORY instrument -->
+    <div class="instrument" id="memInstrument">
+      <div class="instrument-masthead">
+        <span class="card-label" data-i18n="card.memory">Memory</span>
+        <span class="instrument-meta" id="memSub">— / — MB</span>
+      </div>
       <div class="gauge-container">
         <div class="gauge">
-          <svg viewBox="0 0 36 36">
+          <svg class="gauge-arc" viewBox="0 0 36 36" aria-hidden="true">
             <circle class="track" cx="18" cy="18" r="15"/>
             <circle class="fill" id="memArc" cx="18" cy="18" r="15"/>
           </svg>
-          <div class="pct" style="color:var(--purple)" id="memPct">0%</div>
-        </div>
-        <div>
-          <div class="card-value" style="color:var(--text)" id="memVal">0<span style="font-size:14px;font-weight:400"> MB</span></div>
-          <div class="card-sub" id="memSub">— / — MB</div>
+          <svg class="gauge-ticks" viewBox="0 0 36 36" aria-hidden="true">
+            <line x1="6.61" y1="29.39" x2="5.62" y2="30.38"/>
+            <line x1="18" y1="2.5" x2="18" y2="1.1"/>
+            <line x1="29.39" y1="29.39" x2="30.38" y2="30.38"/>
+          </svg>
+          <div class="gauge-readout">
+            <div class="pct" id="memPct">0%</div>
+            <div class="gauge-unit">%</div>
+          </div>
+          <div class="gauge-val-hidden card-value" id="memVal">0<span style="font-size:14px;font-weight:400"> MB</span></div>
         </div>
       </div>
       <div class="spark-wrap"><canvas id="memSpark"></canvas></div>
     </div>
 
-    <!-- Network -->
-    <div class="card col-6">
-      <div class="card-label" data-i18n="card.network">◎ Network Throughput</div>
-      <div class="chart-wrap"><canvas id="netChart"></canvas></div>
-      <div class="chart-legend">
-        <span><div class="ldot" style="background:var(--blue)"></div>RX <b id="rxRate">—</b></span>
-        <span><div class="ldot" style="background:var(--zig)"></div>TX <b id="txRate">—</b></span>
-        <span style="margin-left:auto">↓<b id="rxTotal">—</b> ↑<b id="txTotal">—</b></span>
-      </div>
-    </div>
   </div>
 
-  <!-- Proxy stats -->
-  <div class="stat-row">
-    <div class="stat-cell">
-      <div class="val" style="color:var(--green)" id="pxActive">0</div>
-      <div class="lbl"><span data-i18n="stats.activeOf">Active /</span> <span id="pxMax">0</span></div>
+  <!-- NETWORK throughput well -->
+  <div class="kpi-network">
+    <div class="instrument-masthead">
+      <span class="card-label" data-i18n="card.network">Network Throughput</span>
+      <span class="card-label net-window">LAST 60S</span>
     </div>
-    <div class="stat-cell">
-      <div class="val" style="color:var(--cyan)" id="pxHs">0</div>
-      <div class="lbl" data-i18n="stats.handshakes">Handshakes</div>
+    <div class="net-legend">
+      <span class="net-legend-item">
+        <i class="ldot" style="background:var(--rx)"></i>
+        <span class="net-legend-tag">RX</span>
+        <span class="net-legend-val">
+          <!--ICON:arrow-down--><svg class="net-arrow" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--rx)" stroke-width="2.2" stroke-linecap="butt" stroke-linejoin="miter"><line x1="12" y1="5" x2="12" y2="17"/><polyline points="6,12 12,18 18,12"/></svg>
+          <b id="rxRate">—</b>
+        </span>
+      </span>
+      <span class="net-legend-item">
+        <i class="ldot" style="background:var(--tx)"></i>
+        <span class="net-legend-tag">TX</span>
+        <span class="net-legend-val">
+          <!--ICON:arrow-up--><svg class="net-arrow" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--tx)" stroke-width="2.2" stroke-linecap="butt" stroke-linejoin="miter"><line x1="12" y1="7" x2="12" y2="19"/><polyline points="6,12 12,6 18,12"/></svg>
+          <b id="txRate">—</b>
+        </span>
+      </span>
+      <span class="net-legend-totals">
+        <span class="net-total">
+          <!--ICON:arrow-down--><svg class="net-arrow dim" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="butt" stroke-linejoin="miter"><line x1="12" y1="5" x2="12" y2="17"/><polyline points="6,12 12,18 18,12"/></svg>
+          <b id="rxTotal">—</b>
+        </span>
+        <span class="net-total">
+          <!--ICON:arrow-up--><svg class="net-arrow dim" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="butt" stroke-linejoin="miter"><line x1="12" y1="7" x2="12" y2="19"/><polyline points="6,12 12,6 18,12"/></svg>
+          <b id="txTotal">—</b>
+        </span>
+      </span>
     </div>
-    <div class="stat-cell">
-      <div class="val" style="color:var(--text)" id="pxTotal">0</div>
-      <div class="lbl" data-i18n="stats.total">Total Connections</div>
-    </div>
-    <div class="stat-cell">
-      <div class="val" id="pxDrops" style="color:var(--text-muted)">0</div>
-      <div class="lbl" id="pxDropLbl">Drops</div>
-    </div>
+    <div class="chart-wrap"><canvas id="netChart"></canvas></div>
   </div>
 
-  <!-- Users -->
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     STAT STRIP — one surface-1 bar, 4 flex cells divided by steel hairlines.
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="stat-row">
+  <div class="stat-cell">
+    <div class="stat-val-line">
+      <span class="val" id="pxActive" style="color:var(--signal-go)">0</span>
+      <span class="stat-val-sub">/ <span id="pxMax">0</span></span>
+    </div>
+    <div class="lbl" data-i18n="stats.activeOf">ACTIVE / MAX</div>
+  </div>
+  <div class="stat-cell">
+    <div class="stat-val-line">
+      <span class="val" id="pxHs" style="color:var(--text-hi)">0</span>
+    </div>
+    <div class="lbl" data-i18n="stats.handshakes">HANDSHAKES</div>
+  </div>
+  <div class="stat-cell">
+    <div class="stat-val-line">
+      <span class="val" id="pxTotal" style="color:var(--text-hi)">0</span>
+    </div>
+    <div class="lbl" data-i18n="stats.total">TOTAL CONNECTIONS</div>
+  </div>
+  <div class="stat-cell">
+    <div class="stat-val-line">
+      <span class="val" id="pxDrops" style="color:var(--text-mid)">0</span>
+    </div>
+    <div class="lbl" id="pxDropLbl">DROPS</div>
+  </div>
+</div>
+
+<div class="body-grid">
+  <div class="body-left">
+<!-- Users -->
   <div class="users-card" id="usersCard" style="display:none">
-    <div class="users-head">
-      <div class="title" data-i18n="users.title">👥 Users</div>
-      <div class="users-head-right">
-        <div class="users-meta" id="usersMeta">—</div>
-        <button class="ui-btn add-user-btn" id="addUserBtn" type="button" data-i18n="users.add">+ Add User</button>
-      </div>
+    <!-- MASTHEAD: eyebrow flush-left · flex:1 hairline rule · right-aligned mono meta (no icon, no button here) -->
+    <div class="users-head section-masthead">
+      <div class="title" data-i18n="users.title">Users</div>
+      <div class="masthead-rule"></div>
+      <div class="users-meta" id="usersMeta">—</div>
     </div>
+
     <div class="users-note" id="usersNote">—</div>
 
     <!-- Add user form (hidden by default) -->
@@ -136,7 +222,7 @@
       <div class="form-row">
         <div class="form-field">
           <label data-i18n="users.who">Who is this for?</label>
-          <input id="newUserName" class="ui-input" type="text" data-i18n-ph="users.namePh" placeholder="e.g. Мама, dad, work 💼" autocomplete="off">
+          <input id="newUserName" class="ui-input" type="text" data-i18n-ph="users.namePh" placeholder="e.g. Мама, dad, work" autocomplete="off">
         </div>
         <div class="form-field">
           <label><span data-i18n="users.secret">Secret</span> <span class="form-hint" data-i18n="users.secretHint">(leave empty to auto-generate)</span></label>
@@ -151,19 +237,73 @@
     </div>
 
     <div class="users-list" id="usersList"></div>
+
+    <!-- Add-user action moved BELOW the list (Paper AddUser-wrap). #addUserBtn id preserved. -->
+    <div class="add-user-wrap">
+      <button class="ui-btn add-user-btn" id="addUserBtn" type="button"><!--ICON:plus--><span data-i18n="users.add">Add user</span></button>
+    </div>
   </div>
 
-  <!-- Routing & upstream -->
-  <div class="tunnel-card" id="routingCard" style="display:none">
-    <div class="tunnel-header">
-      <div class="tunnel-icon">🧭</div>
-      <div class="tunnel-title" data-i18n="routing.title">Routing &amp; Upstream</div>
-      <div class="badge" id="routingBadge"><div class="pulse-dot"></div><span id="routingStatus">—</span></div>
+<!-- ================= LIVE LOGS ================= -->
+<!-- This block lives inside the LEFT column of the body row, directly after the Users section.
+     Container keeps NO old card chrome (transparent, open section). -->
+<section class="logs-card" id="logsSection">
+
+  <!-- Masthead: eyebrow + steel rule + ws-badge (right) -->
+  <div class="logs-header section-masthead">
+    <span class="masthead-eyebrow" data-i18n="logs.title">Live Logs</span>
+    <span class="masthead-rule"></span>
+    <div class="ws-badge">
+      <span class="ws-dot off" id="wsDot"></span>
+      <span id="wsLabel">connecting…</span>
     </div>
-    <div class="routing-controls">
-      <button class="ui-btn" id="routingMiddleBtn" type="button">MiddleProxy: —</button>
-      <div class="routing-upstream-ctl">
-        <label for="routingUpstreamSelect" data-i18n="routing.upstream">Upstream</label>
+  </div>
+
+  <!-- Controls: level filter chips + search + auto-scroll + jump-latest -->
+  <div class="logs-controls">
+    <div class="log-filters">
+      <button class="ui-btn log-filter active" type="button" data-filter="error" data-i18n="logs.error">Error</button>
+      <button class="ui-btn log-filter active" type="button" data-filter="warn" data-i18n="logs.warn">Warn</button>
+      <button class="ui-btn log-filter active" type="button" data-filter="stats" data-i18n="logs.stats">Stats</button>
+    </div>
+    <div class="log-search-box">
+      <!--ICON:search-->
+      <input id="logSearch" class="log-search" type="search" data-i18n-ph="logs.searchPh" placeholder="Search logs" autocomplete="off">
+    </div>
+    <button class="ui-btn log-ctl-btn active" id="autoScrollBtn" type="button"><!--ICON:autoscroll--><span class="log-ctl-label">Auto-scroll: on</span></button>
+    <button class="ui-btn log-ctl-btn" id="jumpLatestBtn" type="button"><!--ICON:jump-latest--><span class="log-ctl-label" data-i18n="logs.jumpLatest">Jump to latest</span></button>
+  </div>
+
+  <!-- Sunk well: JS appends .log-line rows via addLine() -->
+  <div class="logs-body" id="logsBody"></div>
+
+</section>
+  </div>
+  <div class="body-rail">
+<!-- ════════════════ RIGHT RAIL ════════════════ -->
+<!-- These three sections live inside the Body row's right column:
+     <div class="body-row"> ... <div class="right-rail"> [PASTE HERE] </div> </div>
+     The .right-rail wrapper is owned by the Body-layout section; only the three
+     cards below belong to THIS part. Each card is an open "section" (no glass box):
+     a masthead (eyebrow + hairline rule + optional right meta/badge) then content. -->
+
+<!-- ── ROUTING & UPSTREAM ── -->
+<div class="rail-section" id="routingCard" style="display:none">
+  <div class="masthead">
+    <div class="masthead-eyebrow" data-i18n="routing.title">Routing &amp; Upstream</div>
+    <div class="masthead-rule"></div>
+    <div class="badge masthead-badge" id="routingBadge"><span class="signal-sq"></span><span id="routingStatus">—</span></div>
+  </div>
+
+  <!-- Inline controls, presented as detail-style rows (label-caps left, control right) -->
+  <div class="routing-controls">
+    <div class="ctl-row">
+      <span class="ctl-label">MiddleProxy</span>
+      <button class="ui-btn routing-toggle-btn" id="routingMiddleBtn" type="button">MiddleProxy: —</button>
+    </div>
+    <div class="ctl-row routing-upstream-ctl">
+      <label class="ctl-label" for="routingUpstreamSelect" data-i18n="routing.upstream">Upstream</label>
+      <div class="ctl-right">
         <select id="routingUpstreamSelect" class="ui-select">
           <option value="auto">auto</option>
           <option value="direct">direct</option>
@@ -173,140 +313,133 @@
         </select>
         <button class="ui-btn active" id="routingUpstreamApply" type="button" data-i18n="btn.apply">Apply</button>
       </div>
-      <div class="routing-extra-ctl" id="routingTunnelCtl" style="display:none">
-        <label for="routingTunnelIfaceSelect" data-i18n="routing.tunnelPin">Tunnel pin</label>
+    </div>
+    <div class="ctl-row routing-extra-ctl" id="routingTunnelCtl" style="display:none">
+      <label class="ctl-label" for="routingTunnelIfaceSelect" data-i18n="routing.tunnelPin">Tunnel pin</label>
+      <div class="ctl-right">
         <select id="routingTunnelIfaceSelect" class="ui-select"></select>
         <button class="ui-btn" id="routingTunnelIfaceApply" type="button" data-i18n="btn.pin">Pin</button>
       </div>
-      <div class="routing-extra-ctl" id="routingProxyCtl" style="display:none">
-        <label id="routingProxyHostLabel" for="routingProxyHost" data-i18n="routing.proxyHost">Proxy host</label>
+    </div>
+    <div class="ctl-row routing-extra-ctl routing-proxy-ctl" id="routingProxyCtl" style="display:none">
+      <label class="ctl-label" id="routingProxyHostLabel" for="routingProxyHost" data-i18n="routing.proxyHost">Proxy host</label>
+      <div class="ctl-right routing-proxy-grid">
         <input id="routingProxyHost" class="ui-input routing-host" type="text" placeholder="127.0.0.1" autocomplete="off">
-        <label for="routingProxyPort" data-i18n="routing.port">Port</label>
+        <label class="ctl-sublabel" for="routingProxyPort" data-i18n="routing.port">Port</label>
         <input id="routingProxyPort" class="ui-input routing-port" type="number" min="1" max="65535" placeholder="1080" autocomplete="off">
-        <label for="routingProxyUser" data-i18n="routing.user">User</label>
+        <label class="ctl-sublabel" for="routingProxyUser" data-i18n="routing.user">User</label>
         <input id="routingProxyUser" class="ui-input routing-user" type="text" placeholder="optional" autocomplete="off">
-        <label for="routingProxyPass" data-i18n="routing.pass">Pass</label>
+        <label class="ctl-sublabel" for="routingProxyPass" data-i18n="routing.pass">Pass</label>
         <input id="routingProxyPass" class="ui-input routing-pass" type="password" placeholder="optional" autocomplete="off">
         <button class="ui-btn" id="routingProxyApply" type="button" data-i18n="btn.setTarget">Set target</button>
       </div>
-      <div class="routing-action-note" id="routingActionNote"></div>
     </div>
-    <div class="tunnel-details">
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl">MiddleProxy</span>
-        <span class="tunnel-val" id="routingMiddle">—</span>
-      </div>
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl" data-i18n="routing.upstream">Upstream</span>
-        <span class="tunnel-val" id="routingUpstream">—</span>
-      </div>
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl" data-i18n="routing.target">Target</span>
-        <span class="tunnel-val" id="routingTarget">—</span>
-      </div>
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl" data-i18n="routing.policy">Policy</span>
-        <span class="tunnel-val" id="routingPolicy">—</span>
-      </div>
-    </div>
-    <div class="routing-list" id="routingTunnelsList"></div>
+    <div class="routing-action-note" id="routingActionNote"></div>
   </div>
 
-  <!-- Egress / Tunnel Quality -->
-  <div class="tunnel-card" id="egressCard" style="display:none">
-    <div class="tunnel-header">
-      <div class="tunnel-icon">📶</div>
-      <div class="tunnel-title" data-i18n="egress.title">Tunnel Quality</div>
+  <!-- Detail rows (label-caps left, value right) -->
+  <div class="detail-rows">
+    <div class="detail-row">
+      <span class="detail-label">MiddleProxy</span>
+      <span class="detail-val" id="routingMiddle">—</span>
     </div>
-    <div class="tunnel-details">
-      <div class="tunnel-stat">
-        <span class="tunnel-val" id="egressSummary">—</span>
-      </div>
+    <div class="detail-row">
+      <span class="detail-label" data-i18n="routing.upstream">Upstream</span>
+      <span class="detail-val" id="routingUpstream">—</span>
     </div>
-    <div class="egress-list" id="egressList"></div>
-  </div>
-
-  <!-- Masking health -->
-  <div class="tunnel-card" id="maskingCard" style="display:none">
-    <div class="tunnel-header">
-      <div class="tunnel-icon">🧰</div>
-      <div class="tunnel-title" data-i18n="mask.title">Masking Health</div>
-      <div class="badge" id="maskBadge"><div class="pulse-dot"></div><span id="maskStatus">—</span></div>
+    <div class="detail-row">
+      <span class="detail-label" data-i18n="routing.target">Target</span>
+      <span class="detail-val" id="routingTarget">—</span>
     </div>
-    <div class="tunnel-details">
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl" data-i18n="mask.mode">Mode</span>
-        <span class="tunnel-val" id="maskMode">—</span>
-      </div>
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl" data-i18n="mask.endpoint">Endpoint</span>
-        <span class="tunnel-val" id="maskTarget">—</span>
-      </div>
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl">Nginx</span>
-        <span class="tunnel-val" id="maskNginx">—</span>
-      </div>
-      <div class="tunnel-stat">
-        <span class="tunnel-lbl" data-i18n="mask.timer">Health Timer</span>
-        <span class="tunnel-val" id="maskTimer">—</span>
-      </div>
+    <div class="detail-row">
+      <span class="detail-label" data-i18n="routing.policy">Policy</span>
+      <span class="detail-val" id="routingPolicy">—</span>
     </div>
   </div>
 
-  <!-- Live logs -->
-  <div class="logs-card">
-    <div class="logs-header">
-      <div class="title" data-i18n="logs.title">▸ Live Logs</div>
-      <div class="ws-badge"><div class="ws-dot off" id="wsDot"></div><span id="wsLabel">connecting…</span></div>
-    </div>
-    <div class="logs-controls">
-      <div class="log-filters">
-        <button class="ui-btn log-filter active" type="button" data-filter="error" data-i18n="logs.error">Error</button>
-        <button class="ui-btn log-filter active" type="button" data-filter="warn" data-i18n="logs.warn">Warn</button>
-        <button class="ui-btn log-filter active" type="button" data-filter="stats" data-i18n="logs.stats">Stats</button>
-      </div>
-      <input id="logSearch" class="ui-input log-search" type="search" data-i18n-ph="logs.searchPh" placeholder="Search logs">
-      <button class="ui-btn active" id="autoScrollBtn" type="button">Auto-scroll: on</button>
-      <button class="ui-btn" id="jumpLatestBtn" type="button" data-i18n="logs.jumpLatest">Jump to latest</button>
-    </div>
-    <div class="logs-body" id="logsBody"></div>
+  <!-- Tunnel interfaces list (JS-rendered rows) -->
+  <div class="routing-list" id="routingTunnelsList"></div>
+</div>
+
+<!-- ── TUNNEL QUALITY (egress) ── -->
+<div class="rail-section" id="egressCard" style="display:none">
+  <div class="masthead">
+    <div class="masthead-eyebrow" data-i18n="egress.title">Tunnel Quality</div>
+    <div class="masthead-rule"></div>
+    <div class="masthead-meta" id="egressSummary">—</div>
   </div>
+  <!-- egress rows (JS-rendered) -->
+  <div class="egress-list" id="egressList"></div>
+</div>
 
-  <div class="footer">Built with <a href="https://ziglang.org" target="_blank">Zig</a> · proxy.sleep3r.ru</div>
-
-  <!-- Shared tooltip for all charts -->
-  <div id="chartTooltip" class="chart-tooltip"></div>
-
-  <!-- Delete confirmation modal -->
-  <div class="modal-overlay" id="deleteModal" style="display:none">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
-      <div class="modal-title" id="deleteModalTitle" data-i18n="modal.deleteUser">Delete User</div>
-      <div class="modal-body">
-        Are you sure you want to delete <b id="deleteUserName"></b>?
-        <br><span class="form-hint" data-i18n="modal.restartNote">The proxy will be restarted to apply changes.</span>
-      </div>
-      <div class="modal-actions">
-        <button class="ui-btn danger" id="deleteConfirm" type="button" data-i18n="btn.delete">Delete</button>
-        <button class="ui-btn" id="deleteCancel" type="button" data-i18n="btn.cancel">Cancel</button>
-      </div>
+<!-- ── MASKING ── -->
+<div class="rail-section" id="maskingCard" style="display:none">
+  <div class="masthead">
+    <div class="masthead-eyebrow" data-i18n="mask.title">Masking</div>
+    <div class="masthead-rule"></div>
+    <div class="badge masthead-badge" id="maskBadge"><span class="signal-sq"></span><span id="maskStatus">—</span></div>
+  </div>
+  <div class="detail-rows">
+    <div class="detail-row">
+      <span class="detail-label" data-i18n="mask.mode">Mode</span>
+      <span class="detail-val" id="maskMode">—</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-label" data-i18n="mask.endpoint">Endpoint</span>
+      <span class="detail-val" id="maskTarget">—</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-label">Nginx</span>
+      <span class="detail-val" id="maskNginx">—</span>
+    </div>
+    <div class="detail-row">
+      <span class="detail-label" data-i18n="mask.timer">Health timer</span>
+      <span class="detail-val" id="maskTimer">—</span>
     </div>
   </div>
+</div>
+  </div>
+</div>
 
-  <div class="modal-overlay" id="deleteTunnelModal" style="display:none">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteTunnelTitle">
-      <div class="modal-title" id="deleteTunnelTitle" data-i18n="modal.deleteTunnel">Delete Tunnel</div>
-      <div class="modal-body">
-        Delete <b id="deleteTunnelName"></b> from the tunnel pool?
-        <br><span class="form-hint">The interface will be stopped, config files removed, and proxy routing refreshed.</span>
-      </div>
-      <div class="modal-actions">
-        <button class="ui-btn danger" id="deleteTunnelConfirm" type="button">Delete</button>
-        <button class="ui-btn" id="deleteTunnelCancel" type="button">Cancel</button>
-      </div>
+<!-- ============================================================= -->
+<!-- FOOTER -->
+<!-- ============================================================= -->
+<div class="footer">
+  <div class="footer-inner">
+    <div class="footer-built">
+      <span class="footer-built-label">Built with</span>
+      <svg class="footer-zig" width="15" height="15" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><g fill="#F7A41D"><path d="M38.484 23.843l-15.06 18.405-7.529-11.712z"/><path d="M38.484 23.843l-10.876 9.203-4.183 9.202h-5.02v42.667h7.53l-9.203 4.183-6.693 14.222H0V23.843z"/><path d="M25.935 84.915L10.039 103.32l-6.693-9.202zM46.85 23.843l5.02 11.713-20.916 6.692z"/><path d="M46.85 23.843h46.013v18.405H30.954L46.85 32.21z"/><path d="M97.046 84.915L81.15 103.32l-5.856-10.875z"/><path d="M97.046 84.915l-13.386 7.53-2.51 10.875H35.137V84.915z"/><path d="M125.49 5.438L43.503 103.32 2.51 122.562l81.987-98.719zM117.96 23.843l-.836 15.06-15.059 4.182z"/><path d="M128 23.843v79.477H88.68l11.712-10.039 4.183-8.366h5.02v-41.83h-7.53l8.366-7.53 7.53-11.712z"/><path d="M104.575 84.915l4.183 12.55-20.078 5.855z"/></g></svg>
+      <a class="footer-built-link" href="https://ziglang.org" target="_blank" rel="noopener">Zig</a>
+    </div>
+    <div class="footer-host">proxy.sleep3r.ru</div>
+  </div>
+</div>
+
+<div id="chartTooltip" class="chart-tooltip"></div>
+
+<div class="modal-overlay" id="deleteModal" style="display:none">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
+    <div class="modal-title" id="deleteModalTitle" data-i18n="modal.deleteUser">Delete User</div>
+    <div class="modal-body">Are you sure you want to delete <b id="deleteUserName"></b>?<br><span class="form-hint" data-i18n="modal.restartNote">The proxy will be restarted to apply changes.</span></div>
+    <div class="modal-actions">
+      <button class="ui-btn danger" id="deleteConfirm" type="button" data-i18n="btn.delete">Delete</button>
+      <button class="ui-btn" id="deleteCancel" type="button" data-i18n="btn.cancel">Cancel</button>
     </div>
   </div>
 </div>
 
-<script src="/app.js?v=20260609"></script>
+<div class="modal-overlay" id="deleteTunnelModal" style="display:none">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="deleteTunnelTitle">
+    <div class="modal-title" id="deleteTunnelTitle" data-i18n="modal.deleteTunnel">Delete Tunnel</div>
+    <div class="modal-body">Delete <b id="deleteTunnelName"></b> from the tunnel pool?<br><span class="form-hint">The interface will be stopped, config files removed, and proxy routing refreshed.</span></div>
+    <div class="modal-actions">
+      <button class="ui-btn danger" id="deleteTunnelConfirm" type="button">Delete</button>
+      <button class="ui-btn" id="deleteTunnelCancel" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+
+</div>
+<script src="/app.js?v=20260610"></script>
 </body>
 </html>

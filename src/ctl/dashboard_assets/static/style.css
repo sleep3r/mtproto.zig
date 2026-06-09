@@ -692,3 +692,1074 @@ body::before, body::after { content: none; }
     transition-duration: 140ms !important;
   }
 }
+
+
+/* ═══════════════════ PAPER-LAYOUT CSS (section build) ═══════════════════ */
+<![CDATA[/* ───────────────────────────────────────────────────────────────
+   TOPBAR — bus-bar (h56, border-bottom steel, full-bleed band)
+   The band itself spans the viewport; its contents are padded by the
+   48px-ish gutter so brand sits flush-left and telemetry flush-right.
+   NOTE: this REPLACES the old `.header` rules (lines ~100-130 of
+   style.css). Remove `.header`, `.header-left`, `.header h1`,
+   `.header-right` blocks — keep `.zig-logo` / `.version-pill` but they
+   are re-declared below to the Paper values.
+   ─────────────────────────────────────────────────────────────── */
+.topbar {
+  height: 56px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 20px;
+  padding: 0 var(--gutter);
+  background: var(--ground);
+  border-bottom: 1px solid var(--border-steel);
+  margin-bottom: 0;            /* hero-section owns the top gap */
+}
+
+/* brand cluster: logo + wordmark + version chip */
+.topbar-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.zig-logo { width: 28px; height: 28px; flex-shrink: 0; display: block; }
+.zig-logo img, .zig-logo svg { width: 100%; height: 100%; display: block; }
+.topbar-wordmark { display: flex; align-items: baseline; gap: 7px; }
+.topbar-wordmark .wm {
+  font-family: var(--font-text);
+  font-size: 15px; font-weight: 600; letter-spacing: -0.01em; line-height: 18px;
+}
+.topbar-wordmark .accent { color: var(--accent); }
+.topbar-wordmark .dim { color: var(--text-mid); font-weight: 500; }
+.version-pill {
+  font-family: var(--font-mono);
+  font-size: 11px; font-weight: 500; line-height: 14px; letter-spacing: 0;
+  color: var(--text-low);
+  background: var(--surface-2);
+  border: 1px solid var(--border-steel);
+  border-radius: var(--radius-chip);
+  padding: 2px 6px;
+}
+.version-pill:empty { display: none; }
+
+/* right cluster */
+.topbar-right {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 20px; flex-wrap: wrap;
+}
+
+/* status / data badges = signal-square + word (no pills, no glow) */
+.badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 0; border: 0; background: none; border-radius: 0;
+  font-size: 13px; font-weight: 560; letter-spacing: 0.01em;
+  color: var(--signal-go);
+}
+.badge #proxyUp, .badge #dataBadgeText { color: var(--text-hi); }
+.badge.off { color: var(--signal-stop); }
+.badge.off #proxyUp { color: var(--signal-stop); }
+.data-badge { color: var(--text-mid); }
+.data-badge #dataBadgeText { color: var(--text-mid); }
+.data-badge.ok, .data-badge.ok #dataBadgeText { color: var(--signal-go); }
+.data-badge.stale, .data-badge.stale #dataBadgeText { color: var(--signal-stop); }
+.data-badge.paused, .data-badge.paused #dataBadgeText { color: var(--signal-caution); }
+.data-badge.syncing, .data-badge.syncing #dataBadgeText { color: var(--text-mid); }
+.sig-sq {
+  width: 8px; height: 8px; border-radius: var(--radius-chip);
+  background: currentColor; flex-shrink: 0; animation: none;
+}
+
+/* lang toggle — minimal ghost button, mono-ish caps */
+.lang-toggle {
+  height: 28px; padding: 0 9px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--text-hi);
+}
+
+/* poll controls */
+.poll-controls { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; }
+.poll-controls label {
+  font-size: 10.5px; font-weight: 620; text-transform: uppercase; letter-spacing: 0.17em;
+  color: var(--text-low);
+}
+.poll-select { height: 28px; padding: 0 10px; font-family: var(--font-mono); font-size: 12px; }
+/* pause/resume → square icon button */
+.poll-toggle.icon-btn {
+  height: 28px; width: 28px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text-mid); font-size: 0;            /* hide the i18n word, show svg only */
+}
+.poll-toggle.icon-btn svg { width: 14px; height: 14px; }
+.poll-toggle.icon-btn.active { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-glow); }
+
+/* telemetry crawl */
+.telemetry {
+  font-family: var(--font-mono); font-size: 12px; line-height: 16px;
+  color: var(--text-mid); white-space: nowrap;
+  font-variant-numeric: tabular-nums; font-feature-settings: 'tnum' 1;
+}
+.telemetry b { color: var(--text-mid); font-weight: 500; }
+
+/* ───────────────────────────────────────────────────────────────
+   STATUS HERO — the single sodium-lamp moment.
+   Fixed surface-1 background + steel border at all states; only the
+   signal-square + verdict text take the state colour (set by JS as an
+   inline `color` on #statusHero, inherited via currentColor).
+   REPLACES the old `#statusHero` block (lines ~194-213).
+   ─────────────────────────────────────────────────────────────── */
+.hero-section { padding: 32px var(--gutter) 0; }
+#statusHero {
+  display: flex; align-items: center; gap: 24px;
+  padding: 26px 30px;
+  border-radius: var(--radius-hero);
+  border: 1px solid var(--border-steel);
+  background: var(--surface-1);
+  color: var(--signal-go);          /* default state colour; JS overrides */
+}
+.hero-verdict { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.hero-verdict-top { display: flex; align-items: center; gap: 16px; }
+/* state signal-square: inherits the hero's currentColor */
+#statusHeroIcon {
+  width: 12px; height: 12px; border-radius: var(--radius-chip);
+  background: currentColor; flex-shrink: 0; display: inline-block;
+  font-size: 0;                     /* in case JS leaves a glyph behind */
+}
+/* the verdict itself — full-size Archivo, coloured by state */
+#statusHeroText {
+  font-family: var(--font-display);
+  font-size: 40px; font-weight: 640; letter-spacing: -0.018em; line-height: 44px;
+  color: currentColor;
+}
+/* 3×32 amber block cursor, blinks unless reduced-motion */
+.hero-cursor {
+  width: 3px; height: 32px; flex-shrink: 0;
+  background: var(--accent);
+  animation: heroCaret 1.1s steps(1) infinite;
+}
+@keyframes heroCaret { 0%,49% { opacity: 1; } 50%,100% { opacity: 0; } }
+
+/* ───────────────────────────────────────────────────────────────
+   FOOTER — hairline rule, "Built with [Zig] Zig" left / host mono right.
+   REPLACES the old `.footer` block (lines ~582-583).
+   ─────────────────────────────────────────────────────────────── */
+.footer { padding: 56px var(--gutter) 30px; border: 0; margin: 0; text-align: left; }
+.footer-inner {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-top: 20px; border-top: 1px solid var(--border-hair);
+}
+.footer-built { display: flex; align-items: center; gap: 8px; }
+.footer-built-label { font-family: var(--font-text); font-size: 12px; color: var(--text-low); }
+.footer-zig { width: 15px; height: 15px; flex-shrink: 0; display: block; }
+.footer-built-link {
+  font-family: var(--font-text); font-size: 12px; font-weight: 540;
+  color: var(--text-mid); text-decoration: none;
+}
+.footer-built-link:hover { color: var(--text-hi); }
+.footer-host {
+  font-family: var(--font-mono); font-size: 12px; line-height: 16px;
+  color: var(--text-low);
+}
+
+/* ── reduced motion ── */
+@media (prefers-reduced-motion: reduce) {
+  .hero-cursor { animation: none; opacity: 1; }
+}
+
+/* ── responsive: stack topbar on narrow viewports ── */
+@media (max-width: 820px) {
+  .topbar { height: auto; flex-direction: column; align-items: flex-start; gap: 12px; padding-top: 14px; padding-bottom: 14px; }
+  .topbar-right { width: 100%; justify-content: flex-start; }
+  .telemetry { white-space: normal; }
+  #statusHeroText { font-size: 30px; line-height: 34px; }
+  .footer-inner { flex-direction: column; align-items: flex-start; gap: 10px; }
+}]]>
+
+/* ════════════════════════════════════════════════════════════════════════
+   KPI BAND  — Paper "Bahnhof Console" v2
+   Flex row, gap 24. CPU+MEM live on the open board (hairline-divided);
+   the network throughput is a sunk well with its own steel/hair frame.
+   ════════════════════════════════════════════════════════════════════════ */
+.kpi-band {
+  display: flex;
+  gap: 24px;
+  align-items: stretch;
+  margin-bottom: 40px;
+}
+
+/* CPU + MEMORY share the board, divided by a hairline. grow 2 (Paper). */
+.kpi-gauges {
+  display: flex;
+  flex: 2 1 0%;
+  min-width: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--radius-surface);
+  overflow: hidden;
+}
+
+/* Each gauge instrument */
+.instrument {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-width: 0;
+  padding: 16px 22px;
+  gap: 12px;
+}
+.kpi-gauges .instrument + .instrument { border-left: 1px solid var(--border-hair); }
+
+/* Network throughput well. grow 1.8 (Paper). Sunk darker ground, steel top. */
+.kpi-network {
+  display: flex;
+  flex-direction: column;
+  flex: 1.8 1 0%;
+  min-width: 0;
+  padding: 16px 18px;
+  gap: 12px;
+  background: var(--well-rx);
+  border: 1px solid var(--border-hair);
+  border-top-color: var(--border-steel);
+  border-radius: var(--radius-surface);
+}
+
+.app.stale .instrument,
+.app.stale .kpi-network,
+.app.stale .stat-cell { opacity: 0.62; }
+
+/* ── Instrument masthead: eyebrow flush-left, mono meta flush-right ── */
+.instrument-masthead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-steel);
+}
+.kpi-network .instrument-masthead { border-bottom-color: var(--border-steel); }
+
+/* Eyebrow (caps text-low, NO icon). Overrides legacy .card-label box model. */
+.instrument-masthead .card-label {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: inline-block;
+  font-family: var(--font-text);
+  font-size: 10.5px;
+  font-weight: 620;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--text-low);
+  line-height: 14px;
+  white-space: nowrap;
+}
+.net-window { flex-shrink: 0; }
+
+.instrument-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-feature-settings: 'tnum' 1;
+  color: var(--text-low);
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+/* ── Radial gauge (270° arc, gap at 6 o'clock). 104px to match Paper. ──
+   viewBox 0 0 36 36 + r=15 is preserved so setGauge()'s 70.69/94.25
+   dasharray math keeps working unchanged. */
+.gauge-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 0;
+}
+.gauge {
+  width: 104px;
+  height: 104px;
+  position: relative;
+  flex-shrink: 0;
+}
+.gauge .gauge-arc {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(135deg);   /* 270° arc, gap parked at the bottom */
+}
+.gauge circle { fill: none; stroke-linecap: butt; }
+.gauge .track { stroke: var(--border-steel); stroke-width: 3; stroke-dasharray: 70.69 94.25; }
+.gauge .fill  { stroke: var(--signal-go); stroke-width: 3; stroke-dasharray: 0 94.25; }
+
+/* Three end/cardinal tick stubs — separate overlay so the arc transform
+   does not drag them around. */
+.gauge .gauge-ticks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.gauge .gauge-ticks line { stroke: var(--border-steel); stroke-width: 1.5; }
+
+/* Centered readout: big Archivo number + small "%" beneath. */
+.gauge-readout {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  pointer-events: none;
+}
+.gauge .pct {
+  position: static;
+  transform: none;
+  font-family: var(--font-display);
+  font-size: 30px;
+  font-weight: 620;
+  letter-spacing: -0.018em;
+  line-height: 30px;
+  font-feature-settings: 'tnum' 1;
+  color: var(--text-hi) !important;
+}
+.gauge-unit {
+  font-family: var(--font-text);
+  font-size: 10.5px;
+  font-weight: 620;
+  line-height: 12px;
+  color: var(--text-low);
+}
+/* JS still writes #cpuVal/#memVal; keep them present but out of the dial. */
+.gauge-val-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── Sparkline (canvas needs a sized parent for getBoundingClientRect) ── */
+.spark-wrap {
+  height: 34px;
+  margin-top: auto;
+  position: relative;
+  border-top: 1px solid var(--border-hair);
+}
+.spark-wrap canvas { width: 100% !important; height: 100% !important; display: block; }
+
+/* ── Network legend ── */
+.net-legend {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+.net-legend-item { display: flex; align-items: center; gap: 8px; }
+.ldot { width: 8px; height: 8px; border-radius: 0; flex-shrink: 0; }
+.net-legend-tag {
+  font-family: var(--font-text);
+  font-size: 10.5px;
+  font-weight: 620;
+  letter-spacing: 0.14em;
+  color: var(--text-mid);
+  line-height: 14px;
+}
+.net-legend-val { display: flex; align-items: center; gap: 5px; }
+.net-arrow { flex-shrink: 0; display: block; }
+.net-arrow.dim { color: var(--text-low); }
+.net-legend-val b,
+.net-total b {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  font-feature-settings: 'tnum' 1;
+  color: var(--text-hi);
+}
+.net-legend-totals {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+}
+.net-total { display: flex; align-items: center; gap: 4px; color: var(--text-low); }
+.net-total b { color: var(--text-mid); }
+
+/* ── Network chart (canvas self-sizes against this 150px box) ── */
+.chart-wrap {
+  height: 150px;
+  position: relative;
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+.chart-wrap canvas { width: 100% !important; height: 100% !important; display: block; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   STAT STRIP — one surface-1 bar, 4 flex cells, steel hairline dividers.
+   ════════════════════════════════════════════════════════════════════════ */
+.stat-row {
+  display: flex;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--radius-surface);
+  overflow: hidden;
+  margin-bottom: 40px;
+}
+.stat-cell {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  gap: 5px;
+  padding: 16px 22px;
+  text-align: left;
+}
+.stat-cell + .stat-cell { border-left: 1px solid var(--border-steel); }
+
+.stat-val-line { display: flex; align-items: baseline; gap: 8px; }
+.stat-cell .val {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.018em;
+  line-height: 26px;
+  font-feature-settings: 'tnum' 1;
+  color: var(--text-hi);
+}
+.stat-val-sub {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-feature-settings: 'tnum' 1;
+  color: var(--text-mid);
+  line-height: 16px;
+}
+.stat-cell .lbl {
+  font-family: var(--font-text);
+  font-size: 10.5px;
+  font-weight: 620;
+  text-transform: uppercase;
+  letter-spacing: 0.17em;
+  color: var(--text-low);
+  line-height: 14px;
+}
+
+/* ── Motion (respects prefers-reduced-motion via the existing global guard) ── */
+.gauge .fill { transition: stroke-dasharray 450ms var(--ease-out, ease), stroke 300ms var(--ease-out, ease); }
+
+/* ── Responsive: stack the band, two-up the stat strip ── */
+@media (max-width: 900px) {
+  .kpi-band { flex-direction: column; }
+  .kpi-gauges, .kpi-network { flex: 1 1 auto; }
+}
+@media (max-width: 560px) {
+  .kpi-gauges { flex-direction: column; }
+  .kpi-gauges .instrument + .instrument { border-left: 0; border-top: 1px solid var(--border-hair); }
+  .stat-row { flex-wrap: wrap; }
+  .stat-cell { flex: 1 1 50%; }
+  .stat-cell:nth-child(odd) + .stat-cell { border-left: 1px solid var(--border-steel); }
+  .stat-cell:nth-child(n+3) { border-top: 1px solid var(--border-steel); }
+}
+
+/* ── Masthead section rule (shared): eyebrow · flex:1 hairline · right meta ── */
+.users-head, .tunnel-header, .logs-header {
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 0 12px 0; border-bottom: 1px solid var(--border-steel);
+}
+.users-head .title, .tunnel-title, .logs-header .title {
+  font-family: var(--font-text);
+  font-size: 13px; font-weight: 620; text-transform: uppercase; letter-spacing: 0.15em;
+  color: var(--text-mid); white-space: nowrap; flex-shrink: 0;
+}
+/* the flex:1 hairline rule that separates eyebrow from right-aligned meta */
+.section-masthead { gap: 16px; }
+.section-masthead .masthead-rule { flex: 1 1 0; height: 1px; background: var(--border-steel); }
+.users-meta {
+  font-size: 12px; color: var(--text-low); font-family: var(--font-mono);
+  flex-shrink: 0; white-space: nowrap;
+}
+
+/* ── Cards become open sections, not glass boxes ── */
+.users-card, .tunnel-card, .logs-card {
+  background: transparent; border: 0; border-radius: 0;
+  margin-bottom: 40px; overflow: visible;
+}
+
+.users-note { padding: 12px 2px 0; font-size: 12px; color: var(--text-low); font-family: var(--font-mono); }
+.users-list { display: flex; flex-direction: column; }
+
+/* ── User row (timetable baseline grid) ── */
+.user-row {
+  display: grid;
+  grid-template-columns: 36px minmax(140px, 1.2fr) 104px minmax(0, 2fr) auto;
+  gap: 14px; align-items: center;
+  padding: 0 2px; height: 50px;
+  border-bottom: 1px solid var(--border-hair);
+  transition: background 0.12s;
+}
+.user-row:hover { background: var(--surface-2); }
+
+/* col 1: toggle slot (fixed 36, never shrinks) */
+.user-name .user-toggle-switch { flex-shrink: 0; }
+
+/* col 2: name + sessions badge */
+.user-name {
+  font-family: var(--font-text);
+  font-size: 14px; color: var(--text-hi); font-weight: 540; letter-spacing: -0.003em;
+  display: flex; align-items: center; gap: 9px; min-width: 0; overflow: hidden;
+}
+.user-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-sessions {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 19px; height: 18px; padding: 1px 6px;
+  border-radius: var(--radius-chip);
+  font-family: var(--font-mono); font-size: 11px; font-weight: 500;
+  background: var(--signal-go-fill); color: var(--signal-go);
+  flex-shrink: 0;
+}
+.user-sessions.zero { background: var(--surface-2); color: var(--text-low); }
+
+/* col 3: route — signal-square + word */
+.user-route { display: flex; align-items: center; min-width: 0; }
+.user-direct-toggle {
+  font-size: 13px !important; font-weight: 540; text-transform: none; letter-spacing: 0;
+  padding: 0 0 0 16px !important; height: auto !important;
+  border: 0 !important; background: transparent !important; border-radius: 0 !important;
+  cursor: pointer; position: relative; color: var(--text-mid) !important;
+  display: inline-flex; align-items: center;
+}
+.user-direct-toggle::before {
+  content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 8px; height: 8px; border-radius: var(--radius-chip); background: var(--signal-idle);
+}
+.user-direct-toggle.on::before { background: var(--signal-go); }
+.user-direct-toggle:hover { color: var(--text-hi) !important; }
+
+/* col 4: link (mono, truncated) */
+.user-link {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--text-mid);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+
+/* col 5: actions — fixed-width slots, always visible (no hover-reveal) */
+.user-actions { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; flex-shrink: 0; }
+.user-actions .ui-btn {
+  height: 28px; font-size: 11px; padding: 0 9px; font-family: var(--font-mono);
+  border-radius: var(--radius-ctl); color: var(--text-mid); background: transparent;
+}
+.user-actions .ui-btn:hover { color: var(--text-hi); background: var(--surface-2); border-color: var(--border-steel-bright); }
+.user-actions .ui-btn:disabled { opacity: 0.4; cursor: default; }
+/* icon-only square buttons (share QR + delete) keep a 30px square footprint */
+.user-share, .user-delete {
+  width: 30px; padding: 0 !important;
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.user-share svg, .user-delete svg { width: 15px; height: 15px; display: block; }
+/* delete: amber/red ink, always visible (Paper shows it on every row) */
+.user-delete {
+  color: var(--signal-stop) !important;
+  border-color: rgba(208, 106, 91, 0.4) !important;
+  background: transparent !important;
+  opacity: 1;
+}
+.user-delete:hover { background: var(--signal-stop-fill) !important; border-color: var(--signal-stop) !important; }
+.user-delete svg { color: var(--signal-stop); }
+.user-share svg { color: currentColor; }
+
+/* disabled user row */
+.user-empty { padding: 16px 2px; color: var(--text-low); font-size: 13px; }
+.user-row.disabled { opacity: 0.55; }
+.user-row.disabled .user-link { font-style: italic; color: var(--text-low); }
+.user-row.disabled .user-name-text { color: var(--text-mid); }
+
+/* ── Toggle (squared hardware switch) ── */
+.user-toggle-switch {
+  position: relative; display: inline-block;
+  width: 36px; height: 20px; flex-shrink: 0;
+  vertical-align: middle; cursor: pointer;
+}
+.user-toggle-switch input { opacity: 0; width: 0; height: 0; }
+.user-toggle-slider {
+  position: absolute; inset: 0;
+  background: var(--well); border: 1px solid var(--border-steel);
+  border-radius: var(--radius-ctl); transition: background 0.18s, border-color 0.18s;
+}
+.user-toggle-slider::before {
+  content: ''; position: absolute; height: 14px; width: 14px; left: 2px; top: 2px;
+  background: var(--surface-2); border-radius: var(--radius-chip);
+  transition: transform 0.18s, background 0.18s;
+}
+.user-toggle-switch input:checked + .user-toggle-slider { background: var(--signal-go-fill); border-color: var(--signal-go); }
+.user-toggle-switch input:checked + .user-toggle-slider::before { transform: translateX(16px); background: var(--signal-go); }
+
+/* ── Add-user button (now a separate row below the list, pt 16) ── */
+.add-user-wrap { display: flex; padding-top: 16px; }
+.add-user-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 32px; padding: 0 14px !important;
+  color: var(--text-hi) !important; border-color: var(--border-steel) !important;
+  background: transparent !important; font-weight: 540 !important; font-size: 13px;
+}
+.add-user-btn svg { width: 14px; height: 14px; display: block; color: var(--text-mid); flex-shrink: 0; }
+.add-user-btn:hover { border-color: var(--border-steel-bright) !important; background: var(--surface-2) !important; }
+.add-user-btn:hover svg { color: var(--text-hi); }
+
+/* ── Add user form ── */
+.add-user-form { padding: 16px 2px; border-bottom: 1px solid var(--border-hair); background: transparent; }
+.form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.form-field { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 160px; }
+.form-field label { font-size: 10.5px; font-weight: 620; text-transform: uppercase; letter-spacing: 0.14em; color: var(--text-low); }
+.form-field .ui-input { height: 32px; font-size: 13px; width: 100%; }
+.form-hint { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--text-low); }
+.form-actions { display: flex; gap: 6px; align-items: center; }
+.form-actions .ui-btn { height: 32px; font-size: 13px; }
+.form-status { margin-top: 8px; font-size: 12px; min-height: 16px; }
+.form-status.error { color: var(--signal-stop); }
+.form-status.info { color: var(--text-mid); }
+
+/* ── Responsive: stack the row on narrow screens ── */
+@media (max-width: 760px) {
+  .user-row { grid-template-columns: 1fr; gap: 8px; height: auto; padding: 12px 2px; }
+  .user-link { white-space: normal; word-break: break-all; }
+  .user-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .form-row { flex-direction: column; }
+}
+
+/* reduced-motion: kill the toggle/hover transitions */
+@media (prefers-reduced-motion: reduce) {
+  .user-row, .user-toggle-slider, .user-toggle-slider::before,
+  .user-actions .ui-btn, .add-user-btn { transition: none !important; }
+}
+
+<![CDATA[/* ============================================================================
+   LIVE LOGS  — Paper "Bahnhof Console" 1:1
+   Section is an open (transparent) block; masthead rule, sunk well.
+   ========================================================================== */
+
+/* Open section wrapper (shared look with users/routing sections) */
+.logs-card {
+  background: transparent; border: 0; border-radius: 0;
+  display: flex; flex-direction: column; gap: 14px;
+  margin: 0; overflow: visible;
+}
+
+/* ── Masthead: eyebrow + flex rule + right meta ─────────────────────────── */
+.logs-header.section-masthead {
+  display: flex; align-items: center; gap: 16px;
+  padding: 0; border: 0;                 /* rule is the flex hairline, not a border */
+}
+.section-masthead .masthead-eyebrow {
+  font-family: var(--font-text);
+  font-size: 13px; font-weight: 620; letter-spacing: 0.15em;
+  text-transform: uppercase; color: var(--text-mid);
+  white-space: nowrap; flex-shrink: 0; line-height: 16px;
+}
+.section-masthead .masthead-rule {
+  flex: 1 1 0; height: 1px; background: var(--border-steel); min-width: 24px;
+}
+/* ws-badge sits at the right end of the rule */
+.logs-header .ws-badge {
+  display: inline-flex; align-items: center; gap: 7px;
+  flex-shrink: 0; white-space: nowrap;
+  font-family: var(--font-mono); font-size: 12px; font-weight: 400;
+  line-height: 16px; color: var(--text-low);
+  font-feature-settings: 'tnum' 1;
+}
+.ws-dot { width: 8px; height: 8px; border-radius: var(--radius-chip); flex-shrink: 0; }
+.ws-dot.on  { background: var(--signal-go); }
+.ws-dot.off { background: var(--signal-caution); }
+
+/* ── Controls row ───────────────────────────────────────────────────────── */
+.logs-controls {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 0;
+}
+.log-filters { display: inline-flex; align-items: center; gap: 8px; }
+
+/* Level filter chip — h26, r2, mono caps; active = level-coloured fill */
+.log-filter {
+  height: 26px; padding: 0 10px;
+  font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  border-radius: var(--radius-chip);
+  display: inline-flex; align-items: center;
+}
+.log-filter:not(.active) {
+  color: var(--text-low); border-color: var(--border-hair); background: transparent;
+}
+.log-filter.active[data-filter="error"] { color: var(--signal-stop);    border-color: rgba(208,106,91,0.4); background: var(--signal-stop-fill); }
+.log-filter.active[data-filter="warn"]  { color: var(--signal-caution); border-color: rgba(201,162,75,0.4); background: var(--signal-caution-fill); }
+.log-filter.active[data-filter="stats"] { color: var(--signal-go);      border-color: rgba(111,181,138,0.4); background: var(--signal-go-fill); }
+
+/* Search — flex-grow, well bg, steel border, leading search icon */
+.log-search-box {
+  flex: 1 1 0; min-width: 160px;
+  display: flex; align-items: center; gap: 8px;
+  height: 32px; padding: 0 10px;
+  background: var(--well);
+  border: 1px solid var(--border-steel);
+  border-radius: var(--radius-ctl);
+}
+.log-search-box svg { flex-shrink: 0; color: var(--text-low); }
+.log-search-box .log-search {
+  flex: 1 1 0; min-width: 0;
+  height: 100%; padding: 0; border: 0; background: transparent;
+  color: var(--text-hi);
+  font-family: var(--font-text); font-size: 14px; font-weight: 400; line-height: 18px;
+  outline: none;
+}
+.log-search-box .log-search::placeholder { color: var(--text-low); }
+.log-search-box .log-search::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+.log-search-box:focus-within { border-color: var(--border-steel-bright); }
+
+/* Auto-scroll / jump buttons — h32, r3, icon + label, steel border */
+.log-ctl-btn {
+  height: 32px; padding: 0 11px;
+  display: inline-flex; align-items: center; gap: 7px;
+  flex-shrink: 0;
+  font-family: var(--font-text); font-size: 14px; font-weight: 540;
+  border-radius: var(--radius-ctl); border: 1px solid var(--border-steel);
+  color: var(--text-mid);
+}
+.log-ctl-btn svg { flex-shrink: 0; }
+.log-ctl-btn .log-ctl-label { white-space: nowrap; line-height: 18px; }
+.log-ctl-btn.active { color: var(--accent); border-color: var(--accent-dim); background: var(--accent-glow); }
+.log-ctl-btn.active svg { color: var(--accent); }
+
+/* ── Sunk well ──────────────────────────────────────────────────────────── */
+.logs-body {
+  height: 390px; overflow-y: auto;
+  display: flex; flex-direction: column;
+  padding: 10px 0;
+  background: var(--well);                 /* #0E1115 */
+  border: 1px solid var(--border-hair);
+  border-top-color: var(--border-steel);   /* steel cap, hair sides/bottom */
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 16px;
+  font-feature-settings: 'tnum' 1;
+  scroll-behavior: smooth;
+}
+.logs-body::-webkit-scrollbar { width: 6px; }
+.logs-body::-webkit-scrollbar-track { background: transparent; }
+.logs-body::-webkit-scrollbar-thumb { background: var(--border-steel); border-radius: 0; }
+
+/* ── Log line (emitted by addLine) ─────────────────────────────────────── */
+.log-line {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 3px 16px;
+  transition: background 0.1s;
+}
+.log-line:hover { background: var(--surface-1); }
+
+.log-ts {
+  flex-shrink: 0; width: 60px;
+  color: var(--text-low); font-size: 12.5px; line-height: 16px;
+  user-select: none;
+}
+
+/* Level chip is rendered by CSS ::before on .log-msg, never by JS.
+   52px fixed flex slot keeps every message column aligned. */
+.log-msg {
+  flex: 1 1 0; min-width: 0;
+  color: var(--text-mid); font-size: 12.5px; line-height: 16px;
+  word-break: break-word;
+}
+.log-msg::before {
+  content: 'INFO';
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 52px; padding: 2px 0; margin-right: 12px;
+  border-radius: var(--radius-chip);
+  font-size: 10px; font-weight: 600; line-height: 12px; letter-spacing: 0.04em;
+  vertical-align: 1px;
+  color: var(--signal-idle); background: var(--signal-idle-fill);
+}
+.log-line.info  .log-msg            { color: var(--text-mid); }
+.log-line.info  .log-msg::before    { content: 'INFO';  color: var(--signal-idle);    background: var(--signal-idle-fill); }
+.log-line.stats .log-msg::before    { content: 'STATS'; color: var(--signal-go);      background: var(--signal-go-fill); }
+.log-line.drops .log-msg::before    { content: 'DROPS'; color: var(--signal-caution); background: var(--signal-caution-fill); }
+.log-line.warn  .log-msg::before    { content: 'WARN';  color: var(--signal-caution); background: var(--signal-caution-fill); }
+.log-line.error .log-msg::before    { content: 'ERROR'; color: var(--signal-stop);    background: var(--signal-stop-fill); }
+
+/* fresh-line entrance (respects reduced motion below) */
+.log-line.fresh { animation: logSlideIn 0.25s ease; }
+@keyframes logSlideIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .logs-body { scroll-behavior: auto; }
+  .log-line.fresh { animation: none; }
+}]]>
+
+/* ════════════════════════════════════════════════════════════════════════
+   RIGHT RAIL — Routing & Upstream · Tunnel Quality · Masking
+   Open "sections" (no glass box). Layout = flex + gap + padding only.
+   Tokens reused: --surface-*, --border-*, --text-*, --signal-*, fonts, radii.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Each card is a flat section in the rail; spacing between them is the rail's gap.
+   .tunnel-card kept as alias so existing `.app.stale .tunnel-card` opacity rule
+   still applies — add .rail-section to the same elements (done in static HTML)
+   OR keep the legacy selector below. */
+.rail-section {
+  background: transparent; border: 0; border-radius: 0;
+  display: flex; flex-direction: column; gap: 6px;
+  margin-bottom: 36px; overflow: visible; width: 100%;
+}
+.rail-section:last-child { margin-bottom: 0; }
+.app.stale .rail-section { opacity: 0.62; }
+
+/* ── Masthead: eyebrow flush-left · flex:1 hairline rule · right meta/badge ── */
+.masthead {
+  display: flex; align-items: center; gap: 14px;
+  padding-bottom: 12px; width: 100%;
+}
+.masthead-eyebrow {
+  font-family: var(--font-text);
+  font-size: 13px; font-weight: 620; text-transform: uppercase; letter-spacing: 0.15em;
+  color: var(--text-mid); white-space: nowrap; flex-shrink: 0;
+}
+.masthead-rule { flex: 1 1 0%; height: 1px; background: var(--border-steel); }
+.masthead-meta {
+  flex-shrink: 0; font-family: var(--font-mono); font-size: 12px;
+  color: var(--text-low); white-space: nowrap;
+}
+/* badge sitting at the right end of a masthead (routing / masking) */
+.masthead-badge { flex-shrink: 0; margin-left: 0; }
+
+/* signal square used inside masthead badges (replaces legacy .pulse-dot) */
+.badge .signal-sq {
+  width: 8px; height: 8px; border-radius: var(--radius-chip);
+  background: var(--signal-go); flex-shrink: 0; display: inline-block;
+}
+.badge.off .signal-sq { background: var(--signal-stop); }
+.badge { display: inline-flex; align-items: center; gap: 7px; }
+
+/* ── Shared detail rows (label-caps left, value right, hairline divided) ── */
+.detail-rows { display: flex; flex-direction: column; }
+.detail-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 11px 2px; border-bottom: 1px solid var(--border-hair);
+}
+.detail-row:last-child { border-bottom: 0; }
+.detail-label {
+  font-family: var(--font-text);
+  font-size: 10.5px; font-weight: 620; text-transform: uppercase; letter-spacing: 0.17em;
+  color: var(--text-low); flex-shrink: 0;
+}
+.detail-val {
+  font-family: var(--font-mono); font-size: 12.5px; color: var(--text-hi);
+  font-feature-settings: 'tnum' 1;
+  text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* a value that is a state word with a leading signal square */
+.detail-val .signal-sq {
+  width: 8px; height: 8px; border-radius: var(--radius-chip);
+  background: var(--signal-idle); display: inline-block; vertical-align: 1px;
+  margin-right: 8px; flex-shrink: 0;
+}
+
+/* ── ROUTING controls (presented as detail-ish rows) ── */
+.routing-controls { display: flex; flex-direction: column; }
+.ctl-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 9px 2px; border-bottom: 1px solid var(--border-hair);
+}
+.ctl-label {
+  font-family: var(--font-text);
+  font-size: 10.5px; font-weight: 620; text-transform: uppercase; letter-spacing: 0.17em;
+  color: var(--text-low); flex-shrink: 0;
+}
+.ctl-right { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.ctl-sublabel {
+  font-family: var(--font-text); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-low);
+}
+/* MiddleProxy toggle button — quiet, becomes amber-ish ink when on (.active via JS) */
+.routing-toggle-btn { font-family: var(--font-mono); font-size: 12px; height: 28px; }
+/* proxy host/port/user/pass collapse to a tidy wrapping grid in the narrow rail */
+.routing-proxy-ctl { align-items: flex-start; flex-direction: column; gap: 8px; }
+.routing-proxy-grid {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  width: 100%; justify-content: flex-start;
+}
+.routing-host { width: 100%; }
+.routing-port { width: 76px; }
+.routing-user, .routing-pass { width: 108px; }
+.routing-action-note {
+  font-size: 12px; color: var(--text-low); min-height: 0;
+  padding: 4px 2px 0; font-family: var(--font-mono);
+}
+.routing-action-note:empty { padding: 0; }
+.routing-action-note.error { color: var(--signal-stop); }
+.routing-action-note.ok { color: var(--signal-go); }
+
+/* ── ROUTING tunnel list (JS rows) — vertical stack, hairline divided ── */
+.routing-list { display: flex; flex-direction: column; }
+.routing-row {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 2px; border-bottom: 1px solid var(--border-hair);
+}
+.routing-row:last-child { border-bottom: 0; }
+.routing-row-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.routing-iface {
+  font-family: var(--font-mono); font-size: 13px; color: var(--text-hi);
+  display: inline-flex; align-items: center; gap: 9px; min-width: 0;
+}
+.routing-iface-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.routing-tag {
+  font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em;
+  color: var(--text-low); border: 0; border-radius: 0; padding: 0; flex-shrink: 0;
+}
+/* state word sits at the right of the top line, signal-square in front */
+.routing-state {
+  font-family: var(--font-text); font-size: 13px; font-weight: 560;
+  display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+.routing-state::before {
+  content: ''; width: 8px; height: 8px; border-radius: var(--radius-chip);
+  background: var(--signal-idle); flex-shrink: 0;
+}
+.routing-state.on { color: var(--signal-go); }
+.routing-state.on::before { background: var(--signal-go); }
+.routing-state.mid { color: var(--signal-caution); }
+.routing-state.mid::before { background: var(--signal-caution); }
+.routing-state.off { color: var(--signal-stop); }
+.routing-state.off::before { background: var(--signal-stop); }
+/* second line: meta (left) + xfer (right) */
+.routing-row-bottom { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.routing-meta {
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-mid);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.routing-xfer {
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-low);
+  white-space: nowrap; flex-shrink: 0; font-feature-settings: 'tnum' 1;
+}
+.routing-actions { display: flex; justify-content: flex-end; }
+.routing-actions .ui-btn { height: 26px; font-size: 11px; padding: 0 9px; font-family: var(--font-mono); }
+.routing-actions .routing-delete {
+  width: 28px; padding: 0 !important; display: inline-flex; align-items: center; justify-content: center;
+}
+.routing-actions .routing-delete svg { width: 15px; height: 15px; }
+.routing-empty { padding: 12px 2px; font-size: 12px; color: var(--text-low); font-family: var(--font-mono); }
+
+/* ── TUNNEL QUALITY (egress) — vertical stacked rows ── */
+.egress-list { display: flex; flex-direction: column; }
+.egress-row {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 2px; border-bottom: 1px solid var(--border-hair);
+  background: transparent; border-radius: 0;
+}
+.egress-row:last-child { border-bottom: 0; }
+.egress-row.is-bottleneck { background: transparent; border-color: var(--border-hair); }
+/* line 1: signal-square + iface + tag (left), quality word (right) */
+.egress-row-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.egress-iface {
+  display: inline-flex; align-items: center; gap: 9px; min-width: 0;
+  font-family: var(--font-mono); font-size: 13px; color: var(--text-hi); font-weight: 400;
+}
+.egress-iface .signal-sq {
+  width: 9px; height: 9px; border-radius: var(--radius-chip);
+  background: var(--signal-idle); flex-shrink: 0; display: inline-block;
+}
+.egress-iface .egress-iface-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* color the leading square by quality (applied on .egress-iface via state class) */
+.egress-iface.q-good .signal-sq { background: var(--signal-go); }
+.egress-iface.q-degraded .signal-sq { background: var(--signal-caution); }
+.egress-iface.q-poor .signal-sq { background: var(--signal-stop); }
+.egress-iface.q-up .signal-sq { background: var(--signal-go); }
+.egress-iface.q-down .signal-sq,
+.egress-iface.q-unknown .signal-sq { background: var(--signal-idle); }
+/* the quality word at the right — colored by quality, no chip background */
+.egress-quality {
+  font-family: var(--font-text); font-size: 13px; font-weight: 560;
+  padding: 0; border-radius: 0; background: transparent; text-align: right; flex-shrink: 0;
+}
+.egress-quality-good { color: var(--signal-go); }
+.egress-quality-degraded { color: var(--signal-caution); }
+.egress-quality-poor { color: var(--signal-stop); }
+.egress-quality-up { color: var(--signal-go); }
+.egress-quality-down { color: var(--signal-stop); }
+.egress-quality-unknown { color: var(--text-mid); }
+/* line 2: metrics in one mono string (rtt · loss · hs). Status word folded in by JS. */
+.egress-metrics { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.egress-stats {
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-mid);
+  font-feature-settings: 'tnum' 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.egress-row.q-down .egress-stats,
+.egress-row.q-unknown .egress-stats { color: var(--text-low); }
+/* the individual hidden slots kept for back-compat & per-metric tooltips */
+.egress-status, .egress-rtt, .egress-loss, .egress-hs { display: none; }
+/* line 3: quality bar (track + colored fill) */
+.egress-bar { height: 3px; width: 100%; background: var(--surface-3); flex-shrink: 0; }
+.egress-bar-fill { height: 3px; width: 0; background: var(--signal-idle); transition: width 140ms ease; }
+.egress-bar-fill.q-good { background: var(--signal-go); }
+.egress-bar-fill.q-degraded { background: var(--signal-caution); }
+.egress-bar-fill.q-poor { background: var(--signal-stop); }
+.egress-bar-fill.q-up { background: var(--signal-go); }
+.egress-bar-fill.q-down { background: var(--signal-stop); }
+.egress-bar-fill.q-unknown { background: var(--signal-idle); }
+/* optional bottleneck line (warning icon + caution text), spans the row */
+.egress-bottleneck {
+  display: flex; align-items: center; gap: 7px;
+  font-family: var(--font-text); font-size: 12px; font-weight: 540; color: var(--signal-caution);
+}
+.egress-bottleneck svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+/* motion respects reduced-motion (handled globally); local transitions kept subtle */
+.routing-row, .egress-row { transition: background 140ms ease; }
+@media (prefers-reduced-motion: reduce) {
+  .egress-bar-fill, .routing-row, .egress-row { transition: none; }
+}
+
+/* Generic icon sizing — applied to any inline SVG dropped into a slot.
+   Icons are authored at 24x24 but render crisp at 14-18px. */
+.icon,
+.ui-btn svg,
+.user-share svg,
+.user-delete svg,
+.routing-delete svg,
+.masthead svg,
+.legend svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  display: block;
+}
+
+/* Slightly smaller in dense inline-text contexts (legend arrows, totals). */
+.legend svg,
+.net-totals svg {
+  width: 13px;
+  height: 13px;
+  vertical-align: -1px;
+}
+
+/* Topbar / control-bar action glyphs read a touch larger. */
+.langToggle svg,
+#langToggle svg,
+#pollToggle svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Status-square glyphs in the hero/share modal carry the accent at full size;
+   keep them aligned with adjacent type. */
+.send-plane.icon { width: 18px; height: 18px; }
+
+/* Icons inherit color from their button/text context via currentColor. */
+.ui-btn svg { color: inherit; }
+.user-delete svg,
+.routing-delete.danger svg { color: var(--signal-stop, #D06A5B); }
+
+/* ── Two-column body wrapper (Paper asymmetric layout) ── */
+.body-grid { display: flex; flex-direction: row; align-items: flex-start; gap: 36px; width: 100%; }
+.body-left { display: flex; flex-direction: column; gap: 48px; flex: 1.65; min-width: 0; }
+.body-rail { display: flex; flex-direction: column; gap: 48px; flex: 1; min-width: 0; }
+@media (max-width: 1040px) { .body-grid { flex-direction: column; } .body-left, .body-rail { flex: 1 1 auto; width: 100%; gap: 40px; } }
+
+/* ── Corrective: hard-constrain the topbar Zig logo (img attrs were overridden
+   by a width:100% rule, blowing it up to full width) ── */
+.zig-logo { display: inline-flex; width: 28px; height: 28px; flex-shrink: 0; align-items: center; justify-content: center; }
+.zig-logo img, .zig-logo svg { width: 28px; height: 28px; display: block; }
+
+/* ── Corrective: KPI band must be a flex ROW so gauges(2) sit beside the network well(1.8) ── */
+.kpi-band { display: flex; flex-direction: row; align-items: stretch; gap: 24px; width: 100%; }
+.kpi-gauges { display: flex; flex-direction: row; align-items: stretch; }
+@media (max-width: 900px) { .kpi-band { flex-direction: column; } }
+
+/* ── Corrective: user-row has 4 grid children (.user-name holds the toggle),
+   not 5 — the toggle is NOT a separate column. Name column must be wide. ── */
+.user-row { grid-template-columns: minmax(150px, 1.4fr) 104px minmax(0, 2fr) auto; }
+.user-name { display: flex; align-items: center; gap: 0; min-width: 0; }
+.user-name-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 680px) { .user-row { grid-template-columns: 1fr; } }
