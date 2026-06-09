@@ -259,7 +259,7 @@ body::before, body::after { content: none; }
 .gauge svg { transform: rotate(135deg); }   /* 270° arc, gap at the bottom */
 .gauge circle { fill: none; stroke-linecap: butt; }
 .gauge .track { stroke: var(--border-steel); stroke-width: 3; stroke-dasharray: 70.69 94.25; }
-.gauge .fill { stroke-width: 3; stroke-dasharray: 0 94.25; transition: stroke-dasharray 0.8s cubic-bezier(0.4,0,0.2,1), stroke 0.3s; }
+.gauge .fill { stroke-width: 3; stroke-dasharray: 0 94.25; }   /* transition defined once in the Motion section */
 .gauge .pct {
   position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
   font-family: var(--font-display);
@@ -606,4 +606,89 @@ body::before, body::after { content: none; }
   .routing-actions { justify-content: flex-start; }
   .egress-row { grid-template-columns: minmax(0,1fr) 80px; }
   .egress-quality, .egress-rtt, .egress-loss, .egress-hs { display: none; }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Motion & interaction (Emil Kowalski's design-eng principles)
+   A professional dashboard: crisp & fast. Custom strong ease-out, press
+   feedback on every pressable, transform/opacity only, reduced-motion aware.
+   NOTE: the users / routing / egress lists are re-rendered every poll (~3s), so
+   they get NO entrance animation (it would replay constantly) — only hover/press
+   transitions, which animate on interaction, not on (re)creation.
+   ───────────────────────────────────────────────────────────────────────────── */
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+/* Press feedback — the interface confirms it heard the tap (scale 0.97, ~120ms).
+   transform/opacity only; never `all`. */
+.ui-btn {
+  transition: background 130ms ease, color 130ms ease, border-color 130ms ease,
+              transform 120ms var(--ease-out);
+}
+.ui-btn:active:not(:disabled) { transform: scale(0.97); }
+.user-direct-toggle:active { transform: scale(0.96); }
+
+/* Toggle switch — the slide IS the feedback; the press nudge composes with the
+   checked translate (transform is one non-additive property), so an enabled
+   user's knob doesn't teleport to the left edge while pressed. */
+.user-toggle-slider { transition: background 160ms ease, border-color 160ms ease; }
+.user-toggle-slider::before { transition: transform 160ms var(--ease-out), background 160ms ease; }
+.user-toggle-switch input:not(:checked) + .user-toggle-slider:active::before { transform: scale(0.96); }
+.user-toggle-switch input:checked + .user-toggle-slider:active::before { transform: translateX(16px) scale(0.96); }
+
+/* Surfaces that react to hover get a snappy, property-specific transition */
+.stat-cell { transition: background 140ms ease; }
+.user-row { transition: background 120ms ease; }
+.log-line { transition: background 100ms ease; }
+.user-delete { transition: opacity 140ms ease, transform 120ms var(--ease-out); }
+.egress-row, .routing-row { transition: background 140ms ease, border-color 140ms ease; }
+
+/* Gauge value tween — seen every poll (no replay/interrupt risk); an SVG arc
+   length can't be a transform, so 450ms ease-out lets the needle settle. */
+.gauge .fill { transition: stroke-dasharray 450ms var(--ease-out), stroke 300ms var(--ease-out); }
+
+/* Toast — occasional; asymmetric enter/exit (enter elegant, exit snappier),
+   transform+opacity only. Exit (base) ≤ the 300ms JS removal timer. */
+.toast { transition: transform 200ms var(--ease-out), opacity 200ms var(--ease-out); }
+.toast.show { transition: transform 280ms var(--ease-out), opacity 240ms var(--ease-out); }
+
+/* Modal entry (occasional) — fade scrim + scale-from-0.96 (never scale(0)),
+   centered origin (modals are not anchored to a trigger). @starting-style drives
+   the entrance with no JS; exit is instant (display toggles off) which is fine. */
+.modal-overlay {
+  opacity: 1;
+  transition: opacity 200ms var(--ease-out);
+}
+@starting-style { .modal-overlay { opacity: 0; } }
+.modal {
+  transform-origin: center;
+  transition: transform 220ms var(--ease-out), opacity 220ms var(--ease-out);
+}
+@starting-style { .modal { opacity: 0; transform: scale(0.96); } }
+
+/* QR share modal is built + appended by JS with inline styles; style its entrance
+   here so it scales in from 0.96 like the other modals. */
+#shareModalOverlay { transition: opacity 200ms var(--ease-out); }
+@starting-style { #shareModalOverlay { opacity: 0; } }
+#shareModalOverlay > div {
+  transform-origin: center;
+  transition: transform 240ms var(--ease-out), opacity 240ms var(--ease-out);
+}
+@starting-style { #shareModalOverlay > div { opacity: 0; transform: scale(0.96); } }
+
+/* Hover-driven transforms only on real pointers (touch taps fire :hover falsely) */
+@media (hover: hover) and (pointer: fine) {
+  .ui-btn.user-share:hover, .add-user-btn:hover { transform: translateY(-1px); }
+}
+
+/* Reduced motion: keep opacity/colour for comprehension, drop all movement
+   (no transform/clip/dash tweens, no keyframes) — per the skill's guidance. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-property: opacity, background, background-color, color, border-color, fill, stroke, box-shadow !important;
+    transition-duration: 140ms !important;
+  }
 }
