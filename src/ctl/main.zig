@@ -22,7 +22,7 @@ const nfqws = @import("nfqws.zig");
 const tunnel = @import("tunnel.zig");
 const recovery = @import("recovery.zig");
 const dashboard = @import("dashboard.zig");
-const egress = @import("egress.zig");
+const tunnel_singbox = @import("tunnel_singbox.zig");
 const ipv6hop = @import("ipv6hop.zig");
 const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
@@ -136,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, sub, "tunnel")) {
                     return tunnel.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "egress")) {
-                    return egress.run(&ui, allocator, &remaining_args);
+                    return tunnel_singbox.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "recovery")) {
                     return recovery.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "dashboard")) {
@@ -278,7 +278,7 @@ fn tunnelOrEgressInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         tr(ui.lang, "VPN share-link (VLESS-Reality / VMess / Trojan / Shadowsocks / WireGuard)", "VPN-ссылка (VLESS-Reality / VMess / Trojan / Shadowsocks / WireGuard)"),
     };
     const idx = try ui.menu(i18n.get(ui.lang, .tunnel_vpn_type_prompt), &items);
-    if (idx == 1) return egress.runInteractive(ui, allocator);
+    if (idx == 1) return tunnel_singbox.runInteractive(ui, allocator);
     return tunnel.runInteractive(ui, allocator);
 }
 
