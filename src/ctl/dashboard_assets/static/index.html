@@ -31,7 +31,7 @@
     <div class="badge data-badge syncing" id="dataBadge"><span class="sig-sq"></span><span id="dataBadgeText">Syncing...</span></div>
 
     <!-- language toggle (EN/RU). JS sets textContent to the OTHER lang -->
-    <button id="langToggle" class="ui-btn lang-toggle" type="button" title="Language / Язык">RU</button>
+    <div id="langToggle" class="lang-seg" role="button" tabindex="0" title="Language / Язык"><span class="lang-cell" data-lang="en">EN</span><span class="lang-cell" data-lang="ru">RU</span></div>
 
     <!-- poll controls: REFRESH eyebrow + interval select + pause/resume -->
     <div class="poll-controls">
@@ -60,6 +60,17 @@
         <span id="statusHeroIcon"></span>
         <span id="statusHeroText" data-i18n="hero.checking">Checking…</span>
         <span class="hero-cursor" aria-hidden="true"></span>
+      </div>
+      <span class="hero-sub" id="statusHeroSub"></span>
+    </div>
+    <div class="hero-figures">
+      <div class="hero-fig">
+        <span class="hero-fig-label" data-i18n="hero.connected">CONNECTED</span>
+        <span class="hero-fig-val" id="heroConnected">0</span>
+      </div>
+      <div class="hero-fig hero-fig-div">
+        <span class="hero-fig-label" data-i18n="hero.uptimeLbl">UPTIME</span>
+        <span class="hero-fig-val mono" id="heroUptime">—</span>
       </div>
     </div>
   </div>

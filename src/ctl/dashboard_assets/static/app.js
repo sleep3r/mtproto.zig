@@ -51,6 +51,8 @@ const I18N = {
     'hero.stalled': 'Your proxy is running but not responding — it looks stuck. Restarting usually fixes this.',
     'hero.idle': 'Your proxy is online and ready. No one is connected yet — share a link to get started.',
     'hero.busy': "Everything's working. {n} connected right now.",
+    'hero.vChecking': 'Checking…', 'hero.vOffline': 'Offline', 'hero.vStalled': 'Stalled', 'hero.vIdle': 'All quiet — idle', 'hero.vBusy': 'Busy — {n} connected',
+    'hero.connected': 'Connected', 'hero.uptimeLbl': 'Uptime',
     'toast.connected': 'Someone just connected through your proxy.',
     'toast.linkCopied': 'Link copied — send it to someone you love.',
     'autoscroll.on': 'Auto-scroll: on', 'autoscroll.off': 'Auto-scroll: off', 'btn.pause': 'Pause', 'btn.resume': 'Resume',
@@ -80,6 +82,8 @@ const I18N = {
     'hero.stalled': 'Прокси запущен, но не отвечает — похоже, завис. Обычно помогает перезапуск.',
     'hero.idle': 'Прокси онлайн и готов. Пока никто не подключён — поделитесь ссылкой, чтобы начать.',
     'hero.busy': 'Всё работает. Сейчас подключено: {n}.',
+    'hero.vChecking': 'Проверка…', 'hero.vOffline': 'Офлайн', 'hero.vStalled': 'Завис', 'hero.vIdle': 'Тишина — простой', 'hero.vBusy': 'Активно — {n} на связи',
+    'hero.connected': 'Подключено', 'hero.uptimeLbl': 'Аптайм',
     'toast.connected': 'Кто-то только что подключился через ваш прокси.',
     'toast.linkCopied': 'Ссылка скопирована — отправьте близкому.',
     'autoscroll.on': 'Автопрокрутка: вкл', 'autoscroll.off': 'Автопрокрутка: выкл', 'btn.pause': 'Пауза', 'btn.resume': 'Продолжить',
@@ -91,7 +95,12 @@ function applyStaticI18n() {
   document.documentElement.setAttribute('lang', LANG);
   document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.getAttribute('data-i18n')); });
   document.querySelectorAll('[data-i18n-ph]').forEach(el => { el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph'))); });
-  const tg = $('langToggle'); if (tg) tg.textContent = (LANG === 'ru') ? 'EN' : 'RU';
+  const tg = $('langToggle');
+  if (tg) {
+    const cells = tg.querySelectorAll('.lang-cell');
+    if (cells.length) cells.forEach((c) => c.classList.toggle('on', c.dataset.lang === LANG));
+    else tg.textContent = (LANG === 'ru') ? 'EN' : 'RU';
+  }
 }
 function setLang(l) { LANG = (l === 'ru') ? 'ru' : 'en'; localStorage.setItem('dashLang', LANG); applyStaticI18n(); }
 const MH = 90;       // max history points
@@ -417,26 +426,26 @@ function showToast(msg, type) {
 // One plain-language verdict at the top of the page — the answer to the only
 // question most people open the dashboard to ask: "is everything OK?"
 function setStatusHero(online, active, state) {
-  const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText');
+  const el = $('statusHero'), icon = $('statusHeroIcon'), txt = $('statusHeroText'), sub = $('statusHeroSub');
   if (!el) return;
   // Paper hero: fixed surface-1 panel; only the signal square (#statusHeroIcon,
-  // background:currentColor) + verdict text take the state colour, which they
-  // inherit from the hero's color. No translucent bg, no glyph.
+  // background:currentColor) + verdict take the state colour. Short verdict on top,
+  // descriptive sub-line beneath (the right-side figures are filled in poll()).
   el.style.background = '';
   if (icon) icon.textContent = '';
+  let color, verdict, subline;
   if (!online) {
-    el.style.color = 'var(--signal-stop)';
-    txt.textContent = t('hero.offline');
+    color = 'var(--signal-stop)'; verdict = t('hero.vOffline'); subline = t('hero.offline');
   } else if (state === 'stalled') {
-    el.style.color = 'var(--signal-caution)';
-    txt.textContent = t('hero.stalled');
+    color = 'var(--signal-caution)'; verdict = t('hero.vStalled'); subline = t('hero.stalled');
   } else if (active > 0) {
-    el.style.color = 'var(--accent)';
-    txt.textContent = t('hero.busy').replace('{n}', active);
+    color = 'var(--accent)'; verdict = t('hero.vBusy').replace('{n}', active); subline = t('hero.busy').replace('{n}', active);
   } else {
-    el.style.color = 'var(--signal-go)';
-    txt.textContent = t('hero.idle');
+    color = 'var(--signal-go)'; verdict = t('hero.vIdle'); subline = t('hero.idle');
   }
+  el.style.color = color;
+  txt.textContent = verdict;
+  if (sub) sub.textContent = subline;
 }
 
 // The "share with someone you love" moment: a scannable QR + one-tap send.
@@ -1249,6 +1258,12 @@ async function poll() {
   }
   window._prevActive = _act;
   setStatusHero(pi.online, _act, pi.state);
+  // hero right-side figures (Paper parity)
+  const _hc = $('heroConnected'); if (_hc) _hc.textContent = _act;
+  const _hu = $('heroUptime'); if (_hu) _hu.textContent = pi.uptime || d.uptime || '—';
+  // CPU masthead "peak N%" (Paper parity)
+  const _cp = $('cpuPeak');
+  if (_cp) { const _pk = Math.max(Number(d.cpu) || 0, ...((d.cpu_history || []).map((p) => Number(p.v) || 0))); _cp.textContent = Math.round(_pk) + '%'; }
   $('pxActive').textContent = _act;
   $('pxMax').textContent = p.max || 0;
   $('pxHs').textContent = p.hs_inflight || 0;

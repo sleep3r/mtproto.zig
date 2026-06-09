@@ -1780,3 +1780,21 @@ body::before, body::after { content: none; }
 .gauge { width: 124px !important; height: 124px !important; }
 .spark-wrap { margin-top: auto !important; height: 36px !important; }   /* trace sits at the cell floor */
 .chart-wrap { height: 112px !important; }
+
+/* ── Hero parity: right-side figures (CONNECTED/UPTIME) + sub-line ── */
+#statusHero { display: flex !important; flex-direction: row !important; align-items: center !important; gap: 24px !important; }
+.hero-verdict { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 0; }
+.hero-sub { font-family: 'Inter', sans-serif; font-size: 14px; font-weight: 540; color: var(--text-mid); line-height: 20px; padding-left: 28px; }
+.hero-figures { display: flex; flex-direction: row; align-items: center; flex-shrink: 0; }
+.hero-fig { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; padding: 0 24px; }
+.hero-fig-div { border-left: 1px solid var(--border-steel); }
+.hero-fig-label { font-family: 'Inter', sans-serif; font-size: 10.5px; font-weight: 620; letter-spacing: 0.17em; color: var(--text-low); text-transform: uppercase; }
+.hero-fig-val { font-family: 'Archivo', sans-serif; font-size: 30px; font-weight: 620; letter-spacing: -0.018em; line-height: 32px; color: var(--text-hi); font-feature-settings: 'tnum' 1; }
+.hero-fig-val.mono { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 500; }
+@media (max-width: 760px) { .hero-figures { display: none; } }
+
+/* ── Segmented EN|RU lang toggle (Paper parity) ── */
+.lang-seg { display: inline-flex; align-items: center; border: 1px solid var(--border-steel); border-radius: 3px; overflow: hidden; height: 28px; cursor: pointer; }
+.lang-cell { display: flex; align-items: center; padding: 0 9px; height: 100%; font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-low); transition: background 130ms ease, color 130ms ease; }
+.lang-cell + .lang-cell { border-left: 1px solid var(--border-steel); }
+.lang-cell.on { color: var(--text-hi); background: var(--surface-2); }
