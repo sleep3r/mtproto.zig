@@ -982,7 +982,7 @@ function renderRouting(routing) {
   const middleBtn = $('routingMiddleBtn');
   if (middleBtn) {
     const enabled = Boolean(routing.middle_proxy_enabled);
-    middleBtn.textContent = enabled ? 'MiddleProxy: ON' : 'MiddleProxy: OFF';
+    middleBtn.textContent = enabled ? 'On' : 'Off';
     middleBtn.classList.toggle('active', enabled);
   }
 

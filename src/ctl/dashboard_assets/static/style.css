@@ -1798,3 +1798,8 @@ body::before, body::after { content: none; }
 .lang-cell { display: flex; align-items: center; padding: 0 9px; height: 100%; font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: var(--text-low); transition: background 130ms ease, color 130ms ease; }
 .lang-cell + .lang-cell { border-left: 1px solid var(--border-steel); }
 .lang-cell.on { color: var(--text-hi); background: var(--surface-2); }
+
+/* ── MiddleProxy state control reads as a green on/off toggle, not an amber
+   primary button (amber is reserved for the hero + true primary actions) ── */
+#routingMiddleBtn { min-width: 52px; text-align: center; }
+#routingMiddleBtn.active { color: var(--signal-go) !important; border-color: var(--signal-go) !important; background: var(--signal-go-fill) !important; }
