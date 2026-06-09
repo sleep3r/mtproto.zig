@@ -228,6 +228,12 @@ async def _dashboard_security(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    # index.html carries no cache-busting query string (only style.css/app.js do),
+    # so browsers heuristically cache it and keep loading the OLD asset URLs after a
+    # redeploy. Force revalidation of the HTML entry (ETag still yields a 304 when it
+    # is unchanged) so a freshly deployed dashboard shows up immediately.
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
 
 
