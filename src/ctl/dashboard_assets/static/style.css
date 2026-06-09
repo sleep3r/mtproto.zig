@@ -1763,3 +1763,20 @@ body::before, body::after { content: none; }
 .user-name { display: flex; align-items: center; gap: 0; min-width: 0; }
 .user-name-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 680px) { .user-row { grid-template-columns: 1fr; } }
+
+/* ── Corrective: tighten the KPI band to Paper density (gauges were floating in
+   cells stretched to the tall network well). Shorten the chart + paddings. ── */
+.chart-wrap { height: 122px !important; }
+.kpi-network { padding: 16px 18px !important; gap: 10px !important; }
+.kpi-network .net-legend { margin: 0 !important; }
+.instrument { padding: 16px 22px !important; gap: 10px !important; justify-content: flex-start !important; }
+.instrument .gauge-container { flex: 1 1 auto; align-items: center; }
+.spark-wrap { height: 34px !important; margin-top: 6px !important; }
+
+/* ── Corrective 2: gauge prominent + pinned under the eyebrow with the sparkline
+   right below (no floating in the middle). Paper has the dial as the subject. ── */
+.instrument { justify-content: flex-start !important; gap: 12px !important; }
+.instrument .gauge-container { flex: 0 0 auto !important; padding: 6px 0 !important; }
+.gauge { width: 124px !important; height: 124px !important; }
+.spark-wrap { margin-top: auto !important; height: 36px !important; }   /* trace sits at the cell floor */
+.chart-wrap { height: 112px !important; }

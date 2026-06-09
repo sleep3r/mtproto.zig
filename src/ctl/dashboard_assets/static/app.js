@@ -291,7 +291,7 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
   }
   peak *= 1.2;
 
-  const PAD = 32;       // left padding
+  const PAD = 2;        // no axis labels (Paper-clean trace) → minimal left gutter
   const PAD_TOP = 6;    // top padding
   const cw = w - PAD;
   const ch = h - PAD_TOP;
@@ -300,26 +300,14 @@ function drawSpark(canvasId, data, color, maxVal, unit) {
 
   x.clearRect(0, 0, w, h);
 
-  // Y-axis ticks
-  const ticks = unit === '%' ? [0, 50, 100] : [0, peak * 0.5, peak];
-  x.font = '8px Inter, sans-serif';
-  x.textAlign = 'right';
-  x.textBaseline = 'middle';
-
-  for (const tv of ticks) {
-    const frac = tv / peak;
-    const y = PAD_TOP + ch * (1 - frac);
-    x.strokeStyle = 'rgba(39,47,56,0.8)';
-    x.lineWidth = 0.5;
-    x.beginPath();
-    x.moveTo(PAD, y);
-    x.lineTo(w, y);
-    x.stroke();
-    if (tv > 0) {
-      x.fillStyle = 'rgba(124,134,152,0.5)';
-      x.fillText(unit === '%' ? tv + '%' : tv.toFixed(0), PAD - 4, y);
-    }
-  }
+  // Paper sparkline: a clean seismograph trace with one faint baseline rule —
+  // no Y-axis ticks/labels (those "100%/50%" marks floated in the empty cell).
+  x.strokeStyle = 'rgba(39,47,56,0.8)';
+  x.lineWidth = 1;
+  x.beginPath();
+  x.moveTo(PAD, PAD_TOP + ch);
+  x.lineTo(w, PAD_TOP + ch);
+  x.stroke();
 
   // Data line
   x.beginPath();
