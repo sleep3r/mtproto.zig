@@ -86,9 +86,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         // noise even on a perfectly clean uninstall.
         sys.execSilent(allocator, &.{ "systemctl", "stop", svc });
         sys.execSilent(allocator, &.{ "systemctl", "disable", svc });
-        // Remove unit files
-        var path_buf: [128]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/etc/systemd/system/{s}.service", .{svc}) catch continue;
+        // Remove the unit file. Entries already carrying a `.timer`/`.service` suffix are
+        // full unit names; bare ones (e.g. "mtproto-proxy") get `.service` appended. The
+        // old code always appended `.service`, so "mtproto-mask-health.service" tried to
+        // delete "...service.service" and left the real file behind.
+        var path_buf: [160]u8 = undefined;
+        const path = if (std.mem.indexOfScalar(u8, svc, '.') != null)
+            std.fmt.bufPrint(&path_buf, "/etc/systemd/system/{s}", .{svc}) catch continue
+        else
+            std.fmt.bufPrint(&path_buf, "/etc/systemd/system/{s}.service", .{svc}) catch continue;
         _ = sys.execForward(&.{ "rm", "-f", path }) catch {};
     }
 

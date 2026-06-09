@@ -363,8 +363,9 @@ for f in \
 done
 
 # No mtproto unit files registered with systemd anymore.
-if systemctl list-unit-files 2>/dev/null | grep -qE "mtproto-(proxy|singbox|tunnel-pool|mask)"; then
-  echo "FAIL: mtproto unit files still registered"; fail=1
+leftover_units="$(systemctl list-unit-files 2>/dev/null | grep -E "mtproto-(proxy|singbox|tunnel-pool|mask)" || true)"
+if [ -n "$leftover_units" ]; then
+  echo "FAIL: mtproto unit files still registered:"; printf '%s\n' "$leftover_units"; fail=1
 fi
 
 # The output must be clean — no expected-failure noise from a normal uninstall.
