@@ -1649,11 +1649,13 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    policy_route_matches_iface "$iface" || { reason="policy route check failed"; return 1; }
         \\    if telegram_probe_iface "$iface"; then
         \\        reason="healthy"
-        \\    else
-        \\        reason="policy route ready; Telegram probe failed"
-        \\        log "tunnel $iface selected although Telegram HTTPS probe failed"
+        \\        return 0
         \\    fi
-        \\    return 0
+        \\    # Usable (up + policy route installed) but can't reach Telegram through it.
+        \\    # Return 2 ("degraded-usable") so pool selection PREFERS a tunnel that can
+        \\    # actually reach Telegram, and only falls back to this one if none can.
+        \\    reason="up; Telegram probe failed"
+        \\    return 2
         \\}
         \\
         \\state_value() {
@@ -1707,23 +1709,44 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\previous="$(ip -4 route show table "$TABLE" default 2>/dev/null | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }' || true)"
         \\selected=""
         \\selected_reason=""
+        \\selected_status="healthy"
+        \\fallback=""
+        \\fallback_reason=""
         \\for iface in "${candidates[@]}"; do
-        \\    if probe_iface "$iface"; then
+        \\    if probe_iface "$iface"; then rc=0; else rc=$?; fi
+        \\    if [[ "$rc" -eq 0 ]]; then
         \\        selected="$iface"
         \\        selected_reason="$reason"
         \\        break
+        \\    elif [[ "$rc" -eq 2 && -z "$fallback" ]]; then
+        \\        # Up but can't reach Telegram — remember it as a last resort, but keep
+        \\        # looking for one that actually reaches Telegram. This is the pool
+        \\        # failover: a dead-but-up active tunnel is now skipped over.
+        \\        fallback="$iface"
+        \\        fallback_reason="$reason"
+        \\        log "tunnel $iface up but Telegram probe failed; trying others"
+        \\    else
+        \\        log "tunnel $iface unhealthy: $reason"
         \\    fi
-        \\    log "tunnel $iface unhealthy: $reason"
         \\done
         \\
+        \\if [[ -z "$selected" && -n "$fallback" ]]; then
+        \\    # No tunnel reached Telegram (the probe may be globally blocked/flaky) — fall
+        \\    # back to the first usable one so a single-tunnel deploy doesn't go dark.
+        \\    selected="$fallback"
+        \\    selected_reason="$fallback_reason (fallback)"
+        \\    selected_status="degraded"
+        \\    log "no Telegram-reachable tunnel; falling back to $selected"
+        \\fi
+        \\
         \\if [[ -z "$selected" ]]; then
-        \\    write_state "" "degraded" "no healthy tunnel"
-        \\    echo "No healthy tunnel in pool: ${candidates[*]}" >&2
+        \\    write_state "" "degraded" "no usable tunnel"
+        \\    echo "No usable tunnel in pool: ${candidates[*]}" >&2
         \\    exit 1
         \\fi
         \\
         \\route_table_to_iface "$selected"
-        \\write_state "$selected" "healthy" "$selected_reason"
+        \\write_state "$selected" "$selected_status" "$selected_reason"
         \\
         \\if [[ "$previous" != "$selected" ]]; then
         \\    log "selected tunnel $selected (previous: ${previous:-none})"
@@ -1969,16 +1992,22 @@ test "tunnel pool - append interface avoids duplicates" {
     try std.testing.expectEqualStrings("awg2", added[2]);
 }
 
-test "tunnel pool - script renders policy route replacement and nonfatal Telegram probe" {
+test "tunnel pool - script renders failover (prefer reachable, fall back to usable)" {
     const script = try renderTunnelPoolScript(std.testing.allocator);
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "route_table_to_iface \"$selected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "policy_route_matches_iface \"$iface\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "route show table \"$TABLE\" default 2>/dev/null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "|| true)") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "https://core.telegram.org/getProxyConfig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "selected although Telegram HTTPS probe failed") != null);
+    // probe_iface returns 2 (up but Telegram-unreachable) so the pool can skip a
+    // dead-but-up tunnel and fail over to a healthy one.
+    try std.testing.expect(std.mem.indexOf(u8, script, "return 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "trying others") != null);
+    // ...but a single tunnel whose probe fails is still used (fallback), not dropped.
+    try std.testing.expect(std.mem.indexOf(u8, script, "falling back to $selected") != null);
+    // set -e safety: probe's non-zero exit is captured, not fatal.
+    try std.testing.expect(std.mem.indexOf(u8, script, "if probe_iface \"$iface\"; then rc=0; else rc=$?; fi") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "pinned_interface") != null);
 }
 

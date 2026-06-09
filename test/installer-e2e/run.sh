@@ -237,6 +237,10 @@ for arg in "\$@"; do
       echo "blocked fake tunnel probe: \$*" >>/run/mtproto-fake-curl.log
       exit 7
     fi
+    if [[ "\$arg" == "awg1" ]]; then
+      echo "healthy fake tunnel probe: \$*" >>/run/mtproto-fake-curl.log
+      exit 0
+    fi
     next_is_iface=0
     continue
   fi
@@ -283,13 +287,51 @@ grep -F "User=mtproto" /etc/systemd/system/mtproto-proxy.service >/dev/null
 test -x /usr/local/bin/setup_tunnel.sh
 
 /usr/local/bin/setup_tunnel.sh
+# Single tunnel whose Telegram probe fails: still selected (don't go dark), but marked
+# degraded so the operator knows the probe couldn't confirm reachability.
 grep -F "active=awg0" /run/mtproto-proxy/tunnel-pool.state >/dev/null
-grep -F "status=healthy" /run/mtproto-proxy/tunnel-pool.state >/dev/null
-grep -F "reason=policy route ready; Telegram probe failed" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "status=degraded" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "reason=up; Telegram probe failed (fallback)" /run/mtproto-proxy/tunnel-pool.state >/dev/null
 grep -F "blocked fake tunnel probe:" /run/mtproto-fake-curl.log >/dev/null
 
 ip -4 rule show | grep -E "fwmark (0xc8|200).*(lookup|table) 200" >/dev/null
 ip -4 route get 149.154.175.50 mark 200 | grep -F " dev awg0" >/dev/null
+CONTAINER_SCRIPT
+}
+
+# Pool failover: with awg0 (Telegram probe BLOCKED) already active and degraded, adding a
+# second tunnel awg1 whose probe SUCCEEDS must fail the pool over to awg1. Before the fix
+# the controller kept the first up interface (awg0) and never switched.
+verify_tunnel_pool_failover() {
+  local container="$1"
+
+  run_script_in_container "$container" <<'CONTAINER_SCRIPT'
+set -Eeuo pipefail
+
+cat >/tmp/awg1.conf <<'AWG_CONF'
+[Interface]
+PrivateKey = fake-private-key-1
+Address = 10.123.1.2/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = fake-peer-key-1
+Endpoint = 203.0.113.2:51820
+AllowedIPs = 0.0.0.0/0
+AWG_CONF
+
+mtbuddy setup tunnel --iface awg1 /tmp/awg1.conf
+
+# Pool is now [awg0 (probe blocked), awg1 (probe ok)] with priority-auto. The controller
+# must skip the dead-but-up awg0 and select awg1.
+/usr/local/bin/setup_tunnel.sh
+grep -F "active=awg1" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "status=healthy" /run/mtproto-proxy/tunnel-pool.state >/dev/null
+grep -F "healthy fake tunnel probe:" /run/mtproto-fake-curl.log >/dev/null
+ip -4 route get 149.154.175.50 mark 200 | grep -F " dev awg1" >/dev/null
+
+# And when awg1 also goes unreachable, fall back (no healthy tunnel) rather than error out.
+# (awg1 stays up; only its probe would need to fail — covered by the single-tunnel case.)
 CONTAINER_SCRIPT
 }
 
@@ -383,6 +425,10 @@ run_case() {
   echo "::group::Setup tunnel with failing Telegram probe ($base_image)"
   install_fake_tunnel_tools "$container"
   verify_tunnel_probe_failure_is_nonfatal "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-probe-failure.log"
+  echo "::endgroup::"
+
+  echo "::group::Tunnel pool failover to a healthy tunnel ($base_image)"
+  verify_tunnel_pool_failover "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-pool-failover.log"
   echo "::endgroup::"
 
   dump_container_debug "$container" "$safe"
