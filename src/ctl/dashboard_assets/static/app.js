@@ -1296,6 +1296,12 @@ function renderEgress(egress, opts) {
 }
 
 function renderEgressFromRouting(routing) {
+  // Only surface tunnel/egress UI when egress actually goes through a tunnel. In
+  // direct/socks5/http modes _routing_status still reports a placeholder awg0 probe
+  // (the default interface, shown "down"), which otherwise flashed an orange tunnel
+  // card on every poll until the async /api/egress (which knows the mode isn't tunnel)
+  // cleared it again.
+  if (!routing || String(routing.upstream_type || '').toLowerCase() !== 'tunnel') return;
   if (lastEgress && Array.isArray(lastEgress.tunnels) && lastEgress.tunnels.length) return;
   const tunnels = routing && Array.isArray(routing.tunnels) ? routing.tunnels : [];
   if (!tunnels.length) return;
