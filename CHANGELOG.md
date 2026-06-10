@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/sleep3r/mtproto.zig/compare/v1.4.1...v1.4.2) (2026-06-10)
+
+
+### Bug Fixes
+
+* **middleproxy:** detect NAT IP through the egress so socks/tunnel + ad-tag work out of the box ([#335](https://github.com/sleep3r/mtproto.zig/issues/335)) ([d377acc](https://github.com/sleep3r/mtproto.zig/commit/d377acca167d63ff090c7c28c673f0928326585a))
+
 ## [1.4.1](https://github.com/sleep3r/mtproto.zig/compare/v1.4.0...v1.4.1) (2026-06-10)
 
 
