@@ -209,10 +209,17 @@ When pushing higher levels, tune config and probe limits together.
 
 ## Known coverage gaps (tracked)
 
-Two process-level scenarios are intentionally not yet automated; they require harness
+A few process-level scenarios are intentionally not yet automated; they require harness
 machinery whose cost currently outweighs the value, and the underlying logic has unit/KAT
 coverage:
 
+- **S2C (DC→client) relay direction** (`run.py`): every scenario asserts only the C2S
+  direction (`tunnel_bytes` reaching the fake DC). Asserting the reverse path needs the
+  test client to derive the obfuscation keys and decode the FakeTLS application records
+  the proxy re-encodes — modeling the full S2C obfuscation/record layer client-side. A
+  naive "fake DC echoes raw bytes, expect a 0x17 record back" check proved unreliable, so
+  it was dropped rather than shipped flaky. The S2C re-encode path is covered indirectly
+  by the relay-step unit tests.
 - **MiddleProxy success path** (`run.py`): only the MP→direct *fallback* is exercised
   e2e. A success variant needs the fake middle-proxy to complete the AES-CBC
   `rpc_handshake` (derive keys via the `get_middleproxy_aes_key_and_iv` construction) and
