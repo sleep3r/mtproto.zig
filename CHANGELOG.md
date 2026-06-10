@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/sleep3r/mtproto.zig/compare/v1.3.0...v1.4.0) (2026-06-10)
+
+
+### Features
+
+* **dashboard:** "Bahnhof Console" redesign + fix long-name counter overflow ([#328](https://github.com/sleep3r/mtproto.zig/issues/328)) ([5fbd7e3](https://github.com/sleep3r/mtproto.zig/commit/5fbd7e3234119e467f56fb8e82f13b7a5b3b3b45))
+
+
+### Bug Fixes
+
+* remediate full-repo audit findings (security, robustness, tests) ([#331](https://github.com/sleep3r/mtproto.zig/issues/331)) ([b3f1657](https://github.com/sleep3r/mtproto.zig/commit/b3f1657941d28c9ebcfd41989464b7634a9f9eae))
+
 ## [1.3.0](https://github.com/sleep3r/mtproto.zig/compare/v1.2.0...v1.3.0) (2026-06-09)
 
 
