@@ -149,12 +149,33 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Only this leg's own (unique) artifacts — minisign.pub is shared and is uploaded
+          # once by the publish-pubkey job, so parallel legs never race to --clobber it.
           FILES=(
             "dist/${{ matrix.artifact_name }}.tar.gz"
             "dist/${{ matrix.artifact_name }}.tar.gz.sha256"
             "dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig"
-            "dist/minisign.pub"
           )
           gh release upload "${{ needs.release-please.outputs.tag_name }}" \
             "${FILES[@]}" \
             --clobber
+
+  publish-pubkey:
+    # The minisign public key is identical for every artifact. Uploading it from each of the
+    # 6 matrix legs made them race to --clobber the same asset; the loser hit HTTP 404/422
+    # and (v1.4.2) that failure dropped a whole build leg's artifacts from the release. Upload
+    # it exactly once, after all legs finish.
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    needs: [release-please, build-and-upload]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Upload minisign public key
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PINNED_MINISIGN_PUBKEY="RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO"
+          printf '%s\n' "untrusted comment: mtproto.zig minisign public key" > minisign.pub
+          printf '%s\n' "${PINNED_MINISIGN_PUBKEY}" >> minisign.pub
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" minisign.pub --clobber
