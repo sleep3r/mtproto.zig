@@ -98,18 +98,21 @@ pub fn onReadable(
 ) void {
     switch (slot.mp_step) {
         .waiting_rpc_nonce_response => {
+            // Nonce-stage failures get the same MP->direct fallback as the handshake stage:
+            // a stale/garbling middleproxy endpoint or a rotated secret (selector mismatch)
+            // shouldn't drop the client when a working direct path to the same DC exists.
             const payload = read_frame(loop, slot, false) catch |err| {
                 log.debug("[{d}] mp nonce frame read failed: {any}", .{ slot.conn_id, err });
-                close_slot(loop, slot, "mp read nonce ans failed");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp read nonce ans failed");
                 return;
             } orelse return;
 
             if (payload.len != 32) {
-                close_slot(loop, slot, "mp bad nonce ans len");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp bad nonce ans len");
                 return;
             }
             if (!std.mem.eql(u8, payload[0..4], &middleproxy.rpc_nonce_req)) {
-                close_slot(loop, slot, "mp bad nonce ans type");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp bad nonce ans type");
                 return;
             }
 
@@ -118,12 +121,12 @@ pub fn onReadable(
             const secret_slice = loop.state.middle_proxy_secret[0..loop.state.middle_proxy_secret_len];
             if (!std.mem.eql(u8, payload[4..8], key_sel)) {
                 unlock_shared(loop);
-                close_slot(loop, slot, "mp key selector mismatch");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp key selector mismatch");
                 return;
             }
             if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
                 unlock_shared(loop);
-                close_slot(loop, slot, "mp crypto schema mismatch");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp crypto schema mismatch");
                 return;
             }
 
@@ -134,13 +137,13 @@ pub fn onReadable(
 
             const tg_addr = slot.current_upstream_addr orelse {
                 unlock_shared(loop);
-                close_slot(loop, slot, "mp missing logical upstream addr");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp missing logical upstream addr");
                 return;
             };
 
             const local_addr = localSocketAddress(slot.upstream_fd) catch {
                 unlock_shared(loop);
-                close_slot(loop, slot, "mp getsockname failed");
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp getsockname failed");
                 return;
             };
             var middle_local_addr = local_addr;
@@ -165,6 +168,18 @@ pub fn onReadable(
                         const my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
                         my_ip_v4_opt = my_ip_v4;
                         middle_local_addr = ip4(nat_ip, local_port);
+                    } else switch (local_addr) {
+                        // No explicit NAT IP configured/detected: fall back to the source
+                        // address getsockname() reports — the IP Telegram actually observes
+                        // — matching mtprotoproxy. Leaving my_ip_v4 null would send 0.0.0.0
+                        // as the client IP while the server IP stays real, guaranteeing a
+                        // key mismatch and a failed handshake on every connection.
+                        .ip4 => |loc4| {
+                            var my_ip_v4 = loc4.bytes;
+                            std.mem.reverse(u8, &my_ip_v4);
+                            my_ip_v4_opt = my_ip_v4;
+                        },
+                        .ip6 => {},
                     }
 
                     std.mem.writeInt(u16, &tg_port, tg4.port, .little);

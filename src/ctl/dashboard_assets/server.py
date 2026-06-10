@@ -227,7 +227,22 @@ async def _dashboard_security(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    # Real CSP, not just frame-ancestors: block injected/external SCRIPT (the dashboard's
+    # only script is the external /app.js — there are no inline <script> blocks), which
+    # bounds the blast radius of any future escaping mistake on this root control plane.
+    # style-src keeps 'unsafe-inline' for the page's inline style= attributes + Google
+    # Fonts CSS; style injection is far less dangerous than script execution.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'",
+    )
     # index.html carries no cache-busting query string (only style.css/app.js do),
     # so browsers heuristically cache it and keep loading the OLD asset URLs after a
     # redeploy. Force revalidation of the HTML entry (ETag still yields a 304 when it
@@ -297,12 +312,19 @@ def ensure_log_thread():
 ensure_log_thread()
 
 _recent_logs = []
+# Absolute sequence number of _recent_logs[0]. Each appended line has a monotonically
+# increasing seq; trimming the front advances this base. WebSocket clients track their own
+# cursor against these seqs so concurrent /ws/logs viewers each get the FULL stream — the
+# old code let whichever client's drain happened to pop a line be the only one to see it.
+_recent_base_seq = 0
 _recent_lock = threading.Lock()
 MAX_RECENT = 100
 USER_SECRET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 def _drain_to_recent():
+    """Move any buffered journal lines into the shared _recent_logs ring (idempotent)."""
+    global _recent_base_seq
     drained = []
     while True:
         try:
@@ -312,8 +334,20 @@ def _drain_to_recent():
     if drained:
         with _recent_lock:
             _recent_logs.extend(drained)
-            del _recent_logs[: max(0, len(_recent_logs) - MAX_RECENT)]
+            overflow = max(0, len(_recent_logs) - MAX_RECENT)
+            if overflow:
+                del _recent_logs[:overflow]
+                _recent_base_seq += overflow
     return drained
+
+
+def _logs_since(cursor):
+    """Return (new_entries, next_cursor) for entries with seq >= cursor. Non-destructive,
+    so every client reads independently."""
+    with _recent_lock:
+        end = _recent_base_seq + len(_recent_logs)
+        start_idx = max(0, cursor - _recent_base_seq)
+        return list(_recent_logs[start_idx:]), end
 
 
 def _proxy_stats() -> dict:
@@ -371,6 +405,7 @@ def _proxy_stats() -> dict:
                     ("rate_drops", r"rate\+=(\d+)"),
                     ("cap_drops", r"cap\+=(\d+)"),
                     ("sat_drops", r"sat\+=(\d+)"),
+                    ("pool_drops", r"pool\+=(\d+)"),
                     ("hs_budget_drops", r"hs_budget\+=(\d+)"),
                     ("hs_timeout", r"hs_timeout\+=(\d+)"),
                 ]:
@@ -2756,9 +2791,12 @@ async def api_qr(text: str = ""):
     ):
         return PlainTextResponse("invalid link", status_code=400)
     try:
-        # argv list (no shell) → the link cannot inject a command.
+        # Feed the link over STDIN, not as an argv element: the link embeds the per-user
+        # MTProto secret (ee<32-hex>...), and an argv copy is visible to any local user via
+        # ps / /proc/<pid>/cmdline. argv (no shell) already prevents command injection.
         out = subprocess.run(
-            ["qrencode", "-t", "SVG", "-m", "2", "-o", "-", text],
+            ["qrencode", "-t", "SVG", "-m", "2", "-o", "-"],
+            input=text.encode(),
             capture_output=True,
             timeout=5,
         )
@@ -2930,18 +2968,27 @@ async def ws_logs(ws: WebSocket):
     if _DASH_ENFORCE_HOST and _host_hostname(ws.headers.get("host", "")) not in _DASH_LOOPBACK_HOSTS:
         await ws.close(code=1008)
         return
+    # WebSocket reads bypass CORS, so a cross-origin page (e.g. evil.com) could otherwise
+    # open ws://localhost/ws/logs, pass the loopback Host-pin, ride the browser's cached
+    # Basic credentials, and stream the proxy logs. Mirror the HTTP middleware's Origin gate.
+    ws_origin = ws.headers.get("origin")
+    if ws_origin and urlparse(ws_origin).netloc != ws.headers.get("host", ""):
+        await ws.close(code=1008)
+        return
     if not _dashboard_auth_ok(ws.headers.get("authorization")):
         await ws.close(code=1008)
         return
     await ws.accept()
     _drain_to_recent()
-    with _recent_lock:
-        backlog = list(_recent_logs)
+    # Per-client cursor: send the current backlog, then only entries newer than what THIS
+    # client has already seen. No destructive sharing between concurrent viewers.
+    backlog, cursor = _logs_since(0)
     for e in backlog:
         await ws.send_json(e)
     try:
         while True:
-            new = _drain_to_recent()
+            _drain_to_recent()
+            new, cursor = _logs_since(cursor)
             for item in new:
                 await ws.send_json(item)
             if not new:

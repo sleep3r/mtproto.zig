@@ -25,3 +25,6 @@ codebase.txt
 # Internal planning docs — kept local, not published
 ROADMAP_1.0.md
 PRODUCT_VISION.md
+
+# dashboard auth token (generated at runtime)
+src/ctl/dashboard_assets/dashboard.token

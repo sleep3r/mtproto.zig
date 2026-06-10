@@ -90,12 +90,23 @@ fn formatProxyEndpoint(host: []const u8, port: u16, out: []u8) []const u8 {
 fn curlEscapeInto(buf: []u8, start: usize, s: []const u8) ?usize {
     var pos = start;
     for (s) |c| {
-        if (c == '\\' or c == '"') {
+        // curl's config parser is line-oriented: a raw CR/LF would terminate the quoted
+        // value and let the rest be parsed as new directives (option injection). Emit
+        // curl's supported escapes for \n/\r/\t; reject any other control byte outright.
+        const esc: ?u8 = switch (c) {
+            '\\', '"' => c,
+            '\n' => 'n',
+            '\r' => 'r',
+            '\t' => 't',
+            else => null,
+        };
+        if (esc) |e| {
             if (pos + 2 > buf.len) return null;
             buf[pos] = '\\';
-            buf[pos + 1] = c;
+            buf[pos + 1] = e;
             pos += 2;
         } else {
+            if (c < 0x20 or c == 0x7f) return null; // un-escapable control byte
             if (pos + 1 > buf.len) return null;
             buf[pos] = c;
             pos += 1;
@@ -127,6 +138,11 @@ fn writeCurlProxyConfig(
     const rnd = rnd_source.interface().int(u64);
     const path = std.fmt.bufPrint(path_buf, "/tmp/.mtproxy-curl-{d}-{x}.conf", .{ std.os.linux.getpid(), rnd }) catch
         return error.CurlConfigPathTooLong;
+
+    // scheme/endpoint are interpolated unescaped into the proxy line; reject control bytes
+    // so they can't break out of the value (same option-injection class as the creds).
+    for (scheme) |c| if (c < 0x20 or c == 0x7f) return error.CurlConfigWriteFailed;
+    for (endpoint) |c| if (c < 0x20 or c == 0x7f) return error.CurlConfigWriteFailed;
 
     const header = std.fmt.bufPrint(content_buf, "proxy = \"{s}://{s}\"\nproxy-user = \"", .{ scheme, endpoint }) catch
         return error.CurlConfigTooLong;
@@ -171,6 +187,16 @@ pub fn fetchUrlBytesViaProxy(
         "--fail",
         "--show-error",
         "--location",
+        // Bound redirect chains and pin to https so a TLS-terminating middlebox or
+        // compromised endpoint can't downgrade a hard-coded https URL to cleartext (or
+        // bounce it through dozens of internal hops). curl's default allows ~50 redirects
+        // and permits https->http.
+        "--max-redirs",
+        "3",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
         "--max-time",
         "10",
     });
@@ -274,9 +300,10 @@ fn runCurlFetch(allocator: std.mem.Allocator, url: []const u8, interface: ?[]con
     // curl requires --interface and its value as separate argv elements; the
     // `--interface=<iface>` form is a common shell idiom but not supported by
     // every curl version, hence the split.
-    var argv_buf: [10][]const u8 = undefined;
+    var argv_buf: [16][]const u8 = undefined;
     var n: usize = 0;
-    for ([_][]const u8{ "curl", "--silent", "--fail", "--show-error", "--location", "--max-time", "10" }) |a| {
+    // --max-redirs/--proto pinning: bound redirects and forbid an https->http downgrade.
+    for ([_][]const u8{ "curl", "--silent", "--fail", "--show-error", "--location", "--max-redirs", "3", "--proto", "=https", "--proto-redir", "=https", "--max-time", "10" }) |a| {
         argv_buf[n] = a;
         n += 1;
     }

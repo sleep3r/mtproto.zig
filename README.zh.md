@@ -227,12 +227,19 @@ sudo mtbuddy setup tunnel /path/to/awg0.conf
 sudo mtbuddy setup tunnel 'vpn://...'
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 
+# 通过 VPN 分享链接出口 — 为 代理→Telegram 跳转提供干净、难以封锁的上游。
+#   vless:// vmess:// trojan:// ss://  -> 本地 sing-box TUN 隧道（type=tunnel；VLESS-Reality 将跳转伪装为真实 TLS）。
+#   wireguard://                       -> 原生内核 WG 隧道（等同 `setup tunnel`）。
+#   多个链接                            -> urltest 故障转移池。
+sudo mtbuddy setup egress 'vless://...@host:443?security=reality&pbk=...&sni=...&flow=xtls-rprx-vision'
+sudo mtbuddy setup egress 'wireguard://<privkey>@host:51820?publickey=...&address=10.0.0.2/32'
+
 # IPv6 hopping
 sudo mtbuddy ipv6-hop --check
 sudo mtbuddy ipv6-hop --auto --prefix 2a01:abcd:ef00:: --threshold 5
 
 # Update Cloudflare DNS A record
-sudo mtbuddy update-dns 1.2.3.4
+sudo mtbuddy update-dns 1.2.3.4 proxy.example.com
 
 # Full help
 mtbuddy --help

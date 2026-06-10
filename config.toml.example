@@ -51,7 +51,8 @@ port = 443
 
 # Maximum concurrent client connections. With lazy pool allocation,
 # raising this does NOT increase idle memory — slots are created on demand.
-# max_connections = 65535
+# (auto-clamped to a RAM-safe estimate on startup unless unsafe_override_limits).
+# max_connections = 512
 
 # SO_REUSEPORT epoll worker threads. 1 (default) = the classic single-threaded
 # loop, behavior identical to before. 0 = auto (one per CPU). >1 spreads the
@@ -61,22 +62,22 @@ port = 443
 # SIGHUP config reload is refused (restart to apply config changes).
 # workers = 1
 
-# Seconds to wait for the first byte from a new client before dropping.
-# Keep high (300) to accommodate mobile pre-warmed connection pools.
-# idle_timeout_sec = 300
+# Seconds of inactivity before an idle connection is dropped. Raise it to better
+# accommodate mobile pre-warmed connection pools.
+# idle_timeout_sec = 120
 
 # Per-connection random jitter (± percent) applied to the idle timeout, so a
 # constant timeout isn't itself a behavioral fingerprint. 0 disables. Default 15.
 # idle_timeout_jitter_pct = 15
 
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
-# handshake_timeout_sec = 60
+# handshake_timeout_sec = 15
 
-# Per-connection MiddleProxy stream buffer size in KiB.
-# 1024 (default) is the validated minimum for reliable media downloads (Stories, video).
-# Values below 1024 may cause MiddleProxyBufferOverflow on media-heavy sessions.
-# Raise to 2048 for high-throughput media; values below 512 are not recommended.
-# middleproxy_buffer_kb = 1024
+# Per-connection MiddleProxy stream buffer size in KiB. Must exceed the largest single
+# RPC_PROXY_ANS frame: a max download part is 1 MiB + framing, so 2048 (default) carries
+# 1 MiB media parts with headroom. 1024 truncates them; oversized frames close the
+# connection cleanly. Floor is 64 KiB.
+# middleproxy_buffer_kb = 2048
 
 # Runtime log verbosity: debug, info (default), warn, err.
 # Set to "debug" to see DC routing, relay errors, and connection lifecycle details.

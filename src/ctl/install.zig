@@ -300,7 +300,11 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
         }
         if (!opts.domain_provided) {
             if (doc.get("censorship", "tls_domain")) |d_str| {
-                opts.tls_domain = d_str;
+                // doc.get returns a slice into the doc's heap lines, freed by the deferred
+                // doc.deinit() at end of this block. tls_domain is used much later (written
+                // into the generated config + every ee-link), so dupe it into the caller's
+                // (arena) allocator rather than retaining a dangling pointer.
+                opts.tls_domain = try allocator.dupe(u8, d_str);
             }
         }
     }
@@ -586,29 +590,41 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     // ── Install binary + service file ──
     {
         _ = sys.exec(allocator, &.{ "mkdir", "-p", INSTALL_DIR }) catch {};
-        _ = sys.execForward(&.{
+        // Capture the install(1) exit code: if the copy fails (ENOSPC, read-only /opt,
+        // immutable attr) we must NOT report success and restart the service — that would
+        // leave the OLD binary running while claiming an upgrade to the new version.
+        const install_rc = sys.execForward(&.{
             "install",             "-m",                            "0755",
             artifact.binaryPath(), INSTALL_DIR ++ "/mtproto-proxy",
-        }) catch {};
+        }) catch {
+            ui.fail("Failed to install the mtproto-proxy binary into " ++ INSTALL_DIR);
+            return;
+        };
+        if (install_rc != 0) {
+            ui.fail("Installing the mtproto-proxy binary failed (disk full / read-only " ++ INSTALL_DIR ++ "?)");
+            return;
+        }
         release.writeServiceFile();
     }
     ui.ok(ui.str(.install_binary_ok));
 
     // ── Copy user config (if provided) ──
     if (opts.config_path) |cfg_path| {
-        const cp = sys.exec(allocator, &.{ "cp", cfg_path, INSTALL_DIR ++ "/config.toml" }) catch {
+        // `install -m 0640` creates the destination with the restrictive mode atomically —
+        // unlike `cp` (preserves a possibly 0644 source mode, leaving a world-readable
+        // window) followed by a best-effort chmod whose failure was previously swallowed.
+        const cfg_rc = sys.execForward(&.{
+            "install", "-m", "0640", cfg_path, INSTALL_DIR ++ "/config.toml",
+        }) catch {
             ui.fail("Failed to copy --config file into the install dir");
             return;
         };
-        defer cp.deinit();
-        if (cp.exit_code != 0) {
+        if (cfg_rc != 0) {
             // Do NOT fall through to generating a fresh config with a different
             // secret — that would silently discard the operator's intended users.
             ui.fail("Failed to copy --config file into the install dir");
             return;
         }
-        // The supplied config holds secrets; restrict it (cp preserves source mode).
-        _ = sys.exec(allocator, &.{ "chmod", "0640", INSTALL_DIR ++ "/config.toml" }) catch {};
     }
 
     // ── Generate config ──
@@ -730,6 +746,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         const port_str = std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port}) catch "443";
         var mss_str_buf: [8]u8 = undefined;
         const mss_str = std.fmt.bufPrint(&mss_str_buf, "{d}", .{opts.tcpmss_value}) catch "88";
+
+        // Delete any identical pre-existing rule first so a re-run of `mtbuddy install`
+        // (a supported idempotent flow) doesn't append duplicate OUTPUT mangle rules that
+        // accumulate without bound. Mirrors nfqws' remove-before-add discipline.
+        deleteTcpmssRule(allocator, "iptables", port_str, mss_str);
+        deleteTcpmssRule(allocator, "ip6tables", port_str, mss_str);
 
         _ = sys.exec(allocator, &.{
             "iptables", "-t",      "mangle",  "-A",     "OUTPUT",
@@ -1319,6 +1341,22 @@ fn groupExists(allocator: std.mem.Allocator, name: []const u8) bool {
     const result = sys.exec(allocator, &.{ "getent", "group", name }) catch return false;
     defer result.deinit();
     return result.exit_code == 0;
+}
+
+/// Best-effort: delete every copy of our TCPMSS OUTPUT rule for `cmd` (iptables/ip6tables),
+/// looping `-D` until no match remains, so a subsequent `-A` can't create duplicates.
+fn deleteTcpmssRule(allocator: std.mem.Allocator, cmd: []const u8, port_str: []const u8, mss_str: []const u8) void {
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const r = sys.exec(allocator, &.{
+            cmd,       "-t",      "mangle",  "-D",     "OUTPUT",
+            "-p",      "tcp",     "--sport", port_str, "--tcp-flags",
+            "SYN,ACK", "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
+            mss_str,
+        }) catch return;
+        defer r.deinit();
+        if (r.exit_code != 0) return; // no more matching rules
+    }
 }
 
 fn runRequired(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {

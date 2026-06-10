@@ -98,11 +98,14 @@ pub const ObfuscationParams = struct {
         return crypto.AesCtr.init(&self.encrypt_key, self.encrypt_iv);
     }
 
-    /// Securely wipe key material.
+    /// Securely wipe key material. Uses secureZero (volatile) rather than @memset(.,0):
+    /// these are dead stores (the slot is recycled and the bytes never read again), so a
+    /// plain memset can be eliminated by the optimizer in Release builds, leaving the live
+    /// AES-256-CTR keys resident in freed memory.
     pub fn wipe(self: *ObfuscationParams) void {
-        @memset(&self.decrypt_key, 0);
+        std.crypto.secureZero(u8, &self.decrypt_key);
         self.decrypt_iv = 0;
-        @memset(&self.encrypt_key, 0);
+        std.crypto.secureZero(u8, &self.encrypt_key);
         self.encrypt_iv = 0;
     }
 };
@@ -155,6 +158,10 @@ pub fn prepareTgNonce(
     @memcpy(nonce[constants.proto_tag_pos..][0..4], &tag_bytes);
 
     if (enc_key_iv) |key_iv| {
+        // Must be exactly key_len+iv_len: a longer slice would overflow the fixed `reversed`
+        // stack buffer, a shorter one would leave its tail undefined and copy garbage into
+        // the outbound nonce. Both current callers pass exactly 48 bytes.
+        std.debug.assert(key_iv.len == constants.key_len + constants.iv_len);
         // Reverse the key+IV into the nonce
         var reversed: [constants.key_len + constants.iv_len]u8 = undefined;
         for (0..key_iv.len) |i| {

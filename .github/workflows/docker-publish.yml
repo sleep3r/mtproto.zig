@@ -49,8 +49,13 @@ jobs:
           tags=(
             "${image}:${safe_ref}-${arch}"
             "${image}:${plain_ref}-${arch}"
-            "${image}:latest-${arch}"
           )
+          # Only a plain stable release (vMAJOR.MINOR.PATCH, no -rc/-beta suffix) moves
+          # :latest. Otherwise a manually-pushed prerelease or an out-of-order hotfix tag
+          # would silently downgrade users who pull :latest.
+          if [[ "$safe_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags+=( "${image}:latest-${arch}" )
+          fi
 
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           {
@@ -112,8 +117,11 @@ jobs:
           tags=(
             "${safe_ref}"
             "${plain_ref}"
-            "latest"
           )
+          # Only a plain stable release moves the multi-arch :latest manifest (see arch job).
+          if [[ "$safe_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags+=( "latest" )
+          fi
 
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           {

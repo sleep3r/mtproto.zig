@@ -154,7 +154,12 @@ pub fn queueOrWriteOwnedMsg(
         }
 
         const remaining = owned[n..];
-        try queue.appendCopy(remaining);
+        // Free `owned` on the appendCopy error path too — `try` here would leak it (every
+        // other exit frees it). Matches the OOM-safety of the sibling write helpers.
+        queue.appendCopy(remaining) catch |err| {
+            queue.allocator.free(owned);
+            return err;
+        };
         queue.allocator.free(owned);
         return false;
     }

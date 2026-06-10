@@ -133,6 +133,15 @@ pub fn onSocks5Readable(
                 return;
             };
 
+            // A conforming SOCKS5 server cannot pipeline past the 2-byte greeting reply;
+            // trailing bytes are protocol garbage from a broken/hostile upstream. Fail fast
+            // (like the CONNECT stage) instead of silently dropping them in sendSocks5* and
+            // then stalling until the handshake timeout.
+            if (have.len > socks5.greeting_response_len) {
+                close_slot(loop, slot, "socks5 unsolicited upstream data");
+                return;
+            }
+
             switch (method) {
                 .no_auth => {
                     sendSocks5Connect(loop, slot, queue_upstream, close_slot);
@@ -157,6 +166,12 @@ pub fn onSocks5Readable(
             if (!ok) {
                 log.debug("[{d}] socks5 authentication failed", .{slot.conn_id});
                 close_slot(loop, slot, "socks5 auth rejected");
+                return;
+            }
+
+            // Same as the greeting stage: no legitimate pipelining past the 2-byte auth reply.
+            if (have.len > socks5.auth_response_len) {
+                close_slot(loop, slot, "socks5 unsolicited upstream data");
                 return;
             }
 

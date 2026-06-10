@@ -266,6 +266,11 @@ pub const MiddleProxyContext = struct {
                 },
             }
 
+            // A single client frame larger than the c2s buffer can never accumulate fully,
+            // so the "need more data" break below would spin until c2s_buf overflows. Reject
+            // it cleanly (close) instead of stalling.
+            if (header_len + payload_len > self.c2s_buf.len) return error.MiddleProxyFrameTooLarge;
+
             if (self.c2s_len - pos < header_len + payload_len) {
                 break; // Need more data
             }
@@ -437,13 +442,18 @@ pub const MiddleProxyContext = struct {
             }
 
             if (frame_len < 12 or frame_len > (1 << 24)) {
-                // Do not hard-fail on bad len; drop current decrypted window and resync.
-                // This matches telemt strategy and avoids tearing down long-lived sessions
-                // due to a single malformed/partial decrypted window.
-                self.s2c_len = 0;
-                self.s2c_decrypted_len = 0;
-                break;
+                // The CBC stream is frame-aligned and strictly seq-numbered, so a
+                // length this far out of range is real desync, not a recoverable
+                // partial window: zeroing the buffer cannot re-align the AES-CBC
+                // decryptor or read_seq_no (the old "resync" looped forever or tripped
+                // BadMiddleProxySeqNo anyway). Close cleanly so the client reconnects.
+                return error.BadMiddleProxyFrameSize;
             }
+
+            // A frame larger than the reassembly buffer can never accumulate enough
+            // decrypted bytes below, so it would stall until s2c_buf overflows. Reject it
+            // immediately; operators carrying large media parts raise middleproxy_buffer_kb.
+            if (frame_len > self.s2c_buf.len) return error.MiddleProxyFrameTooLarge;
 
             if (self.s2c_decrypted_len - parse_pos < frame_len) {
                 break; // Not enough decrypted data yet
@@ -852,4 +862,112 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
 
     const rpc_payload = out_buf[8 .. total_len - 4];
     try std.testing.expectEqualSlices(u8, &rpc_proxy_req, rpc_payload[0..4]);
+}
+
+// ── getAesKeyAndIv known-answer tests ──────────────────────────────────────────
+//
+// Independent reference re-derivation of the middle-proxy AES key/iv, mirroring
+// alexbers/mtprotoproxy get_middleproxy_aes_key_and_iv. It is deliberately written from
+// the spec (not by calling getAesKeyAndIv) so any regression in that function's field
+// order, the both-IPs-or-neither v4 rule, the IPv6 block insertion, or the
+// md5(s[1:])/sha1(s)/md5(s[2:]) construction is caught as a mismatch.
+fn refKeyIv(
+    nonce_srv: *const [16]u8,
+    nonce_clt: *const [16]u8,
+    clt_ts: *const [4]u8,
+    srv_ip: *const [4]u8,
+    clt_port: *const [2]u8,
+    purpose: []const u8,
+    clt_ip: *const [4]u8,
+    srv_port: *const [2]u8,
+    secret: []const u8,
+    ipv6: ?struct { clt: [16]u8, srv: [16]u8 },
+) struct { [32]u8, [16]u8 } {
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    const put = struct {
+        fn f(b: []u8, pos: *usize, bytes: []const u8) void {
+            @memcpy(b[pos.* .. pos.* + bytes.len], bytes);
+            pos.* += bytes.len;
+        }
+    }.f;
+    put(&buf, &n, nonce_srv);
+    put(&buf, &n, nonce_clt);
+    put(&buf, &n, clt_ts);
+    put(&buf, &n, srv_ip);
+    put(&buf, &n, clt_port);
+    put(&buf, &n, purpose);
+    put(&buf, &n, clt_ip);
+    put(&buf, &n, srv_port);
+    put(&buf, &n, secret);
+    put(&buf, &n, nonce_srv);
+    if (ipv6) |v6| {
+        put(&buf, &n, &v6.clt);
+        put(&buf, &n, &v6.srv);
+    }
+    put(&buf, &n, nonce_clt);
+    const s = buf[0..n];
+
+    var md5_all: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(s[1..], &md5_all, .{});
+    var sha1_all: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(s, &sha1_all, .{});
+    var key: [32]u8 = undefined;
+    @memcpy(key[0..12], md5_all[0..12]);
+    @memcpy(key[12..32], sha1_all[0..20]);
+    var iv: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(s[2..], &iv, .{});
+    return .{ key, iv };
+}
+
+test "getAesKeyAndIv KAT: v4 with both IPs, CLIENT and SERVER" {
+    const nonce_srv = [_]u8{0x11} ** 16;
+    const nonce_clt = [_]u8{0x22} ** 16;
+    const clt_ts = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    const srv_ip = [_]u8{ 91, 105, 192, 110 };
+    const clt_ip = [_]u8{ 203, 0, 113, 9 };
+    const clt_port = [_]u8{ 0x39, 0x30 };
+    const srv_port = [_]u8{ 0xBB, 0x01 };
+    const secret = [_]u8{0x07} ** 16;
+
+    inline for (.{ "CLIENT", "SERVER" }) |purpose| {
+        const got = getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, purpose, &clt_ip, &srv_port, &secret, null, null);
+        const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, purpose, &clt_ip, &srv_port, &secret, null);
+        try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
+        try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);
+    }
+}
+
+test "getAesKeyAndIv KAT: v4 with NAT-translated client IP" {
+    const nonce_srv = [_]u8{0x33} ** 16;
+    const nonce_clt = [_]u8{0x44} ** 16;
+    const clt_ts = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const srv_ip = [_]u8{ 149, 154, 167, 51 };
+    const nat_clt_ip = [_]u8{ 192, 0, 2, 7 }; // host's own public IP, not the client's
+    const clt_port = [_]u8{ 0x10, 0x27 };
+    const srv_port = [_]u8{ 0xBB, 0x01 };
+    const secret = [_]u8{0x5a} ** 16;
+
+    const got = getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "CLIENT", &nat_clt_ip, &srv_port, &secret, null, null);
+    const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "CLIENT", &nat_clt_ip, &srv_port, &secret, null);
+    try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
+    try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);
+}
+
+test "getAesKeyAndIv KAT: v6 with the IPv6 block" {
+    const nonce_srv = [_]u8{0x55} ** 16;
+    const nonce_clt = [_]u8{0x66} ** 16;
+    const clt_ts = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const srv_ip = [_]u8{ 0, 0, 0, 0 };
+    const clt_ip = [_]u8{ 0, 0, 0, 0 };
+    const clt_port = [_]u8{ 0x39, 0x30 };
+    const srv_port = [_]u8{ 0xBB, 0x01 };
+    const secret = [_]u8{0x99} ** 16;
+    const clt_v6 = [_]u8{0xab} ** 16;
+    const srv_v6 = [_]u8{0xcd} ** 16;
+
+    const got = getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "SERVER", &clt_ip, &srv_port, &secret, &clt_v6, &srv_v6);
+    const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "SERVER", &clt_ip, &srv_port, &secret, .{ .clt = clt_v6, .srv = srv_v6 });
+    try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
+    try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);
 }

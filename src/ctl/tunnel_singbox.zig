@@ -244,7 +244,13 @@ fn setupWireguard(ui: *Tui, allocator: std.mem.Allocator, links: []const []const
             ui.fail("Failed to parse a wireguard:// link");
             return;
         };
-        const tmp = try std.fmt.allocPrint(a, "/tmp/mtbuddy-wg-{d}.conf", .{idx});
+        // Stage the .conf (which contains the WG PRIVATE KEY) in a ROOT-OWNED dir, not
+        // world-writable /tmp. writeFileMode follows symlinks and only sets 0600 on create,
+        // so a predictable /tmp/mtbuddy-wg-<idx>.conf let a local user pre-create a symlink
+        // and have root's write land on an arbitrary file (CWE-59 overwrite-as-root). /etc
+        // and /etc/amnezia are root-owned, so no unprivileged user can plant a symlink here.
+        _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/amnezia" }) catch {};
+        const tmp = try std.fmt.allocPrint(a, "/etc/amnezia/.mtbuddy-stage-{d}.conf", .{idx});
         sys.writeFileMode(tmp, conf, 0o600) catch {
             ui.fail("Failed to stage the WireGuard config");
             return;

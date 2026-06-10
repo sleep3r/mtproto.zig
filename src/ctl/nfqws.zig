@@ -69,13 +69,19 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         return;
     }
 
-    // Read proxy port from config
+    // Read proxy port from config. Copy it into a stack buffer BEFORE deinit — toml.get()
+    // returns a slice into the doc's heap lines, which deinit frees; the port is used far
+    // below (iptables argv + the systemd unit), so an aliased slice would be a use-after-free.
+    var port_buf: [16]u8 = undefined;
     var port: []const u8 = "443";
     {
         var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch null;
         if (doc) |*d| {
             defer d.deinit();
-            port = d.get("server", "port") orelse "443";
+            const raw = d.get("server", "port") orelse "443";
+            const n = @min(raw.len, port_buf.len);
+            @memcpy(port_buf[0..n], raw[0..n]);
+            port = port_buf[0..n];
         }
     }
 
@@ -89,17 +95,12 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         _ = sys.exec(allocator, &.{ "rm", "-f", "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service" }) catch {};
         _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
 
-        // Remove iptables rules
+        // Remove iptables rules from the LIVE ruleset only. We deliberately do NOT
+        // iptables-save the whole firewall here: the unit is gone (so nothing re-adds the
+        // rule on boot) and a full snapshot would freeze whatever transient state (Docker
+        // NAT, fail2ban bans, operator rules) happens to be live into the boot ruleset.
         removeNfqwsRules(allocator, ipt.iptables);
         removeNfqwsRules(allocator, ipt.ip6tables);
-        var save_cmd_buf: [512]u8 = undefined;
-        const save_cmd = std.fmt.bufPrint(&save_cmd_buf, "{s} > /etc/iptables/rules.v4 2>/dev/null; {s} > /etc/iptables/rules.v6 2>/dev/null", .{
-            ipt.iptables_save,
-            ipt.ip6tables_save,
-        }) catch "";
-        if (save_cmd.len > 0) {
-            _ = sys.exec(allocator, &.{ "bash", "-c", save_cmd }) catch {};
-        }
 
         ui.ok("nfqws-mtproto removed");
         return;
@@ -217,14 +218,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         return;
     }
 
-    var save_cmd_buf: [512]u8 = undefined;
-    const save_cmd = std.fmt.bufPrint(&save_cmd_buf, "mkdir -p /etc/iptables && {s} > /etc/iptables/rules.v4 && {s} > /etc/iptables/rules.v6", .{
-        ipt.iptables_save,
-        ipt.ip6tables_save,
-    }) catch "";
-    if (save_cmd.len > 0) {
-        _ = sys.exec(allocator, &.{ "bash", "-c", save_cmd }) catch {};
-    }
+    // NOTE: we intentionally do NOT `iptables-save > /etc/iptables/rules.v4` here. The
+    // systemd unit's ExecStartPre re-adds the NFQUEUE rule on every boot, so persisting it
+    // is redundant — and a full-firewall snapshot would clobber any operator-curated
+    // rules.v4 and freeze transient chains (Docker, fail2ban) into the boot ruleset.
     ui.ok("NFQUEUE rules applied (queue " ++ NFQUEUE_NUM ++ ")");
 
     // ── Create systemd service ──

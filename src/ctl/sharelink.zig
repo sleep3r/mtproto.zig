@@ -48,6 +48,31 @@ fn percentDecodeAlloc(a: std.mem.Allocator, s: []const u8) ![]const u8 {
     return decoded;
 }
 
+/// True if `s` contains any control character (incl. CR/LF) or DEL. Such bytes, once
+/// percent-decoded, would let a share-link field break out of its `Key = value` line in
+/// a generated WireGuard `.conf` and inject arbitrary [Interface] directives — notably
+/// PostUp/PreUp/PostDown, which wg-quick/awg-quick execute as shell commands as root.
+fn hasControlBytes(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
+/// Percent-decode a share-link field and reject it if the result smuggles control bytes.
+/// Used for every field that lands verbatim in a generated config (CWE-78 hardening).
+fn percentDecodeChecked(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const decoded = try percentDecodeAlloc(a, s);
+    if (hasControlBytes(decoded)) return error.UnsafeLinkField;
+    return decoded;
+}
+
+/// Validate a raw (un-decoded) field that is emitted verbatim into a config line.
+fn rawFieldChecked(s: []const u8) ![]const u8 {
+    if (hasControlBytes(s)) return error.UnsafeLinkField;
+    return s;
+}
+
 /// Return the (raw, undecoded) value of `key` in a `k=v&k2=v2` query string, or null.
 pub fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
@@ -164,11 +189,14 @@ fn parseUriCred(a: std.mem.Allocator, link: []const u8, scheme: Scheme, prefix: 
     return l;
 }
 
-fn jsonStr(obj: std.json.Value, key: []const u8) ?[]const u8 {
+fn jsonStr(a: std.mem.Allocator, obj: std.json.Value, key: []const u8) ?[]const u8 {
     const v = obj.object.get(key) orelse return null;
     return switch (v) {
         .string => |s| s,
-        .integer => |i| std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{i}) catch null,
+        // Integer-typed JSON fields (e.g. "port": 10443) are formatted into the SAME
+        // arena as every other field so XrayLink's "all strings owned by `a`" contract
+        // holds and nothing leaks onto the page allocator.
+        .integer => |i| std.fmt.allocPrint(a, "{d}", .{i}) catch null,
         else => null,
     };
 }
@@ -179,25 +207,25 @@ fn parseVmess(a: std.mem.Allocator, link: []const u8) !XrayLink {
     const parsed = std.json.parseFromSlice(std.json.Value, a, decoded, .{}) catch return error.BadLink;
     const o = parsed.value;
     if (o != .object) return error.BadLink;
-    const add = jsonStr(o, "add") orelse return error.BadLink;
-    const port_s = jsonStr(o, "port") orelse return error.BadLink;
-    const id = jsonStr(o, "id") orelse return error.BadLink;
+    const add = jsonStr(a, o, "add") orelse return error.BadLink;
+    const port_s = jsonStr(a, o, "port") orelse return error.BadLink;
+    const id = jsonStr(a, o, "id") orelse return error.BadLink;
     var l = XrayLink{
         .scheme = .vmess,
-        .name = try a.dupe(u8, jsonStr(o, "ps") orelse "egress"),
+        .name = try a.dupe(u8, jsonStr(a, o, "ps") orelse "egress"),
         .address = try a.dupe(u8, add),
         .port = std.fmt.parseInt(u16, std.mem.trim(u8, port_s, " "), 10) catch return error.BadLink,
         .id = try a.dupe(u8, id),
     };
-    if (jsonStr(o, "aid")) |s| l.alter_id = std.fmt.parseInt(u16, std.mem.trim(u8, s, " "), 10) catch 0;
-    if (jsonStr(o, "scy")) |s| if (s.len > 0) {
+    if (jsonStr(a, o, "aid")) |s| l.alter_id = std.fmt.parseInt(u16, std.mem.trim(u8, s, " "), 10) catch 0;
+    if (jsonStr(a, o, "scy")) |s| if (s.len > 0) {
         l.cipher = try a.dupe(u8, s);
     };
-    if (jsonStr(o, "net")) |s| l.network = try a.dupe(u8, s);
-    if (jsonStr(o, "host")) |s| l.host = try a.dupe(u8, s);
-    if (jsonStr(o, "path")) |s| l.path = try a.dupe(u8, s);
-    if (jsonStr(o, "sni")) |s| l.sni = try a.dupe(u8, s);
-    const tls = jsonStr(o, "tls") orelse "";
+    if (jsonStr(a, o, "net")) |s| l.network = try a.dupe(u8, s);
+    if (jsonStr(a, o, "host")) |s| l.host = try a.dupe(u8, s);
+    if (jsonStr(a, o, "path")) |s| l.path = try a.dupe(u8, s);
+    if (jsonStr(a, o, "sni")) |s| l.sni = try a.dupe(u8, s);
+    const tls = jsonStr(a, o, "tls") orelse "";
     if (tls.len > 0) l.security = "tls";
     return l;
 }
@@ -312,27 +340,28 @@ pub fn convertWireguardLink(a: std.mem.Allocator, link_in: []const u8) ![]const 
         rest = rest[0..q];
     }
     const at = std.mem.indexOfScalar(u8, rest, '@') orelse return error.BadLink;
-    const private_key = try percentDecodeAlloc(a, rest[0..at]);
+    const private_key = try percentDecodeChecked(a, rest[0..at]);
     const hp = try splitHostPort(rest[at + 1 ..]);
+    const host = try rawFieldChecked(hp.host);
 
-    const pub_key = try percentDecodeAlloc(a, queryParam(query, "publickey") orelse queryParam(query, "public_key") orelse return error.BadLink);
-    const address = try percentDecodeAlloc(a, queryParam(query, "address") orelse "10.0.0.2/32");
-    const mtu = queryParam(query, "mtu") orelse "1420";
+    const pub_key = try percentDecodeChecked(a, queryParam(query, "publickey") orelse queryParam(query, "public_key") orelse return error.BadLink);
+    const address = try percentDecodeChecked(a, queryParam(query, "address") orelse "10.0.0.2/32");
+    const mtu = try rawFieldChecked(queryParam(query, "mtu") orelse "1420");
 
     var aw: std.Io.Writer.Allocating = .init(a);
     const w = &aw.writer;
     try w.print("[Interface]\nPrivateKey = {s}\nAddress = {s}\nMTU = {s}\n", .{ private_key, address, mtu });
-    if (queryParam(query, "dns")) |dns| try w.print("DNS = {s}\n", .{try percentDecodeAlloc(a, dns)});
+    if (queryParam(query, "dns")) |dns| try w.print("DNS = {s}\n", .{try percentDecodeChecked(a, dns)});
     // AmneziaWG obfuscation knobs (only emitted when present).
     inline for (.{ "jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4" }) |k| {
         if (queryParam(query, k)) |v| {
             var ku: [4]u8 = undefined;
             const upper = std.ascii.upperString(&ku, k);
-            try w.print("{s} = {s}\n", .{ upper, v });
+            try w.print("{s} = {s}\n", .{ upper, try rawFieldChecked(v) });
         }
     }
-    try w.print("\n[Peer]\nPublicKey = {s}\nEndpoint = {s}:{d}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n", .{ pub_key, hp.host, hp.port });
-    if (queryParam(query, "presharedkey")) |psk| try w.print("PresharedKey = {s}\n", .{try percentDecodeAlloc(a, psk)});
+    try w.print("\n[Peer]\nPublicKey = {s}\nEndpoint = {s}:{d}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n", .{ pub_key, host, hp.port });
+    if (queryParam(query, "presharedkey")) |psk| try w.print("PresharedKey = {s}\n", .{try percentDecodeChecked(a, psk)});
     return aw.written();
 }
 

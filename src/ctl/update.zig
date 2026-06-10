@@ -193,10 +193,20 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Install new binary ──
     ui.step(ui.str(.update_installing));
-    _ = sys.execForward(&.{ "install", "-m", "0755", artifact.binaryPath(), INSTALL_DIR ++ "/mtproto-proxy" }) catch {};
+    // Capture the install(1) result: if the swap fails (ENOSPC, read-only /opt, immutable
+    // attr) the OLD binary stays in place and the service below would restart it happily,
+    // so reporting "updated to <tag>" would be a lie. Fail, restart the unchanged service
+    // so the proxy comes back up, and abort.
+    const proxy_install_rc = sys.execForward(&.{ "install", "-m", "0755", artifact.binaryPath(), INSTALL_DIR ++ "/mtproto-proxy" }) catch 1;
+    if (proxy_install_rc != 0) {
+        ui.fail("Failed to install the new mtproto-proxy binary — keeping the current version");
+        _ = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+        return;
+    }
 
     if (buddy_path) |bp| {
-        _ = sys.execForward(&.{ "install", "-m", "0755", bp, "/usr/local/bin/mtbuddy" }) catch {};
+        const buddy_rc = sys.execForward(&.{ "install", "-m", "0755", bp, "/usr/local/bin/mtbuddy" }) catch 1;
+        if (buddy_rc != 0) ui.warn("Failed to update the mtbuddy CLI (proxy binary was updated)");
     }
 
     // Fix ownership

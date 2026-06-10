@@ -37,7 +37,7 @@ Secondary assets:
 `mtproto.zig` aims to:
 - make MTProto traffic resemble common TLS traffic
 - reduce fingerprinting by DPI and active probes
-- enforce connection caps and per-subnet throttling
+- enforce connection caps; provide an opt-in per-subnet rate limiter and a per-IP handshake flood guard (both disabled by default to avoid carrier-NAT false positives)
 - fail safely on invalid handshakes and malformed frames
 - verify release artifacts (signature + checksum) in default install/update flows
 

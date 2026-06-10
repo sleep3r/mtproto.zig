@@ -17,11 +17,34 @@ const SummaryLine = tui_mod.SummaryLine;
 const INSTALL_DIR = "/opt/mtproto-proxy/monitor";
 const VENV_DIR = INSTALL_DIR ++ "/.venv";
 const VENV_PYTHON = VENV_DIR ++ "/bin/python";
+const UV_PYTHON_INSTALL_DIR = INSTALL_DIR ++ "/.uv-python";
+const UV_SUBPROCESS_PATH = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const UV_PYTHON_INSTALL_ENV = "UV_PYTHON_INSTALL_DIR=" ++ UV_PYTHON_INSTALL_DIR;
 /// Pinned uv release (verified against its published .sha256 at install time).
 /// Bump deliberately; do not float to "latest".
 const UV_VERSION = "0.11.19";
 const SERVICE_NAME = "proxy-monitor";
 const SERVICE_FILE = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
+
+const VENV_CREATE_ARGV = [_][]const u8{
+    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, "uv", "venv", VENV_DIR, "--python", "python3",
+};
+
+const PIP_INSTALL_ARGV = [_][]const u8{
+    "env",
+    UV_SUBPROCESS_PATH,
+    UV_PYTHON_INSTALL_ENV,
+    "uv",
+    "pip",
+    "install",
+    "--python",
+    VENV_PYTHON,
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "psutil==6.1.1",
+    "websockets==14.1",
+    "starlette==0.41.3",
+};
 
 // Embed dashboard assets at comptime
 const server_py = @embedFile("dashboard_assets/server.py");
@@ -33,6 +56,14 @@ const logo_svg = @embedFile("dashboard_assets/static/logo.svg");
 pub const DashboardOpts = struct {
     quiet: bool = false,
 };
+
+fn dashboardVenvCreateArgv() []const []const u8 {
+    return &VENV_CREATE_ARGV;
+}
+
+fn dashboardPipInstallArgv() []const []const u8 {
+    return &PIP_INSTALL_ARGV;
+}
 
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
@@ -173,9 +204,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     // so `uv venv` (running as root) can fail to overwrite it.
     _ = sys.exec(allocator, &.{ "rm", "-rf", VENV_DIR }) catch {};
 
-    const venv_res = sys.exec(allocator, &.{
-        "uv", "venv", VENV_DIR, "--python", "python3",
-    }) catch {
+    // The systemd unit uses ProtectHome=yes. uv-managed interpreters installed
+    // under /root/.local/share/uv/python become invisible to ExecStart, so keep
+    // any downloaded Python under /opt alongside the dashboard.
+    const venv_res = sys.exec(allocator, dashboardVenvCreateArgv()) catch {
         ui.fail("Failed to create virtualenv with uv");
         return;
     };
@@ -195,12 +227,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     // 0.115.6 requires starlette>=0.40,<0.42, satisfied by 0.41.3. The stronger
     // `uv pip install --require-hashes -r requirements.txt` (full transitive hash
     // pinning) is the follow-up.
-    const pip_res = sys.exec(allocator, &.{
-        "uv",                "pip",           "install",
-        "--python",          VENV_PYTHON,     "fastapi==0.115.6",
-        "uvicorn==0.34.0",   "psutil==6.1.1", "websockets==14.1",
-        "starlette==0.41.3",
-    }) catch {
+    const pip_res = sys.exec(allocator, dashboardPipInstallArgv()) catch {
         ui.fail("Failed to install Python dependencies via uv");
         return;
     };
@@ -226,6 +253,23 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
         \\Restart=on-failure
         \\RestartSec=5
         \\WorkingDirectory=/opt/mtproto-proxy/monitor
+        \\# Defense-in-depth: this is a root control plane (it shells out to systemctl/ip/
+        \\# journalctl and rewrites config.toml), so it keeps full filesystem write + caps,
+        \\# but bounds the kernel attack surface a compromise of the Python process could
+        \\# reach. AF_NETLINK is kept for `ip`; AF_UNIX for the systemd/dbus socket.
+        \\NoNewPrivileges=yes
+        \\ProtectKernelTunables=yes
+        \\ProtectKernelModules=yes
+        \\ProtectKernelLogs=yes
+        \\ProtectControlGroups=yes
+        \\ProtectClock=yes
+        \\ProtectHome=yes
+        \\PrivateTmp=yes
+        \\RestrictRealtime=yes
+        \\RestrictSUIDSGID=yes
+        \\LockPersonality=yes
+        \\RestrictNamespaces=yes
+        \\RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
         \\
         \\[Install]
         \\WantedBy=multi-user.target
@@ -273,4 +317,13 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
             .{ .label = "the proxy behind Nginx — never expose plain HTTP to the internet.", .style = .highlight },
         });
     }
+}
+
+test "dashboard venv keeps uv-managed Python outside ProtectHome paths" {
+    const argv = dashboardVenvCreateArgv();
+    try std.testing.expect(argv.len >= 4);
+    try std.testing.expectEqualStrings("env", argv[0]);
+    try std.testing.expectEqualStrings("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", argv[1]);
+    try std.testing.expectEqualStrings("UV_PYTHON_INSTALL_DIR=/opt/mtproto-proxy/monitor/.uv-python", argv[2]);
+    try std.testing.expectEqualStrings("uv", argv[3]);
 }

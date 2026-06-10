@@ -196,8 +196,17 @@ download_artifact() {
     local sig_url="https://github.com/${REPO}/releases/download/${TAG}/${sig_name}"
     curl_download "$sig_url" "$TMP/${sig_name}" || fail "Signature download failed: $sig_url"
     step "Verifying signature for $artifact"
-    minisign -V -q -m "$TMP/${sha_name}" -x "$TMP/${sig_name}" -P "$MINISIGN_PUBKEY" \
+    local sig_out
+    sig_out="$(minisign -V -m "$TMP/${sha_name}" -x "$TMP/${sig_name}" -P "$MINISIGN_PUBKEY" 2>&1)" \
       || fail "Signature verification failed: $sha_name"
+    # The signature alone only proves the key signed SOME release. Bind it to THIS tag +
+    # artifact via the signed trusted comment ("tag:<TAG> artifact:<name>") so an attacker
+    # with release-asset write but not the signing key can't serve an older, validly-signed
+    # (and possibly vulnerable) build as the current 'latest'.
+    printf '%s\n' "$sig_out" | grep -Fq "tag:${TAG} " \
+      || fail "Signature trusted-comment tag mismatch for $sha_name (expected tag:${TAG})"
+    printf '%s\n' "$sig_out" | grep -Fq "artifact:${artifact}" \
+      || fail "Signature trusted-comment artifact mismatch for $sha_name (expected artifact:${artifact})"
   else
     step "INSECURE mode: skipping minisign signature verification"
   fi
@@ -249,6 +258,10 @@ fi
 
 # ── run with forwarded args, or point to the one next step ────────
 if [ "${#FORWARD_ARGS[@]}" -gt 0 ]; then
+  # exec replaces this shell, so the EXIT trap that removes $TMP never fires. Clean up the
+  # temp dir (tarballs, sigs, extracted binary) now — the binary is already installed.
+  rm -rf "$TMP"
+  trap - EXIT
   exec "$INSTALL_TO" "${FORWARD_ARGS[@]}"
 else
   printf '\n'

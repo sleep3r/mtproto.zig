@@ -227,12 +227,19 @@ sudo mtbuddy setup tunnel /path/to/awg0.conf
 sudo mtbuddy setup tunnel 'vpn://...'
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 
+# خروج از طریق لینک اشتراکی VPN — مسیر بالادست تمیز و سخت‌مسدودشدنی برای پرش پروکسی→تلگرام.
+#   vless:// vmess:// trojan:// ss://  -> تونل محلی sing-box TUN (type=tunnel؛ VLESS-Reality پرش را مانند TLS واقعی استتار می‌کند).
+#   wireguard://                       -> تونل WG کرنل بومی (مانند `setup tunnel`).
+#   چند لینک                            -> استخر failover با urltest.
+sudo mtbuddy setup egress 'vless://...@host:443?security=reality&pbk=...&sni=...&flow=xtls-rprx-vision'
+sudo mtbuddy setup egress 'wireguard://<privkey>@host:51820?publickey=...&address=10.0.0.2/32'
+
 # IPv6 hopping
 sudo mtbuddy ipv6-hop --check
 sudo mtbuddy ipv6-hop --auto --prefix 2a01:abcd:ef00:: --threshold 5
 
 # Update Cloudflare DNS A record
-sudo mtbuddy update-dns 1.2.3.4
+sudo mtbuddy update-dns 1.2.3.4 proxy.example.com
 
 # Full help
 mtbuddy --help

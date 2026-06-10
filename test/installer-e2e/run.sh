@@ -79,19 +79,22 @@ unregister_container() {
   local container="$1"
   local entry
   local next=()
-  for entry in "${ACTIVE_CONTAINERS[@]}"; do
+  # Guarded expansion: under `set -u`, expanding an empty array as "${arr[@]}" raises
+  # "unbound variable" on bash < 4.4 (e.g. macOS system bash 3.2). The "${arr[@]+...}"
+  # form expands to nothing when the array is empty instead of erroring.
+  for entry in ${ACTIVE_CONTAINERS[@]+"${ACTIVE_CONTAINERS[@]}"}; do
     if [[ "${entry%%:*}" != "$container" ]]; then
       next+=("$entry")
     fi
   done
-  ACTIVE_CONTAINERS=("${next[@]}")
+  ACTIVE_CONTAINERS=(${next[@]+"${next[@]}"})
 }
 
 cleanup_containers() {
   local entry
   local container
   local prefix
-  for entry in "${ACTIVE_CONTAINERS[@]}"; do
+  for entry in ${ACTIVE_CONTAINERS[@]+"${ACTIVE_CONTAINERS[@]}"}; do
     container="${entry%%:*}"
     prefix="${entry#*:}"
     if docker inspect "$container" >/dev/null 2>&1; then
@@ -402,6 +405,27 @@ verify_install() {
   return 1
 }
 
+# `mtbuddy update` must swap only the binary + service file. config.toml (the user secret
+# and tls_domain — which must NEVER change on a live deploy, or every distributed share link
+# breaks) must be byte-identical afterwards, and the proxy must come back up.
+verify_update_preserves_config() {
+  local container="$1"
+  run_in_container "$container" bash -lc '
+    set -Eeuo pipefail
+    cfg=/opt/mtproto-proxy/config.toml
+    before_hash="$(sha256sum "$cfg" | cut -d" " -f1)"
+    mtbuddy update --version "'"$VERSION"'" --yes
+    after_hash="$(sha256sum "$cfg" | cut -d" " -f1)"
+    if [ "$before_hash" != "$after_hash" ]; then
+      echo "FAIL: config.toml changed across mtbuddy update ($before_hash -> $after_hash)"
+      exit 1
+    fi
+    systemctl is-active --quiet mtproto-proxy
+    test -x /opt/mtproto-proxy/mtproto-proxy
+    echo "update preserved config.toml and the proxy is active"
+  '
+}
+
 run_case() {
   local base_image="$1"
   local safe
@@ -463,6 +487,11 @@ run_case() {
   echo "::group::Re-run nfqws setup ($base_image)"
   run_in_container "$container" mtbuddy setup nfqws 2>&1 | tee "$LOG_DIR/$safe.nfqws-rerun.log"
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-nfqws-rerun.log"
+  echo "::endgroup::"
+
+  echo "::group::Update preserves config.toml + keeps service active ($base_image)"
+  verify_update_preserves_config "$container" 2>&1 | tee "$LOG_DIR/$safe.update.log"
+  verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-update.log"
   echo "::endgroup::"
 
   echo "::group::Setup tunnel with failing Telegram probe ($base_image)"

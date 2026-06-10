@@ -32,9 +32,36 @@ fn physicalRows(visible_len: usize, width: u16) usize {
     return (visible_len + width - 1) / width;
 }
 
-/// Count visible columns (UTF-8 codepoints, ignoring byte count).
+/// Approximate terminal display width (columns) of a UTF-8 string. Counts double-width
+/// CJK/emoji as 2 and zero-width combining marks / variation selectors / ZWJ as 0 — a
+/// plain codepoint count mis-sizes exactly the menu items that start with an emoji, which
+/// then breaks the redraw row accounting (physicalRows) that depends on this.
+fn codepointWidth(cp: u21) usize {
+    if (cp == 0x200d) return 0; // ZWJ
+    if ((cp >= 0x0300 and cp <= 0x036f) or // combining diacritical marks
+        (cp >= 0x1ab0 and cp <= 0x1aff) or
+        (cp >= 0x1dc0 and cp <= 0x1dff) or
+        (cp >= 0x20d0 and cp <= 0x20ff) or
+        (cp >= 0xfe00 and cp <= 0xfe0f)) return 0; // variation selectors
+    if ((cp >= 0x1100 and cp <= 0x115f) or // Hangul Jamo
+        (cp >= 0x2e80 and cp <= 0xa4cf) or // CJK
+        (cp >= 0xac00 and cp <= 0xd7a3) or // Hangul syllables
+        (cp >= 0xf900 and cp <= 0xfaff) or // CJK compat ideographs
+        (cp >= 0xfe30 and cp <= 0xfe4f) or // CJK compat forms
+        (cp >= 0xff00 and cp <= 0xff60) or // fullwidth forms
+        (cp >= 0xffe0 and cp <= 0xffe6) or
+        (cp >= 0x1f300 and cp <= 0x1faff) or // emoji & pictographs
+        (cp >= 0x20000 and cp <= 0x3fffd)) return 2; // CJK extension planes
+    return 1;
+}
+
+/// Sum the display columns of `s`. Falls back to byte count on invalid UTF-8.
 fn visibleLen(s: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(s) catch s.len;
+    const view = std.unicode.Utf8View.init(s) catch return s.len;
+    var it = view.iterator();
+    var width: usize = 0;
+    while (it.nextCodepoint()) |cp| width += codepointWidth(cp);
+    return width;
 }
 
 pub const Key = enum {
@@ -125,6 +152,9 @@ pub const Spinner = struct {
         }
         self.active = true;
         self.done.store(false, .release);
+        g_term_out_fd = self.tui.out_fd;
+        g_term_cursor_hidden = true;
+        installTerminalSignalHandlers();
         self.tui.writeRaw(Color.cursor_hide);
         // Print initial frame immediately
         self.tui.print("  {s}{s}{s} {s}", .{
@@ -169,6 +199,7 @@ pub const Spinner = struct {
         } else {
             self.tui.print("  {s}✖{s} {s}\n", .{ Color.err, Color.reset, self.label });
         }
+        g_term_cursor_hidden = false;
         self.tui.writeRaw(Color.cursor_show);
     }
 
@@ -183,6 +214,50 @@ pub const Spinner = struct {
         }
     }
 };
+
+// ── Terminal restoration on fatal signals ──────────────────────────────────
+// Raw mode (ECHO/ICANON off) and a hidden cursor must be undone if the process is killed
+// by SIGTERM/SIGHUP mid-interaction — `defer self.exitRawMode()` does NOT run on a signal,
+// leaving the shell with echo off (user must blind-type `reset`). We stash the active
+// termios/fds in file scope so a small handler can restore them, then re-raise the signal.
+var g_term_orig: ?std.posix.termios = null;
+var g_term_in_fd: std.posix.fd_t = -1;
+var g_term_out_fd: std.posix.fd_t = -1;
+var g_term_cursor_hidden: bool = false;
+var g_term_handlers_installed: bool = false;
+
+fn restoreTerminalGlobal() void {
+    if (g_term_orig) |orig| {
+        std.posix.tcsetattr(g_term_in_fd, .FLUSH, orig) catch {};
+    }
+    if (g_term_cursor_hidden and g_term_out_fd >= 0) {
+        linux_io.writeAllFd(g_term_out_fd, Color.cursor_show);
+    }
+}
+
+fn onFatalSignal(sig: std.posix.SIG) callconv(.c) void {
+    restoreTerminalGlobal();
+    // Reset to default disposition and re-raise so the exit status reflects the signal.
+    var dfl = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(sig, &dfl, null);
+    std.posix.raise(sig) catch std.process.exit(1);
+}
+
+fn installTerminalSignalHandlers() void {
+    if (g_term_handlers_installed) return;
+    g_term_handlers_installed = true;
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = onFatalSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+}
 
 pub const Tui = struct {
     out_fd: std.posix.fd_t,
@@ -212,6 +287,12 @@ pub const Tui = struct {
         const current = std.posix.tcgetattr(self.in_fd) catch return;
         self.orig_termios = current;
 
+        // Publish to file scope so a SIGTERM/SIGHUP handler can restore the terminal.
+        g_term_orig = current;
+        g_term_in_fd = self.in_fd;
+        g_term_out_fd = self.out_fd;
+        installTerminalSignalHandlers();
+
         var raw = current;
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
@@ -227,6 +308,7 @@ pub const Tui = struct {
         if (self.orig_termios) |orig| {
             std.posix.tcsetattr(self.in_fd, .FLUSH, orig) catch {};
             self.orig_termios = null;
+            g_term_orig = null;
         }
     }
 
@@ -242,24 +324,42 @@ pub const Tui = struct {
         if (c == 127 or c == 8) return .{ .key = .backspace };
 
         if (c == '\x1b') {
-            var fds = [_]std.posix.pollfd{
-                .{ .fd = self.in_fd, .events = std.posix.POLL.IN, .revents = 0 },
-            };
-            const p = std.posix.poll(&fds, 0) catch 0;
-            if (p == 0) return .{ .key = .escape };
+            // Disambiguate a lone ESC from a CSI/SS3 sequence whose bytes may arrive in a
+            // separate read (common over SSH, where ESC and "[A" land in different packets).
+            // A short poll timeout — not poll(0) — gives the rest of the sequence time to
+            // arrive instead of misreporting .escape and leaking "[A" as stray .char events.
+            const intro = self.readByteTimeout(50) orelse return .{ .key = .escape };
+            if (intro != '[' and intro != 'O') return .{ .key = .escape };
 
-            var seq: [2]u8 = undefined;
-            const seq_n = std.posix.read(self.in_fd, &seq) catch 0;
-            if (seq_n < 2) return .{ .key = .escape };
-            if (seq[0] == '[') {
-                if (seq[1] == 'A') return .{ .key = .up };
-                if (seq[1] == 'B') return .{ .key = .down };
-                if (seq[1] == 'C') return .{ .key = .right };
-                if (seq[1] == 'D') return .{ .key = .left };
+            var final = self.readByteTimeout(50) orelse return .{ .key = .escape };
+            // Drain CSI parameter bytes (0x30-0x3F) until a final byte (0x40-0x7E) so longer
+            // sequences (Delete = ESC [ 3 ~, modified arrows ESC [ 1 ; 5 A) are fully
+            // consumed rather than leaving trailing bytes behind.
+            while (final >= 0x30 and final <= 0x3F) {
+                final = self.readByteTimeout(50) orelse break;
             }
-            return .{ .key = .escape };
+            return switch (final) {
+                'A' => .{ .key = .up },
+                'B' => .{ .key = .down },
+                'C' => .{ .key = .right },
+                'D' => .{ .key = .left },
+                else => .{ .key = .escape },
+            };
         }
         return .{ .key = .char, .ch = c };
+    }
+
+    /// Poll `in_fd` for up to `timeout_ms` and read a single byte; null on timeout/EOF/error.
+    fn readByteTimeout(self: *Self, timeout_ms: i32) ?u8 {
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = self.in_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const p = std.posix.poll(&fds, timeout_ms) catch return null;
+        if (p == 0) return null;
+        var byte: [1]u8 = undefined;
+        const n = std.posix.read(self.in_fd, &byte) catch return null;
+        if (n == 0) return null;
+        return byte[0];
     }
 
     // ── Low-level output ───────────────────────────────────────────────────
@@ -423,10 +523,12 @@ pub const Tui = struct {
                     lines += physicalRows(vis, width);
                 }
                 tui.clearLine();
-                tui.print("  {s}╰─❯{s} {s}↑↓ navigate  Enter select{s}\n", .{
-                    Color.gray, Color.reset, Color.dim, Color.reset,
+                const nav_hint = i18n.get(tui.lang, .tui_nav_hint_menu);
+                tui.print("  {s}╰─❯{s} {s}{s}{s}\n", .{
+                    Color.gray, Color.reset, Color.dim, nav_hint, Color.reset,
                 });
-                lines += physicalRows(35, width);
+                // "  ╰─❯ " prefix is 6 display columns; use the localized hint's real width.
+                lines += physicalRows(6 + visibleLen(nav_hint), width);
                 return lines;
             }
         }.apply;
@@ -437,7 +539,13 @@ pub const Tui = struct {
         defer self.exitRawMode();
 
         while (true) {
-            const ev = self.readKey() catch continue;
+            // EOF on stdin (e.g. `mtbuddy < /dev/null`, piped/scripted input) must abort
+            // the interactive flow — `catch continue` here re-read EOF forever, pinning a
+            // CPU core. Only transient read errors retry.
+            const ev = self.readKey() catch |err| switch (err) {
+                error.EndOfStream => return error.EndOfStream,
+                else => continue,
+            };
             var changed = false;
 
             if (ev.key == .up and selected > 0) {
@@ -450,7 +558,7 @@ pub const Tui = struct {
                 self.print("\n", .{});
                 return selected;
             } else if (ev.key == .ctrl_c) {
-                self.print("\n\n  {s}Exited{s}\n", .{ Color.dim, Color.reset });
+                self.print("\n\n  {s}{s}{s}\n", .{ Color.dim, i18n.get(self.lang, .tui_exited), Color.reset });
                 self.exitRawMode();
                 std.process.exit(0);
             }
@@ -482,10 +590,13 @@ pub const Tui = struct {
         const first = std.ascii.toLower(trimmed[0]);
         if (first == 'y' or first == 'd') return true; // y, yes, да
         if (first == 'n') return false;
-        // Russian: д = 0xd0 0xb4 (UTF-8)
-        if (trimmed.len >= 2 and trimmed[0] == 0xd0 and trimmed[1] == 0xb4) return true;
-        // Russian: н = 0xd0 0xbd
-        if (trimmed.len >= 2 and trimmed[0] == 0xd0 and trimmed[1] == 0xbd) return false;
+        // Russian, both cases: д=0xd0 0xb4 / Д=0xd0 0x94 ; н=0xd0 0xbd / Н=0xd0 0x9d.
+        // Without the capital forms, typing «Нет» at a default-yes prompt fell through to
+        // `return default` (== yes) — the action proceeded despite an explicit refusal.
+        if (trimmed.len >= 2 and trimmed[0] == 0xd0) {
+            if (trimmed[1] == 0xb4 or trimmed[1] == 0x94) return true; // д/Д
+            if (trimmed[1] == 0xbd or trimmed[1] == 0x9d) return false; // н/Н
+        }
 
         return default;
     }
@@ -603,10 +714,11 @@ pub const Tui = struct {
                     }
                 }
                 tui.clearLine();
-                tui.print("  {s}╰─❯{s} {s}↑↓ navigate  Space toggle  Enter confirm{s}\n", .{
-                    Color.gray, Color.reset, Color.dim, Color.reset,
+                const nav_hint = i18n.get(tui.lang, .tui_nav_hint_checkbox);
+                tui.print("  {s}╰─❯{s} {s}{s}{s}\n", .{
+                    Color.gray, Color.reset, Color.dim, nav_hint, Color.reset,
                 });
-                lines += physicalRows(49, width); // footer visible length
+                lines += physicalRows(6 + visibleLen(nav_hint), width); // localized footer width
 
                 return lines;
             }
@@ -619,7 +731,11 @@ pub const Tui = struct {
         defer self.exitRawMode();
 
         while (true) {
-            const ev = self.readKey() catch continue;
+            // See menu(): abort on stdin EOF instead of spinning at 100% CPU.
+            const ev = self.readKey() catch |err| switch (err) {
+                error.EndOfStream => return error.EndOfStream,
+                else => continue,
+            };
             var changed = false;
 
             if (ev.key == .up and selected > 0) {
@@ -635,7 +751,7 @@ pub const Tui = struct {
                 self.print("\n", .{});
                 return state;
             } else if (ev.key == .ctrl_c) {
-                self.print("\n\n  {s}Exited{s}\n", .{ Color.dim, Color.reset });
+                self.print("\n\n  {s}{s}{s}\n", .{ Color.dim, i18n.get(self.lang, .tui_exited), Color.reset });
                 self.exitRawMode();
                 std.process.exit(0);
             }
@@ -841,3 +957,21 @@ pub const SummaryLine = struct {
         code,
     };
 };
+
+test "visibleLen counts display columns: ASCII=1, emoji/CJK=2, combining/VS=0" {
+
+    try std.testing.expectEqual(@as(usize, 5), visibleLen("hello"));
+
+    // Emoji is double-width.
+
+    try std.testing.expectEqual(@as(usize, 2), visibleLen("\xF0\x9F\x9A\x80")); // 🚀 U+1F680
+
+    // CJK is double-width.
+
+    try std.testing.expectEqual(@as(usize, 4), visibleLen("\xE4\xBD\xA0\xE5\xA5\xBD")); // 你好
+
+    // Variation selector (U+FE0F) is zero-width.
+
+    try std.testing.expectEqual(@as(usize, 1), visibleLen("\xE2\x9C\x94\xEF\xB8\x8F")); // ✔️
+
+}

@@ -64,8 +64,12 @@ def tcp_states(port: int) -> Dict[str, int]:
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return {}
 
-    suffix = f":{port}"
+    want = str(port)
     states: Dict[str, int] = {}
+
+    def port_of(addr: str) -> str:
+        # ss prints addr:port; IPv6 is [::1]:443. rsplit on the last ':' gives the port.
+        return addr.rsplit(":", 1)[-1]
 
     for line in out.splitlines():
         line = line.strip()
@@ -77,7 +81,9 @@ def tcp_states(port: int) -> Dict[str, int]:
             continue
 
         state, local_addr, peer_addr = parts[0], parts[3], parts[4]
-        if suffix in local_addr or suffix in peer_addr:
+        # Exact port match, not substring: `:443` must not also count :4433/:44310 etc.
+        # (unrelated services on a shared VPS), which would skew the CLOSE-WAIT assertions.
+        if port_of(local_addr) == want or port_of(peer_addr) == want:
             states[state] = states.get(state, 0) + 1
 
     return states
@@ -290,6 +296,23 @@ def main() -> int:
         return 0
 
     failures: list[str] = []
+
+    # Hard fail if the proxy died at any point: a crashed PID makes every /proc read return
+    # None, so all threshold asserts early-return and the script would otherwise print PASS
+    # for a wedged/crashed proxy.
+    if not os.path.exists(f"/proc/{args.pid}"):
+        failures.append(
+            f"proxy PID {args.pid} no longer exists — it crashed or exited during the run"
+        )
+
+    # Churn results were previously never asserted (ok=0/fail=N still PASSed). Require the
+    # bulk of churn connections to have succeeded.
+    min_ok = int(args.churn_total * 0.95)
+    if ok < min_ok:
+        failures.append(
+            f"churn success ratio too low: ok={ok}/{args.churn_total} (min {min_ok}, fail={fail})"
+        )
+
     base_stats: ProcStats = baseline["stats"]  # type: ignore[assignment]
     idle_close_stats: ProcStats = after_idle_close["stats"]  # type: ignore[assignment]
     churn_stats: ProcStats = after_churn["stats"]  # type: ignore[assignment]

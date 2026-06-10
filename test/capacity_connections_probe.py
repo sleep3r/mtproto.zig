@@ -675,8 +675,12 @@ def open_connections(
             failures += 1
             fail_streak += 1
             s.close()
-            if fail_streak >= fail_streak_limit:
-                break
+
+        # Check the streak after BOTH failure paths: a proxy that accepts connects but
+        # never completes the payload (e.g. tls-auth-full against an unresponsive proxy)
+        # would otherwise spin until the open budget expires, ignoring --fail-streak-limit.
+        if fail_streak >= fail_streak_limit:
+            break
 
     return sockets, failures, connect_ok, payload_ok
 

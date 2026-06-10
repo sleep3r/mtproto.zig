@@ -1190,6 +1190,13 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\fi
         \\
         \\if [[ -z "$selected" ]]; then
+        \\    # Fail CLOSED: the fwmark->table rule is already installed, so if we leave
+        \\    # table $TABLE empty the kernel falls through to the main table and the proxy's
+        \\    # SO_MARK'd egress leaks out the host's real uplink — exactly what the tunnel is
+        \\    # meant to hide. Install a blackhole default so marked traffic is dropped until
+        \\    # a tunnel recovers.
+        \\    ip -4 route replace blackhole default table "$TABLE" 2>/dev/null || true
+        \\    ip -6 route replace blackhole default table "$TABLE" 2>/dev/null || true
         \\    write_state "" "degraded" "no usable tunnel"
         \\    echo "No usable tunnel in pool: ${candidates[*]}" >&2
         \\    exit 1

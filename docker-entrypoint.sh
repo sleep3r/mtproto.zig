@@ -27,7 +27,14 @@ mask = true
 user1 = "$SECRET"
 EOF
     chmod 0640 "$CONFIG" 2>/dev/null || true
-    echo "mtproto-proxy: generated $CONFIG with a random user1 secret: $SECRET" >&2
+    # Don't echo the secret into the container log stream by default (json-file/journald/
+    # CloudWatch persist it, exposing the access secret to anyone with log-read access).
+    # Print where to find it; opt in to echoing it with MTPROTO_PRINT_SECRET=1.
+    if [ "${MTPROTO_PRINT_SECRET:-0}" = "1" ]; then
+        echo "mtproto-proxy: generated $CONFIG with a random user1 secret: $SECRET" >&2
+    else
+        echo "mtproto-proxy: generated $CONFIG with a random user1 secret. View it with: grep user1 $CONFIG (or set MTPROTO_PRINT_SECRET=1 to print it here)." >&2
+    fi
 fi
 
 exec /usr/local/bin/mtproto-proxy "$CONFIG"

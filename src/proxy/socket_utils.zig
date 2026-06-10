@@ -102,7 +102,17 @@ pub fn checkSocketConnectError(fd: posix.fd_t) !void {
     const rc = linux.getsockopt(fd, posix.SOL.SOCKET, so_error_opt, std.mem.asBytes(&so_error).ptr, &opt_len);
     if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
     if (so_error == 0) return;
-    return error.ConnectionRefused;
+    // Map SO_ERROR to a specific error so failover logs distinguish DPI blackholing/
+    // throttling (ETIMEDOUT/EHOSTUNREACH/ENETUNREACH) from a genuine refusal — the old code
+    // collapsed every cause into ConnectionRefused, hiding exactly what an operator needs.
+    return switch (@as(posix.E, @enumFromInt(so_error))) {
+        .TIMEDOUT => error.Timeout,
+        .CONNREFUSED => error.ConnectionRefused,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .CONNRESET => error.ConnectionResetByPeer,
+        else => error.ConnectionRefused,
+    };
 }
 
 pub fn addressFromSockaddrStorage(storage: *const posix.sockaddr.storage) ?Address {
@@ -181,9 +191,14 @@ pub fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
 }
 
-pub fn setSendTimeout(fd: posix.fd_t, timeout_sec: u32) void {
-    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
+/// Bound how long unacknowledged transmit data may stay outstanding before the connection
+/// is failed. Unlike SO_SNDTIMEO (which only affects BLOCKING send and is therefore inert
+/// on our non-blocking relay sockets), TCP_USER_TIMEOUT works regardless of blocking mode.
+pub fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
+    const sol_tcp: i32 = 6; // IPPROTO_TCP
+    const tcp_user_timeout: u32 = 18; // TCP_USER_TIMEOUT
+    const val: c_uint = timeout_ms;
+    posix.setsockopt(fd, sol_tcp, tcp_user_timeout, std.mem.asBytes(&val)) catch return;
 }
 
 pub fn setTcpKeepalive(fd: posix.fd_t) void {
@@ -210,7 +225,8 @@ pub fn setTcpNoDelay(fd: posix.fd_t) void {
 pub fn configureRelaySocket(fd: posix.fd_t) void {
     setTcpNoDelay(fd);
     setTcpKeepalive(fd);
-    setSendTimeout(fd, 30);
+    // 30s cap on unacknowledged data (effective on non-blocking sockets, unlike SO_SNDTIMEO).
+    setTcpUserTimeout(fd, 30_000);
 }
 
 pub fn formatAddress(addr: Address, buf: *[64]u8) []const u8 {

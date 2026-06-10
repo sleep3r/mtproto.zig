@@ -33,6 +33,11 @@ jobs:
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     needs: release-please
     runs-on: ubuntu-latest
+    # Gate the minisign signing key behind a protected GitHub Environment: only runs of
+    # this job (not an arbitrary push/PR workflow) can reference MINISIGN_SECRET_KEY, and
+    # the environment's protection rules (required reviewer / tag restriction) apply.
+    # Configure the secret on the `release` environment in repo settings.
+    environment: release
     # Only needs to upload release assets — not issues/PR write.
     permissions:
       contents: write

@@ -165,7 +165,12 @@ Source: `src/ctl/`. Interactive TUI (raw terminal, arrow-key nav, EN/RU i18n).
 |--------|---------|
 | `main.zig` | CLI dispatch + interactive menu |
 | `install.zig` / `update.zig` / `uninstall.zig` | Install / signed self-update / clean removal |
-| `tunnel.zig` | AmneziaWG tunnel + SO_MARK policy routing |
+| `tunnel.zig` | Tunnel-egress orchestration (SO_MARK policy routing) |
+| `tunnel_wg.zig` | WG/AmneziaWG kernel-tunnel backend + tunnel-pool failover script |
+| `tunnel_singbox.zig` | Share-link sing-box TUN egress (vless/vmess/trojan/ss); dispatches `wireguard://` to `tunnel_wg.zig` |
+| `sharelink.zig` | VPN share-link parsing + `wireguard://` → WG `.conf` transform (std-only) |
+| `ipv6hop.zig` | IPv6 `/64` address rotation + Cloudflare DNS update |
+| `config_cmd.zig` / `fronting_domain.zig` | `config` get/set editor / domain-fronting x25519 helper |
 | `dashboard.zig` | FastAPI dashboard installer (pinned+verified `uv` + pinned deps) |
 | `masking.zig` / `nfqws.zig` / `recovery.zig` | Masking backend / zapret desync (latest release tag) / recovery |
 | `release.zig` / `links.zig` / `i18n.zig` | Unit/asset generation / tg:// link builder / localization |

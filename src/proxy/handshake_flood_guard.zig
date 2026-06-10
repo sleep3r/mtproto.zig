@@ -261,8 +261,12 @@ pub const HandshakeFloodGuard = struct {
     fn getOrPutEntry(self: *HandshakeFloodGuard, key: ClientKey, now_s: i64) *Entry {
         const start = self.indexFor(key);
         var first_stale_idx: ?usize = null;
-        var oldest_idx: usize = start;
+        var oldest_idx: ?usize = null;
         var oldest_ts: i64 = std.math.maxInt(i64);
+        // Last-resort victim if every probe slot holds an active block (a massive
+        // multi-IP flood): the absolute oldest, block-state notwithstanding.
+        var fallback_idx: usize = start;
+        var fallback_ts: i64 = std.math.maxInt(i64);
 
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
@@ -275,16 +279,26 @@ pub const HandshakeFloodGuard = struct {
             }
             if (entry.key.eql(key)) return entry;
 
+            if (entry.last_event_s < fallback_ts) {
+                fallback_ts = entry.last_event_s;
+                fallback_idx = idx;
+            }
+
+            // Never evict a still-blocked offender — blocked clients are dropped at accept
+            // without record(), so their last_event_s freezes and they would otherwise look
+            // "stale"/"oldest" and get silently unblocked exactly when the guard matters.
+            if (entry.blocked_until_s > now_s) continue;
+
             if (now_s - entry.last_event_s > stale_after_s and first_stale_idx == null) {
                 first_stale_idx = idx;
             }
-            if (entry.last_event_s < oldest_ts) {
+            if (oldest_idx == null or entry.last_event_s < oldest_ts) {
                 oldest_ts = entry.last_event_s;
                 oldest_idx = idx;
             }
         }
 
-        const victim_idx = first_stale_idx orelse oldest_idx;
+        const victim_idx = first_stale_idx orelse (oldest_idx orelse fallback_idx);
         self.entries[victim_idx] = freshEntry(key, now_s);
         return &self.entries[victim_idx];
     }

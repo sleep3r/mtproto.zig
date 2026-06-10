@@ -20,6 +20,27 @@ pub const SERVICE_FILE = "/etc/systemd/system/mtproto-proxy.service";
 const RELEASES_API = "https://api.github.com/repos/" ++ REPO_OWNER ++ "/" ++ REPO_NAME ++ "/releases/latest";
 const MINISIGN_PUBKEY = build_options.minisign_pubkey;
 
+/// 8 random bytes as 16 lowercase hex chars (for unpredictable temp-dir names). Falls back
+/// to a fixed string only if getrandom is entirely unavailable.
+fn randomHex8(buf: *[16]u8) []const u8 {
+    var rb: [8]u8 = .{0} ** 8;
+    var off: usize = 0;
+    while (off < rb.len) {
+        const rc = std.os.linux.getrandom(rb[off..].ptr, rb.len - off, 0);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) break;
+                off += rc;
+            },
+            .INTR => continue,
+            else => break,
+        }
+    }
+    return std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+        rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7],
+    }) catch "deadbeefdeadbeef";
+}
+
 // ── Result types ────────────────────────────────────────────────
 
 /// Storage for a resolved release tag (e.g. "v0.12.0").
@@ -63,6 +84,20 @@ pub const Artifact = struct {
 
 /// Resolve a release tag: normalise provided version or fetch latest.
 /// Returns true on success (tag is populated), false on failure.
+/// A release tag is interpolated into root-side `/tmp/...` paths that get `rm -rf`/`mkdir`,
+/// so it must contain no path separators or `..`. Accept only `[0-9A-Za-z._-]` (the GitHub
+/// tag charset plus dots/dashes); reject `/` and `..` traversal from a malicious --version
+/// or a MITM'd releases API response.
+fn isValidTag(t: []const u8) bool {
+    if (t.len == 0 or t.len > 64) return false;
+    for (t) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or c == '.' or c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return std.mem.indexOf(u8, t, "..") == null;
+}
+
 pub fn resolveTag(
     allocator: std.mem.Allocator,
     version: ?[]const u8,
@@ -80,7 +115,7 @@ pub fn resolveTag(
             @memcpy(tag.buf[0..n], v[0..n]);
             tag.len = n;
         }
-        return true;
+        return isValidTag(tag.slice());
     }
     return resolveLatest(allocator, tag);
 }
@@ -113,15 +148,20 @@ pub fn downloadProxyArtifact(
         &[_][]const u8{"mtproto-proxy-linux-x86_64"};
 
     // ── Prepare extraction directory ──
+    // Unpredictable name + create-exclusive 0700 (mkdir without -p): a local unprivileged
+    // user can't pre-create this path as a symlink to hijack the verified download/extract
+    // that runs as root (CWE-377 TOCTOU). A fixed /tmp/mtproto-<label>-<tag> was guessable.
+    var rand_hex_buf: [16]u8 = undefined;
+    const rand_hex = randomHex8(&rand_hex_buf);
     const extract_dir = std.fmt.bufPrint(
         &artifact.extract_dir_buf,
-        "/tmp/mtproto-{s}-{s}",
-        .{ label, tag },
+        "/tmp/mtproto-{s}-{s}-{s}",
+        .{ label, tag, rand_hex },
     ) catch return false;
     artifact.extract_dir_len = extract_dir.len;
 
     _ = sys.exec(allocator, &.{ "rm", "-rf", extract_dir }) catch {};
-    const mk = sys.exec(allocator, &.{ "mkdir", "-p", extract_dir }) catch return false;
+    const mk = sys.exec(allocator, &.{ "mkdir", "-m", "0700", extract_dir }) catch return false;
     defer mk.deinit();
     if (mk.exit_code != 0) return false;
 
@@ -304,7 +344,9 @@ fn resolveLatest(allocator: std.mem.Allocator, tag: *Tag) bool {
     const n = @min(parsed.len, tag.buf.len);
     @memcpy(tag.buf[0..n], parsed[0..n]);
     tag.len = n;
-    return true;
+    // The tag came from a network response — validate before it reaches root-side
+    // rm -rf/mkdir paths (a MITM'd or compromised API must not inject `../`).
+    return isValidTag(tag.slice());
 }
 
 fn downloadReleaseFile(
@@ -416,7 +458,13 @@ fn verifyReleaseChecksum(
         var sig_path_buf: [352]u8 = undefined;
         const sig_path = std.fmt.bufPrint(&sig_path_buf, "{s}/{s}", .{ work_dir, sig_name }) catch return false;
         if (!downloadReleaseFile(allocator, tag, sig_name, sig_path)) return false;
-        if (!verifyMinisignSignature(allocator, checksum_path, sig_path)) return false;
+        // Bind the signature to THIS tag + artifact (the bare name, sans .tar.gz) so a
+        // validly-signed older/different build can't be substituted (anti-rollback).
+        const artifact = if (std.mem.endsWith(u8, tar_name, ".tar.gz"))
+            tar_name[0 .. tar_name.len - ".tar.gz".len]
+        else
+            tar_name;
+        if (!verifyMinisignSignature(allocator, checksum_path, sig_path, tag, artifact)) return false;
     }
 
     var expected_buf: [64]u8 = undefined;
@@ -434,16 +482,32 @@ pub fn signatureVerificationAvailable() bool {
     return hasEmbeddedMinisignPubkey();
 }
 
+/// True if `out` contains `needle` followed by a word boundary (space/CR/LF/end), so that
+/// e.g. "artifact:mtproto-proxy-linux-x86_64" does NOT spuriously match the "_v3" variant.
+fn trustedCommentHasToken(out: []const u8, needle: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, out, start, needle)) |idx| {
+        const after = idx + needle.len;
+        if (after >= out.len or out[after] == '\n' or out[after] == '\r' or out[after] == ' ') return true;
+        start = idx + 1;
+    }
+    return false;
+}
+
 fn verifyMinisignSignature(
     allocator: std.mem.Allocator,
     message_path: []const u8,
     signature_path: []const u8,
+    tag: []const u8,
+    artifact: []const u8,
 ) bool {
     if (!sys.commandExists("minisign")) return false;
+    // No -q: we need the printed "Trusted comment: tag:<T> artifact:<A>" line to verify the
+    // signature is bound to this exact release+artifact, not just signed by the key at some
+    // point (which would otherwise allow a signed-release downgrade/substitution).
     const res = sys.exec(allocator, &.{
         "minisign",
         "-V",
-        "-q",
         "-m",
         message_path,
         "-x",
@@ -452,7 +516,24 @@ fn verifyMinisignSignature(
         MINISIGN_PUBKEY,
     }) catch return false;
     defer res.deinit();
-    return res.exit_code == 0;
+    if (res.exit_code != 0) return false;
+
+    var tag_buf: [96]u8 = undefined;
+    const tag_needle = std.fmt.bufPrint(&tag_buf, "tag:{s}", .{tag}) catch return false;
+    var art_buf: [256]u8 = undefined;
+    const art_needle = std.fmt.bufPrint(&art_buf, "artifact:{s}", .{artifact}) catch return false;
+    return trustedCommentHasToken(res.stdout, tag_needle) and
+        trustedCommentHasToken(res.stdout, art_needle);
+}
+
+test "trustedCommentHasToken respects word boundaries" {
+    const line = "Trusted comment: tag:v1.2.3 artifact:mtproto-proxy-linux-x86_64\n";
+    try std.testing.expect(trustedCommentHasToken(line, "tag:v1.2.3"));
+    try std.testing.expect(trustedCommentHasToken(line, "artifact:mtproto-proxy-linux-x86_64"));
+    // A prefix of the real artifact must NOT match (guards base vs _v3 substitution).
+    const v3 = "Trusted comment: tag:v1.2.3 artifact:mtproto-proxy-linux-x86_64_v3\n";
+    try std.testing.expect(!trustedCommentHasToken(v3, "artifact:mtproto-proxy-linux-x86_64"));
+    try std.testing.expect(!trustedCommentHasToken(line, "tag:v1.2.30"));
 }
 
 fn readExpectedSha256(allocator: std.mem.Allocator, checksum_path: []const u8, out: *[64]u8) bool {

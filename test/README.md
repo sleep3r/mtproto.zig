@@ -206,3 +206,19 @@ Primary bottlenecks typically are:
 3. Available RAM.
 
 When pushing higher levels, tune config and probe limits together.
+
+## Known coverage gaps (tracked)
+
+Two process-level scenarios are intentionally not yet automated; they require harness
+machinery whose cost currently outweighs the value, and the underlying logic has unit/KAT
+coverage:
+
+- **MiddleProxy success path** (`run.py`): only the MP→direct *fallback* is exercised
+  e2e. A success variant needs the fake middle-proxy to complete the AES-CBC
+  `rpc_handshake` (derive keys via the `get_middleproxy_aes_key_and_iv` construction) and
+  answer steady-state encrypted frames. The key derivation itself is now covered by
+  known-answer tests in `src/protocol/middleproxy.zig`.
+- **Share-link / sing-box egress** (`installer-e2e/run.sh`): the WG/AmneziaWG tunnel pool
+  is covered, but the sing-box TUN egress (`mtbuddy setup egress 'vless://…'`) is not — it
+  needs a stub `sing-box` that creates a dummy TUN interface. Link parsing + config JSON
+  generation are covered by unit tests in `src/ctl/`.

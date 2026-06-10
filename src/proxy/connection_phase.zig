@@ -50,6 +50,28 @@ pub fn isProxyHandshakePhase(phase: ConnectionPhase) bool {
     };
 }
 
+/// True when a handshake-phase timeout is attributable to the CLIENT (we are reading the
+/// client's handshake or writing our ServerHello to it), as opposed to an upstream-driven
+/// stall: connecting to a DC, talking to an upstream SOCKS5/HTTP proxy, or running the
+/// middleproxy RPC handshake. Only client-driven timeouts should feed the per-IP flood
+/// guard; otherwise an upstream outage behind one CGNAT IP turns into client blocks.
+pub fn isClientDrivenHandshakePhase(phase: ConnectionPhase) bool {
+    return switch (phase) {
+        .reading_tls_header,
+        .reading_direct_obfuscated_handshake,
+        .reading_client_hello_body,
+        .writing_server_hello_first,
+        .desync_wait,
+        .writing_server_hello_rest,
+        .reading_mtproto_tls_header,
+        .reading_mtproto_tls_body,
+        => true,
+        // connecting_upstream, writing_dc_nonce, middle_proxy_handshake, all proxy_*
+        // handshake sub-phases, and non-handshake phases are not the client's fault.
+        else => false,
+    };
+}
+
 pub fn shouldCloseOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
     if (phase == .idle) return false;
 
@@ -69,6 +91,21 @@ test "epoll hangup helper" {
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
+}
+
+test "client-driven handshake phase classification" {
+    // Client-side handshake phases are the client's fault on timeout.
+    try std.testing.expect(isClientDrivenHandshakePhase(.reading_tls_header));
+    try std.testing.expect(isClientDrivenHandshakePhase(.reading_direct_obfuscated_handshake));
+    try std.testing.expect(isClientDrivenHandshakePhase(.reading_mtproto_tls_body));
+    try std.testing.expect(isClientDrivenHandshakePhase(.writing_server_hello_first));
+    // Upstream-driven phases must NOT be blamed on the client (NAT/VPN false positives).
+    try std.testing.expect(!isClientDrivenHandshakePhase(.connecting_upstream));
+    try std.testing.expect(!isClientDrivenHandshakePhase(.writing_dc_nonce));
+    try std.testing.expect(!isClientDrivenHandshakePhase(.middle_proxy_handshake));
+    try std.testing.expect(!isClientDrivenHandshakePhase(.proxy_socks5_greeting));
+    try std.testing.expect(!isClientDrivenHandshakePhase(.proxy_http_connect_resp));
+    try std.testing.expect(!isClientDrivenHandshakePhase(.relaying));
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {

@@ -45,7 +45,7 @@ RUN apt-get update \
 
 WORKDIR /build
 
-COPY build.zig ./
+COPY build.zig build.zig.zon ./
 COPY src ./src
 
 RUN set -eu \

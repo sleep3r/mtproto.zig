@@ -96,8 +96,11 @@ pub fn send(
     slot.tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
     slot.phase = .writing_dc_nonce;
 
-    @memset(&tg_enc_key, 0);
-    @memset(&tg_enc_iv_bytes, 0);
-    @memset(&tg_dec_key, 0);
-    @memset(&tg_dec_key_iv, 0);
+    // secureZero (volatile), not @memset: these transient copies of the upstream Telegram
+    // AES key/IV are never read again, so a plain memset is a dead store the optimizer may
+    // drop in Release builds, leaving key material on the stack.
+    std.crypto.secureZero(u8, &tg_enc_key);
+    std.crypto.secureZero(u8, &tg_enc_iv_bytes);
+    std.crypto.secureZero(u8, &tg_dec_key);
+    std.crypto.secureZero(u8, &tg_dec_key_iv);
 }

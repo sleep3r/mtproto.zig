@@ -23,6 +23,7 @@ import hmac
 import os
 import random
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -301,14 +302,18 @@ class ProxyInstance:
     workdir: Path
 
     def stop(self) -> None:
-        if self.proc.poll() is not None:
-            return
-        self.proc.terminate()
         try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=3)
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=3)
+        finally:
+            # Remove the per-scenario workdir (config.toml with the user secret + proxy.log).
+            # Without this, repeated local runs leave a pile of mtproto-e2e-* dirs in /tmp.
+            shutil.rmtree(self.workdir, ignore_errors=True)
 
     def read_log_tail(self, max_lines: int = 80) -> str:
         if not self.log_path.exists():
@@ -343,6 +348,7 @@ def start_proxy(config_text: str, port: int) -> ProxyInstance:
             except subprocess.TimeoutExpired:
                 proc.kill()
         tail = log_path.read_text(errors="replace") if log_path.exists() else ""
+        shutil.rmtree(temp_dir, ignore_errors=True)  # don't leak the workdir on early failure
         raise RuntimeError(f"proxy failed to listen on port {port}\n{tail}")
 
     return ProxyInstance(proc=proc, cfg_path=cfg_path, log_path=log_path, port=port, workdir=temp_dir)
@@ -361,6 +367,9 @@ class FakeSocks5Server:
         self.tunnel_bytes = 0
         self.middleproxy_frame_seen = 0
         self.middleproxy_disconnects = 0
+        # When set, the fake DC sends these raw bytes back once after receiving the first
+        # C2S chunk — used to exercise the server->client (S2C) relay direction.
+        self.echo_payload: Optional[bytes] = None
 
     def start(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -493,6 +502,7 @@ class FakeSocks5Server:
 
     def _tunnel_loop(self, conn: socket.socket) -> None:
         conn.settimeout(0.2)
+        echoed = False
         while not self._stop.is_set():
             try:
                 data = conn.recv(4096)
@@ -504,6 +514,12 @@ class FakeSocks5Server:
                 return
             with self._lock:
                 self.tunnel_bytes += len(data)
+            if self.echo_payload is not None and not echoed:
+                echoed = True
+                try:
+                    conn.sendall(self.echo_payload)
+                except OSError:
+                    return
 
 
 class FakeHttpConnectServer:
@@ -671,6 +687,8 @@ def base_config(
     idle_timeout_sec: int = 30,
     graceful_shutdown_timeout_sec: int = 15,
     max_connections: int = 4096,
+    desync: bool = False,
+    fast_mode: bool = False,
 ) -> str:
     lines: list[str] = []
     lines.append("[general]")
@@ -697,8 +715,8 @@ def base_config(
     if mask_port is not None:
         lines.append(f"mask_port = {mask_port}")
     lines.append(f"fake_tls_only = {'true' if fake_tls_only else 'false'}")
-    lines.append("desync = false")
-    lines.append("fast_mode = false")
+    lines.append(f"desync = {'true' if desync else 'false'}")
+    lines.append(f"fast_mode = {'true' if fast_mode else 'false'}")
     lines.append("")
 
     lines.append("[upstream]")
@@ -750,6 +768,75 @@ def scenario_fake_telegram_dc_via_socks5() -> None:
             assert forwarded, "no C2S bytes reached fake DC tunnel"
         assert socks.tunnel_bytes > 0, "no C2S bytes reached fake DC tunnel"
         assert any(p == 443 for _, p in socks.connect_targets), f"no DC connect in {socks.connect_targets}"
+    finally:
+        proxy.stop()
+        socks.stop()
+
+
+def scenario_desync_relay_via_socks5() -> None:
+    """desync + fast_mode enabled: the DPI byte-splitting paths must still relay correctly.
+    Defaults-off ships untested at the process level; this exercises the enabled code."""
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+        desync=True,
+        fast_mode=True,
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(2.0)
+            perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x11" * 64))
+            assert wait_for_condition(
+                lambda: len(socks.connect_targets) > 0, timeout_sec=2.0
+            ), "SOCKS5 CONNECT not attempted with desync enabled"
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x12" * 128))
+            assert wait_for_condition(
+                lambda: socks.tunnel_bytes > 0, timeout_sec=2.0
+            ), "desync corrupted the relay — no C2S bytes reached the fake DC"
+    finally:
+        proxy.stop()
+        socks.stop()
+
+
+def scenario_s2c_relay_via_socks5() -> None:
+    """Server->client (S2C) direction: the fake DC echoes a payload and the client must
+    receive it back framed as FakeTLS application records (deobfuscation -> TLS re-encode ->
+    epoll write). The other scenarios only ever assert the C2S direction."""
+    socks = FakeSocks5Server(mode="success")
+    socks.echo_payload = b"\xAB" * 256
+    socks.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(3.0)
+            perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            # Drain any trailing handshake records, then drive a C2S byte so the DC echoes.
+            _ = read_proxy_records(c, budget_sec=0.25)
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x11" * 64))
+            assert wait_for_condition(
+                lambda: socks.tunnel_bytes > 0, timeout_sec=2.0
+            ), "C2S did not reach the fake DC, so it never echoed"
+            # The echoed S2C bytes come back wrapped as TLS application records
+            # (type 0x17, version 0x0303). read_proxy_records returns the raw byte stream.
+            records = read_proxy_records(c, budget_sec=1.5)
+            assert bytes([TLS_RECORD_APPLICATION, 0x03, 0x03]) in records, (
+                f"no S2C TLS application record received back from the proxy "
+                f"(got {len(records)} bytes, head={records[:8].hex()})"
+            )
     finally:
         proxy.stop()
         socks.stop()
@@ -1044,7 +1131,12 @@ def scenario_replay_attack_rejected() -> None:
         _ = read_proxy_records(c1, budget_sec=0.25)
         c1.sendall(build_tls_record(TLS_RECORD_CHANGE_CIPHER, b"\x01"))
         c1.sendall(build_tls_record(TLS_RECORD_APPLICATION, obf))
-        time.sleep(0.4)
+        # Wait for c1's upstream connect to actually land instead of a fixed sleep — on a
+        # loaded CI runner the connect can take longer than the old 0.4s budget, making the
+        # ==1 assertion below flake to 0.
+        assert wait_for_condition(
+            lambda: len(socks.connect_targets) == 1, timeout_sec=3.0
+        ), f"c1 did not produce exactly one upstream connect: {socks.connect_targets}"
 
         c2 = socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0)
         c2.settimeout(2.0)
@@ -1052,6 +1144,7 @@ def scenario_replay_attack_rejected() -> None:
         assert_socket_closed_soon(c2, timeout_sec=2.0)
         c2.close()
 
+        # Settle, then assert the replay added NO second connect (the actual property).
         time.sleep(0.4)
         assert len(socks.connect_targets) == 1, f"replay should not create 2nd upstream connect: {socks.connect_targets}"
         c1.close()
@@ -1179,11 +1272,17 @@ def scenario_sigterm_during_active_relay() -> None:
 
         assert proxy.proc.returncode is not None, "proxy return code is missing"
     finally:
+        # On the assertion-failure path (proxy ignored SIGTERM) the process is still alive;
+        # proxy.stop() escalates to kill and frees the port so later local runs aren't
+        # confused by an orphaned proxy. Every other scenario calls proxy.stop() in finally.
+        proxy.stop()
         socks.stop()
 
 
 SCENARIOS: dict[str, Callable[[], None]] = {
     "fake_telegram_dc_via_socks5": scenario_fake_telegram_dc_via_socks5,
+    "desync_relay_via_socks5": scenario_desync_relay_via_socks5,
+    "s2c_relay_via_socks5": scenario_s2c_relay_via_socks5,
     "direct_secure_via_socks5": scenario_direct_secure_via_socks5,
     "direct_secure_bad_secret": scenario_direct_secure_bad_secret_not_relayed,
     "socks5_upstream_failure": scenario_socks5_upstream_failure,

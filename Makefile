@@ -29,10 +29,11 @@ deploy: build ## Build and push proxy + mtbuddy to server
 	scp zig-out/bin/mtbuddy root@$(SERVER):/usr/local/bin/mtbuddy.new
 	-@if [ -f $(CONFIG) ]; then scp $(CONFIG) root@$(SERVER):/opt/mtproto-proxy/config.toml; fi
 	-@if [ -f .env ]; then \
-		awk '{print "export " $$0}' .env > .env.tmp && \
-		scp .env.tmp root@$(SERVER):/opt/mtproto-proxy/env.sh && \
-		ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh' && \
-		rm .env.tmp; \
+		tmp=$$(mktemp) && \
+		awk '{print "export " $$0}' .env > "$$tmp" && \
+		scp "$$tmp" root@$(SERVER):/opt/mtproto-proxy/env.sh && \
+		ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh'; \
+		rm -f "$$tmp"; \
 	fi
 	ssh root@$(SERVER) 'install -m 0755 /opt/mtproto-proxy/mtproto-proxy.new /opt/mtproto-proxy/mtproto-proxy'
 	ssh root@$(SERVER) 'install -m 0755 /usr/local/bin/mtbuddy.new /usr/local/bin/mtbuddy'

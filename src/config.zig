@@ -27,7 +27,8 @@ pub const UpstreamMode = enum {
 pub const UnknownSniAction = enum {
     /// Forward to the masking backend (current default; no wire change).
     mask,
-    /// Emit a real `unrecognized_name` TLS alert (like stock nginx), then close.
+    /// Emit a fatal `handshake_failure` (40) TLS alert (like nginx ssl_reject_handshake),
+    /// then close. (Not `unrecognized_name`/112 — see tls.zig reject_handshake_alert.)
     reject,
     /// Close silently with no response.
     drop,
@@ -78,6 +79,18 @@ fn parseUpstreamMode(value: []const u8) ?UpstreamMode {
     if (std.mem.eql(u8, value, "socks5") or std.mem.eql(u8, value, "socks")) return .socks5;
     if (std.mem.eql(u8, value, "http") or std.mem.eql(u8, value, "http_connect")) return .http;
     return null;
+}
+
+/// Parse a TOML-ish boolean leniently: true/1/yes/on (and false/0/no/off), case-insensitive.
+/// Previously every [server]/[censorship]/etc. bool used `eql(value, "true")`, so `mask = yes`,
+/// `mask = 1`, or `fake_tls_only = True` silently became false — a footgun that turned OFF
+/// active-probe masking or turned ON the DPI-fingerprintable dd transport. Matches the
+/// lenient parsing [access.direct_users] already used.
+fn parseBool(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "true") or
+        std.mem.eql(u8, value, "1") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
 }
 
 fn stripInlineComment(value: []const u8) []const u8 {
@@ -270,8 +283,8 @@ pub const Config = struct {
     fake_tls_only: bool = true,
     /// What to do with a TLS ClientHello whose SNI doesn't match tls_domain:
     /// `mask` (default — forward to the masking backend, current behavior),
-    /// `reject` (emit a real `unrecognized_name` TLS alert like stock nginx, then
-    /// close), or `drop` (silent close). Default keeps the wire unchanged.
+    /// `reject` (emit a fatal `handshake_failure` TLS alert like nginx
+    /// ssl_reject_handshake, then close), or `drop` (silent close). Default keeps the wire unchanged.
     unknown_sni_action: UnknownSniAction = .mask,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
@@ -282,9 +295,11 @@ pub const Config = struct {
     /// MiddleProxy stream buffer size in KiB.
     /// In current design, each connection keeps 2 such buffers and EventLoop
     /// keeps 2 shared scratch buffers.
-    /// Minimum 1024 recommended — lower values cause MiddleProxyBufferOverflow on media
-    /// downloads (Stories, video messages) through middle proxy.
-    middleproxy_buffer_kb: u32 = 1024,
+    /// Must exceed the largest single RPC_PROXY_ANS frame. A max download part is 1 MiB
+    /// of payload plus MTProto + RPC framing, so a 1024 KiB buffer is just too small and
+    /// truncates 1 MiB-part media downloads (Stories, video messages). Default 2048 gives
+    /// headroom; oversized frames now close the connection cleanly rather than stalling.
+    middleproxy_buffer_kb: u32 = 2048,
     /// Runtime log level: "debug", "info" (default), "warn", "err"
     log_level: std.log.Level = .info,
     /// Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet
@@ -507,18 +522,25 @@ pub const Config = struct {
 
             // Section headers
             if (line[0] == '[') {
-                in_users_section = std.mem.eql(u8, line, "[access.users]");
-                in_direct_users_section = std.mem.eql(u8, line, "[access.direct_users]") or std.mem.eql(u8, line, "[access.admins]");
-                in_user_max_conns_section = std.mem.eql(u8, line, "[access.user_max_conns]");
-                in_user_expirations_section = std.mem.eql(u8, line, "[access.user_expirations]");
-                in_censorship_section = std.mem.eql(u8, line, "[censorship]");
-                in_server_section = std.mem.eql(u8, line, "[server]");
-                in_general_section = std.mem.eql(u8, line, "[general]");
-                in_metrics_section = std.mem.eql(u8, line, "[metrics]");
-                in_upstream_section = std.mem.eql(u8, line, "[upstream]");
-                in_upstream_socks5_section = std.mem.eql(u8, line, "[upstream.socks5]");
-                in_upstream_http_section = std.mem.eql(u8, line, "[upstream.http]");
-                in_upstream_tunnel_section = std.mem.eql(u8, line, "[upstream.tunnel]");
+                // Strip a trailing inline comment ("[server] # main settings") and spaces
+                // before matching — otherwise a TOML-legal commented header matches no
+                // section and every key until the next header is silently dropped (e.g.
+                // [access.users] # mine → zero users).
+                var header = line;
+                if (std.mem.indexOfScalar(u8, header, '#')) |h| header = header[0..h];
+                header = std.mem.trim(u8, header, &[_]u8{ ' ', '\t', '\r' });
+                in_users_section = std.mem.eql(u8, header, "[access.users]");
+                in_direct_users_section = std.mem.eql(u8, header, "[access.direct_users]") or std.mem.eql(u8, header, "[access.admins]");
+                in_user_max_conns_section = std.mem.eql(u8, header, "[access.user_max_conns]");
+                in_user_expirations_section = std.mem.eql(u8, header, "[access.user_expirations]");
+                in_censorship_section = std.mem.eql(u8, header, "[censorship]");
+                in_server_section = std.mem.eql(u8, header, "[server]");
+                in_general_section = std.mem.eql(u8, header, "[general]");
+                in_metrics_section = std.mem.eql(u8, header, "[metrics]");
+                in_upstream_section = std.mem.eql(u8, header, "[upstream]");
+                in_upstream_socks5_section = std.mem.eql(u8, header, "[upstream.socks5]");
+                in_upstream_http_section = std.mem.eql(u8, header, "[upstream.http]");
+                in_upstream_tunnel_section = std.mem.eql(u8, header, "[upstream.tunnel]");
                 // Sub-sections are also part of the upstream family;
                 // entering a sub-section should not reset the parent.
                 if (in_upstream_socks5_section or in_upstream_http_section or in_upstream_tunnel_section) {
@@ -554,10 +576,7 @@ pub const Config = struct {
                         try cfg.users.put(name, secret);
                     }
                 } else if (in_direct_users_section) {
-                    const enabled = std.mem.eql(u8, value, "true") or
-                        std.mem.eql(u8, value, "1") or
-                        std.mem.eql(u8, value, "yes");
-                    if (!enabled) continue;
+                    if (!parseBool(value)) continue;
                     if (!cfg.direct_users.contains(key)) {
                         const name = try allocator.dupe(u8, key);
                         try cfg.direct_users.put(name, {});
@@ -581,12 +600,12 @@ pub const Config = struct {
                     }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
-                        cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
+                        cfg.use_middle_proxy = parseBool(value);
                     } else if (std.mem.eql(u8, key, "force_media_middle_proxy")) {
-                        cfg.force_media_middle_proxy = std.mem.eql(u8, value, "true");
+                        cfg.force_media_middle_proxy = parseBool(value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         // telemt compatibility: [general].fast_mode
-                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                        cfg.fast_mode = parseBool(value);
                     } else if (std.mem.eql(u8, key, "ad_tag")) {
                         // telemt compatibility: [general].ad_tag
                         // If [server].tag is present and valid, it has priority.
@@ -640,7 +659,7 @@ pub const Config = struct {
                         if (cfg.middle_proxy_nat_ip) |prev| allocator.free(prev);
                         cfg.middle_proxy_nat_ip = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
-                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                        cfg.fast_mode = parseBool(value);
                     } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.middleproxy_buffer_kb;
                         cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
@@ -657,7 +676,7 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "rate_limit_per_subnet")) {
                         cfg.rate_limit_per_subnet = std.fmt.parseInt(u8, value, 10) catch cfg.rate_limit_per_subnet;
                     } else if (std.mem.eql(u8, key, "handshake_flood_guard_enabled")) {
-                        cfg.handshake_flood_guard_enabled = std.mem.eql(u8, value, "true");
+                        cfg.handshake_flood_guard_enabled = parseBool(value);
                     } else if (std.mem.eql(u8, key, "handshake_flood_guard_threshold")) {
                         const parsed = std.fmt.parseInt(u16, value, 10) catch cfg.handshake_flood_guard_threshold;
                         cfg.handshake_flood_guard_threshold = @max(@as(u16, 1), parsed);
@@ -671,7 +690,7 @@ pub const Config = struct {
                         const parsed = std.fmt.parseInt(u8, value, 10) catch cfg.idle_timeout_jitter_pct;
                         cfg.idle_timeout_jitter_pct = @min(@as(u8, 100), parsed);
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
-                        cfg.unsafe_override_limits = std.mem.eql(u8, value, "true");
+                        cfg.unsafe_override_limits = parseBool(value);
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
@@ -686,26 +705,26 @@ pub const Config = struct {
                         if (cfg.tls_domain.ptr != default_tls_domain.ptr) allocator.free(cfg.tls_domain);
                         cfg.tls_domain = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "mask")) {
-                        cfg.mask = std.mem.eql(u8, value, "true");
+                        cfg.mask = parseBool(value);
                     } else if (std.mem.eql(u8, key, "mask_target")) {
                         if (cfg.mask_target) |target| allocator.free(target);
                         cfg.mask_target = if (value.len > 0) try allocator.dupe(u8, value) else null;
                     } else if (std.mem.eql(u8, key, "mask_port")) {
                         cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "desync")) {
-                        cfg.desync = std.mem.eql(u8, value, "true");
+                        cfg.desync = parseBool(value);
                     } else if (std.mem.eql(u8, key, "fake_tls_only")) {
-                        cfg.fake_tls_only = std.mem.eql(u8, value, "true");
+                        cfg.fake_tls_only = parseBool(value);
                     } else if (std.mem.eql(u8, key, "drs")) {
-                        cfg.drs = std.mem.eql(u8, value, "true");
+                        cfg.drs = parseBool(value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
-                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                        cfg.fast_mode = parseBool(value);
                     } else if (std.mem.eql(u8, key, "unknown_sni_action")) {
                         if (parseUnknownSniAction(value)) |action| cfg.unknown_sni_action = action;
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
-                        cfg.metrics.enabled = std.mem.eql(u8, value, "true");
+                        cfg.metrics.enabled = parseBool(value);
                     } else if (std.mem.eql(u8, key, "host")) {
                         if (cfg.metrics.host) |prev| allocator.free(prev);
                         cfg.metrics.host = try allocator.dupe(u8, value);
@@ -718,7 +737,7 @@ pub const Config = struct {
                             cfg.upstream_mode = mode;
                         }
                     } else if (std.mem.eql(u8, key, "allow_direct_fallback")) {
-                        cfg.allow_direct_fallback = std.mem.eql(u8, value, "true");
+                        cfg.allow_direct_fallback = parseBool(value);
                     }
                 } else if (in_upstream_socks5_section or in_upstream_http_section) {
                     if (std.mem.eql(u8, key, "host")) {
@@ -901,8 +920,8 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expect(!cfg.fast_mode); // Default is false
     try std.testing.expect(cfg.fake_tls_only); // Default is true (secure: dd off)
-    try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
+    try std.testing.expectEqual(@as(u32, 2048), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(usize, 2048 * 1024), cfg.middleProxyBufferBytes());
     try std.testing.expectEqual(@as(u8, 0), cfg.rate_limit_per_subnet); // Default 0 (disabled)
     try std.testing.expect(!cfg.handshake_flood_guard_enabled);
     try std.testing.expectEqual(@as(u16, 20), cfg.handshake_flood_guard_threshold);
@@ -1959,4 +1978,31 @@ test "parse config - fuzz malformed/random content" {
         var parsed = Config.parse(std.testing.allocator, buf[0..len]) catch continue;
         parsed.deinit(std.testing.allocator);
     }
+}
+
+test "parseBool accepts true/1/yes/on case-insensitively, rejects others" {
+    try std.testing.expect(parseBool("true"));
+    try std.testing.expect(parseBool("True"));
+    try std.testing.expect(parseBool("TRUE"));
+    try std.testing.expect(parseBool("1"));
+    try std.testing.expect(parseBool("yes"));
+    try std.testing.expect(parseBool("on"));
+    try std.testing.expect(!parseBool("false"));
+    try std.testing.expect(!parseBool("0"));
+    try std.testing.expect(!parseBool("no"));
+    try std.testing.expect(!parseBool(""));
+    try std.testing.expect(!parseBool("tru"));
+}
+
+test "section header with an inline comment still selects the section" {
+    const toml =
+        \\[server] # main settings
+        \\port = 9999
+        \\[censorship]   # masking knobs
+        \\mask = yes
+    ;
+    var cfg = try Config.parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 9999), cfg.port);
+    try std.testing.expect(cfg.mask); // `mask = yes` now parses (parseBool) under a commented header
 }

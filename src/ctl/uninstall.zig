@@ -105,6 +105,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/sing-box" }) catch {};
 
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-mask-health.timer" }) catch {};
+    // recovery.zig installs this script; update.zig treats its mere existence as "recovery
+    // is installed" and silently re-enables the whole timer stack. Remove it on uninstall
+    // so a later reinstall+update doesn't resurrect recovery.
+    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtproto-mask-health.sh" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.timer" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.service" }) catch {};
 
@@ -136,6 +140,22 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_netns.sh" }) catch {};
     sys.execSilent(allocator, &.{ "ip", "netns", "del", "tg_proxy_ns" });
 
+    // Bring down WG/AmneziaWG tunnel interfaces and remove their configs. The egress
+    // feature writes VPN provider PRIVATE KEYS to /etc/amnezia/**.conf (0600) and brings
+    // up awg0..N; leaving them up keeps live tunnels and leaves the provider's keys on
+    // disk after "uninstall succeeded". Best-effort down + ip link del + rm the configs.
+    const tunnel_teardown =
+        \\for conf in /etc/amnezia/amneziawg/*.conf /etc/amnezia/awg*.conf /etc/wireguard/awg*.conf; do
+        \\  [ -f "$conf" ] || continue
+        \\  iface=$(basename "$conf" .conf)
+        \\  command -v awg-quick >/dev/null 2>&1 && awg-quick down "$conf" 2>/dev/null || true
+        \\  command -v wg-quick  >/dev/null 2>&1 && wg-quick  down "$conf" 2>/dev/null || true
+        \\  ip link del "$iface" 2>/dev/null || true
+        \\done
+        \\rm -rf /etc/amnezia 2>/dev/null || true
+    ;
+    _ = sys.execForward(&.{ "bash", "-c", tunnel_teardown }) catch {};
+
     // 5. Remove masking config. The site name MUST match masking.zig
     //    ("mtproto-masking"); the old "mtproto-mask" name never matched the
     //    installed vhost, so it was left enabled while its cert was deleted,
@@ -161,9 +181,13 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     //    IPv6, then re-persist rules.v4/v6 so the clamp doesn't return on reboot.
     //    Match any `--set-mss <n>` (not just the default 88) so a custom
     //    `--tcpmss <n>` clamp is also removed.
+    //    Also replay-delete any orphaned nfqws NFQUEUE rule: its unit adds the rule in
+    //    ExecStartPre with no ExecStopPost, so stopping the (now-removed) unit leaves the
+    //    `-j NFQUEUE --queue-num 200` rule live — and the iptables-save below would
+    //    otherwise re-persist that dead rule across reboots.
     const tcpmss_cleanup =
         \\for ipt in iptables ip6tables; do
-        \\  "$ipt" -t mangle -S OUTPUT 2>/dev/null | grep -E -- '-j TCPMSS --set-mss [0-9]+' | while read -r line; do
+        \\  "$ipt" -t mangle -S OUTPUT 2>/dev/null | grep -E -- '-j (TCPMSS --set-mss [0-9]+|NFQUEUE --queue-num [0-9]+)' | while read -r line; do
         \\    rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
         \\    "$ipt" -t mangle $rule 2>/dev/null || true
         \\  done

@@ -227,12 +227,20 @@ sudo mtbuddy setup tunnel /path/to/awg0.conf
 sudo mtbuddy setup tunnel 'vpn://...'
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 
+# Egress qua liên kết chia sẻ VPN — upstream sạch, khó chặn cho chặng proxy→Telegram.
+#   vless:// vmess:// trojan:// ss://  -> tunnel sing-box TUN cục bộ (type=tunnel; VLESS-Reality
+#                                        ngụy trang chặng nhảy thành TLS thật).
+#   wireguard://                       -> tunnel WG kernel gốc (giống `setup tunnel`).
+#   nhiều liên kết                     -> pool tự chuyển dự phòng (urltest).
+sudo mtbuddy setup egress 'vless://...@host:443?security=reality&pbk=...&sni=...&flow=xtls-rprx-vision'
+sudo mtbuddy setup egress 'wireguard://<privkey>@host:51820?publickey=...&address=10.0.0.2/32'
+
 # IPv6 hopping
 sudo mtbuddy ipv6-hop --check
 sudo mtbuddy ipv6-hop --auto --prefix 2a01:abcd:ef00:: --threshold 5
 
 # Update Cloudflare DNS A record
-sudo mtbuddy update-dns 1.2.3.4
+sudo mtbuddy update-dns 1.2.3.4 proxy.example.com
 
 # Full help
 mtbuddy --help

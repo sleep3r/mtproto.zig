@@ -64,7 +64,8 @@ pub const TomlDoc = struct {
     /// Get a value by [section].key. Returns null if not found.
     pub fn get(self: *Self, section_name: []const u8, key: []const u8) ?[]const u8 {
         var in_section = false;
-        const target_header = sectionHeader(section_name);
+        var hdr_buf: [128]u8 = undefined;
+        const target_header = sectionHeader(section_name, &hdr_buf);
 
         for (self.lines.items) |line| {
             const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
@@ -91,7 +92,8 @@ pub const TomlDoc = struct {
 
     /// Set a value in [section].key, creating section/key if needed.
     pub fn set(self: *Self, section_name: []const u8, key: []const u8, value: []const u8) !void {
-        const target_header = sectionHeader(section_name);
+        var hdr_buf: [128]u8 = undefined;
+        const target_header = sectionHeader(section_name, &hdr_buf);
         var in_section = false;
         var section_end: ?usize = null;
 
@@ -148,7 +150,8 @@ pub const TomlDoc = struct {
         if (self.lines.items.len > 0) {
             try self.lines.append(self.allocator, try self.allocator.dupe(u8, ""));
         }
-        try self.lines.append(self.allocator, try self.allocator.dupe(u8, sectionHeader(section_name)));
+        var hdr_buf: [128]u8 = undefined;
+        try self.lines.append(self.allocator, try self.allocator.dupe(u8, sectionHeader(section_name, &hdr_buf)));
     }
 
     /// Add a key-value pair (must call addSection first).
@@ -188,17 +191,13 @@ pub const TomlDoc = struct {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-fn sectionHeader(name: []const u8) []const u8 {
-    // Return comptime-known section headers for known section names
-    if (std.mem.eql(u8, name, "server")) return "[server]";
-    if (std.mem.eql(u8, name, "censorship")) return "[censorship]";
-    if (std.mem.eql(u8, name, "general")) return "[general]";
-    if (std.mem.eql(u8, name, "upstream")) return "[upstream]";
-    if (std.mem.eql(u8, name, "upstream.tunnel")) return "[upstream.tunnel]";
-    if (std.mem.eql(u8, name, "access.users")) return "[access.users]";
-    if (std.mem.eql(u8, name, "access.direct_users")) return "[access.direct_users]";
-    // Fallback: just return the name (caller is responsible for brackets)
-    return name;
+/// Return the bracketed `[name]` form into `buf` (already-bracketed names pass through).
+/// Previously unknown names were returned WITHOUT brackets, so e.g. doc.set("upstream.xray",
+/// …) wrote a bracket-less `upstream.xray` line — invalid TOML that get() could never read
+/// back and that duplicated on every write. Bracketing any name fixes all three.
+fn sectionHeader(name: []const u8, buf: []u8) []const u8 {
+    if (name.len > 0 and name[0] == '[') return name;
+    return std.fmt.bufPrint(buf, "[{s}]", .{name}) catch name;
 }
 
 const KeyValue = struct {
@@ -272,4 +271,27 @@ test "parseKeyValue: inline comment stripped when outside quotes" {
 test "parseKeyValue: quoted '#' preserved" {
     const kv = parseKeyValue("secret = \"abc#def\"") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("abc#def", kv.value);
+}
+
+test "set/get round-trips a dotted (non-allowlisted) section with brackets" {
+    var doc = TomlDoc.initEmpty(std.testing.allocator);
+    defer doc.deinit();
+
+    try doc.set("upstream.xray", "links", "[\"vless://x\"]");
+    // The written header must be valid bracketed TOML, and get() must read it back.
+    const rendered = try doc.render(std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[upstream.xray]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\nupstream.xray\n") == null);
+
+    const v = doc.get("upstream.xray", "links") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("[\"vless://x\"]", v);
+
+    // A second set must update in place, not duplicate the malformed header.
+    try doc.set("upstream.xray", "links", "[]");
+    var count: usize = 0;
+    for (doc.lines.items) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "[upstream.xray]")) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }

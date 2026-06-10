@@ -223,7 +223,11 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeGauge(writer, "mtproto_accept_paused", "whether accepts are paused due to fd pressure", boolToInt(snapshot.accept_paused));
     try writeGauge(writer, "mtproto_saturation_paused", "whether accepts are paused due to saturation", boolToInt(snapshot.saturation_paused));
     try writeCounter(writer, "mtproto_drops_capacity_total", "connections dropped because max_connections was reached", snapshot.drops_capacity_total);
-    try writeCounter(writer, "mtproto_drops_saturation_total", "accept attempts dropped due to saturation hysteresis", snapshot.drops_saturation_total);
+    try writeCounter(writer, "mtproto_drops_pool_total", "connections dropped because a worker's connection pool was exhausted", snapshot.drops_pool_total);
+    // NOTE: this counts saturation-pause transitions, not dropped connections — pending
+    // connections stay in the kernel backlog and are served after resume. Name kept for
+    // dashboard back-compat; see HELP for the real meaning.
+    try writeCounter(writer, "mtproto_drops_saturation_total", "times accepts were paused due to saturation hysteresis (NOT dropped connections; backlog is served after resume)", snapshot.drops_saturation_total);
     try writeCounter(writer, "mtproto_drops_rate_limit_total", "connections dropped by subnet rate limiter", snapshot.drops_rate_limit_total);
     try writeCounter(writer, "mtproto_drops_flood_guard_total", "connections dropped by exact-IP handshake flood guard", snapshot.drops_flood_guard_total);
     try writeCounter(writer, "mtproto_drops_handshake_budget_total", "connections dropped because handshake budget was exhausted", snapshot.drops_handshake_budget_total);
@@ -457,9 +461,10 @@ test "metrics output contains required metrics" {
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
     };
-    defer cfg.deinit(std.testing.allocator);
     try cfg.users.put(try std.testing.allocator.dupe(u8, "test"), [_]u8{0x11} ** 16);
 
+    // ProxyState.init takes ownership of cfg; state.deinit() frees it. Do NOT also
+    // defer cfg.deinit() here — that double-frees the users hashmap (SIGSEGV).
     var state = try proxy.ProxyState.init(std.testing.allocator, cfg, "test-config.toml");
     defer state.deinit();
 
@@ -477,9 +482,9 @@ test "metrics rejects unknown path" {
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
     };
-    defer cfg.deinit(std.testing.allocator);
     try cfg.users.put(try std.testing.allocator.dupe(u8, "test"), [_]u8{0x22} ** 16);
 
+    // ProxyState.init takes ownership of cfg (freed by state.deinit); no separate deinit.
     var state = try proxy.ProxyState.init(std.testing.allocator, cfg, "test-config.toml");
     defer state.deinit();
 

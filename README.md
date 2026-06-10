@@ -58,7 +58,7 @@ Most MTProto proxies are large, dependency-heavy, and use lots of memory. This o
 ## Why Zig?
 
 We chose Zig because it provides the raw performance and micro-footprint of C, but without the memory unsafety or build-system nightmares:
-- **No arbitrary allocations:** All connection slots and buffers are pre-allocated on startup. There is no garbage collector dropping frames under heavy load.
+- **No hot-path allocations:** Connection-slot bookkeeping is pre-sized at startup; slot structs and their heavy buffers are created on first use and reused, so the relay path never allocates per byte. There is no garbage collector dropping frames under heavy load.
 - **Hermetic cross-compilation:** Run `zig build` on macOS, and out comes a statically linked Linux binary. No Docker, no `glibc` version mismatches.
 - **Comptime:** Costly operations like protocol definition mapping, endianness conversions, and bilingual string lookup for `mtbuddy` are resolved during compilation, giving instant startup times.
 
@@ -96,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/boo
 # or: MTPROTO_INSECURE=1
 ```
 
-This downloads the latest `mtbuddy` binary, verifies minisign signature + SHA-256 checksum from the GitHub Release, and runs `mtbuddy --help`. Then install the proxy:
+This downloads the latest `mtbuddy` binary, verifies minisign signature + SHA-256 checksum from the GitHub Release, and prints the next-step install command. Then install the proxy:
 
 ```bash
 # Minimal — auto-generates a secret, enables all DPI bypass modules
@@ -167,7 +167,7 @@ sudo mtbuddy --interactive
 | `--tcpmss <n>` | `88` | TCPMSS clamp value (forces ClientHello fragmentation) |
 | `--no-dpi` | — | Disable all DPI modules |
 | `--middle-proxy` | — | Enable Telegram MiddleProxy relay |
-| `--ipv6-hop` | — | Enable IPv6 auto-hopping |
+| `--ipv6-hop` | — | Print a reminder to configure IPv6 auto-hopping (run `mtbuddy ipv6-hop`; needs Cloudflare API) |
 | `--version, -v <tag>` | `latest` | Release version to install |
 | `--insecure` | — | Allow unsigned assets (not recommended) |
 
@@ -240,7 +240,7 @@ sudo mtbuddy ipv6-hop --check
 sudo mtbuddy ipv6-hop --auto --prefix 2a01:abcd:ef00:: --threshold 5
 
 # Update Cloudflare DNS A record
-sudo mtbuddy update-dns 1.2.3.4
+sudo mtbuddy update-dns 1.2.3.4 proxy.example.com
 
 # Full help
 mtbuddy --help
@@ -280,7 +280,7 @@ If your VPS is in a region where Telegram DCs are blocked at the network level, 
 
 Currently supported VPN types:
 - **AmneziaWG** — DPI-resistant WireGuard fork (recommended for Russia/Iran)
-- **WireGuard** — standard WireGuard (planned)
+- **WireGuard** — standard kernel WireGuard (via `setup egress 'wireguard://…'` or a WG `.conf` through the AmneziaWG-compatible backend)
 
 ```
 Client → mtproto-proxy (host namespace)
@@ -303,7 +303,7 @@ sudo mtbuddy setup tunnel 'vpn://...'
 sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 ```
 
-In the interactive `mtbuddy` menu, tunnel setup first asks for the VPN type (AmneziaWG for now), then shows the current tunnel pool. Choose **Create new tunnel** to append the next free `awgN`, or choose an existing interface to replace that pool member's config.
+In the interactive `mtbuddy` menu, tunnel setup first asks for the VPN type (AmneziaWG or standard WireGuard), then shows the current tunnel pool. Choose **Create new tunnel** to append the next free `awgN`, or choose an existing interface to replace that pool member's config.
 
 `mtbuddy` keeps `[general].use_middle_proxy` unchanged and only configures transport (`[upstream].type = "tunnel"`).
 After setup, it installs `mtproto-tunnel-pool.timer`, validates policy routes (`mark 200`) to Telegram DC ranges, and prints operational commands. The pool controller probes Telegram through each tunnel and rewrites table 200 with `ip route replace`; automatic failover does not restart `mtproto-proxy`.
@@ -421,6 +421,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[upstream.http] username` | — | HTTP proxy username (empty = no auth) |
 | `[upstream.http] password` | — | HTTP proxy password |
 | `[general] use_middle_proxy` | `false` | ME mode for DC1..5 (recommended for promo parity) |
+| `[general] force_media_middle_proxy` | `true` | Route media-path (DC ±10000) traffic via MiddleProxy even when `use_middle_proxy=false` |
 | `[general] ad_tag` | — | Alias for `[server].tag` |
 | `[server] port` | `443` | TCP listen port |
 | `[server] bind_address` | — | Specific IP to bind the listen socket (default: all interfaces) |
@@ -434,7 +435,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] idle_timeout_jitter_pct` | `15` | Per-connection ±% jitter on the idle timeout so a constant value isn't a fingerprint (`0` disables) |
 | `[server] handshake_timeout_sec` | `15` | Handshake completion timeout |
 | `[server] graceful_shutdown_timeout_sec` | `15` | SIGTERM drain timeout before force-close |
-| `[server] middleproxy_buffer_kb` | `1024` | ME per-connection buffer (KiB). Below 1024 may cause overflow on media traffic |
+| `[server] middleproxy_buffer_kb` | `2048` | ME per-connection buffer (KiB). Must hold one max RPC frame; below 1024 truncates 1 MiB media parts |
 | `[server] tag` | — | 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server] log_level` | `"info"` | `debug` / `info` / `warn` / `err` |
 | `[server] rate_limit_per_subnet` | `0` | Max new conns/sec per /24 (IPv4) or /48 (IPv6). `0` = disabled (default, NAT-friendly); set e.g. `30` for non-NAT hosts |
@@ -449,6 +450,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] host` | `"127.0.0.1"` | Metrics bind address |
 | `[metrics] port` | `9400` | Metrics port |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
+| `[censorship] fake_tls_only` | `true` | Reject the non-TLS `dd` transport; accept only FakeTLS (`ee`) clients |
 | `[censorship] mask` | `true` | Forward unauthenticated clients to `tls_domain` |
 | `[censorship] unknown_sni_action` | `"mask"` | Unknown-SNI ClientHello: `mask` (forward), `reject` (fatal TLS alert like a rejecting server), or `drop` |
 | `[censorship] mask_target` | unset | Optional backend host for masked clients |
@@ -593,7 +595,7 @@ docker build -t mtproto-zig .
 docker buildx build --platform linux/amd64,linux/arm64 -t your-registry/mtproto-zig:latest --push .
 ```
 
-Published `linux/amd64` images are built with a portable CPU profile (`-Dcpu=x86_64`) to avoid `Illegal instruction` crashes on older VPS CPUs.
+Published `linux/amd64` images are built with `-Dcpu=x86_64+aes` — the x86-64 baseline plus AES-NI for fast crypto. This requires a CPU with AES-NI (virtually all VPS hardware since ~2011); on a QEMU/KVM guest exposing a CPU model without `aes`, build your own image with `-Dcpu=x86_64` to avoid `Illegal instruction`.
 
 > For production censorship-bypass deployments, prefer the native `mtbuddy install` flow. OS-level mitigations (iptables TCPMSS, nfqws, tunnel policy routing, masking/recovery units) are not applied inside the container; only the proxy binary runs there.
 

@@ -530,5 +530,26 @@ fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
 }
 
 test {
+    // Zig only collects tests from files reachable through analyzed test code. The root
+    // test previously referenced only `tunnel`, so 25+ tests in modules reached solely
+    // from main() (sharelink, links, config_cmd, fronting_domain, install, ipv6hop, …)
+    // never ran under `zig build test` — CI was green on code it never exercised. Pull in
+    // every test-bearing ctl module explicitly.
     std.testing.refAllDecls(tunnel);
+    _ = @import("sharelink.zig");
+    _ = @import("tunnel_wg.zig");
+    _ = @import("tunnel_singbox.zig");
+    _ = @import("links.zig");
+    _ = @import("config_cmd.zig");
+    _ = @import("fronting_domain.zig");
+    _ = @import("install.zig");
+    _ = @import("ipv6hop.zig");
+    _ = @import("toml.zig");
+    _ = @import("i18n.zig");
+    _ = @import("tui.zig");
+    _ = @import("release.zig");
+    _ = @import("nfqws.zig");
+    _ = @import("masking.zig");
+    _ = @import("uninstall.zig");
+    _ = @import("update.zig");
 }

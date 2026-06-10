@@ -176,6 +176,14 @@ pub const S = enum(u16) {
     install_warn_user_ignored,
     install_warn_ipv6_hop_manual,
     install_secret_gen_failed,
+
+    // ── TUI chrome (menu/checkbox footers, exit) ──
+    // NOTE: en_strings and ru_strings are positional arrays indexed by @intFromEnum(S).
+    // APPEND new keys here AND at the END of BOTH arrays (never mid-list) so existing
+    // indices don't shift.
+    tui_nav_hint_menu,
+    tui_nav_hint_checkbox,
+    tui_exited,
 };
 
 /// Get a localized string by key.
@@ -442,6 +450,12 @@ const en_strings = [_][]const u8{
     "IPv6 auto-hopping is not configured by install. Run `mtbuddy ipv6-hop` (requires Cloudflare API credentials).",
     // install_secret_gen_failed
     "Couldn't generate a secure secret on this system. Pass your own 32-hex secret with --secret instead.",
+    // tui_nav_hint_menu
+    "↑↓ navigate  Enter select",
+    // tui_nav_hint_checkbox
+    "↑↓ navigate  Space toggle  Enter confirm",
+    // tui_exited
+    "Exited",
 };
 
 // ── Russian strings ─────────────────────────────────────────────
@@ -699,6 +713,12 @@ const ru_strings = [_][]const u8{
     "Авто-смена IPv6 не настраивается при установке. Запустите `mtbuddy ipv6-hop` (нужны ключи Cloudflare API).",
     // install_secret_gen_failed
     "Не удалось сгенерировать безопасный случайный секрет (системный генератор недоступен). Укажите свой 32-hex секрет через --secret.",
+    // tui_nav_hint_menu
+    "↑↓ выбор  Enter выбрать",
+    // tui_nav_hint_checkbox
+    "↑↓ выбор  Space отметить  Enter подтвердить",
+    // tui_exited
+    "Выход",
 };
 
 // ── Comptime validation ─────────────────────────────────────────
@@ -711,6 +731,21 @@ comptime {
     if (ru_strings.len != num_keys) {
         @compileError("ru_strings length mismatch with S enum");
     }
+}
+
+test "i18n anchor strings — catches index drift between the S enum and the tables" {
+    // The en/ru tables are positional (indexed by @intFromEnum). The comptime guard only
+    // checks LENGTH, so a key inserted mid-enum with a string appended at the end of just
+    // one array would shift every later entry undetected. These anchors at the start, a
+    // couple of interior points, and the very end would break loudly if that happened.
+    try std.testing.expectEqualStrings("Select language / Выберите язык:", get(.en, .select_language));
+    try std.testing.expectEqualStrings("English", get(.en, .lang_english));
+    try std.testing.expectEqualStrings("Exited", get(.en, .tui_exited));
+    try std.testing.expectEqualStrings("Выход", get(.ru, .tui_exited));
+    try std.testing.expectEqualStrings("↑↓ navigate  Enter select", get(.en, .tui_nav_hint_menu));
+    // install_secret_gen_failed sits just before the appended TUI keys.
+    try std.testing.expect(std.mem.indexOf(u8, get(.en, .install_secret_gen_failed), "--secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get(.ru, .install_secret_gen_failed), "--secret") != null);
 }
 
 test "Lang.fromEnvMap prefers LC_ALL over LANG" {

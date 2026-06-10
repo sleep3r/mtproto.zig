@@ -59,8 +59,11 @@ fn fillRandom(bytes: []u8) bool {
 pub const Ipv6Opts = struct {
     mode: Mode = .manual,
     interface: []const u8 = "eth0",
-    ipv6_prefix: []const u8 = "2a01:48a0:4301:bf",
-    dns_name: []const u8 = "proxy.sleep3r.ru",
+    /// Operator's allocated /64 prefix (no trailing ::). Required for rotation — there is
+    /// no sensible universal default, so it stays empty until provided via --prefix.
+    ipv6_prefix: []const u8 = "",
+    /// Hostname whose Cloudflare A/AAAA record to update. Empty = skip DNS updates.
+    dns_name: []const u8 = "",
     ban_threshold: u32 = 10,
 };
 
@@ -109,8 +112,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     var prefix_buf: [64]u8 = undefined;
     const prefix = try ui.input(
         "IPv6 /64 prefix",
-        "Your allocated /64 prefix without trailing ::.",
-        "2a01:48a0:4301:bf",
+        "Your allocated /64 prefix without trailing :: (e.g. 2001:db8:1234:5678).",
+        "",
         &prefix_buf,
     );
 
@@ -134,6 +137,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: Ipv6Opts) !void {
         },
 
         .manual => {
+            if (opts.ipv6_prefix.len == 0) {
+                ui.fail("No IPv6 /64 prefix given — pass --prefix <your-/64> (e.g. 2001:db8:1234:5678)");
+                return;
+            }
             ui.step("Manual IPv6 rotation...");
             removeOldIpv6(allocator, opts.interface);
             const new_ip = addNewIpv6(allocator, opts.ipv6_prefix, opts.interface);
@@ -143,7 +150,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: Ipv6Opts) !void {
                 ui.summaryBox("IPv6 Hop Complete", &.{
                     .{ .label = "New address:", .value = ip },
                     .{ .label = "Interface:", .value = opts.interface },
-                    .{ .label = "DNS:", .value = opts.dns_name },
+                    .{ .label = "DNS:", .value = if (opts.dns_name.len > 0) opts.dns_name else "(none)" },
                 });
             } else {
                 ui.fail("Failed to add new IPv6");
@@ -151,21 +158,32 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: Ipv6Opts) !void {
         },
 
         .auto => {
+            if (opts.ipv6_prefix.len == 0) {
+                ui.fail("No IPv6 /64 prefix given — pass --prefix <your-/64> (e.g. 2001:db8:1234:5678)");
+                return;
+            }
             ui.info("Auto-hop mode started");
             ui.print("  Ban threshold: {d} timeouts/60s\n", .{opts.ban_threshold});
             ui.info("Running in foreground. Ctrl+C to stop.");
             ui.writeRaw("\n");
 
-            // Auto-hop loop — runs forever
+            // Auto-hop loop — runs forever. Each iteration uses its own arena so the
+            // journalctl/exec output captured for ban detection (and any rotation's dup'd
+            // IP + Cloudflare JSON) is freed every cycle instead of accumulating for the
+            // life of the process on the shared init arena.
             while (true) {
-                const timeouts = countRecentTimeouts(allocator);
+                var it_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer it_arena.deinit();
+                const a = it_arena.allocator();
+
+                const timeouts = countRecentTimeouts(a);
                 if (timeouts >= opts.ban_threshold) {
                     ui.warn("Ban detected — rotating IPv6...");
-                    removeOldIpv6(allocator, opts.interface);
-                    const new_ip = addNewIpv6(allocator, opts.ipv6_prefix, opts.interface);
+                    removeOldIpv6(a, opts.interface);
+                    const new_ip = addNewIpv6(a, opts.ipv6_prefix, opts.interface);
                     if (new_ip) |ip| {
                         ui.ok("Hopped to new IPv6");
-                        updateDns(ui, allocator, ip, opts.dns_name);
+                        updateDns(ui, a, ip, opts.dns_name);
                         ui.stepOk("Hop complete, sleeping 60s", ip);
                     }
                     sleepSeconds(60);
@@ -179,7 +197,26 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: Ipv6Opts) !void {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-const STATE_FILE = "/tmp/mtproto-ipv6-current";
+// Root-owned location (not world-writable /tmp): a local user must not be able to
+// pre-create/poison this file (its content is fed to `ip -6 addr del`) or symlink-clobber
+// it via root's truncating write. /opt/mtproto-proxy is created 0755 root by the installer.
+const STATE_FILE = "/opt/mtproto-proxy/ipv6-current";
+
+/// Conservative IPv6 literal sanity check: hex digits and at least two colons only. Guards
+/// `ip -6 addr del <content>` against a poisoned/garbage state file deleting the wrong
+/// address (e.g. the host's primary IPv6) — defense in depth atop the root-owned path.
+fn looksLikeIpv6(s: []const u8) bool {
+    if (s.len < 2 or s.len > 45) return false;
+    var colons: usize = 0;
+    for (s) |c| {
+        if (c == ':') {
+            colons += 1;
+        } else if (!std.ascii.isHex(c)) {
+            return false;
+        }
+    }
+    return colons >= 2;
+}
 
 fn readStateFile(allocator: std.mem.Allocator) ?[]const u8 {
     const r = sys.exec(allocator, &.{ "cat", STATE_FILE }) catch return null;
@@ -192,6 +229,10 @@ fn readStateFile(allocator: std.mem.Allocator) ?[]const u8 {
 fn removeOldIpv6(allocator: std.mem.Allocator, interface: []const u8) void {
     const old_ip = readStateFile(allocator) orelse return;
     defer allocator.free(old_ip);
+
+    // Never pass an unvalidated value to `ip -6 addr del` — a poisoned state file could
+    // otherwise delete the host's primary IPv6 and cut connectivity.
+    if (!looksLikeIpv6(old_ip)) return;
 
     var addr_buf: [128]u8 = undefined;
     const addr = std.fmt.bufPrint(&addr_buf, "{s}/64", .{old_ip}) catch return;
@@ -223,8 +264,8 @@ fn addNewIpv6(allocator: std.mem.Allocator, prefix: []const u8, interface: []con
     defer r.deinit();
     if (r.exit_code != 0) return null;
 
-    // Save state using native I/O
-    sys.writeFile(STATE_FILE, ip) catch {};
+    // Save state 0600 in the root-owned dir (no symlink-following hazard there).
+    sys.writeFileMode(STATE_FILE, ip, 0o600) catch {};
 
     return allocator.dupe(u8, ip) catch null;
 }
@@ -241,17 +282,32 @@ fn countRecentTimeouts(allocator: std.mem.Allocator) u32 {
     }) catch return 0;
     defer r.deinit();
 
+    // The proxy never logs the literal "Handshake timeout"; per-event closes are at debug
+    // level and filtered out by default. It DOES emit per-interval drop deltas at info,
+    // e.g. "  drops: cap+=0 ... hs_timeout+=12 mp_fallback+=0 pool+=0". Sum the
+    // hs_timeout deltas observed in the window — that's the real timeout count.
+    return sumHandshakeTimeoutDeltas(r.stdout);
+}
+
+/// Sum every `hs_timeout+=N` delta in proxy journal output. Pure for testability.
+fn sumHandshakeTimeoutDeltas(journal: []const u8) u32 {
     var count: u32 = 0;
-    var lines = std.mem.splitScalar(u8, r.stdout, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "Handshake timeout") != null) {
-            count +|= 1;
+    const marker = "hs_timeout+=";
+    var search = journal;
+    while (std.mem.indexOf(u8, search, marker)) |idx| {
+        const after = search[idx + marker.len ..];
+        var end: usize = 0;
+        while (end < after.len and after[end] >= '0' and after[end] <= '9') end += 1;
+        if (end > 0) {
+            count +|= std.fmt.parseInt(u32, after[0..end], 10) catch 0;
         }
+        search = after[end..];
     }
     return count;
 }
 
 fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_name: []const u8) void {
+    if (dns_name.len == 0) return; // No hostname configured — nothing to update.
     if (updateCloudflareRecord(ui, allocator, .aaaa, dns_name, new_ip, 30)) {
         ui.ok("DNS AAAA record updated");
     }
@@ -260,11 +316,16 @@ fn updateDns(ui: *Tui, allocator: std.mem.Allocator, new_ip: []const u8, dns_nam
 /// Update DNS A record (from update_dns.sh).
 pub fn updateDnsA(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     const new_ip = args.next() orelse {
-        ui.fail("Usage: mtbuddy update-dns <new_ip>");
+        ui.fail("Usage: mtbuddy update-dns <new_ip> <hostname>");
         return;
     };
 
-    const dns_name = "proxy.sleep3r.ru";
+    // Hostname must be supplied by the operator — there is no shared default. (Previously
+    // hardcoded to the author's personal domain, so it never worked for anyone else.)
+    const dns_name = args.next() orelse {
+        ui.fail("Usage: mtbuddy update-dns <new_ip> <hostname>");
+        return;
+    };
 
     ui.step("Updating DNS A record...");
     if (!updateCloudflareRecord(ui, allocator, .a, dns_name, new_ip, 60)) return;
@@ -342,15 +403,18 @@ fn loadCloudflareCredentials(ui: *Tui, allocator: std.mem.Allocator) ?Cloudflare
         ui.warn("CF_TOKEN not set — skipping DNS update");
         return null;
     };
-    errdefer allocator.free(token);
-
+    // NOTE: errdefer does NOT run on `return null` (only on error returns), so every
+    // null-return path below frees `token`/`zone` explicitly — otherwise the Cloudflare
+    // bearer token leaks (and lingers un-zeroed) on each partial-config call.
     const zone = sys.readEnvFile(allocator, CLOUDFLARE_ENV_PATH, "CF_ZONE") orelse {
+        allocator.free(token);
         ui.warn("CF_ZONE not set — skipping DNS update");
         return null;
     };
-    errdefer allocator.free(zone);
 
     if (token.len == 0 or zone.len == 0) {
+        allocator.free(token);
+        allocator.free(zone);
         ui.warn("CF_TOKEN or CF_ZONE empty — skipping DNS update");
         return null;
     }
@@ -511,4 +575,55 @@ fn cloudflareResponseSuccess(allocator: std.mem.Allocator, response_json: []cons
         .bool => |ok| ok,
         else => false,
     };
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+test "looksLikeIpv6 accepts valid literals and rejects junk" {
+    try std.testing.expect(looksLikeIpv6("2001:db8::1"));
+    try std.testing.expect(looksLikeIpv6("2a01:48a0:4301:bf:1122:3344:5566:7788"));
+    try std.testing.expect(!looksLikeIpv6(""));
+    try std.testing.expect(!looksLikeIpv6("eth0"));
+    try std.testing.expect(!looksLikeIpv6("192.168.1.1")); // dots, not hex/colon
+    try std.testing.expect(!looksLikeIpv6("2001:db8::1; rm -rf /")); // shell metachars
+    try std.testing.expect(!looksLikeIpv6("nocolons"));
+}
+
+test "sumHandshakeTimeoutDeltas sums hs_timeout deltas, ignores other fields" {
+    const journal =
+        \\Jun 10 conn stats: active=5/512 hs_inflight=0
+        \\Jun 10   drops: cap+=0 sat+=1 rate+=0 flood_guard+=0 hs_budget+=2 hs_timeout+=7 mp_fallback+=0 pool+=0
+        \\Jun 10   drops: cap+=0 sat+=0 rate+=0 flood_guard+=0 hs_budget+=0 hs_timeout+=5 mp_fallback+=1 pool+=0
+    ;
+    try std.testing.expectEqual(@as(u32, 12), sumHandshakeTimeoutDeltas(journal));
+    try std.testing.expectEqual(@as(u32, 0), sumHandshakeTimeoutDeltas("no markers here\nhs_budget+=99"));
+}
+
+test "cloudflareExtractRecordId reads id from array and object results" {
+    const a = std.testing.allocator;
+    {
+        const id = cloudflareExtractRecordId(a, "{\"result\":[{\"id\":\"abc123\",\"name\":\"x\"}]}") orelse return error.TestUnexpectedNull;
+        defer a.free(id);
+        try std.testing.expectEqualStrings("abc123", id);
+    }
+    {
+        const id = cloudflareExtractRecordId(a, "{\"result\":{\"id\":\"def456\"}}") orelse return error.TestUnexpectedNull;
+        defer a.free(id);
+        try std.testing.expectEqualStrings("def456", id);
+    }
+    try std.testing.expect(cloudflareExtractRecordId(a, "{\"result\":[]}") == null);
+    try std.testing.expect(cloudflareExtractRecordId(a, "not json") == null);
+}
+
+test "cloudflareResponseSuccess parses the success flag" {
+    const a = std.testing.allocator;
+    try std.testing.expect(cloudflareResponseSuccess(a, "{\"success\":true,\"result\":{}}"));
+    try std.testing.expect(!cloudflareResponseSuccess(a, "{\"success\":false}"));
+    try std.testing.expect(!cloudflareResponseSuccess(a, "{}"));
+    try std.testing.expect(!cloudflareResponseSuccess(a, "garbage"));
+}
+
+test "cloudflareRecordTypeText" {
+    try std.testing.expectEqualStrings("A", cloudflareRecordTypeText(.a));
+    try std.testing.expectEqualStrings("AAAA", cloudflareRecordTypeText(.aaaa));
 }

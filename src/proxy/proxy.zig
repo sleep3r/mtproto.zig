@@ -70,6 +70,8 @@ test {
     _ = @import("middle_proxy_nat.zig");
     _ = @import("dc_nonce.zig");
     _ = @import("upstream_failover.zig");
+    _ = @import("socks5.zig");
+    _ = @import("../monitoring.zig");
 }
 
 const log = std.log.scoped(.proxy);
@@ -312,6 +314,7 @@ const epollCreate = socket_utils.epollCreate;
 const ConnectionPhase = connection_phase.ConnectionPhase;
 const hasFatalEpollHangup = connection_phase.hasFatalEpollHangup;
 const shouldCloseOnFatalHangup = connection_phase.shouldCloseOnFatalHangup;
+const isClientDrivenHandshakePhase = connection_phase.isClientDrivenHandshakePhase;
 const RelayProgress = relay_steps.RelayProgress;
 const AddressList = net_helpers.AddressList;
 const ip4 = net_helpers.ip4;
@@ -532,6 +535,13 @@ const ConnectionSlot = struct {
     upstream_interest_in: bool = false,
     upstream_interest_out: bool = false,
     desync_wait_enqueued: bool = false,
+    /// Relay half-close drain: one peer gracefully closed (RDHUP, no HUP/ERR) while data
+    /// was still queued for the other peer. The hung-up fd is detached from epoll and the
+    /// surviving direction is flushed before the slot is torn down, so backpressured s2c/
+    /// c2s data isn't silently truncated. `*_detached` marks which fd left epoll.
+    relay_half_closed: bool = false,
+    client_detached: bool = false,
+    upstream_detached: bool = false,
 
     fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
@@ -830,6 +840,7 @@ pub const ProxyState = struct {
         drops_handshake_budget_total: u64,
         handshake_timeouts_total: u64,
         middleproxy_fallback_total: u64,
+        drops_pool_total: u64,
         close_reasons: [CloseReason.count]u64,
         client_to_upstream_bytes_total: u64,
         upstream_to_client_bytes_total: u64,
@@ -1085,6 +1096,9 @@ pub const ProxyState = struct {
     stats_dropped_hs_budget: std.atomic.Value(u64),
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
+    /// Per-worker connection pool exhausted while the global cap still had room
+    /// (SO_REUSEPORT hashes connections to workers, so one pool can fill first).
+    stats_dropped_pool: std.atomic.Value(u64),
     /// Per-reason connection close counters (RED errors + evasion signals).
     close_reasons: [CloseReason.count]std.atomic.Value(u64),
     /// Per-worker monotonic-ms liveness heartbeat (index = worker_id). /healthz and
@@ -1208,6 +1222,7 @@ pub const ProxyState = struct {
             .stats_dropped_flood_guard = std.atomic.Value(u64).init(0),
             .stats_dropped_hs_budget = std.atomic.Value(u64).init(0),
             .stats_hs_timeout = std.atomic.Value(u64).init(0),
+            .stats_dropped_pool = std.atomic.Value(u64).init(0),
             .close_reasons = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** CloseReason.count,
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
@@ -1410,6 +1425,7 @@ pub const ProxyState = struct {
             .drops_handshake_budget_total = self.stats_dropped_hs_budget.load(.monotonic),
             .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
             .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
+            .drops_pool_total = self.stats_dropped_pool.load(.monotonic),
             .close_reasons = close_reasons,
             .client_to_upstream_bytes_total = self.client_to_upstream_bytes_total.load(.monotonic),
             .upstream_to_client_bytes_total = self.upstream_to_client_bytes_total.load(.monotonic),
@@ -1596,7 +1612,13 @@ pub const ProxyState = struct {
         }
 
         // Worker 0 on the main thread owns the signalfd (signal handling + watchdog).
-        var loop0 = try EventLoop.init(self, server.socket.handle, signal_controller.fd, 0, per_worker_pool);
+        // On init failure, signal the already-spawned workers to drain before propagating
+        // — otherwise the LIFO defers above join() workers that never observe shutdown and
+        // the process hangs with worker 0's listener still in the SO_REUSEPORT group.
+        var loop0 = EventLoop.init(self, server.socket.handle, signal_controller.fd, 0, per_worker_pool) catch |err| {
+            self.shutting_down.store(true, .release);
+            return err;
+        };
         defer loop0.deinit();
         sd_notify.ready(self.notify_socket);
         loop0.run() catch |err| {
@@ -2012,10 +2034,17 @@ const EventLoop = struct {
     prev_dropped_hs_budget: u64,
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
+    prev_dropped_pool: u64,
     shared_read_buf: [read_buf_size]u8,
     desync_wait_slots: std.ArrayListUnmanaged(u32),
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
+    /// Fds whose slot was closed during the current epoll batch. closeSlot unmaps them
+    /// from fd_to_slot immediately (so stale events in the same batch miss) but defers the
+    /// actual close() until the batch finishes — otherwise the kernel could hand a
+    /// just-freed fd number to an accept()/connect() later in the SAME batch, and a stale
+    /// hangup event for the old fd would then be misattributed to the new connection.
+    pending_close_fds: std.ArrayListUnmanaged(posix.fd_t),
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t, signal_fd: posix.fd_t, worker_id: usize, pool_capacity: u32) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -2044,8 +2073,10 @@ const EventLoop = struct {
             .prev_dropped_hs_budget = 0,
             .prev_hs_timeout = 0,
             .prev_mp_fallback = 0,
+            .prev_dropped_pool = 0,
             .shared_read_buf = undefined,
             .desync_wait_slots = .empty,
+            .pending_close_fds = .empty,
             .mp_c2s_scratch = null,
             .mp_s2c_scratch = null,
         };
@@ -2067,6 +2098,9 @@ const EventLoop = struct {
             }
         }
 
+        self.drainPendingCloses();
+        self.pending_close_fds.deinit(self.state.allocator);
+
         if (self.mp_c2s_scratch) |buf| self.state.allocator.free(buf);
         if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
         self.desync_wait_slots.deinit(self.state.allocator);
@@ -2075,12 +2109,31 @@ const EventLoop = struct {
         closeFd(self.epoll_fd);
     }
 
+    /// Defer closing `fd` until the end of the current epoll batch (see pending_close_fds).
+    /// Falls back to an immediate close only if the bookkeeping allocation fails.
+    fn deferClose(self: *EventLoop, fd: posix.fd_t) void {
+        self.pending_close_fds.append(self.state.allocator, fd) catch {
+            closeFd(fd);
+        };
+    }
+
+    fn drainPendingCloses(self: *EventLoop) void {
+        for (self.pending_close_fds.items) |fd| closeFd(fd);
+        self.pending_close_fds.clearRetainingCapacity();
+    }
+
     fn run(self: *EventLoop) !void {
         var events: [256]linux.epoll_event = undefined;
         const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
         var next_timer_tick_ns: i128 = nowNs();
 
         while (true) {
+            // Close fds whose slots were torn down in the previous batch (and by timers /
+            // desync processing). Doing it here — before this iteration's accept()/connect()
+            // calls — guarantees a freed fd number is never recycled within the batch that
+            // still has queued events for it. See pending_close_fds.
+            self.drainPendingCloses();
+
             // Per-worker liveness heartbeat (this worker's slot), and pet the
             // systemd watchdog at half the configured interval — ONLY from the
             // signal owner AND only while EVERY worker is alive, so a wedged
@@ -2185,7 +2238,27 @@ const EventLoop = struct {
             }
         }
 
+        // A handler above may have replaced upstream_fd: DC failover
+        // (cleanupFailedUpstreamConnect -> tryNextDcEndpoint -> startConnectUpstream) and
+        // middleproxy->direct fallback both connect() a NEW socket. The original event fd
+        // then belongs to a now-closed connection, and shouldCloseOnFatalHangup's
+        // connecting-phase exemption only matches the *current* upstream_fd — so a stale
+        // hangup for the old fd would tear down the freshly started replacement. Drop any
+        // event whose fd no longer belongs to this slot before applying the close.
+        if (fd != slot.client_fd and fd != slot.upstream_fd) return;
+
         if (fatal_hangup and shouldCloseOnFatalHangup(slot.phase, fd, slot.upstream_fd)) {
+            // During an active relay a *graceful* half-close (RDHUP with no HUP/ERR) on one
+            // peer must not discard data already queued for the other peer. Detach the
+            // hung-up fd from epoll and flush the surviving direction before tearing down;
+            // a hard error (HUP/ERR) or an empty opposite queue still closes immediately.
+            const graceful = (events & (linux.EPOLL.HUP | linux.EPOLL.ERR)) == 0;
+            const relaying = slot.phase == .relaying or slot.phase == .mask_relaying;
+            const opposite_pending = if (fd == slot.client_fd) slot.hasUpstreamPending() else slot.hasClientPending();
+            if (graceful and relaying and opposite_pending and !slot.relay_half_closed) {
+                self.beginRelayHalfClose(slot, fd);
+                return;
+            }
             self.closeSlot(slot, "epoll hup/err");
             return;
         }
@@ -2204,10 +2277,13 @@ const EventLoop = struct {
         const active_now = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
         if (active_now >= (max * 9) / 10) {
+            // No connection is dropped here — the backlog is retained and served after the
+            // 80% resume. Count only the transition INTO pause so the counter measures
+            // saturation-pause events rather than every accept attempt while paused.
             if (!self.saturation_paused) {
                 self.pauseSaturation();
+                _ = self.state.stats_dropped_saturation.fetchAdd(1, .monotonic);
             }
-            _ = self.state.stats_dropped_saturation.fetchAdd(1, .monotonic);
             return;
         }
 
@@ -2275,7 +2351,11 @@ const EventLoop = struct {
             // cap above.
 
             const slot = self.pool.acquire() orelse {
+                // Per-worker pool is full even though the global active count was under
+                // max_connections (SO_REUSEPORT can skew connections onto one worker).
+                // Count it distinctly from the global cap so the drop isn't invisible.
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
+                _ = self.state.stats_dropped_pool.fetchAdd(1, .monotonic);
                 closeFd(cfd);
                 continue;
             };
@@ -2326,6 +2406,7 @@ const EventLoop = struct {
         const cur_hs = self.state.stats_dropped_hs_budget.load(.monotonic);
         const cur_hst = self.state.stats_hs_timeout.load(.monotonic);
         const cur_mpf = self.state.stats_mp_fallback.load(.monotonic);
+        const cur_pool = self.state.stats_dropped_pool.load(.monotonic);
 
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
@@ -2334,6 +2415,7 @@ const EventLoop = struct {
         const d_hs = cur_hs - self.prev_dropped_hs_budget;
         const d_hst = cur_hst - self.prev_hs_timeout;
         const d_mpf = cur_mpf - self.prev_mp_fallback;
+        const d_pool = cur_pool - self.prev_dropped_pool;
 
         self.prev_dropped_cap = cur_cap;
         self.prev_dropped_saturation = cur_sat;
@@ -2342,8 +2424,9 @@ const EventLoop = struct {
         self.prev_dropped_hs_budget = cur_hs;
         self.prev_hs_timeout = cur_hst;
         self.prev_mp_fallback = cur_mpf;
+        self.prev_dropped_pool = cur_pool;
 
-        const has_drops = d_cap + d_sat + d_rate + d_flood + d_hs + d_hst + d_mpf > 0;
+        const has_drops = d_cap + d_sat + d_rate + d_flood + d_hs + d_hst + d_mpf + d_pool > 0;
 
         // Build per-user active connection counts for dashboard parsing
         var user_buf: [1024]u8 = undefined;
@@ -2379,8 +2462,8 @@ const EventLoop = struct {
         });
 
         if (has_drops) {
-            log.info("  drops: cap+={d} sat+={d} rate+={d} flood_guard+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
-                d_cap, d_sat, d_rate, d_flood, d_hs, d_hst, d_mpf,
+            log.info("  drops: cap+={d} sat+={d} rate+={d} flood_guard+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} pool+={d}", .{
+                d_cap, d_sat, d_rate, d_flood, d_hs, d_hst, d_mpf, d_pool,
             });
         }
 
@@ -2783,6 +2866,13 @@ const EventLoop = struct {
             slot.last_activity_ms = nowMs();
         }
 
+        // Relay half-close: upstream gracefully closed and we were draining its already-read
+        // s2c data to a slow client. Once that queue empties, the connection is done.
+        if (slot.upstream_detached and !slot.hasClientPending()) {
+            self.closeSlot(slot, "relay drained after peer half-close");
+            return;
+        }
+
         switch (slot.phase) {
             .writing_server_hello_first => {
                 if (!slot.hasClientPending()) {
@@ -2865,6 +2955,13 @@ const EventLoop = struct {
                 }
                 if (had_pending and !slot.hasUpstreamPending()) {
                     slot.last_activity_ms = nowMs();
+                }
+
+                // Relay half-close: client gracefully closed and we were draining its
+                // already-read c2s data to upstream. Once that queue empties, we're done.
+                if (slot.client_detached and !slot.hasUpstreamPending()) {
+                    self.closeSlot(slot, "relay drained after peer half-close");
+                    return;
                 }
 
                 if (slot.phase == .writing_dc_nonce and !slot.hasUpstreamPending()) {
@@ -3000,6 +3097,10 @@ const EventLoop = struct {
                 // occupied a budget slot. Covers both FakeTLS and the dd path,
                 // which is entered from this function after the TLS sniff.
                 if (!self.reserveHandshakeBudget(slot)) {
+                    // Feed the flood guard so a client that repeatedly burns the budget
+                    // accrues a score (and the per-IP handshake_budget column is no longer
+                    // dead telemetry). This is a client-driven, first-byte event.
+                    _ = self.state.floodRecord(slot.peer_addr, .handshake_budget, floodGuardSettings(&self.state.config));
                     self.closeSlot(slot, "handshake budget exhausted");
                     return;
                 }
@@ -3420,8 +3521,8 @@ const EventLoop = struct {
 
     /// Handle a ClientHello whose SNI is missing or doesn't match tls_domain,
     /// per `unknown_sni_action`: `mask` forwards to the masking backend (default,
-    /// active-probe defense), `reject` emits a real `unrecognized_name` TLS alert
-    /// like stock nginx and closes, `drop` closes silently. Validation-failed /
+    /// active-probe defense), `reject` emits a fatal `handshake_failure` (40) TLS alert
+    /// like nginx ssl_reject_handshake and closes, `drop` closes silently. Validation-failed /
     /// replay cases (SNI matched) keep masking — they're not handled here.
     fn handleInvalidSni(self: *EventLoop, slot: *ConnectionSlot, client_hello: []const u8, reason: []const u8) void {
         switch (self.state.config.unknown_sni_action) {
@@ -3914,7 +4015,14 @@ const EventLoop = struct {
                     continue;
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
-                    _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
+                    // Only blame the client's IP when the stall is client-driven. An
+                    // upstream-side timeout (DC unreachable, slow upstream proxy, stale
+                    // middleproxy secret) is not the client's fault, and feeding it to the
+                    // flood guard would block legit secret-holders behind a shared NAT
+                    // during an upstream outage.
+                    if (isClientDrivenHandshakePhase(slot.phase) and !slot.mp_step.awaitingMiddleProxy()) {
+                        _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
+                    }
                     // A timeout while still waiting on the middleproxy RPC handshake
                     // means the cached DC/secret likely went stale (Telegram rotates
                     // them) — ask the updater to refresh ahead of its periodic timer.
@@ -4001,20 +4109,24 @@ const EventLoop = struct {
                     slot.mp_step == .waiting_rpc_handshake_response;
             },
 
-            .relaying => {
-                want_client_in = !slot.hasUpstreamPending();
-                want_upstream_in = !slot.hasClientPending();
-            },
-
-            .mask_relaying => {
-                want_client_in = !slot.hasUpstreamPending();
-                want_upstream_in = !slot.hasClientPending();
+            .relaying, .mask_relaying => {
+                if (slot.relay_half_closed) {
+                    // One side gracefully closed; only drain the surviving direction's
+                    // queued data (want_*_out already reflects hasXPending). Don't read
+                    // from either peer — c2s has nowhere to go and the closed side is gone.
+                    want_client_in = false;
+                    want_upstream_in = false;
+                } else {
+                    want_client_in = !slot.hasUpstreamPending();
+                    want_upstream_in = !slot.hasClientPending();
+                }
             },
 
             else => {},
         }
 
-        if (slot.client_fd != -1) {
+        // A detached fd (relay half-close) has left epoll — never modFd it.
+        if (slot.client_fd != -1 and !slot.client_detached) {
             if (slot.client_interest_in != want_client_in or slot.client_interest_out != want_client_out) {
                 try self.modFd(slot.client_fd, want_client_in, want_client_out);
                 slot.client_interest_in = want_client_in;
@@ -4022,7 +4134,7 @@ const EventLoop = struct {
             }
         }
 
-        if (slot.upstream_fd != -1) {
+        if (slot.upstream_fd != -1 and !slot.upstream_detached) {
             if (slot.upstream_interest_in != want_upstream_in or slot.upstream_interest_out != want_upstream_out) {
                 try self.modFd(slot.upstream_fd, want_upstream_in, want_upstream_out);
                 slot.upstream_interest_in = want_upstream_in;
@@ -4058,6 +4170,35 @@ const EventLoop = struct {
         return buf;
     }
 
+    /// Begin a relay half-close drain: the peer on `hung_fd` gracefully closed while data
+    /// was still queued for the other peer. Detach `hung_fd` from epoll (it stays open so
+    /// closeSlot still closes it) and let the surviving direction flush; the writable
+    /// handler closes the slot once its queue drains, with the relay idle timer as backstop.
+    fn beginRelayHalfClose(self: *EventLoop, slot: *ConnectionSlot, hung_fd: posix.fd_t) void {
+        _ = self.delFd(hung_fd) catch {};
+        if (hung_fd == slot.client_fd) {
+            slot.client_detached = true;
+            slot.client_interest_in = false;
+            slot.client_interest_out = false;
+        } else {
+            slot.upstream_detached = true;
+            slot.upstream_interest_in = false;
+            slot.upstream_interest_out = false;
+        }
+        slot.relay_half_closed = true;
+        slot.last_activity_ms = nowMs();
+        self.syncInterests(slot) catch {
+            self.closeSlot(slot, "half-close sync failed");
+            return;
+        };
+        // If the surviving direction had nothing buffered after all, close now.
+        if (slot.upstream_detached and !slot.hasClientPending()) {
+            self.closeSlot(slot, "relay drained after peer half-close");
+        } else if (slot.client_detached and !slot.hasUpstreamPending()) {
+            self.closeSlot(slot, "relay drained after peer half-close");
+        }
+    }
+
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
         log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
@@ -4070,17 +4211,20 @@ const EventLoop = struct {
             slot.s2c_bytes,
         });
 
+        // Unmap from fd_to_slot immediately so any later stale event in this batch misses,
+        // but defer the actual close() to batch end so the fd number can't be recycled by
+        // an accept()/connect() mid-batch and then misattributed (see pending_close_fds).
         if (slot.client_fd != -1) {
             _ = self.delFd(slot.client_fd) catch {};
             self.pool.unmapFd(slot.client_fd);
-            closeFd(slot.client_fd);
+            self.deferClose(slot.client_fd);
             slot.client_fd = -1;
         }
 
         if (slot.upstream_fd != -1) {
             _ = self.delFd(slot.upstream_fd) catch {};
             self.pool.unmapFd(slot.upstream_fd);
-            closeFd(slot.upstream_fd);
+            self.deferClose(slot.upstream_fd);
             slot.upstream_fd = -1;
         }
 
@@ -4107,6 +4251,9 @@ const EventLoop = struct {
         self.state.collectRetiredUserMetrics();
 
         slot.desync_wait_enqueued = false;
+        slot.relay_half_closed = false;
+        slot.client_detached = false;
+        slot.upstream_detached = false;
         slot.phase = .idle;
         self.pool.release(slot);
     }

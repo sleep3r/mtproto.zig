@@ -22,18 +22,46 @@ pub const NGINX_PORT = "8443";
 pub const MaskingOpts = struct {
     tls_domain: []const u8 = "rutube.ru",
     skip_monitor: bool = false,
+    /// Operator explicitly asked for this domain (--domain / positional / interactive
+    /// change). When false, execute() keeps the tls_domain already in config.toml.
+    domain_explicit: bool = false,
+    /// Allow changing an already-configured tls_domain even though it breaks every
+    /// distributed share link.
+    force: bool = false,
 };
+
+const config_path = INSTALL_DIR ++ "/config.toml";
+
+/// Read the unquoted `[censorship].tls_domain` from config.toml into `buf`, or null when
+/// absent/unreadable. tls_domain is immutable on a live deploy (every share link embeds
+/// it), so callers default to this instead of clobbering it with "rutube.ru".
+fn readConfiguredTlsDomain(allocator: std.mem.Allocator, buf: []u8) ?[]const u8 {
+    if (!sys.fileExists(config_path)) return null;
+    var doc = toml.TomlDoc.load(allocator, config_path) catch return null;
+    defer doc.deinit();
+    const raw = doc.get("censorship", "tls_domain") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\"");
+    if (trimmed.len == 0 or trimmed.len > buf.len) return null;
+    @memcpy(buf[0..trimmed.len], trimmed);
+    return buf[0..trimmed.len];
+}
 
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = MaskingOpts{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--domain")) {
-            if (args.next()) |val| opts.tls_domain = val;
+            if (args.next()) |val| {
+                opts.tls_domain = val;
+                opts.domain_explicit = true;
+            }
         } else if (std.mem.eql(u8, arg, "--no-monitor")) {
             opts.skip_monitor = true;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            opts.force = true;
         } else if (arg.len > 0 and arg[0] != '-') {
             opts.tls_domain = arg;
+            opts.domain_explicit = true;
         }
     }
     try execute(ui, allocator, opts);
@@ -43,11 +71,15 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     ui.section(i18n.get(ui.lang, .menu_setup_masking));
 
+    // Default the prompt to the domain already deployed — changing it breaks live links.
+    var existing_buf: [320]u8 = undefined;
+    const existing = readConfiguredTlsDomain(allocator, &existing_buf);
+
     var domain_buf: [256]u8 = undefined;
     const domain = try ui.input(
         i18n.get(ui.lang, .install_domain_prompt),
         i18n.get(ui.lang, .install_domain_help),
-        "rutube.ru",
+        existing orelse "rutube.ru",
         &domain_buf,
     );
 
@@ -56,13 +88,45 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         return;
     }
 
-    try execute(ui, allocator, .{ .tls_domain = domain });
+    // If the operator typed a domain different from the live one, require informed consent
+    // before clobbering it.
+    var force = false;
+    if (existing) |e| {
+        if (!std.mem.eql(u8, e, domain)) {
+            var warn_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&warn_buf, "Changing tls_domain from '{s}' to '{s}' INVALIDATES every share link already distributed.", .{ e, domain }) catch "Changing tls_domain invalidates every distributed share link.";
+            ui.warn(msg);
+            if (!try ui.confirm("Change tls_domain anyway?", false)) {
+                ui.info(i18n.get(ui.lang, .aborting));
+                return;
+            }
+            force = true;
+        }
+    }
+
+    try execute(ui, allocator, .{ .tls_domain = domain, .domain_explicit = true, .force = force });
 }
 
-pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void {
+pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: MaskingOpts) !void {
     if (!sys.isRoot()) {
         ui.fail(i18n.get(ui.lang, .error_not_root));
         return;
+    }
+
+    var opts = opts_in;
+
+    // tls_domain is immutable on a live deploy — every distributed share link embeds it.
+    // Keep whatever config.toml already has unless the operator explicitly chose a new one.
+    var existing_domain_buf: [320]u8 = undefined;
+    if (readConfiguredTlsDomain(allocator, &existing_domain_buf)) |cur| {
+        if (!opts.domain_explicit) {
+            opts.tls_domain = cur;
+        } else if (!std.mem.eql(u8, cur, opts.tls_domain) and !opts.force) {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Refusing to change tls_domain from '{s}' to '{s}' — this invalidates every distributed share link. Re-run with --force to override.", .{ cur, opts.tls_domain }) catch "Refusing to change tls_domain (would break share links); re-run with --force.";
+            ui.fail(msg);
+            return;
+        }
     }
 
     _ = fronting_domain.warnIfPoorFrontingDomain(ui, allocator, opts.tls_domain);
@@ -131,6 +195,13 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         ui.ok("Self-signed certificate generated");
     }
 
+    // openssl failures are swallowed above; a missing key/cert is exactly what makes the
+    // later `nginx -t` fail, so bail now rather than tearing down the default site first.
+    if (!sys.fileExists(CERT_DIR ++ "/cert.pem") or !sys.fileExists(CERT_DIR ++ "/key.pem")) {
+        ui.fail("TLS certificate or key is missing — cannot configure masking");
+        return;
+    }
+
     // ── Configure Nginx ──
     ui.step("Configuring Nginx...");
     sys.execSilent(allocator, &.{ "mkdir", "-p", "/var/www/masking" });
@@ -174,18 +245,24 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         };
     }
 
+    // Enable our vhost and validate BEFORE removing the default site, so a failed test
+    // never leaves nginx with a broken config and no default vhost (which would take
+    // nginx fully down on its next restart — reboot, certbot hook, mask-health timer).
     _ = sys.exec(allocator, &.{ "ln", "-sf", "/etc/nginx/sites-available/mtproto-masking", "/etc/nginx/sites-enabled/" }) catch {};
-    _ = sys.exec(allocator, &.{ "rm", "-f", "/etc/nginx/sites-enabled/default" }) catch {};
 
     const nginx_test = sys.exec(allocator, &.{ "nginx", "-t" }) catch null;
     if (nginx_test) |r| {
         defer r.deinit();
         if (r.exit_code != 0) {
-            ui.fail("Nginx config test failed");
+            // Roll back: drop only our vhost, leaving the existing config (incl. default).
+            _ = sys.exec(allocator, &.{ "rm", "-f", "/etc/nginx/sites-enabled/mtproto-masking" }) catch {};
+            ui.fail("Nginx config test failed — masking vhost rolled back, nginx left unchanged");
             return;
         }
     }
 
+    // Config is valid — now it is safe to disable the default site and reload.
+    _ = sys.exec(allocator, &.{ "rm", "-f", "/etc/nginx/sites-enabled/default" }) catch {};
     _ = sys.execForward(&.{ "systemctl", "restart", "nginx" }) catch {};
     _ = sys.exec(allocator, &.{ "systemctl", "enable", "nginx" }) catch {};
     ui.ok("Nginx configured on 127.0.0.1:" ++ NGINX_PORT);
@@ -204,7 +281,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
     }
 
     // ── Update mtproto config ──
-    const config_path = INSTALL_DIR ++ "/config.toml";
+    var config_written = false;
     if (sys.fileExists(config_path)) {
         var doc = toml.TomlDoc.load(allocator, config_path) catch {
             ui.warn("Could not read config.toml");
@@ -224,6 +301,21 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: MaskingOpts) !void 
         doc.save(config_path) catch {};
         _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path }) catch {};
         ui.ok("Updated config.toml with tls_domain, mask=true, mask_port = " ++ NGINX_PORT);
+        config_written = true;
+    }
+
+    // The running proxy only re-reads config on reload/restart. Apply it now so masking
+    // actually takes effect instead of waiting for some arbitrary later restart (the
+    // fresh-install path is covered by install.zig's final restart; this is the standalone
+    // `mtbuddy setup-masking` path).
+    if (config_written and sys.isServiceActive("mtproto-proxy")) {
+        var reloaded = false;
+        if (sys.exec(allocator, &.{ "systemctl", "reload", "mtproto-proxy" }) catch null) |r| {
+            defer r.deinit();
+            reloaded = r.exit_code == 0;
+        }
+        if (!reloaded) _ = sys.execForward(&.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
+        ui.ok("Reloaded mtproto-proxy to apply masking");
     }
 
     // ── Install masking monitor ──
