@@ -37,10 +37,11 @@ port = 443
 # public_port = 443
 
 # IPv4 address Telegram MiddleProxy sees for outbound DC connections.
-# Set this when DC traffic exits through a VPN/NAT IP that differs from
-# public_ip or when auto-detection cannot see the real egress. Docker bridge
-# or remote VPN NAT that rewrites source ports can still break MiddleProxy;
-# prefer native/host-network deployments there.
+# Auto-detected through the SAME egress DC traffic uses: direct -> the host IP,
+# socks5/http -> the proxy's exit IP, tunnel -> the tunnel's exit IP. So SOCKS/
+# tunnel egress + ad-tag now work out of the box without setting this. Only set
+# it to override (e.g. Docker bridge / remote NAT that rewrites source ports and
+# breaks auto-detection — there, prefer native/host-network deployments).
 # middle_proxy_nat_ip = "203.0.113.10"
 
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).

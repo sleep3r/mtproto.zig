@@ -372,7 +372,7 @@ type = "auto"            # auto | direct | tunnel | socks5 | http
 port = 443
 # public_ip = "proxy.example.com"   # Inbound IP/domain used in client links
 # public_port = 443                 # Link port when behind HAProxy/Nginx
-# middle_proxy_nat_ip = "203.0.113.10"   # Outbound IPv4 seen by Telegram MiddleProxy
+# middle_proxy_nat_ip = "203.0.113.10"   # Override outbound IPv4 seen by Telegram MiddleProxy (auto-detected through the egress otherwise)
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
@@ -427,7 +427,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] bind_address` | — | Specific IP to bind the listen socket (default: all interfaces) |
 | `[server] public_ip` | auto | Inbound IP/domain shown in client links. Required with VPN tunnel; set IPv4 explicitly if clients fail on IPv6 links |
 | `[server] public_port` | `[server].port` | Port shown in client links; useful when HAProxy/Nginx exposes a different public port |
-| `[server] middle_proxy_nat_ip` | auto | Outbound IPv4 used in MiddleProxy key derivation; auto-detected independently from `public_ip`, set explicitly when DC traffic exits through a VPN/NAT IP |
+| `[server] middle_proxy_nat_ip` | auto | Outbound IPv4 used in MiddleProxy key derivation; auto-detected **through the configured egress** (direct → host IP, socks5/http → proxy exit IP, tunnel → tunnel exit IP), so SOCKS/tunnel + ad-tag work out of the box. Set explicitly only to override when auto-detection can't see the real egress |
 | `[server] backlog` | `4096` | TCP listen queue depth |
 | `[server] max_connections` | `512` | Concurrent connection cap, auto-clamped by RAM and `RLIMIT_NOFILE` |
 | `[server] workers` | `1` | SO_REUSEPORT epoll worker threads. `1` = single-threaded; `0` = one per CPU; `N` spreads relay/crypto load across cores. SIGHUP config reload requires a restart when `>1` |
@@ -585,7 +585,7 @@ docker run --rm \
   ghcr.io/sleep3r/mtproto.zig:latest
 ```
 
-MiddleProxy media/promo traffic is sensitive to the outbound source IP:port used in its encrypted handshake. For Docker deployments that need MiddleProxy, prefer host networking (`--network host`) or a native `mtbuddy` install. `[server].public_ip` is only the inbound address shown to clients; if outbound DC traffic exits through a VPN/NAT IP, set `[server].middle_proxy_nat_ip` to that egress IPv4. Bridge or remote NAT that rewrites source ports can still break MiddleProxy handshakes.
+MiddleProxy media/promo traffic is sensitive to the outbound source IP:port used in its encrypted handshake. The egress IPv4 is **auto-detected through the configured upstream** — direct probes the host, `socks5`/`http` probes through the proxy (so it learns the SOCKS exit IP), and `tunnel` probes through the tunnel interface — so SOCKS/tunnel egress + ad-tag work without manual setup. For Docker deployments that need MiddleProxy, prefer host networking (`--network host`) or a native `mtbuddy` install. `[server].public_ip` is only the inbound address shown to clients; set `[server].middle_proxy_nat_ip` only to override when auto-detection can't see the real egress. Bridge or remote NAT that rewrites source ports can still break MiddleProxy handshakes.
 
 Build locally:
 

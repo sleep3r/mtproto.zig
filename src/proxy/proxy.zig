@@ -323,8 +323,46 @@ const isIpv6 = net_helpers.isIpv6;
 const addressEql = net_helpers.addressEql;
 const getAddressList = net_helpers.getAddressList;
 
-fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
-    return network_detect.detectPublicIpv4(allocator, fetchUrlBytes);
+/// Fetch a public-IP echo service through the SAME egress middle-proxy traffic uses, so
+/// the IP we feed into the MP key derivation matches what Telegram's MiddleProxy observes.
+/// A plain direct probe returns the HOST's IP even when egress is socks5/http/tunnel — the
+/// long-standing "socks + ad-tag doesn't work out of the box, you must set
+/// middle_proxy_nat_ip by hand" trap. Routing the probe through the upstream removes it.
+fn fetchPublicIpProbe(allocator: std.mem.Allocator, cfg: *const Config, url: []const u8) ![]u8 {
+    switch (cfg.upstream_mode) {
+        .socks5, .http => {
+            const host = cfg.upstream_proxy_host orelse return error.InvalidProxyUpstreamConfig;
+            if (cfg.upstream_proxy_port == 0) return error.InvalidProxyUpstreamConfig;
+            return http_fetch.fetchUrlBytesViaProxy(allocator, url, .{
+                .kind = if (cfg.upstream_mode == .socks5) .socks5 else .http_connect,
+                .host = host,
+                .port = cfg.upstream_proxy_port,
+                .username = cfg.upstream_proxy_username,
+                .password = cfg.upstream_proxy_password,
+            });
+        },
+        .tunnel => {
+            const iface = cfg.tunnelCandidateAt(0) orelse cfg.upstream_tunnel_interface orelse "awg0";
+            return fetchUrlBytesViaInterface(allocator, url, iface);
+        },
+        .auto, .direct => return fetchUrlBytes(allocator, url),
+    }
+}
+
+/// Detect the public IPv4 as seen from the configured egress (see fetchPublicIpProbe).
+fn detectPublicIpv4ViaEgress(allocator: std.mem.Allocator, cfg: *const Config) ?[4]u8 {
+    const services = [_][]const u8{
+        "https://api.ipify.org",
+        "https://ifconfig.me",
+        "https://ipv4.icanhazip.com",
+    };
+    for (services) |url| {
+        const bytes = fetchPublicIpProbe(allocator, cfg, url) catch continue;
+        defer allocator.free(bytes);
+        const trimmed = std.mem.trim(u8, bytes, &[_]u8{ ' ', '\t', '\r', '\n' });
+        if (network_detect.parseIpv4Literal(trimmed)) |ip| return ip;
+    }
+    return null;
 }
 
 fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
@@ -1190,9 +1228,19 @@ pub const ProxyState = struct {
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
         const detected_nat_ip4 = if (cfg.datacenter_override == null)
-            middle_proxy_nat.detectIpv4(allocator, &cfg, detectAwgEndpointIpv4, detectPublicIpv4)
+            middle_proxy_nat.detectIpv4(allocator, &cfg, detectAwgEndpointIpv4, detectPublicIpv4ViaEgress)
         else
             null;
+
+        // The ad-tag and non-Premium media both require a working MiddleProxy handshake,
+        // which needs the egress public IP. If MiddleProxy is wanted but we couldn't learn
+        // that IP, say so loudly — otherwise the proxy silently falls back to direct DC
+        // (no ad-tag) and operators never notice.
+        if (detected_nat_ip4 == null and (cfg.use_middle_proxy or cfg.force_media_middle_proxy or cfg.tag != null)) {
+            log.warn("MiddleProxy/ad-tag is enabled but the egress public IP could not be detected; " ++
+                "the ad-tag (and non-Premium media via ME) may not work. Set [server].middle_proxy_nat_ip " ++
+                "to the IP Telegram sees for this server's egress (the SOCKS/tunnel exit IP when egress isn't direct).", .{});
+        }
 
         const owned_config_path = try allocator.dupe(u8, config_path);
         errdefer allocator.free(owned_config_path);
@@ -2465,6 +2513,13 @@ const EventLoop = struct {
             log.info("  drops: cap+={d} sat+={d} rate+={d} flood_guard+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} pool+={d}", .{
                 d_cap, d_sat, d_rate, d_flood, d_hs, d_hst, d_mpf, d_pool,
             });
+        }
+
+        // A run of MiddleProxy->direct fallbacks means the ad-tag (and non-Premium media via
+        // ME) is silently NOT applied for those connections. Surface it instead of letting it
+        // pass unnoticed — the usual cause is a wrong/undetected egress NAT IP.
+        if (d_mpf > 0 and (self.state.config.use_middle_proxy or self.state.config.tag != null)) {
+            log.warn("ad-tag likely inactive: {d} middle-proxy handshake(s) fell back to direct this interval — those connections carry no ad-tag/ME media. Check egress reachability and [server].middle_proxy_nat_ip.", .{d_mpf});
         }
 
         var top_entries: [5]HandshakeFloodGuard.TopEntry = undefined;

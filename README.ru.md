@@ -356,7 +356,7 @@ type = "auto"            # auto | direct | tunnel | socks5 | http
 port = 443
 # public_ip = "proxy.example.com"   # входящий IP/domain для клиентских ссылок
 # public_port = 443                 # порт в ссылках при HAProxy/Nginx
-# middle_proxy_nat_ip = "203.0.113.10"   # исходящий IPv4, который видит Telegram MiddleProxy
+# middle_proxy_nat_ip = "203.0.113.10"   # переопределить исходящий IPv4 для Telegram MiddleProxy (иначе авто-детект через egress)
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll-воркеры: 1 = однопоточно (дефолт); 0 = по числу CPU; N распределяет нагрузку по ядрам
 idle_timeout_sec = 120
@@ -399,7 +399,7 @@ alice = true
 | `[server] port` | `443` | TCP listen port |
 | `[server] public_ip` | auto | Входящий IP/domain для клиентских ссылок |
 | `[server] public_port` | `[server].port` | Порт для клиентских ссылок, если публичный порт отличается от listen-port |
-| `[server] middle_proxy_nat_ip` | auto | Исходящий IPv4 для MiddleProxy key derivation; auto-detect не использует `public_ip`, задайте явно при VPN/NAT egress |
+| `[server] middle_proxy_nat_ip` | auto | Исходящий IPv4 для MiddleProxy key derivation; авто-детект **через настроенный egress** (direct → IP хоста, socks5/http → exit-IP прокси, tunnel → exit-IP туннеля), поэтому SOCKS/туннель + ad-tag работают из коробки. Задавайте явно только для переопределения, если авто-детект не видит реальный egress |
 | `[server] max_connections` | `512` | Лимит одновременных соединений |
 | `[server] workers` | `1` | SO_REUSEPORT epoll-воркеры: `1` = однопоточно; `0` = по числу CPU; `N` распределяет нагрузку relay/crypto по ядрам. При `>1` перезагрузка конфига по SIGHUP требует рестарта |
 | `[server] middleproxy_buffer_kb` | `1024` | Буфер MiddleProxy на соединение |
@@ -528,7 +528,7 @@ docker run --rm \
   ghcr.io/sleep3r/mtproto.zig:latest
 ```
 
-MiddleProxy для медиа/промо чувствителен к исходному source IP:port, который попадает в encrypted handshake. Для Docker-деплоя с MiddleProxy лучше использовать host networking (`--network host`) или нативный `mtbuddy install`. `[server].public_ip` теперь только входящий адрес для клиентов; если DC-трафик выходит через VPN/NAT IP, задайте `[server].middle_proxy_nat_ip` этим egress IPv4. Bridge или удаленный NAT, переписывающий source port, всё равно может ломать MiddleProxy handshake.
+MiddleProxy для медиа/промо чувствителен к исходному source IP:port, который попадает в encrypted handshake. Исходящий IPv4 **авто-детектится через настроенный upstream** — direct зондирует хост, `socks5`/`http` зондирует через прокси (узнаёт exit-IP SOCKS), `tunnel` — через интерфейс туннеля, — поэтому SOCKS/туннель + ad-tag работают без ручной настройки. Для Docker-деплоя с MiddleProxy лучше использовать host networking (`--network host`) или нативный `mtbuddy install`. `[server].public_ip` — только входящий адрес для клиентов; задавайте `[server].middle_proxy_nat_ip` лишь для переопределения, если авто-детект не видит реальный egress. Bridge или удаленный NAT, переписывающий source port, всё равно может ломать MiddleProxy handshake.
 
 Локальная сборка:
 
