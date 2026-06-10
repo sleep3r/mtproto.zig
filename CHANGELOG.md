@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.3](https://github.com/sleep3r/mtproto.zig/compare/v1.4.2...v1.4.3) (2026-06-10)
+
+
+### Bug Fixes
+
+* Add tunnel dependency installer smoke ([#338](https://github.com/sleep3r/mtproto.zig/issues/338)) ([79ca063](https://github.com/sleep3r/mtproto.zig/commit/79ca063cb953fe2f0b7537f946aa6e747f363665))
+
 ## [1.4.2](https://github.com/sleep3r/mtproto.zig/compare/v1.4.1...v1.4.2) (2026-06-10)
 
 
