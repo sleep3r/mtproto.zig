@@ -193,11 +193,22 @@ fn dispatchLinks(ui: *Tui, allocator: std.mem.Allocator, link_list: []const []co
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var links: std.ArrayListUnmanaged([]const u8) = .empty;
     defer links.deinit(allocator);
+    var deps_only = false;
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--deps-only")) {
+            deps_only = true;
+            continue;
+        }
         if (arg.len > 0 and arg[0] != '-') links.append(allocator, arg) catch {};
     }
+    if (deps_only) {
+        ui.step("Checking sing-box dependency...");
+        if (!ensureSingboxInstalled(ui, allocator)) return;
+        ui.ok("sing-box dependency available");
+        return;
+    }
     if (links.items.len == 0) {
-        ui.fail("Usage: mtbuddy setup egress <share-link> [<share-link>...]");
+        ui.fail("Usage: mtbuddy setup egress [--deps-only] <share-link> [<share-link>...]");
         ui.hint("vless:// vmess:// trojan:// ss://  ->  sing-box TUN tunnel (upstream.type=tunnel)");
         ui.hint("wireguard://                       ->  native kernel WG tunnel");
         return;
@@ -290,14 +301,7 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
         _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
     }
 
-    if (!sys.commandExists("sing-box") and !sys.fileExists(SB_BIN)) {
-        ui.step("Installing sing-box...");
-        if (!installSingbox(allocator)) {
-            ui.fail("Failed to install sing-box (download/extract). Check network and retry.");
-            return;
-        }
-        ui.ok("sing-box installed");
-    }
+    if (!ensureSingboxInstalled(ui, allocator)) return;
     const sb_bin: []const u8 = if (sys.fileExists(SB_BIN)) SB_BIN else "sing-box";
 
     const cfg = genSingboxConfig(a, parsed) catch {
@@ -386,6 +390,18 @@ fn wireUpstreamTunnel(allocator: std.mem.Allocator, link_texts: []const []const 
     try arr.append(allocator, ']');
     try doc.set("upstream.xray", "links", arr.items);
     try doc.save(CONFIG_PATH);
+}
+
+fn ensureSingboxInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
+    if (sys.commandExists("sing-box") or sys.fileExists(SB_BIN)) return true;
+
+    ui.step("Installing sing-box...");
+    if (!installSingbox(allocator)) {
+        ui.fail("Failed to install sing-box (download/extract). Check network and retry.");
+        return false;
+    }
+    ui.ok("sing-box installed");
+    return true;
 }
 
 /// Download + install the static sing-box binary for this arch. The release asset name

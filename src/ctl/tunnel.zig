@@ -49,13 +49,18 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "--deps-only")) {
+            opts.deps_only = true;
+            continue;
+        }
+
         if (arg.len > 0 and arg[0] != '-') {
             opts.awg_source = arg;
         }
     }
 
-    if (opts.awg_source.len == 0) {
-        ui.fail("Usage: mtbuddy setup tunnel [--iface awgN] <conf-path-or-vpn-link>");
+    if (!opts.deps_only and opts.awg_source.len == 0) {
+        ui.fail("Usage: mtbuddy setup tunnel [--deps-only] [--iface awgN] <conf-path-or-vpn-link>");
         return;
     }
 

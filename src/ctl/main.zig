@@ -422,7 +422,8 @@ fn printHelp(lang: i18n.Lang) void {
     printCmd(&ui, "update", tr(lang, "Update to latest GitHub release", "Обновить до последнего GitHub релиза"));
     printCmd(&ui, "setup masking", tr(lang, "Setup local Nginx DPI masking", "Настроить локальную DPI-маскировку через Nginx"));
     printCmd(&ui, "setup nfqws", tr(lang, "Setup nfqws TCP desync (Zapret)", "Настроить nfqws TCP desync (Zapret)"));
-    printCmd(&ui, "setup tunnel [--iface awgN] <conf|vpn://>", tr(lang, "Setup AmneziaWG tunnel pool member", "Настроить участника пула туннелей AmneziaWG"));
+    printCmd(&ui, "setup tunnel [--deps-only] [--iface awgN] <conf|vpn://>", tr(lang, "Setup AmneziaWG tunnel pool member", "Настроить участника пула туннелей AmneziaWG"));
+    printCmd(&ui, "setup egress [--deps-only] <share-link...>", tr(lang, "Setup VPN share-link egress", "Настроить egress через VPN-ссылку"));
     printCmd(&ui, "setup dashboard", tr(lang, "Install web monitoring dashboard", "Установить веб-дашборд мониторинга"));
     printCmd(&ui, "setup recovery", tr(lang, "Install DPI auto-recovery", "Установить авто-восстановление DPI"));
     printCmd(&ui, "ipv6-hop", tr(lang, "IPv6 address rotation", "Ротация IPv6 адреса"));

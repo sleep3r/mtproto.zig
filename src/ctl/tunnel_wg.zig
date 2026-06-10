@@ -47,6 +47,26 @@ fn readFileAllocCwd(allocator: std.mem.Allocator, path: []const u8, limit: usize
 pub const TunnelOpts = struct {
     awg_source: []const u8 = "",
     iface: []const u8 = "",
+    deps_only: bool = false,
+};
+
+const AwgRepositorySetup = enum {
+    ubuntu_add_apt_repository,
+    debian_launchpad_focal_source,
+};
+
+const ubuntu_awg_repo_prereqs = [_][]const u8{
+    "ca-certificates",
+    "curl",
+    "gnupg2",
+    "software-properties-common",
+    "python3-launchpadlib",
+};
+
+const debian_awg_repo_prereqs = [_][]const u8{
+    "ca-certificates",
+    "curl",
+    "gnupg2",
 };
 
 /// Set up a tunnel directly from a WireGuard/AmneziaWG `.conf` path — same flow as
@@ -59,6 +79,13 @@ pub fn setupFromConf(ui: *Tui, allocator: std.mem.Allocator, conf_path: []const 
 pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     if (!sys.isRoot()) {
         ui.fail(i18n.get(ui.lang, .error_not_root));
+        return;
+    }
+
+    if (opts.deps_only) {
+        ui.step("Checking AmneziaWG dependencies...");
+        if (!ensureAmneziaWgInstalled(ui, allocator)) return;
+        ui.ok("AmneziaWG dependencies available");
         return;
     }
 
@@ -632,19 +659,30 @@ fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
         "Failed to refresh apt package index",
     )) return false;
 
-    if (!runCommandChecked(
-        ui,
-        allocator,
-        &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "software-properties-common" },
-        "Failed to install software-properties-common",
-    )) return false;
+    const os_release = readFileAllocAbsolute(allocator, "/etc/os-release", 16 * 1024) catch null;
+    defer if (os_release) |content| allocator.free(content);
+    const repo_setup = awgRepositorySetupForOsRelease(os_release orelse "");
 
-    if (!runCommandChecked(
-        ui,
-        allocator,
-        &.{ "add-apt-repository", "-y", "ppa:amnezia/ppa" },
-        "Failed to add Amnezia PPA",
-    )) return false;
+    if (!installAwgRepositoryPrerequisites(ui, allocator, repo_setup)) return false;
+
+    switch (repo_setup) {
+        .ubuntu_add_apt_repository => {
+            if (!runCommandChecked(
+                ui,
+                allocator,
+                &.{ "add-apt-repository", "-y", "ppa:amnezia/ppa" },
+                "Failed to add Amnezia PPA",
+            )) return false;
+        },
+        .debian_launchpad_focal_source => {
+            if (!runCommandChecked(
+                ui,
+                allocator,
+                &.{ "sh", "-c", debianAmneziaRepositorySetupScript() },
+                "Failed to configure Amnezia PPA for Debian",
+            )) return false;
+        },
+    }
 
     if (!runCommandChecked(
         ui,
@@ -667,6 +705,71 @@ fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
     }
 
     return true;
+}
+fn installAwgRepositoryPrerequisites(ui: *Tui, allocator: std.mem.Allocator, repo_setup: AwgRepositorySetup) bool {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    for ([_][]const u8{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "--no-install-recommends" }) |arg| {
+        argv.append(allocator, arg) catch return false;
+    }
+    for (awgRepositoryPrerequisitePackages(repo_setup)) |package| {
+        argv.append(allocator, package) catch return false;
+    }
+
+    return runCommandChecked(ui, allocator, argv.items, "Failed to install AmneziaWG repository prerequisites");
+}
+fn awgRepositoryPrerequisitePackages(repo_setup: AwgRepositorySetup) []const []const u8 {
+    return switch (repo_setup) {
+        .ubuntu_add_apt_repository => &ubuntu_awg_repo_prereqs,
+        .debian_launchpad_focal_source => &debian_awg_repo_prereqs,
+    };
+}
+fn awgRepositorySetupForOsRelease(os_release: []const u8) AwgRepositorySetup {
+    const id = osReleaseValue(os_release, "ID") orelse "";
+    if (std.ascii.eqlIgnoreCase(id, "debian")) return .debian_launchpad_focal_source;
+    return .ubuntu_add_apt_repository;
+}
+fn osReleaseValue(content: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r' });
+        if (trimmed.len <= key.len or trimmed[key.len] != '=') continue;
+        if (!std.mem.eql(u8, trimmed[0..key.len], key)) continue;
+
+        var value = std.mem.trim(u8, trimmed[key.len + 1 ..], &[_]u8{ ' ', '\t', '\r' });
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            value = value[1 .. value.len - 1];
+        }
+        return value;
+    }
+    return null;
+}
+fn debianAmneziaRepositorySetupScript() []const u8 {
+    return
+    \\set -eu
+    \\install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+    \\tmp="$(mktemp)"
+    \\trap 'rm -f "$tmp"' EXIT
+    \\curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x75C9DD72C799870E310542E24166F2C257290828" -o "$tmp"
+    \\gpg --batch --yes --dearmor -o /usr/share/keyrings/amnezia-ppa.gpg "$tmp"
+    \\cat >/etc/apt/sources.list.d/amnezia-ppa.list <<'AMNEZIA_PPA'
+    \\deb [signed-by=/usr/share/keyrings/amnezia-ppa.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
+    \\deb-src [signed-by=/usr/share/keyrings/amnezia-ppa.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
+    \\AMNEZIA_PPA
+    ;
+}
+fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io(), path, .{});
+    defer file.close(io());
+    var reader = file.reader(io(), &.{});
+    return try reader.interface.allocRemaining(allocator, .limited(limit));
+}
+fn containsString(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
 }
 fn runCommandChecked(
     ui: *Tui,
@@ -1415,6 +1518,47 @@ test "tunnel pool timer repeats after oneshot service exits" {
     const source = @embedFile("tunnel_wg.zig");
     const needle = "OnUnitInactiveSec" ++ "=30s";
     try std.testing.expect(std.mem.indexOf(u8, source, needle) != null);
+}
+
+test "tunnel deps - Debian uses explicit Amnezia Launchpad focal source" {
+    const os_release =
+        \\PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"
+        \\NAME="Debian GNU/Linux"
+        \\ID=debian
+        \\VERSION_ID="12"
+        \\VERSION_CODENAME=bookworm
+    ;
+
+    try std.testing.expectEqual(AwgRepositorySetup.debian_launchpad_focal_source, awgRepositorySetupForOsRelease(os_release));
+
+    const script = debianAmneziaRepositorySetupScript();
+    try std.testing.expect(std.mem.indexOf(u8, script, "ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "signed-by=/usr/share/keyrings/amnezia-ppa.gpg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "0x75C9DD72C799870E310542E24166F2C257290828") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "add-apt-repository") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "pipefail") == null);
+
+    const prereqs = awgRepositoryPrerequisitePackages(.debian_launchpad_focal_source);
+    try std.testing.expect(containsString(prereqs, "curl"));
+    try std.testing.expect(containsString(prereqs, "gnupg2"));
+    try std.testing.expect(!containsString(prereqs, "software-properties-common"));
+    try std.testing.expect(!containsString(prereqs, "python3-launchpadlib"));
+}
+
+test "tunnel deps - Ubuntu keeps add-apt-repository PPA path" {
+    const os_release =
+        \\PRETTY_NAME="Ubuntu 24.04.2 LTS"
+        \\NAME="Ubuntu"
+        \\ID=ubuntu
+        \\VERSION_ID="24.04"
+        \\VERSION_CODENAME=noble
+    ;
+
+    try std.testing.expectEqual(AwgRepositorySetup.ubuntu_add_apt_repository, awgRepositorySetupForOsRelease(os_release));
+
+    const prereqs = awgRepositoryPrerequisitePackages(.ubuntu_add_apt_repository);
+    try std.testing.expect(containsString(prereqs, "software-properties-common"));
+    try std.testing.expect(containsString(prereqs, "python3-launchpadlib"));
 }
 
 test "tunnel - converts Amnezia vpn link to AWG config" {

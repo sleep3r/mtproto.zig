@@ -7,6 +7,7 @@ This folder contains practical tools to validate **capacity**, **stability**, an
 - `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.
 - `connection_stability_check.py` — churn + idle-pool stability harness (leak/regression detector).
 - `e2e/run.py` — process-level integration harness (`make e2e` / `zig build e2e`).
+- `installer-e2e/run.sh` — distro-matrix installer smoke, including tunnel dependency installers.
 
 ## E2E Harness
 
@@ -226,6 +227,7 @@ coverage:
   answer steady-state encrypted frames. The key derivation itself is now covered by
   known-answer tests in `src/protocol/middleproxy.zig`.
 - **Share-link / sing-box egress** (`installer-e2e/run.sh`): the WG/AmneziaWG tunnel pool
-  is covered, but the sing-box TUN egress (`mtbuddy setup egress 'vless://…'`) is not — it
-  needs a stub `sing-box` that creates a dummy TUN interface. Link parsing + config JSON
-  generation are covered by unit tests in `src/ctl/`.
+  and sing-box dependency installer are covered, but the full sing-box TUN egress
+  (`mtbuddy setup egress 'vless://…'`) is not — it needs a stub `sing-box` that creates a
+  dummy TUN interface. Link parsing + config JSON generation are covered by unit tests in
+  `src/ctl/`.

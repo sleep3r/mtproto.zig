@@ -7,6 +7,7 @@ LOG_DIR="${MTPROTO_INSTALLER_E2E_LOG_DIR:-$ROOT/test/installer-e2e/logs}"
 IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:11 debian:12 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04}"
 VERSION="${MTPROTO_INSTALLER_E2E_VERSION:-latest}"
 PORT="${MTPROTO_INSTALLER_E2E_PORT:-443}"
+VERIFY_TUNNEL_DEPS="${MTPROTO_INSTALLER_E2E_TUNNEL_DEPS:-1}"
 # Default to the shipped installer default (rutube.ru), not the domain the installer
 # now warns against (wb.ru). The verify curl is domain-agnostic (-k + --resolve forces
 # the local nginx on 127.0.0.1:8443 regardless of SNI/Host), so this stays green.
@@ -426,6 +427,27 @@ verify_update_preserves_config() {
   '
 }
 
+verify_tunnel_dependency_installers() {
+  local container="$1"
+
+  run_script_in_container "$container" <<'CONTAINER_SCRIPT'
+set -Eeuo pipefail
+
+mtbuddy setup tunnel --deps-only
+command -v awg >/dev/null
+command -v awg-quick >/dev/null
+
+mtbuddy setup egress --deps-only
+if command -v sing-box >/dev/null; then
+  singbox="$(command -v sing-box)"
+else
+  singbox="/usr/local/bin/sing-box"
+fi
+test -x "$singbox"
+"$singbox" version | grep -F "sing-box" >/dev/null
+CONTAINER_SCRIPT
+}
+
 run_case() {
   local base_image="$1"
   local safe
@@ -488,6 +510,12 @@ run_case() {
   run_in_container "$container" mtbuddy setup nfqws 2>&1 | tee "$LOG_DIR/$safe.nfqws-rerun.log"
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-nfqws-rerun.log"
   echo "::endgroup::"
+
+  if [[ "$VERIFY_TUNNEL_DEPS" != "0" ]]; then
+    echo "::group::Install tunnel dependency set ($base_image)"
+    verify_tunnel_dependency_installers "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-deps.log"
+    echo "::endgroup::"
+  fi
 
   echo "::group::Update preserves config.toml + keeps service active ($base_image)"
   verify_update_preserves_config "$container" 2>&1 | tee "$LOG_DIR/$safe.update.log"
