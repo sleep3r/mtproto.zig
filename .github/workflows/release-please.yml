@@ -178,4 +178,7 @@ jobs:
           PINNED_MINISIGN_PUBKEY="RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO"
           printf '%s\n' "untrusted comment: mtproto.zig minisign public key" > minisign.pub
           printf '%s\n' "${PINNED_MINISIGN_PUBKEY}" >> minisign.pub
-          gh release upload "${{ needs.release-please.outputs.tag_name }}" minisign.pub --clobber
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" \
+            minisign.pub \
+            --repo "${{ github.repository }}" \
+            --clobber
