@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/sleep3r/mtproto.zig/compare/v1.4.0...v1.4.1) (2026-06-10)
+
+
+### Bug Fixes
+
+* **dashboard:** stop phantom tunnel card flashing in non-tunnel modes ([#333](https://github.com/sleep3r/mtproto.zig/issues/333)) ([aace7cc](https://github.com/sleep3r/mtproto.zig/commit/aace7ccecfab7f0242f1cc4621143efef12a1968))
+
 ## [1.4.0](https://github.com/sleep3r/mtproto.zig/compare/v1.3.0...v1.4.0) (2026-06-10)
 
 
