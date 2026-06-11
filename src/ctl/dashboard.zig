@@ -68,12 +68,46 @@ fn dashboardPipInstallArgv() []const []const u8 {
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = DashboardOpts{};
+    var do_remove = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--quiet")) {
             opts.quiet = true;
+        } else if (std.mem.eql(u8, arg, "--remove") or std.mem.eql(u8, arg, "--uninstall")) {
+            do_remove = true;
         }
     }
+    if (do_remove) return removeDashboard(ui);
     try execute(ui, allocator, opts);
+}
+
+fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
+    return if (lang == .ru) ru else en;
+}
+
+/// Stop and remove only the dashboard (`proxy-monitor`), leaving the proxy itself untouched.
+/// `mtbuddy uninstall` removes everything; this is the targeted counterpart to
+/// `mtbuddy setup dashboard`.
+fn removeDashboard(ui: *Tui) void {
+    if (!sys.isRoot()) {
+        ui.fail(i18n.get(ui.lang, .error_not_root));
+        return;
+    }
+    ui.section(tr(ui.lang, "Remove monitoring dashboard", "Удаление дашборда мониторинга"));
+
+    if (!sys.fileExists(SERVICE_FILE) and !sys.isServiceActive(SERVICE_NAME)) {
+        ui.info(tr(ui.lang, "Dashboard is not installed — nothing to remove.", "Дашборд не установлен — удалять нечего."));
+        return;
+    }
+
+    ui.step(tr(ui.lang, "Stopping and disabling " ++ SERVICE_NAME ++ "...", "Останавливаю и отключаю " ++ SERVICE_NAME ++ "..."));
+    _ = sys.execForward(&.{ "systemctl", "disable", "--now", SERVICE_NAME }) catch {};
+
+    ui.step(tr(ui.lang, "Removing service unit and dashboard files...", "Удаляю unit и файлы дашборда..."));
+    _ = sys.execForward(&.{ "rm", "-f", SERVICE_FILE }) catch {};
+    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-rf", INSTALL_DIR }) catch {};
+
+    ui.ok(tr(ui.lang, "Dashboard removed. The proxy itself is untouched.", "Дашборд удалён. Сам прокси не затронут."));
 }
 
 /// Run in interactive mode.

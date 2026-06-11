@@ -221,6 +221,8 @@ sudo mtbuddy setup recovery
 
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
+# Remove just the dashboard (leaves the proxy running)
+sudo mtbuddy setup dashboard --remove
 
 # VPN tunnel (for servers where Telegram DCs are blocked)
 sudo mtbuddy setup tunnel /path/to/awg0.conf

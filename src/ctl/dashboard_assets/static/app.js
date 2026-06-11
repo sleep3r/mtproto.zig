@@ -1443,7 +1443,7 @@ async function poll() {
       : '<span class="signal-sq"></span>' + disabledText;
     $('maskMode').innerHTML = modeText;
 
-    let endpointText = masking.tls_domain ? (masking.tls_domain + ':443') : (masking.target || '—');
+    let endpointText = masking.tls_domain ? (masking.tls_domain + ':' + (masking.port || 443)) : (masking.target || '—');
     $('maskTarget').textContent = endpointText;
 
     const nginxState = masking.nginx_active

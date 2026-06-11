@@ -215,6 +215,8 @@ sudo mtbuddy setup recovery
 
 # Установить web dashboard
 sudo mtbuddy setup dashboard
+# Удалить только дашборд (прокси продолжит работать)
+sudo mtbuddy setup dashboard --remove
 
 # VPN tunnel pool
 sudo mtbuddy setup tunnel /path/to/awg0.conf

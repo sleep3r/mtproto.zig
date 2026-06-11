@@ -1467,6 +1467,11 @@ def _masking_status() -> dict:
     mask_enabled = bool(censorship["mask"])
     mask_target = str(censorship.get("mask_target") or "").strip()
     mask_port = int(censorship["mask_port"])
+    # Client-facing port for the FakeTLS endpoint shown in the UI: public_port if set
+    # (e.g. behind a load balancer), else the proxy's listen port. NOT mask_port (that's
+    # the internal masking backend), and never a hardcoded 443.
+    _proxy_cfg = _load_proxy_runtime_config()
+    client_port = int(_proxy_cfg.get("public_port") or 0) or int(_proxy_cfg.get("port") or 443)
     tls_domain = censorship["tls_domain"]
 
     using_netns_target = False
@@ -1505,6 +1510,7 @@ def _masking_status() -> dict:
         "mask_port": mask_port,
         "mask_target": mask_target,
         "tls_domain": tls_domain,
+        "port": client_port,
         "target": f"{target_host}:{mask_port}" if mode != "disabled" else "-",
         "using_netns": using_netns_target,
         "endpoint_ok": endpoint_ok,
