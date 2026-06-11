@@ -286,6 +286,12 @@ pub const Config = struct {
     /// `reject` (emit a fatal `handshake_failure` TLS alert like nginx
     /// ssl_reject_handshake, then close), or `drop` (silent close). Default keeps the wire unchanged.
     unknown_sni_action: UnknownSniAction = .mask,
+    /// Opt-in safelist of extra domains the masking backend may front. On an unknown-SNI
+    /// probe whose SNI is on this list, the connection is fronted to *that domain's own*
+    /// server (resolved at startup, port 443) instead of the single mask target — so the
+    /// on-wire conversation matches the SNI the prober claimed. Empty = off (never an open
+    /// relay). Does not affect tls_domain (the only domain tied to share links).
+    mask_sni_safelist: []const []const u8 = &.{},
     /// When `unknown_sni_action = reject`, reset the connection (TCP RST via
     /// SO_LINGER{0}) instead of sending a fatal alert + FIN. Some fronted CDNs /
     /// middleboxes RST a bad handshake where nginx `ssl_reject_handshake` sends a
@@ -737,6 +743,8 @@ pub const Config = struct {
                         if (parseUnknownSniAction(value)) |action| cfg.unknown_sni_action = action;
                     } else if (std.mem.eql(u8, key, "reject_rst")) {
                         cfg.reject_rst = parseBool(value);
+                    } else if (std.mem.eql(u8, key, "mask_sni_safelist")) {
+                        cfg.mask_sni_safelist = parseStringArrayValue(allocator, value) catch &.{};
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {

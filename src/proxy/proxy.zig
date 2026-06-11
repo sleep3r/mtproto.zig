@@ -324,6 +324,14 @@ const isIpv6 = net_helpers.isIpv6;
 const addressEql = net_helpers.addressEql;
 const getAddressList = net_helpers.getAddressList;
 
+/// A safelisted SNI the masking backend may front to that domain's own server.
+pub const MaskSafelistEntry = struct {
+    /// Lower-cased domain (points into the owned Config; matched case-insensitively).
+    domain: []const u8,
+    /// Resolved address (port 443) of that domain's real server.
+    addr: Address,
+};
+
 /// Fetch a public-IP echo service through the SAME egress middle-proxy traffic uses, so
 /// the IP we feed into the MP key derivation matches what Telegram's MiddleProxy observes.
 /// A plain direct probe returns the HOST's IP even when egress is socks5/http/tunnel — the
@@ -544,6 +552,9 @@ const ConnectionSlot = struct {
 
     // Masking: bytes already read from client before deciding to mask
     mask_prebuffer: ?[]u8 = null,
+    /// One-shot override for the next startMasking (SNI-following safelist hit).
+    /// Consumed (read + cleared) inside startMasking so it never leaks to a reused slot.
+    mask_addr_override: ?Address = null,
 
     // Non-blocking MiddleProxy handshake state
     mp_step: MiddleProxyHandshakeStep = .none,
@@ -1126,6 +1137,8 @@ pub const ProxyState = struct {
     accept_paused: std.atomic.Value(bool),
     saturation_paused: std.atomic.Value(bool),
     mask_addr: ?Address,
+    /// Opt-in SNI-following mask targets (config.mask_sni_safelist), resolved at boot.
+    mask_safelist: []const MaskSafelistEntry,
     replay_cache: ReplayCache,
     tls_server_hello_template: [tls.server_hello_template_len]u8,
 
@@ -1233,6 +1246,25 @@ pub const ProxyState = struct {
             }
         }
 
+        // Resolve the opt-in SNI-following mask safelist (each domain → its own server,
+        // port 443). Failed resolutions are skipped, not fatal.
+        var mask_safelist_buf: std.ArrayListUnmanaged(MaskSafelistEntry) = .empty;
+        errdefer mask_safelist_buf.deinit(allocator);
+        if (cfg.mask and cfg.mask_sni_safelist.len > 0) {
+            for (cfg.mask_sni_safelist) |domain| {
+                const sl = getAddressList(allocator, domain, 443) catch {
+                    log.warn("mask_sni_safelist: could not resolve '{s}', skipping", .{domain});
+                    continue;
+                };
+                defer sl.deinit();
+                if (sl.addrs.len > 0) {
+                    mask_safelist_buf.append(allocator, .{ .domain = domain, .addr = sl.addrs[0] }) catch continue;
+                    log.info("mask_sni_safelist: fronting '{s}' enabled", .{domain});
+                }
+            }
+        }
+        const mask_safelist = mask_safelist_buf.toOwnedSlice(allocator) catch &.{};
+
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
@@ -1271,6 +1303,7 @@ pub const ProxyState = struct {
             .accept_paused = std.atomic.Value(bool).init(false),
             .saturation_paused = std.atomic.Value(bool).init(false),
             .mask_addr = resolved_addr,
+            .mask_safelist = mask_safelist,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls.buildServerHelloTemplate(null),
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
@@ -1394,6 +1427,7 @@ pub const ProxyState = struct {
             self.middle_proxy_updater_thread = null;
         }
         self.flood_guard.destroy(self.allocator);
+        self.allocator.free(self.mask_safelist);
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         freeUserMetricsSlice(self.allocator, self.user_metrics);
@@ -3288,13 +3322,13 @@ const EventLoop = struct {
 
         const maybe_sni = tls.extractSni(client_hello);
         if (maybe_sni == null) {
-            self.handleInvalidSni(slot, client_hello, "tls missing sni");
+            self.handleInvalidSni(slot, client_hello, null, "tls missing sni");
             return;
         }
 
         const sni = maybe_sni.?;
         if (!std.ascii.eqlIgnoreCase(sni, self.state.config.tls_domain)) {
-            self.handleInvalidSni(slot, client_hello, "tls sni mismatch");
+            self.handleInvalidSni(slot, client_hello, sni, "tls sni mismatch");
             return;
         }
 
@@ -3622,10 +3656,22 @@ const EventLoop = struct {
     /// active-probe defense), `reject` emits a fatal `handshake_failure` (40) TLS alert
     /// like nginx ssl_reject_handshake and closes, `drop` closes silently. Validation-failed /
     /// replay cases (SNI matched) keep masking — they're not handled here.
-    fn handleInvalidSni(self: *EventLoop, slot: *ConnectionSlot, client_hello: []const u8, reason: []const u8) void {
+    fn handleInvalidSni(self: *EventLoop, slot: *ConnectionSlot, client_hello: []const u8, sni: ?[]const u8, reason: []const u8) void {
         _ = self.state.stats_unknown_sni.fetchAdd(1, .monotonic);
         switch (self.state.config.unknown_sni_action) {
-            .mask => self.startMasking(slot, client_hello) catch self.closeSlot(slot, reason),
+            .mask => {
+                // SNI-following: if the probed SNI is safelisted, front to that domain's
+                // own server so the on-wire conversation matches the SNI the prober claimed.
+                if (sni) |s| {
+                    for (self.state.mask_safelist) |entry| {
+                        if (std.ascii.eqlIgnoreCase(s, entry.domain)) {
+                            slot.mask_addr_override = entry.addr;
+                            break;
+                        }
+                    }
+                }
+                self.startMasking(slot, client_hello) catch self.closeSlot(slot, reason);
+            },
             .reject => {
                 if (self.state.config.reject_rst) {
                     // Mirror a server/middlebox that resets a bad handshake: no alert,
@@ -3646,7 +3692,14 @@ const EventLoop = struct {
     fn startMasking(self: *EventLoop, slot: *ConnectionSlot, buffered: []const u8) !void {
         if (!self.state.config.mask) return error.MaskingDisabled;
 
-        const addr = self.state.mask_addr orelse return error.NoMaskAddress;
+        // Consume a one-shot SNI-following override if set; otherwise the default target.
+        const addr = blk: {
+            if (slot.mask_addr_override) |override| {
+                slot.mask_addr_override = null;
+                break :blk override;
+            }
+            break :blk self.state.mask_addr orelse return error.NoMaskAddress;
+        };
         const pre = try self.state.allocator.alloc(u8, buffered.len);
         @memcpy(pre, buffered);
         slot.mask_prebuffer = pre;
