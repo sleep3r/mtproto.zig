@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.5.0](https://github.com/sleep3r/mtproto.zig/compare/v1.4.4...v1.5.0) (2026-06-11)
+
+
+### Features
+
+* **faketls:** clock-sync, mask-relay cap, fake_cert_size, PROXY-protocol (roadmap wave 2) ([#350](https://github.com/sleep3r/mtproto.zig/issues/350)) ([0577bbf](https://github.com/sleep3r/mtproto.zig/commit/0577bbf1ff0f84f702372ceb67de367b66964b65))
+* **faketls:** opt-in SNI-following mask target (mask_sni_safelist) ([#349](https://github.com/sleep3r/mtproto.zig/issues/349)) ([cdb22ba](https://github.com/sleep3r/mtproto.zig/commit/cdb22bac977835f8ee307ece08e42aa0d93758b9))
+* **faketls:** PQ key_share, RST teardown, jittered desync split, probe metrics ([#347](https://github.com/sleep3r/mtproto.zig/issues/347)) ([1160c5e](https://github.com/sleep3r/mtproto.zig/commit/1160c5e16af2dd3d39aad61f991d90cf1e6982c8))
+
 ## [1.4.4](https://github.com/sleep3r/mtproto.zig/compare/v1.4.3...v1.4.4) (2026-06-11)
 
 
