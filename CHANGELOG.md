@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.4](https://github.com/sleep3r/mtproto.zig/compare/v1.4.3...v1.4.4) (2026-06-11)
+
+
+### Bug Fixes
+
+* **dashboard:** offer "Remove dashboard" in the interactive menu when installed ([#346](https://github.com/sleep3r/mtproto.zig/issues/346)) ([18f8643](https://github.com/sleep3r/mtproto.zig/commit/18f8643e98cfd8c338afd9ed66f82be347bfc74d))
+* **dashboard:** show the real masking-endpoint port + add "setup dashboard --remove" ([#344](https://github.com/sleep3r/mtproto.zig/issues/344)) ([093ed0d](https://github.com/sleep3r/mtproto.zig/commit/093ed0db31d123cd78bbdc08d7e669fcb8188b0a))
+
 ## [1.4.3](https://github.com/sleep3r/mtproto.zig/compare/v1.4.2...v1.4.3) (2026-06-10)
 
 
