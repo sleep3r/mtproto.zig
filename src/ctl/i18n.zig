@@ -458,7 +458,7 @@ const en_strings = [_][]const u8{
     // tui_exited
     "Exited",
     // menu_remove_dashboard
-    "Remove monitoring dashboard",
+    "📊  Remove monitoring dashboard",
 };
 
 // ── Russian strings ─────────────────────────────────────────────
@@ -723,7 +723,7 @@ const ru_strings = [_][]const u8{
     // tui_exited
     "Выход",
     // menu_remove_dashboard
-    "Удалить дашборд мониторинга",
+    "📊  Удалить дашборд мониторинга",
 };
 
 // ── Comptime validation ─────────────────────────────────────────
