@@ -206,6 +206,156 @@ pub fn buildServerHelloWithTemplate(
     return response;
 }
 
+// ============= Post-quantum X25519MLKEM768 ServerHello =============
+//
+// Modern browsers (Chrome/Firefox PQ-first) and CDNs negotiate the hybrid group
+// X25519MLKEM768 (named group 0x11ec). A FakeTLS proxy that always answers a
+// PQ-offering client with a plain x25519 (0x001d) key_share is a passive
+// group-downgrade tell: a real server for that flow would echo 0x11ec. When the
+// client offers 0x11ec we therefore emit a 0x11ec ServerHello key_share of the
+// correct size (1120 = ML-KEM-768 ciphertext 1088 || X25519 32).
+//
+// The share is high-entropy CSPRNG bytes, NOT a real ML-KEM encapsulation. That
+// is deliberate and sufficient: (a) Telegram FakeTLS clients validate only record
+// framing + the HMAC in server-random, never the key_share crypto; (b) passive
+// JA3S/ServerHello fingerprinting keys on the *group and size*, which match; and
+// (c) we are not a TLS terminator — an active prober that completes a real hybrid
+// KEX still cannot finish the handshake with us, so a cryptographically valid
+// ciphertext buys nothing. (Real raw-ML-KEM ct||X25519 encapsulation against the
+// client's ek is a possible future enhancement; std's MlKem768X25519 is X-Wing,
+// a different combiner from the TLS 0x11ec wire format, so it can't be used as-is.)
+
+pub const pq_named_group: u16 = 0x11ec;
+/// X25519MLKEM768 server share: ML-KEM-768 ciphertext (1088) || X25519 (32).
+const pq_key_share_len: usize = 1120;
+/// PQ ServerHello record length: 5(rec hdr)+4(hs hdr)+2(ver)+32(rand)+1+32(sid)
+///   +2(cipher)+1(comp)+2(extlen)+6(supported_versions)+4(ks ext hdr)
+///   +2(group)+2(keylen)+1120(key) = 1215.
+const pq_server_hello_record_len: usize = 95 + pq_key_share_len;
+/// Full PQ response: ServerHello + CCS(6) + AppData(5 + cert payload).
+pub const pq_server_hello_len: usize = pq_server_hello_record_len + 6 + 5 + fake_cert_payload_len;
+/// Offset of the 1120-byte PQ key_share inside the response.
+const pq_key_offset: usize = 95;
+/// Offset of the fake AppData body inside the PQ response.
+const pq_appdata_offset: usize = pq_server_hello_len - fake_cert_payload_len;
+
+/// Return true when the ClientHello carries a key_share entry for X25519MLKEM768
+/// (named group 0x11ec). Mirrors the key_share walk in formatClientHelloFingerprint.
+pub fn clientOffersPqKeyShare(handshake: []const u8) bool {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return false;
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return false; // ClientHello
+    pos += 4; // hs type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > handshake.len) return false;
+    const sid_len: usize = handshake[pos];
+    pos += 1 + sid_len;
+    if (pos + 2 > handshake.len) return false;
+    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return false;
+    pos += cs_len;
+    if (pos + 1 > handshake.len) return false;
+    const comp_len: usize = handshake[pos];
+    pos += 1 + comp_len;
+    if (pos + 2 > handshake.len) return false;
+    const ext_total = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    const ext_end = @min(pos + ext_total, handshake.len);
+    while (pos + 4 <= ext_end) {
+        const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+        const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
+        pos += 4;
+        if (pos + elen > ext_end) break;
+        if (etype == 0x0033) { // key_share: 2-byte client_shares list_len, then entries
+            var kp: usize = pos + 2;
+            const ks_end = pos + elen;
+            while (kp + 4 <= ks_end) {
+                if (std.mem.readInt(u16, handshake[kp..][0..2], .big) == pq_named_group) return true;
+                kp += 4 + @as(usize, std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big));
+            }
+            return false;
+        }
+        pos += elen;
+    }
+    return false;
+}
+
+/// Build a ServerHello that answers an X25519MLKEM768-offering client with a
+/// 0x11ec key_share. Same HMAC-in-server-random + per-connection-random-AppData
+/// construction as buildServerHelloWithTemplate; only the key_share group/size and
+/// the dependent length fields differ.
+pub fn buildServerHelloPq(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+) ![]u8 {
+    if (session_id.len != 32) return error.BadSessionIdLength;
+    const r = try allocator.alloc(u8, pq_server_hello_len);
+    errdefer allocator.free(r);
+    @memset(r, 0);
+
+    // ── Record 1: ServerHello with a 0x11ec key_share ──
+    r[0] = constants.tls_record_handshake; // 0x16
+    r[1] = 0x03;
+    r[2] = 0x03; // record version (TLS 1.2 compat)
+    std.mem.writeInt(u16, r[3..][0..2], @intCast(pq_server_hello_record_len - 5), .big);
+    r[5] = 0x02; // ServerHello
+    std.mem.writeInt(u24, r[6..][0..3], @intCast(pq_server_hello_record_len - 9), .big);
+    r[9] = 0x03;
+    r[10] = 0x03; // server legacy version
+    // r[11..43] server random — left zero (HMAC placeholder, patched at the end)
+    r[43] = 0x20; // session_id length = 32
+    @memcpy(r[tmpl_session_id_offset..][0..32], session_id);
+    std.mem.writeInt(u16, r[tmpl_cipher_offset..][0..2], cipher orelse 0x1301, .big);
+    r[78] = 0x00; // compression: none
+    std.mem.writeInt(u16, r[79..][0..2], @intCast(6 + 4 + 4 + pq_key_share_len), .big); // extensions
+    // supported_versions (0x002b) FIRST — TLS 1.3
+    r[81] = 0x00;
+    r[82] = 0x2b;
+    r[83] = 0x00;
+    r[84] = 0x02;
+    r[85] = 0x03;
+    r[86] = 0x04;
+    // key_share (0x0033)
+    r[87] = 0x00;
+    r[88] = 0x33;
+    std.mem.writeInt(u16, r[89..][0..2], @intCast(4 + pq_key_share_len), .big);
+    std.mem.writeInt(u16, r[91..][0..2], pq_named_group, .big);
+    std.mem.writeInt(u16, r[93..][0..2], @intCast(pq_key_share_len), .big);
+    crypto.randomBytes(r[pq_key_offset..][0..pq_key_share_len]);
+
+    // ── Record 2: Change Cipher Spec ──
+    const ccs = pq_server_hello_record_len;
+    r[ccs] = 0x14;
+    r[ccs + 1] = 0x03;
+    r[ccs + 2] = 0x03;
+    r[ccs + 3] = 0x00;
+    r[ccs + 4] = 0x01;
+    r[ccs + 5] = 0x01;
+
+    // ── Record 3: fake encrypted certificate AppData ──
+    const ad = ccs + 6;
+    r[ad] = 0x17;
+    r[ad + 1] = 0x03;
+    r[ad + 2] = 0x03;
+    std.mem.writeInt(u16, r[ad + 3 ..][0..2], fake_cert_payload_len, .big);
+    crypto.randomBytes(r[pq_appdata_offset..][0..fake_cert_payload_len]);
+
+    // HMAC over the full response (random field zeroed), prefixed by the client digest.
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = HmacSha256.init(secret);
+    hmac.update(client_digest);
+    hmac.update(r);
+    var response_digest: [32]u8 = undefined;
+    hmac.final(&response_digest);
+    @memcpy(r[tmpl_random_offset..][0..32], &response_digest);
+
+    return r;
+}
+
 /// A TLS **fatal** `handshake_failure` alert record — what a server sends when it
 /// refuses to complete the handshake (e.g. nginx `ssl_reject_handshake on`). Send
 /// this, then close, so a rejected probe sees a real server-style teardown. A *fatal*
@@ -844,6 +994,96 @@ test "formatClientHelloFingerprint summarizes ciphers/groups/keyshare" {
     try std.testing.expectEqualStrings("ciphers=1301,1303 groups=001d,11ec keyshare=001d", fp);
     // Truncated input never panics.
     try std.testing.expect(formatClientHelloFingerprint(ch[0..30], &out) == null);
+}
+
+test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
+    var ch: [160]u8 = undefined;
+    var n: usize = 0;
+    const W = struct {
+        fn b(buf: []u8, i: *usize, v: u8) void {
+            buf[i.*] = v;
+            i.* += 1;
+        }
+        fn h(buf: []u8, i: *usize, v: u16) void {
+            std.mem.writeInt(u16, buf[i.*..][0..2], v, .big);
+            i.* += 2;
+        }
+    };
+    W.b(&ch, &n, 0x16);
+    W.b(&ch, &n, 0x03);
+    W.b(&ch, &n, 0x01);
+    const rec_len_at = n;
+    W.h(&ch, &n, 0);
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0x00);
+    const hs_len_at = n;
+    W.h(&ch, &n, 0);
+    const hs_body_start = n;
+    W.h(&ch, &n, 0x0303);
+    var r: usize = 0;
+    while (r < 32) : (r += 1) W.b(&ch, &n, 0xAA);
+    W.b(&ch, &n, 0x00); // session_id len
+    W.h(&ch, &n, 2);
+    W.h(&ch, &n, 0x1301); // cipher_suites
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0x00); // compression
+    const ext_total_at = n;
+    W.h(&ch, &n, 0);
+    const ext_start = n;
+    W.h(&ch, &n, 0x0033); // key_share ext
+    const ks_len_at = n;
+    W.h(&ch, &n, 0);
+    const ks_payload_start = n;
+    W.h(&ch, &n, 8); // client_shares list length
+    W.h(&ch, &n, 0x11ec); // group
+    W.h(&ch, &n, 4); // key length
+    var kk: usize = 0;
+    while (kk < 4) : (kk += 1) W.b(&ch, &n, 0xCC);
+    std.mem.writeInt(u16, ch[ks_len_at..][0..2], @intCast(n - ks_payload_start), .big);
+    std.mem.writeInt(u16, ch[ext_total_at..][0..2], @intCast(n - ext_start), .big);
+    std.mem.writeInt(u16, ch[hs_len_at..][0..2], @intCast(n - hs_body_start), .big);
+    std.mem.writeInt(u16, ch[rec_len_at..][0..2], @intCast(n - 5), .big);
+
+    try std.testing.expect(clientOffersPqKeyShare(ch[0..n]));
+    // Flip the offered group to x25519 -> no longer a PQ offer.
+    std.mem.writeInt(u16, ch[ks_payload_start + 2 ..][0..2], 0x001d, .big);
+    try std.testing.expect(!clientOffersPqKeyShare(ch[0..n]));
+    // Truncated input never panics.
+    try std.testing.expect(!clientOffersPqKeyShare(ch[0..20]));
+}
+
+test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
+    const allocator = std.testing.allocator;
+    const digest = [_]u8{0} ** constants.tls_digest_len;
+    const sid = [_]u8{0x33} ** 32;
+    const secret = [_]u8{0x42} ** 16;
+    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303);
+    defer allocator.free(resp);
+
+    try std.testing.expectEqual(pq_server_hello_len, resp.len);
+    try std.testing.expectEqual(@as(u8, 0x16), resp[0]);
+    try std.testing.expectEqual(@as(u16, @intCast(pq_server_hello_record_len - 5)), std.mem.readInt(u16, resp[3..][0..2], .big));
+    // cipher echoed + session_id echoed
+    try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
+    try std.testing.expectEqualSlices(u8, &sid, resp[tmpl_session_id_offset..][0..32]);
+    // key_share: ext type 0x0033, group 0x11ec, key length 1120
+    try std.testing.expectEqual(@as(u16, 0x0033), std.mem.readInt(u16, resp[87..][0..2], .big));
+    try std.testing.expectEqual(pq_named_group, std.mem.readInt(u16, resp[91..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, @intCast(pq_key_share_len)), std.mem.readInt(u16, resp[93..][0..2], .big));
+    // CCS then AppData records follow the ServerHello record.
+    try std.testing.expectEqual(@as(u8, 0x14), resp[pq_server_hello_record_len]);
+    try std.testing.expectEqual(@as(u8, 0x17), resp[pq_server_hello_record_len + 6]);
+    // HMAC self-consistency: recompute over the response with the random field zeroed.
+    const check = try allocator.dupe(u8, resp);
+    defer allocator.free(check);
+    @memset(check[tmpl_random_offset..][0..32], 0);
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var h = HmacSha256.init(&secret);
+    h.update(&digest);
+    h.update(check);
+    var expected: [32]u8 = undefined;
+    h.final(&expected);
+    try std.testing.expectEqualSlices(u8, &expected, resp[tmpl_random_offset..][0..32]);
 }
 
 test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {

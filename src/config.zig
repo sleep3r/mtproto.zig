@@ -286,8 +286,18 @@ pub const Config = struct {
     /// `reject` (emit a fatal `handshake_failure` TLS alert like nginx
     /// ssl_reject_handshake, then close), or `drop` (silent close). Default keeps the wire unchanged.
     unknown_sni_action: UnknownSniAction = .mask,
+    /// When `unknown_sni_action = reject`, reset the connection (TCP RST via
+    /// SO_LINGER{0}) instead of sending a fatal alert + FIN. Some fronted CDNs /
+    /// middleboxes RST a bad handshake where nginx `ssl_reject_handshake` sends a
+    /// fatal alert; pick whichever your masked domain actually does. Default off.
+    reject_rst: bool = false,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
+    /// Base delay (ms) between the 1-byte desync split and the rest of the ServerHello.
+    desync_split_delay_ms: u32 = 3,
+    /// Random extra delay (0..jitter ms) added to desync_split_delay_ms per connection.
+    /// A *fixed* split gap is itself a passive timing fingerprint; jitter removes it.
+    desync_split_jitter_ms: u32 = 3,
     /// Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
@@ -713,6 +723,10 @@ pub const Config = struct {
                         cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         cfg.desync = parseBool(value);
+                    } else if (std.mem.eql(u8, key, "desync_split_delay_ms")) {
+                        cfg.desync_split_delay_ms = std.fmt.parseInt(u32, value, 10) catch cfg.desync_split_delay_ms;
+                    } else if (std.mem.eql(u8, key, "desync_split_jitter_ms")) {
+                        cfg.desync_split_jitter_ms = std.fmt.parseInt(u32, value, 10) catch cfg.desync_split_jitter_ms;
                     } else if (std.mem.eql(u8, key, "fake_tls_only")) {
                         cfg.fake_tls_only = parseBool(value);
                     } else if (std.mem.eql(u8, key, "drs")) {
@@ -721,6 +735,8 @@ pub const Config = struct {
                         cfg.fast_mode = parseBool(value);
                     } else if (std.mem.eql(u8, key, "unknown_sni_action")) {
                         if (parseUnknownSniAction(value)) |action| cfg.unknown_sni_action = action;
+                    } else if (std.mem.eql(u8, key, "reject_rst")) {
+                        cfg.reject_rst = parseBool(value);
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {

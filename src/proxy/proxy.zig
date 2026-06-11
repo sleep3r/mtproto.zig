@@ -279,6 +279,7 @@ const closeFd = socket_utils.closeFd;
 const checkSocketConnectError = socket_utils.checkSocketConnectError;
 const acceptClient = socket_utils.acceptClient;
 const localSocketAddress = socket_utils.localSocketAddress;
+const setLingerReset = socket_utils.setLingerReset;
 const setNonBlocking = socket_utils.setNonBlocking;
 const secondsToMs = socket_utils.secondsToMs;
 
@@ -879,6 +880,8 @@ pub const ProxyState = struct {
         handshake_timeouts_total: u64,
         middleproxy_fallback_total: u64,
         drops_pool_total: u64,
+        replay_hits_total: u64,
+        unknown_sni_total: u64,
         close_reasons: [CloseReason.count]u64,
         client_to_upstream_bytes_total: u64,
         upstream_to_client_bytes_total: u64,
@@ -1134,6 +1137,12 @@ pub const ProxyState = struct {
     stats_dropped_hs_budget: std.atomic.Value(u64),
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
+    /// Replay-cache hits: a valid handshake whose canonical HMAC was already seen
+    /// (active replay probing). Distinct from a fresh accept.
+    stats_replay_hits: std.atomic.Value(u64),
+    /// ClientHello whose SNI did not match tls_domain (active probing / scanners /
+    /// borrowed-link misuse) — handled per unknown_sni_action.
+    stats_unknown_sni: std.atomic.Value(u64),
     /// Per-worker connection pool exhausted while the global cap still had room
     /// (SO_REUSEPORT hashes connections to workers, so one pool can fill first).
     stats_dropped_pool: std.atomic.Value(u64),
@@ -1273,6 +1282,8 @@ pub const ProxyState = struct {
             .stats_dropped_pool = std.atomic.Value(u64).init(0),
             .close_reasons = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** CloseReason.count,
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
+            .stats_replay_hits = std.atomic.Value(u64).init(0),
+            .stats_unknown_sni = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
@@ -1474,6 +1485,8 @@ pub const ProxyState = struct {
             .handshake_timeouts_total = self.stats_hs_timeout.load(.monotonic),
             .middleproxy_fallback_total = self.stats_mp_fallback.load(.monotonic),
             .drops_pool_total = self.stats_dropped_pool.load(.monotonic),
+            .replay_hits_total = self.stats_replay_hits.load(.monotonic),
+            .unknown_sni_total = self.stats_unknown_sni.load(.monotonic),
             .close_reasons = close_reasons,
             .client_to_upstream_bytes_total = self.client_to_upstream_bytes_total.load(.monotonic),
             .upstream_to_client_bytes_total = self.upstream_to_client_bytes_total.load(.monotonic),
@@ -2932,7 +2945,7 @@ const EventLoop = struct {
             .writing_server_hello_first => {
                 if (!slot.hasClientPending()) {
                     slot.phase = .desync_wait;
-                    slot.desync_deadline_ns = nowNs() + (3 * std.time.ns_per_ms);
+                    slot.desync_deadline_ns = self.desyncSplitDeadlineNs(slot);
                     self.enqueueDesyncWait(slot) catch {
                         self.closeSlot(slot, "desync wait queue failed");
                         return;
@@ -3053,6 +3066,19 @@ const EventLoop = struct {
         if (!slot.hasUpstreamPending() and slot.dc_initial_tail == null) {
             self.startRelay(slot);
         }
+    }
+
+    /// Deadline for the desync first-byte→rest split: a configurable base plus a cheap
+    /// per-connection jitter. A *fixed* gap is itself a passive timing fingerprint; the
+    /// jitter (derived from conn_id, no CSPRNG on the hot path) varies it per connection.
+    fn desyncSplitDeadlineNs(self: *EventLoop, slot: *const ConnectionSlot) i128 {
+        const cfg = &self.state.config;
+        var delay_ms: u64 = cfg.desync_split_delay_ms;
+        if (cfg.desync_split_jitter_ms > 0) {
+            const mix = slot.conn_id *% 0x9E3779B97F4A7C15;
+            delay_ms += (mix >> 33) % (@as(u64, cfg.desync_split_jitter_ms) + 1);
+        }
+        return nowNs() + @as(i128, delay_ms) * std.time.ns_per_ms;
     }
 
     fn enqueueDesyncWait(self: *EventLoop, slot: *ConnectionSlot) !void {
@@ -3288,6 +3314,7 @@ const EventLoop = struct {
 
         const v = validation.?;
         if (self.state.replay_cache.checkAndInsert(&v.canonical_hmac)) {
+            _ = self.state.stats_replay_hits.fetchAdd(1, .monotonic);
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "replay detected, masking failed");
             };
@@ -3324,22 +3351,38 @@ const EventLoop = struct {
             }
             break :blk false;
         };
+        // A PQ-offering client (X25519MLKEM768 0x11ec) must be answered with a 0x11ec
+        // key_share, else we emit a passive group-downgrade tell.
+        const offers_pq = tls.clientOffersPqKeyShare(client_hello_bytes);
         if (fp_consumed) {
             var fp_buf: [256]u8 = undefined;
             if (tls.formatClientHelloFingerprint(client_hello_bytes, &fp_buf)) |fp| {
-                log.info("client ClientHello [{s}] (we serve: cipher echoes client, key_share=x25519 0x001d)", .{fp});
+                log.info("client ClientHello [{s}] (we serve: cipher echoes client, key_share={s})", .{
+                    fp,
+                    if (offers_pq) "X25519MLKEM768 0x11ec" else "x25519 0x001d",
+                });
             }
         }
 
         const echoed_cipher = tls.extractFirstTls13Cipher(client_hello_bytes);
-        slot.server_hello = tls.buildServerHelloWithTemplate(
-            self.state.allocator,
-            self.state.tls_server_hello_template[0..],
-            &slot.validation_secret,
-            &slot.validation_digest,
-            slot.validation_session_id[0..slot.validation_session_id_len],
-            echoed_cipher,
-        ) catch {
+        const session_id = slot.validation_session_id[0..slot.validation_session_id_len];
+        slot.server_hello = (if (offers_pq)
+            tls.buildServerHelloPq(
+                self.state.allocator,
+                &slot.validation_secret,
+                &slot.validation_digest,
+                session_id,
+                echoed_cipher,
+            )
+        else
+            tls.buildServerHelloWithTemplate(
+                self.state.allocator,
+                self.state.tls_server_hello_template[0..],
+                &slot.validation_secret,
+                &slot.validation_digest,
+                session_id,
+                echoed_cipher,
+            )) catch {
             self.closeSlot(slot, "build server hello failed");
             return;
         };
@@ -3580,13 +3623,20 @@ const EventLoop = struct {
     /// like nginx ssl_reject_handshake and closes, `drop` closes silently. Validation-failed /
     /// replay cases (SNI matched) keep masking — they're not handled here.
     fn handleInvalidSni(self: *EventLoop, slot: *ConnectionSlot, client_hello: []const u8, reason: []const u8) void {
+        _ = self.state.stats_unknown_sni.fetchAdd(1, .monotonic);
         switch (self.state.config.unknown_sni_action) {
             .mask => self.startMasking(slot, client_hello) catch self.closeSlot(slot, reason),
             .reject => {
-                // Best-effort raw write of the 7-byte fatal alert before close (mirrors
-                // queue_io's syscall use); a partial/EAGAIN write is fine here.
-                const alert: []const u8 = &tls.reject_handshake_alert;
-                _ = posix.system.write(slot.client_fd, alert.ptr, alert.len);
+                if (self.state.config.reject_rst) {
+                    // Mirror a server/middlebox that resets a bad handshake: no alert,
+                    // force an RST on the (deferred) close via SO_LINGER{0}.
+                    setLingerReset(slot.client_fd);
+                } else {
+                    // Best-effort raw write of the 7-byte fatal alert before close (mirrors
+                    // queue_io's syscall use); a partial/EAGAIN write is fine here.
+                    const alert: []const u8 = &tls.reject_handshake_alert;
+                    _ = posix.system.write(slot.client_fd, alert.ptr, alert.len);
+                }
                 self.closeSlot(slot, reason);
             },
             .drop => self.closeSlot(slot, reason),

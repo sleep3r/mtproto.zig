@@ -222,6 +222,17 @@ pub fn setTcpNoDelay(fd: posix.fd_t) void {
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch return;
 }
 
+/// Force a TCP RST on close instead of a graceful FIN, via SO_LINGER with a zero
+/// timeout. Used to mirror a server/middlebox that resets a rejected handshake.
+pub fn setLingerReset(fd: posix.fd_t) void {
+    // Linux `struct linger { int l_onoff; int l_linger; }`. Defined locally as an
+    // i32/i32 extern struct so it compiles on every target (only the Linux runtime
+    // path actually sets it); setsockopt just copies the bytes.
+    const Linger = extern struct { l_onoff: i32, l_linger: i32 };
+    const lin = Linger{ .l_onoff = 1, .l_linger = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&lin)) catch return;
+}
+
 pub fn configureRelaySocket(fd: posix.fd_t) void {
     setTcpNoDelay(fd);
     setTcpKeepalive(fd);

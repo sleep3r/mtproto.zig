@@ -233,6 +233,8 @@ fn writeMetrics(writer: anytype, state: *proxy.ProxyState, process: ProcessMetri
     try writeCounter(writer, "mtproto_drops_handshake_budget_total", "connections dropped because handshake budget was exhausted", snapshot.drops_handshake_budget_total);
     try writeCounter(writer, "mtproto_handshake_timeouts_total", "connections dropped due to handshake timeout", snapshot.handshake_timeouts_total);
     try writeCounter(writer, "mtproto_middleproxy_fallback_total", "times middleproxy fell back to direct path", snapshot.middleproxy_fallback_total);
+    try writeCounter(writer, "mtproto_replay_hits_total", "valid handshakes whose canonical HMAC was already seen (active replay probing)", snapshot.replay_hits_total);
+    try writeCounter(writer, "mtproto_unknown_sni_total", "ClientHellos whose SNI did not match tls_domain (active probing / scanners)", snapshot.unknown_sni_total);
     // Per-reason close breakdown (RED errors + evasion signal). A spike in
     // tls_validation_failed / replay_detected / handshake_timeout vs baseline is
     // how an operator sees a censor begin actively probing/blocking the node.

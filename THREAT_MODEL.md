@@ -94,10 +94,20 @@ the client sends a ClientHello with `SNI = tls_domain`, and the proxy answers wi
 byte-compatible TLS 1.3 ServerHello. This defeats two DPI strategies well:
 
 - **Handshake fingerprinting** — the ClientHello/ServerHello match a real
-  nginx + OpenSSL stack (extension order, single x25519 key_share, fixed cert-record
+  nginx + OpenSSL stack (extension order, key_share group, fixed cert-record
   size), so the flow is not distinguishable as MTProto by shape alone.
 - **Active probing** — an unauthenticated prober is forwarded to the masking backend
   (a real TLS server) instead of getting a tell-tale proxy error.
+
+**Post-quantum key_share (X25519MLKEM768 / 0x11ec).** Modern browsers and CDNs now
+negotiate the hybrid group X25519MLKEM768; by 2026 a majority of real browser→CDN
+ClientHellos carry a 0x11ec key_share. A FakeTLS proxy that always answers with a
+classical `x25519` (0x001d) key_share is a passive **group-downgrade** tell. The
+proxy therefore echoes a correctly-sized 0x11ec ServerHello key_share whenever the
+client offers 0x11ec. (The share is high-entropy bytes, not a real ML-KEM
+encapsulation: FakeTLS clients validate only record framing + the HMAC in
+server-random, passive fingerprinting keys on the *group and size*, and we are not a
+TLS terminator — so a cryptographically valid ciphertext is unnecessary.)
 
 It does **not** defend against a third strategy that DPI vendors are now leaning on:
 **SNI ↔ destination-IP consistency.** When `tls_domain` is a well-known third-party
