@@ -211,6 +211,10 @@ pub const Config = struct {
     /// server clock (so a wrong VPS clock doesn't silently reject every handshake on the
     /// time-skew check). Unset = no correction. The offset is clamped to ±1 day.
     clock_sync_url: ?[]const u8 = null,
+    /// Expect a HAProxy PROXY-protocol header (v1 or v2) before each connection's TLS, so
+    /// the real client IP is recovered when sitting behind a TLS-terminating load balancer.
+    /// Enable ONLY when every connection truly arrives via such an LB. Default off.
+    accept_proxy_protocol: bool = false,
     /// Explicit public IP address. If set, bypasses detection via external services.
     public_ip: ?[]const u8 = null,
     /// Explicit public port shown in generated Telegram client links.
@@ -658,6 +662,8 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "clock_sync_url")) {
                         if (cfg.clock_sync_url) |prev| allocator.free(prev);
                         cfg.clock_sync_url = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "accept_proxy_protocol")) {
+                        cfg.accept_proxy_protocol = parseBool(value);
                     } else if (std.mem.eql(u8, key, "backlog")) {
                         cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
                     } else if (std.mem.eql(u8, key, "max_connections")) {

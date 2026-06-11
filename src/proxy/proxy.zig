@@ -29,6 +29,7 @@ const MessageQueue = @import("message_queue.zig").MessageQueue;
 const queue_io = @import("queue_io.zig");
 const middle_proxy_routing = @import("middle_proxy_routing.zig");
 const socket_utils = @import("socket_utils.zig");
+const proxy_protocol = @import("proxy_protocol.zig");
 const network_detect = @import("network_detect.zig");
 const http_fetch = @import("http_fetch.zig");
 const fd_limits = @import("fd_limits.zig");
@@ -57,6 +58,7 @@ test {
     _ = @import("socket_utils.zig");
     _ = @import("network_detect.zig");
     _ = @import("http_fetch.zig");
+    _ = @import("proxy_protocol.zig");
     _ = @import("sd_notify.zig");
     _ = @import("fd_limits.zig");
     _ = @import("connection_phase.zig");
@@ -566,6 +568,9 @@ const ConnectionSlot = struct {
     /// One-shot override for the next startMasking (SNI-following safelist hit).
     /// Consumed (read + cleared) inside startMasking so it never leaks to a reused slot.
     mask_addr_override: ?Address = null,
+    /// Expect a HAProxy PROXY-protocol header before the TLS ClientHello (set at accept
+    /// when accept_proxy_protocol is on; cleared once the header is consumed).
+    expect_proxy_header: bool = false,
 
     // Non-blocking MiddleProxy handshake state
     mp_step: MiddleProxyHandshakeStep = .none,
@@ -2450,8 +2455,13 @@ const EventLoop = struct {
             const client_addr = accepted.?.addr;
             accepted_this_round += 1;
 
+            // Behind a PROXY-protocol LB, the accepted address is the load balancer's, not
+            // the client's, so per-IP flood/subnet checks here are meaningless (they'd rate
+            // the LB). They run on the real client address once the PROXY header is parsed
+            // (peer_addr) via the per-handshake flood machinery.
+            const proxy_proto = self.state.config.accept_proxy_protocol;
             const flood_cfg = floodGuardSettings(&self.state.config);
-            if (self.state.floodIsBlocked(client_addr, flood_cfg)) {
+            if (!proxy_proto and self.state.floodIsBlocked(client_addr, flood_cfg)) {
                 _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
                 closeFd(cfd);
                 continue;
@@ -2461,7 +2471,7 @@ const EventLoop = struct {
             setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
+            if (!proxy_proto and !self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
                 _ = self.state.floodRecord(client_addr, .rate_limit, flood_cfg);
                 closeFd(cfd);
@@ -2501,6 +2511,7 @@ const EventLoop = struct {
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
+            slot.expect_proxy_header = proxy_proto;
             slot.client_transport = .fake_tls;
             slot.phase = .reading_tls_header;
             slot.handshake_pos = 0;
@@ -3231,7 +3242,69 @@ const EventLoop = struct {
         }
     }
 
+    const ProxyHeaderStep = enum { done, wait, closed };
+
+    /// MSG_PEEK the connection's first bytes, parse a HAProxy PROXY-protocol header, and
+    /// drain exactly its bytes (leaving the TLS ClientHello untouched in the socket buffer)
+    /// so peer_addr reflects the real client behind a load balancer.
+    fn tryConsumeProxyHeader(self: *EventLoop, slot: *ConnectionSlot) ProxyHeaderStep {
+        var peek: [256]u8 = undefined;
+        const msg_peek: u32 = 0x2; // MSG_PEEK (Linux)
+        const rc = posix.system.recvfrom(slot.client_fd, &peek, peek.len, msg_peek, null, null);
+        const n: usize = switch (posix.errno(rc)) {
+            .SUCCESS => rc,
+            .AGAIN, .INTR => return .wait,
+            else => {
+                self.closeSlot(slot, "proxy header read error");
+                return .closed;
+            },
+        };
+        if (n == 0) {
+            self.closeSlot(slot, "client eof before proxy header");
+            return .closed;
+        }
+        switch (proxy_protocol.parse(peek[0..n])) {
+            .incomplete => {
+                if (n >= peek.len) {
+                    self.closeSlot(slot, "proxy header too long");
+                    return .closed;
+                }
+                return .wait;
+            },
+            .invalid => {
+                self.closeSlot(slot, "invalid proxy header");
+                return .closed;
+            },
+            .ok => |res| {
+                var drain: [256]u8 = undefined;
+                var left: usize = res.consumed;
+                while (left > 0) {
+                    const got = posix.read(slot.client_fd, drain[0..@min(left, drain.len)]) catch {
+                        self.closeSlot(slot, "proxy header drain error");
+                        return .closed;
+                    };
+                    if (got == 0) {
+                        self.closeSlot(slot, "client eof draining proxy header");
+                        return .closed;
+                    }
+                    left -= got;
+                }
+                if (res.src) |real| slot.peer_addr = real;
+                slot.expect_proxy_header = false;
+                slot.last_activity_ms = nowMs();
+                return .done;
+            },
+        }
+    }
+
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.expect_proxy_header) {
+            switch (self.tryConsumeProxyHeader(slot)) {
+                .done => {},
+                .wait => return,
+                .closed => return,
+            }
+        }
         while (slot.tls_hdr_pos < tls_header_len) {
             const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
                 if (err == error.WouldBlock) return;
