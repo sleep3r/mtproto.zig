@@ -242,7 +242,8 @@ pub const pq_server_hello_len: usize = pq_server_hello_record_len + 6 + 5 + fake
 /// Offset of the 1120-byte PQ key_share inside the response.
 const pq_key_offset: usize = 95;
 /// Offset of the fake AppData body inside the PQ response.
-const pq_appdata_offset: usize = pq_server_hello_len - fake_cert_payload_len;
+/// Fixed prefix before the PQ AppData body: ServerHello record + CCS + AppData header.
+const pq_appdata_offset: usize = pq_server_hello_record_len + 6 + 5;
 
 /// Return true when the ClientHello carries a key_share entry for X25519MLKEM768
 /// (named group 0x11ec). Mirrors the key_share walk in formatClientHelloFingerprint.
@@ -296,9 +297,13 @@ pub fn buildServerHelloPq(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
     cipher: ?u16,
+    cert_len: usize,
 ) ![]u8 {
     if (session_id.len != 32) return error.BadSessionIdLength;
-    const r = try allocator.alloc(u8, pq_server_hello_len);
+    if (cert_len > 0xFFFF) return error.CertTooLarge;
+    // Match the fake-cert (AppData) record size used on the non-PQ path so a prober can't
+    // tell PQ vs classical clients apart by cert-record length.
+    const r = try allocator.alloc(u8, pq_appdata_offset + cert_len);
     errdefer allocator.free(r);
     @memset(r, 0);
 
@@ -346,8 +351,8 @@ pub fn buildServerHelloPq(
     r[ad] = 0x17;
     r[ad + 1] = 0x03;
     r[ad + 2] = 0x03;
-    std.mem.writeInt(u16, r[ad + 3 ..][0..2], fake_cert_payload_len, .big);
-    crypto.randomBytes(r[pq_appdata_offset..][0..fake_cert_payload_len]);
+    std.mem.writeInt(u16, r[ad + 3 ..][0..2], @intCast(cert_len), .big);
+    crypto.randomBytes(r[pq_appdata_offset..]);
 
     // HMAC over the full response (random field zeroed), prefixed by the client digest.
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -425,6 +430,9 @@ const tmpl_x25519_key_offset: usize = 95;
 /// fresh per-connection random bytes at runtime so it isn't byte-identical
 /// across connections (which would be a passive DPI distinguisher).
 const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_len;
+/// Fixed ServerHello+CCS+AppData-header prefix length (138); a template's fake-cert size
+/// is `template.len - server_hello_prefix_len`.
+pub const server_hello_prefix_len: usize = tmpl_appdata_offset;
 
 /// Fake encrypted certificate payload size.
 /// 2878 bytes matches a typical Nginx + Let's Encrypt ECDSA P-256 cert chain:
@@ -1097,7 +1105,7 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     const digest = [_]u8{0} ** constants.tls_digest_len;
     const sid = [_]u8{0x33} ** 32;
     const secret = [_]u8{0x42} ** 16;
-    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303);
+    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303, default_fake_cert_size);
     defer allocator.free(resp);
 
     try std.testing.expectEqual(pq_server_hello_len, resp.len);

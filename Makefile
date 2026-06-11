@@ -24,17 +24,21 @@ e2e: ## Run E2E/integration harness
 
 # ── server ops ────────────────────────────────────────────────────────────────
 
-deploy: build ## Build and push proxy + mtbuddy to server
+deploy: build ## Build and push proxy + mtbuddy to server (binary-only; PUSH_CONFIG=1 also pushes config/env)
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/mtproto-proxy.new
 	scp zig-out/bin/mtbuddy root@$(SERVER):/usr/local/bin/mtbuddy.new
-	-@if [ -f $(CONFIG) ]; then scp $(CONFIG) root@$(SERVER):/opt/mtproto-proxy/config.toml; fi
-	-@if [ -f .env ]; then \
-		tmp=$$(mktemp) && \
-		awk '{print "export " $$0}' .env > "$$tmp" && \
-		scp "$$tmp" root@$(SERVER):/opt/mtproto-proxy/env.sh && \
-		ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh'; \
-		rm -f "$$tmp"; \
-	fi
+	@# Config/env push is OPT-IN: by default `make deploy` ships ONLY the binary and never
+	@# touches the live config/secrets. Pushing a stale or drifted local config.toml over a
+	@# live deploy can break every share link (secrets/tls_domain) and the egress mode. Run
+	@# `make deploy PUSH_CONFIG=1` deliberately when you intend to overwrite the remote config.
+	@if [ "$(PUSH_CONFIG)" = "1" ]; then \
+		if [ -f $(CONFIG) ]; then echo "PUSH_CONFIG=1: pushing $(CONFIG) -> remote config.toml"; scp $(CONFIG) root@$(SERVER):/opt/mtproto-proxy/config.toml; fi; \
+		if [ -f .env ]; then \
+			tmp=$$(mktemp) && awk '{print "export " $$0}' .env > "$$tmp" && \
+			scp "$$tmp" root@$(SERVER):/opt/mtproto-proxy/env.sh && \
+			ssh root@$(SERVER) 'chmod 600 /opt/mtproto-proxy/env.sh'; rm -f "$$tmp"; \
+		fi; \
+	else echo "binary-only deploy (config/env left untouched; use PUSH_CONFIG=1 to push them)"; fi
 	ssh root@$(SERVER) 'install -m 0755 /opt/mtproto-proxy/mtproto-proxy.new /opt/mtproto-proxy/mtproto-proxy'
 	ssh root@$(SERVER) 'install -m 0755 /usr/local/bin/mtbuddy.new /usr/local/bin/mtbuddy'
 	ssh root@$(SERVER) 'chown -R mtproto:mtproto /opt/mtproto-proxy/ && systemctl restart mtproto-proxy && systemctl is-active --quiet mtproto-proxy'

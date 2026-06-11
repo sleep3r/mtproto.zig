@@ -94,7 +94,10 @@ pub fn parseHttpDate(head: []const u8) ?i64 {
         if (t.len < 6 or !std.ascii.eqlIgnoreCase(t[0..5], "date:")) continue;
         return parseImfFixdate(std.mem.trim(u8, t[5..], " \t"));
     }
-    return null;
+    // No "Date:" header line — treat the whole input as a bare IMF-fixdate value, as emitted
+    // by `curl -w '%header{date}'` (which we prefer so the Date can never fall outside a
+    // small stdout cap, unlike full `-I` headers).
+    return parseImfFixdate(std.mem.trim(u8, head, " \t\r\n"));
 }
 
 fn parseImfFixdate(v: []const u8) ?i64 {

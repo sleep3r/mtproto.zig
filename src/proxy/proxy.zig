@@ -402,7 +402,9 @@ fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8
 /// (seconds) to add to the local clock so it matches, clamped to ±1 day. Used to correct
 /// a skewed VPS clock that would otherwise fail the handshake time-skew check for everyone.
 fn fetchClockOffsetSeconds(allocator: std.mem.Allocator, url: []const u8) ?i64 {
-    const out = runSmallCommand(allocator, &.{ "curl", "-sSI", "--max-time", "8", url }) orelse return null;
+    // `-w %header{date}` prints ONLY the Date header value (tiny, always within the small
+    // runSmallCommand stdout cap), unlike full `-I` headers where Date could be truncated.
+    const out = runSmallCommand(allocator, &.{ "curl", "-sS", "-o", "/dev/null", "--max-time", "8", "-w", "%header{date}", url }) orelse return null;
     defer allocator.free(out);
     const http_epoch = http_fetch.parseHttpDate(out) orelse return null;
     const off = http_epoch - realtimeSeconds();
@@ -3519,6 +3521,7 @@ const EventLoop = struct {
                 &slot.validation_digest,
                 session_id,
                 echoed_cipher,
+                self.state.tls_server_hello_template.len - tls.server_hello_prefix_len,
             )
         else
             tls.buildServerHelloWithTemplate(
