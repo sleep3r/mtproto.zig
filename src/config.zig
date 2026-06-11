@@ -767,6 +767,7 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "reject_rst")) {
                         cfg.reject_rst = parseBool(value);
                     } else if (std.mem.eql(u8, key, "mask_sni_safelist")) {
+                        freeStringSlice(allocator, cfg.mask_sni_safelist);
                         cfg.mask_sni_safelist = parseStringArrayValue(allocator, value) catch &.{};
                     } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
                         cfg.mask_relay_max_secs = std.fmt.parseInt(u32, value, 10) catch cfg.mask_relay_max_secs;
@@ -875,6 +876,7 @@ pub const Config = struct {
             allocator.free(iface);
         }
         freeStringSlice(allocator, self.upstream_tunnel_interfaces);
+        freeStringSlice(allocator, self.mask_sni_safelist);
         if (self.upstream_tunnel_pinned_interface) |iface| {
             allocator.free(iface);
         }
@@ -987,6 +989,24 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u16, 9400), cfg.metrics.port);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
     try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
+}
+
+test "parse config - mask_sni_safelist parses and frees cleanly" {
+    const content =
+        \\[censorship]
+        \\tls_domain = "example.com"
+        \\mask_sni_safelist = ["a.example", "b.example"]
+        \\mask_sni_safelist = ["c.example"]
+        \\
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    // The duplicate key exercises free-before-reassign; deinit must free the slice
+    // (the testing allocator fails the test on any leak or double-free).
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mask_sni_safelist.len);
+    try std.testing.expectEqualStrings("c.example", cfg.mask_sni_safelist[0]);
 }
 
 test "parse config - custom mask target" {
