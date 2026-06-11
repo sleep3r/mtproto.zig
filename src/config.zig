@@ -282,6 +282,12 @@ pub const Config = struct {
     /// backend). 0 = unlimited. Bounds how long an active prober/scanner can hold a
     /// backend connection open through us; idle masking relays are already idle-timed.
     mask_relay_max_secs: u32 = 0,
+    /// Size (bytes) of the fake encrypted-certificate AppData record in the FakeTLS
+    /// ServerHello. 0 = default (~2878, a typical nginx + Let's Encrypt ECDSA chain). Set
+    /// it to the first encrypted-flight record size your masking backend actually serves so
+    /// an active prober sees the same cert-record size on both the accept and mask paths
+    /// (measure with e.g. `openssl s_client -msg`). Clamped to 256..16384.
+    fake_cert_size: u32 = 0,
     /// Reject the non-TLS "direct obfuscated" (dd / secure) transport. When true
     /// (the default), only FakeTLS (ee) clients are accepted and any non-TLS
     /// first bytes are masked immediately — eliminating the dd active-probe
@@ -758,6 +764,8 @@ pub const Config = struct {
                         cfg.mask_sni_safelist = parseStringArrayValue(allocator, value) catch &.{};
                     } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
                         cfg.mask_relay_max_secs = std.fmt.parseInt(u32, value, 10) catch cfg.mask_relay_max_secs;
+                    } else if (std.mem.eql(u8, key, "fake_cert_size")) {
+                        cfg.fake_cert_size = std.fmt.parseInt(u32, value, 10) catch cfg.fake_cert_size;
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {

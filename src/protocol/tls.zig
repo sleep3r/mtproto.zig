@@ -152,7 +152,11 @@ pub fn buildServerHelloWithTemplate(
     session_id: []const u8,
     cipher: ?u16,
 ) ![]u8 {
-    if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
+    // The ServerHello+CCS+AppData-header prefix is a fixed 138 bytes; only the trailing
+    // fake-cert (AppData body) size varies. Accept any template whose length leaves room
+    // for that prefix, so a profile-matched cert size (see buildServerHelloTemplateAlloc)
+    // works through the same patch path.
+    if (template.len < tmpl_appdata_offset) return error.BadServerHelloTemplate;
 
     // 1. Copy the pre-built Nginx template (random and session_id are zeroed in template)
     const response = try allocator.alloc(u8, template.len);
@@ -187,7 +191,7 @@ pub fn buildServerHelloWithTemplate(
     //     a passive FakeTLS distinguisher. The client never inspects this body
     //     and the HMAC in step 4 covers it, so fresh randomness is protocol-safe.
     //     The record length stays fixed, preserving the size fingerprint.
-    crypto.randomBytes(response[tmpl_appdata_offset..][0..fake_cert_payload_len]);
+    crypto.randomBytes(response[tmpl_appdata_offset..]);
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
@@ -357,6 +361,35 @@ pub fn buildServerHelloPq(
     return r;
 }
 
+/// Build a ServerHello template with a profile-matched fake-cert (AppData) record size.
+/// The fixed 138-byte ServerHello+CCS+AppData-header prefix is copied from the comptime
+/// template; only the AppData length field and body size differ. The result is patched
+/// per-connection by buildServerHelloWithTemplate just like the default template.
+pub fn buildServerHelloTemplateAlloc(allocator: std.mem.Allocator, cert_len: usize) ![]u8 {
+    if (cert_len > 0xFFFF) return error.CertTooLarge;
+    const t = try allocator.alloc(u8, tmpl_appdata_offset + cert_len);
+    errdefer allocator.free(t);
+    @memcpy(t[0..tmpl_appdata_offset], nginx_template[0..tmpl_appdata_offset]);
+    // Patch the AppData record's 2-byte length field (immediately before the body).
+    std.mem.writeInt(u16, t[tmpl_appdata_offset - 2 ..][0..2], @intCast(cert_len), .big);
+    crypto.randomBytes(t[tmpl_appdata_offset..]);
+    return t;
+}
+
+/// Walk a TLS record stream and return the payload length of the first Application Data
+/// (0x17) record, or null. Used to learn the mask origin's first encrypted-flight
+/// (certificate) record size so our fake cert record can match it instead of a fixed 2878.
+pub fn firstAppDataRecordLen(data: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos + 5 <= data.len) {
+        const rtype = data[pos];
+        const rlen = std.mem.readInt(u16, data[pos + 3 ..][0..2], .big);
+        if (rtype == 0x17) return rlen;
+        pos += 5 + rlen;
+    }
+    return null;
+}
+
 /// A TLS **fatal** `handshake_failure` alert record — what a server sends when it
 /// refuses to complete the handshake (e.g. nginx `ssl_reject_handshake on`). Send
 /// this, then close, so a rejected probe sees a real server-style teardown. A *fatal*
@@ -399,6 +432,12 @@ const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_len;
 ///   Finished (~36) + AEAD tags (~50) + record layer overhead.
 /// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
 const fake_cert_payload_len: u16 = 2878;
+
+/// Default fake-cert (AppData) record size when not profile-matched via fake_cert_size.
+pub const default_fake_cert_size: usize = fake_cert_payload_len;
+/// Clamp bounds for a configured/profiled fake-cert size (sane TLS record sizes).
+pub const min_fake_cert_size: usize = 256;
+pub const max_fake_cert_size: usize = 16384;
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
 const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_len;
@@ -1085,6 +1124,26 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     var expected: [32]u8 = undefined;
     h.final(&expected);
     try std.testing.expectEqualSlices(u8, &expected, resp[tmpl_random_offset..][0..32]);
+}
+
+test "buildServerHelloTemplateAlloc + firstAppDataRecordLen match a profile cert size" {
+    const allocator = std.testing.allocator;
+    const tmpl = try buildServerHelloTemplateAlloc(allocator, 1234);
+    defer allocator.free(tmpl);
+    try std.testing.expectEqual(@as(usize, tmpl_appdata_offset + 1234), tmpl.len);
+    try std.testing.expectEqual(@as(u8, 0x17), tmpl[127 + 6]); // AppData record type
+    try std.testing.expectEqual(@as(u16, 1234), std.mem.readInt(u16, tmpl[tmpl_appdata_offset - 2 ..][0..2], .big));
+
+    // The variable-size template patches through the normal builder.
+    const digest = [_]u8{0} ** constants.tls_digest_len;
+    const sid = [_]u8{0x33} ** 32;
+    const secret = [_]u8{0x42} ** 16;
+    const resp = try buildServerHelloWithTemplate(allocator, tmpl, &secret, &digest, &sid, 0x1301);
+    defer allocator.free(resp);
+    try std.testing.expectEqual(tmpl.len, resp.len);
+    try std.testing.expectEqual(@as(?usize, 1234), firstAppDataRecordLen(resp));
+    // No AppData record in a stream that has only ServerHello → null.
+    try std.testing.expectEqual(@as(?usize, null), firstAppDataRecordLen(resp[0..127]));
 }
 
 test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {

@@ -1153,7 +1153,8 @@ pub const ProxyState = struct {
     /// Startup HTTP-Date clock correction (seconds); 0 if disabled or unavailable.
     clock_offset_seconds: i64,
     replay_cache: ReplayCache,
-    tls_server_hello_template: [tls.server_hello_template_len]u8,
+    /// FakeTLS ServerHello template (heap; size varies with fake_cert_size).
+    tls_server_hello_template: []const u8,
 
     // Degradation counters (monotonic totals, delta'd in stats log)
     stats_dropped_cap: std.atomic.Value(u64),
@@ -1289,6 +1290,17 @@ pub const ProxyState = struct {
             }
         }
 
+        // FakeTLS ServerHello template, sized to a profile-matched fake-cert record when
+        // fake_cert_size is set (else the default ~2878). Falls back to the default size
+        // if the configured value can't be built.
+        const fake_cert_size: usize = if (cfg.fake_cert_size == 0)
+            tls.default_fake_cert_size
+        else
+            std.math.clamp(@as(usize, cfg.fake_cert_size), tls.min_fake_cert_size, tls.max_fake_cert_size);
+        const tls_template = tls.buildServerHelloTemplateAlloc(allocator, fake_cert_size) catch
+            try tls.buildServerHelloTemplateAlloc(allocator, tls.default_fake_cert_size);
+        errdefer allocator.free(tls_template);
+
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
@@ -1330,7 +1342,7 @@ pub const ProxyState = struct {
             .mask_safelist = mask_safelist,
             .clock_offset_seconds = clock_offset_seconds,
             .replay_cache = ReplayCache.init(),
-            .tls_server_hello_template = tls.buildServerHelloTemplate(null),
+            .tls_server_hello_template = tls_template,
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
             .stats_dropped_saturation = std.atomic.Value(u64).init(0),
             .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
@@ -1453,6 +1465,7 @@ pub const ProxyState = struct {
         }
         self.flood_guard.destroy(self.allocator);
         self.allocator.free(self.mask_safelist);
+        self.allocator.free(self.tls_server_hello_template);
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
         freeUserMetricsSlice(self.allocator, self.user_metrics);
