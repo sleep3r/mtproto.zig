@@ -396,6 +396,17 @@ fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8
     return allocator.dupe(u8, trimmed) catch null;
 }
 
+/// Fetch the `Date:` header from an HTTPS URL (via curl HEAD) and return the offset
+/// (seconds) to add to the local clock so it matches, clamped to ±1 day. Used to correct
+/// a skewed VPS clock that would otherwise fail the handshake time-skew check for everyone.
+fn fetchClockOffsetSeconds(allocator: std.mem.Allocator, url: []const u8) ?i64 {
+    const out = runSmallCommand(allocator, &.{ "curl", "-sSI", "--max-time", "8", url }) orelse return null;
+    defer allocator.free(out);
+    const http_epoch = http_fetch.parseHttpDate(out) orelse return null;
+    const off = http_epoch - realtimeSeconds();
+    return @max(@as(i64, -86400), @min(@as(i64, 86400), off));
+}
+
 fn detectActiveTunnelInterface(allocator: std.mem.Allocator) ?[]u8 {
     var table_buf: [16]u8 = undefined;
     const table = std.fmt.bufPrint(&table_buf, "{d}", .{tunnel_route_table}) catch "200";
@@ -1139,6 +1150,8 @@ pub const ProxyState = struct {
     mask_addr: ?Address,
     /// Opt-in SNI-following mask targets (config.mask_sni_safelist), resolved at boot.
     mask_safelist: []const MaskSafelistEntry,
+    /// Startup HTTP-Date clock correction (seconds); 0 if disabled or unavailable.
+    clock_offset_seconds: i64,
     replay_cache: ReplayCache,
     tls_server_hello_template: [tls.server_hello_template_len]u8,
 
@@ -1265,6 +1278,17 @@ pub const ProxyState = struct {
         }
         const mask_safelist = mask_safelist_buf.toOwnedSlice(allocator) catch &.{};
 
+        // Optional startup clock correction from an HTTPS Date header.
+        var clock_offset_seconds: i64 = 0;
+        if (cfg.clock_sync_url) |url| {
+            if (fetchClockOffsetSeconds(allocator, url)) |off| {
+                clock_offset_seconds = off;
+                log.info("clock_sync: applied {d}s server-clock correction from {s}", .{ off, url });
+            } else {
+                log.warn("clock_sync: could not read a Date header from {s}", .{url});
+            }
+        }
+
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
@@ -1304,6 +1328,7 @@ pub const ProxyState = struct {
             .saturation_paused = std.atomic.Value(bool).init(false),
             .mask_addr = resolved_addr,
             .mask_safelist = mask_safelist,
+            .clock_offset_seconds = clock_offset_seconds,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls.buildServerHelloTemplate(null),
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
@@ -3337,6 +3362,7 @@ const EventLoop = struct {
             client_hello,
             self.state.user_secrets,
             false,
+            self.state.clock_offset_seconds,
         ) catch null;
 
         if (validation == null) {
@@ -4189,6 +4215,12 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+                if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
+                    now_ms - slot.created_at_ms > secondsToMs(self.state.config.mask_relay_max_secs))
+                {
+                    self.closeSlot(slot, "mask relay max duration");
+                    continue;
+                }
                 if (now_ms - slot.last_activity_ms > (if (slot.idle_timeout_ms > 0) slot.idle_timeout_ms else secondsToMs(self.state.config.idle_timeout_sec))) {
                     self.closeSlot(slot, "relay idle timeout");
                     continue;

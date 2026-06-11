@@ -44,6 +44,7 @@ pub fn validateTlsHandshake(
     handshake: []const u8,
     secrets: []const UserSecret,
     ignore_time_skew: bool,
+    clock_offset_seconds: i64,
 ) !?TlsValidation {
     _ = allocator;
 
@@ -65,7 +66,7 @@ pub fn validateTlsHandshake(
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
-    const now: i64 = if (!ignore_time_skew) realtimeSeconds() else 0;
+    const now: i64 = if (!ignore_time_skew) realtimeSeconds() + clock_offset_seconds else 0;
 
     for (secrets) |entry| {
         var hmac = HmacSha256.init(&entry.secret);
@@ -937,7 +938,7 @@ test "fuzz: TLS ClientHello parsers never panic on arbitrary input" {
             var fp_buf: [256]u8 = undefined;
             _ = formatClientHelloFingerprint(data, &fp_buf);
             const secrets = [_]UserSecret{.{ .name = "u", .secret = [_]u8{0x11} ** 16 }};
-            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true) catch {};
+            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true, 0) catch {};
         }
     }.one, .{});
 }
@@ -1186,7 +1187,7 @@ test "validateTlsHandshake - valid handshake" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("bob", result.?.user);
     try std.testing.expectEqual(@as(u32, 0x12345678), result.?.timestamp);
@@ -1197,7 +1198,7 @@ test "validateTlsHandshake - invalid user" {
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
     var handshake = [_]u8{0xAA} ** 64; // random junk
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result == null);
 }
 
@@ -1221,7 +1222,7 @@ test "validateTlsHandshake - rejects non-32 session id" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result == null);
 }
 
@@ -1253,7 +1254,7 @@ test "validateTlsHandshake returns canonical_hmac" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
     try std.testing.expect(result != null);
     try std.testing.expectEqualSlices(u8, &computed_mac, &result.?.canonical_hmac);
 }
@@ -1421,7 +1422,7 @@ test "validateTlsHandshake - fuzz random and replayed input" {
     for (0..3000) |_| {
         const len: usize = @as(usize, random.int(u16)) % random_buf.len;
         random.bytes(random_buf[0..len]);
-        const parsed = try validateTlsHandshake(allocator, random_buf[0..len], &secrets, true);
+        const parsed = try validateTlsHandshake(allocator, random_buf[0..len], &secrets, true, 0);
         if (parsed) |v| {
             try std.testing.expect(v.session_id.len == 32);
             try std.testing.expect(v.user.len > 0);
@@ -1431,8 +1432,8 @@ test "validateTlsHandshake - fuzz random and replayed input" {
     // Replayed bytes produce identical canonical HMAC.
     var hello_buf: [512]u8 = undefined;
     const hello = try buildTlsAuthClientHello(&hello_buf, secrets[0].secret, "google.com");
-    const first = try validateTlsHandshake(allocator, hello, &secrets, true);
-    const second = try validateTlsHandshake(allocator, hello, &secrets, true);
+    const first = try validateTlsHandshake(allocator, hello, &secrets, true, 0);
+    const second = try validateTlsHandshake(allocator, hello, &secrets, true, 0);
     try std.testing.expect(first != null and second != null);
     try std.testing.expectEqualSlices(u8, &first.?.canonical_hmac, &second.?.canonical_hmac);
 }

@@ -147,7 +147,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
 
     var warmup: usize = 0;
     while (warmup < 1000) : (warmup += 1) {
-        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true);
+        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true, 0);
         if (ok == null) return error.BenchmarkValidationFailed;
     }
 
@@ -155,7 +155,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
     var matched: usize = 0;
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true);
+        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true, 0);
         if (ok != null) matched += 1;
     }
 

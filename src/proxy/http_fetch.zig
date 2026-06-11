@@ -84,6 +84,68 @@ fn formatProxyEndpoint(host: []const u8, port: u16, out: []u8) []const u8 {
     return std.fmt.bufPrint(out, "{s}:{d}", .{ host, port }) catch out[0..0];
 }
 
+/// Parse the unix timestamp from the `Date:` header of a raw HTTP response head (e.g.
+/// `curl -sSI` output). Expects RFC 7231 IMF-fixdate ("Wed, 11 Jun 2026 19:30:00 GMT").
+/// Returns null if not present/parseable. Used for startup server-clock correction.
+pub fn parseHttpDate(head: []const u8) ?i64 {
+    var lines = std.mem.splitScalar(u8, head, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len < 6 or !std.ascii.eqlIgnoreCase(t[0..5], "date:")) continue;
+        return parseImfFixdate(std.mem.trim(u8, t[5..], " \t"));
+    }
+    return null;
+}
+
+fn parseImfFixdate(v: []const u8) ?i64 {
+    const comma = std.mem.indexOfScalar(u8, v, ',') orelse return null;
+    var r = std.mem.trimStart(u8, v[comma + 1 ..], " ");
+    if (r.len < 2) return null;
+    const day = std.fmt.parseInt(u8, std.mem.trim(u8, r[0..2], " "), 10) catch return null;
+    r = std.mem.trimStart(u8, r[2..], " ");
+    if (r.len < 3) return null;
+    const mon = monthFromName(r[0..3]) orelse return null;
+    r = std.mem.trimStart(u8, r[3..], " ");
+    if (r.len < 4) return null;
+    const year = std.fmt.parseInt(i64, r[0..4], 10) catch return null;
+    r = std.mem.trimStart(u8, r[4..], " ");
+    if (r.len < 8) return null;
+    const hh = std.fmt.parseInt(u8, r[0..2], 10) catch return null;
+    const mm = std.fmt.parseInt(u8, r[3..5], 10) catch return null;
+    const ss = std.fmt.parseInt(u8, r[6..8], 10) catch return null;
+    if (day < 1 or day > 31 or hh > 23 or mm > 59 or ss > 60) return null;
+    return civilToEpoch(year, mon, day, hh, mm, ss);
+}
+
+fn monthFromName(s: []const u8) ?u8 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 0..) |n, i| {
+        if (std.ascii.eqlIgnoreCase(s, n)) return @intCast(i + 1);
+    }
+    return null;
+}
+
+/// Howard Hinnant's days_from_civil → unix epoch seconds (UTC).
+fn civilToEpoch(y_in: i64, m: u8, d: u8, hh: u8, mm: u8, ss: u8) i64 {
+    var y = y_in;
+    if (m <= 2) y -= 1;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400; // [0,399]
+    const mp: i64 = if (m > 2) @as(i64, m) - 3 else @as(i64, m) + 9;
+    const doy = @divTrunc(153 * mp + 2, 5) + @as(i64, d) - 1; // [0,365]
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400 + @as(i64, hh) * 3600 + @as(i64, mm) * 60 + @as(i64, ss);
+}
+
+test "parseHttpDate parses an IMF-fixdate Date header" {
+    try std.testing.expectEqual(@as(?i64, 0), parseHttpDate("HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n"));
+    // 2026-06-11 19:30:00 UTC
+    try std.testing.expectEqual(@as(?i64, 1781206200), parseHttpDate("date: Wed, 11 Jun 2026 19:30:00 GMT"));
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("HTTP/1.1 200 OK\r\nServer: x\r\n"));
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("Date: garbage"));
+}
+
 /// Append `s` into `buf` starting at `start`, escaping `\` and `"` for curl's
 /// double-quoted config-file value syntax. Returns the new position, or null on
 /// overflow.

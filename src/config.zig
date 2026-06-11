@@ -207,6 +207,10 @@ pub const Config = struct {
     /// all interfaces ([::]  with IPv4 fallback to 0.0.0.0).
     /// Set to a specific IP when sharing the host with other services.
     bind_address: ?[]const u8 = null,
+    /// Optional HTTPS URL whose `Date:` header is used at startup to correct a skewed
+    /// server clock (so a wrong VPS clock doesn't silently reject every handshake on the
+    /// time-skew check). Unset = no correction. The offset is clamped to ±1 day.
+    clock_sync_url: ?[]const u8 = null,
     /// Explicit public IP address. If set, bypasses detection via external services.
     public_ip: ?[]const u8 = null,
     /// Explicit public port shown in generated Telegram client links.
@@ -274,6 +278,10 @@ pub const Config = struct {
     mask_target: ?[]const u8 = null,
     /// Port used by the masking backend.
     mask_port: u16 = 443,
+    /// Max lifetime (seconds) for a masking-relay connection (a probe forwarded to the
+    /// backend). 0 = unlimited. Bounds how long an active prober/scanner can hold a
+    /// backend connection open through us; idle masking relays are already idle-timed.
+    mask_relay_max_secs: u32 = 0,
     /// Reject the non-TLS "direct obfuscated" (dd / secure) transport. When true
     /// (the default), only FakeTLS (ee) clients are accepted and any non-TLS
     /// first bytes are masked immediately — eliminating the dd active-probe
@@ -641,6 +649,9 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "bind_address")) {
                         if (cfg.bind_address) |prev| allocator.free(prev);
                         cfg.bind_address = try allocator.dupe(u8, value);
+                    } else if (std.mem.eql(u8, key, "clock_sync_url")) {
+                        if (cfg.clock_sync_url) |prev| allocator.free(prev);
+                        cfg.clock_sync_url = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "backlog")) {
                         cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
                     } else if (std.mem.eql(u8, key, "max_connections")) {
@@ -745,6 +756,8 @@ pub const Config = struct {
                         cfg.reject_rst = parseBool(value);
                     } else if (std.mem.eql(u8, key, "mask_sni_safelist")) {
                         cfg.mask_sni_safelist = parseStringArrayValue(allocator, value) catch &.{};
+                    } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
+                        cfg.mask_relay_max_secs = std.fmt.parseInt(u32, value, 10) catch cfg.mask_relay_max_secs;
                     }
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
@@ -853,6 +866,9 @@ pub const Config = struct {
         }
         if (self.bind_address) |ba| {
             allocator.free(ba);
+        }
+        if (self.clock_sync_url) |u| {
+            allocator.free(u);
         }
         if (self.metrics.host) |h| {
             allocator.free(h);
