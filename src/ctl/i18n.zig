@@ -184,6 +184,7 @@ pub const S = enum(u16) {
     tui_nav_hint_menu,
     tui_nav_hint_checkbox,
     tui_exited,
+    menu_remove_dashboard,
 };
 
 /// Get a localized string by key.
@@ -456,6 +457,8 @@ const en_strings = [_][]const u8{
     "↑↓ navigate  Space toggle  Enter confirm",
     // tui_exited
     "Exited",
+    // menu_remove_dashboard
+    "Remove monitoring dashboard",
 };
 
 // ── Russian strings ─────────────────────────────────────────────
@@ -719,6 +722,8 @@ const ru_strings = [_][]const u8{
     "↑↓ выбор  Space отметить  Enter подтвердить",
     // tui_exited
     "Выход",
+    // menu_remove_dashboard
+    "Удалить дашборд мониторинга",
 };
 
 // ── Comptime validation ─────────────────────────────────────────

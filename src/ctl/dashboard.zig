@@ -84,6 +84,20 @@ fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
     return if (lang == .ru) ru else en;
 }
 
+/// Interactive entry (main menu): confirm, then remove the dashboard. Shown in place of
+/// "Setup dashboard" once the dashboard is installed.
+pub fn removeInteractive(ui: *Tui) void {
+    const confirmed = ui.confirm(
+        tr(ui.lang, "Remove the dashboard? The proxy keeps running.", "Удалить дашборд? Прокси продолжит работать."),
+        false,
+    ) catch return;
+    if (!confirmed) {
+        ui.info(i18n.get(ui.lang, .aborting));
+        return;
+    }
+    removeDashboard(ui);
+}
+
 /// Stop and remove only the dashboard (`proxy-monitor`), leaving the proxy itself untouched.
 /// `mtbuddy uninstall` removes everything; this is the targeted counterpart to
 /// `mtbuddy setup dashboard`.

@@ -195,6 +195,7 @@ const Action = enum {
     tunnel,
     recovery,
     dashboard,
+    remove_dashboard,
     ipv6hop,
     status,
     restart,
@@ -231,6 +232,10 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             if (!has_dashboard) {
                 try items.append(allocator, i18n.get(ui.lang, .menu_setup_dashboard));
                 try actions.append(allocator, .dashboard);
+            } else {
+                // Dashboard is installed: offer to remove it instead of installing again.
+                try items.append(allocator, i18n.get(ui.lang, .menu_remove_dashboard));
+                try actions.append(allocator, .remove_dashboard);
             }
             if (!has_recovery) {
                 try items.append(allocator, i18n.get(ui.lang, .menu_setup_recovery));
@@ -258,6 +263,7 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             .masking => try masking.runInteractive(ui, allocator),
             .tunnel => try tunnelOrEgressInteractive(ui, allocator),
             .dashboard => try dashboard.runInteractive(ui, allocator),
+            .remove_dashboard => dashboard.removeInteractive(ui),
             .recovery => try recovery.runInteractive(ui, allocator),
             .ipv6hop => try ipv6hop.runInteractive(ui, allocator),
             .status => showStatus(ui, allocator),
