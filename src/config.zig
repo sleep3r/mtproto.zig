@@ -237,6 +237,13 @@ pub const Config = struct {
     workers: u16 = 1,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
+    /// Max lifetime (seconds) of an established relay connection; 0 = unlimited. When set,
+    /// a relay older than this is recycled with a TCP RST so the client immediately makes a
+    /// fresh connection. Mobile clients that keep one TCP alive for hours accumulate a
+    /// collapsed congestion window (heavy retransmits/reordering); on resume they reuse that
+    /// degraded connection and the re-sync trickles ("updating" hangs). Recycling forces a
+    /// clean reconnect. Telegram resumes transparently across the brief drop. Try 1800-3600.
+    max_connection_lifetime_sec: u32 = 0,
     /// Per-connection random jitter (± percent, 0-100) applied to the effective idle
     /// timeout, so a constant timeout isn't itself a behavioral fingerprint. Computed
     /// once per slot. 0 disables jitter.
@@ -674,6 +681,8 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
                         cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
+                    } else if (std.mem.eql(u8, key, "max_connection_lifetime_sec")) {
+                        cfg.max_connection_lifetime_sec = std.fmt.parseInt(u32, value, 10) catch cfg.max_connection_lifetime_sec;
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.handshake_timeout_sec;
                         cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);

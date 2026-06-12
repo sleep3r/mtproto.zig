@@ -4304,6 +4304,18 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+                // Recycle a too-long-lived relay with a TCP RST so the client makes a fresh
+                // connection. A mobile TCP kept alive for hours collapses its congestion
+                // window; on resume the client reuses it and the re-sync trickles. The RST
+                // makes the client reconnect cleanly (Telegram resumes across the drop).
+                if (self.state.config.max_connection_lifetime_sec > 0 and
+                    now_ms - slot.created_at_ms > secondsToMs(self.state.config.max_connection_lifetime_sec))
+                {
+                    log.info("[{d}] recycling relay: lifetime cap {d}s reached (RST -> fresh reconnect)", .{ slot.conn_id, self.state.config.max_connection_lifetime_sec });
+                    setLingerReset(slot.client_fd);
+                    self.closeSlot(slot, "max connection lifetime");
+                    continue;
+                }
                 if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
                     now_ms - slot.created_at_ms > secondsToMs(self.state.config.mask_relay_max_secs))
                 {
