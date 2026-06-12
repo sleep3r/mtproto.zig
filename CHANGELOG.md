@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.0](https://github.com/sleep3r/mtproto.zig/compare/v1.6.0...v1.7.0) (2026-06-12)
+
+
+### Features
+
+* **proxy:** client_silence_close_sec wedge-breaker; drop max_connection_lifetime_sec ([#355](https://github.com/sleep3r/mtproto.zig/issues/355)) ([c2464db](https://github.com/sleep3r/mtproto.zig/commit/c2464db8b50500ffdd85f7d998e33dfb818711f1))
+
 ## [1.6.0](https://github.com/sleep3r/mtproto.zig/compare/v1.5.0...v1.6.0) (2026-06-12)
 
 
