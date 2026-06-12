@@ -375,6 +375,7 @@ port = 443
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
+# max_connection_lifetime_sec = 0   # Recycle a relay older than N sec (TCP RST) so mobile clients reconnect cleanly after a long background — fixes the "updating" hang on resume. 0 = unlimited; try 1800-3600
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
@@ -431,6 +432,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] workers` | `1` | SO_REUSEPORT epoll 工作线程数。`1` = 单线程；`0` = 每个 CPU 一个；`N` 将中继/加密负载分散到多个核心。当 `>1` 时，SIGHUP 配置重载需要重启 |
 | `[server] idle_timeout_sec` | `120` | 连接空闲超时 |
 | `[server] idle_timeout_jitter_pct` | `15` | 对空闲超时施加每连接 ±% 的抖动，避免固定值成为指纹（`0` 表示禁用） |
+| `[server] max_connection_lifetime_sec` | `0` | 通过 TCP RST 回收存活超过 N 秒的已建立中继，强制客户端干净地重连。修复移动端长时间后台后恢复时卡在"更新中"的问题（长寿命 TCP 的拥塞窗口会塌缩，重新同步极慢）。`0` = 无限制；建议 `1800`–`3600` |
 | `[server] handshake_timeout_sec` | `15` | 握手完成超时 |
 | `[server] graceful_shutdown_timeout_sec` | `15` | 强制关闭前 SIGTERM 排空超时 |
 | `[server] middleproxy_buffer_kb` | `1024` | ME 每连接缓冲区（KiB）。低于 1024 在媒体流量下可能导致溢出 |

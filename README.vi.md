@@ -376,6 +376,7 @@ port = 443
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
+# max_connection_lifetime_sec = 0   # Recycle a relay older than N sec (TCP RST) so mobile clients reconnect cleanly after a long background — fixes the "updating" hang on resume. 0 = unlimited; try 1800-3600
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
@@ -432,6 +433,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] workers` | `1` | Số luồng worker epoll SO_REUSEPORT. `1` = đơn luồng; `0` = một luồng mỗi CPU; `N` phân tán tải chuyển tiếp/mã hóa qua các nhân. Việc nạp lại cấu hình bằng SIGHUP cần khởi động lại khi `>1` |
 | `[server] idle_timeout_sec` | `120` | Thời gian chờ kết nối nhàn rỗi |
 | `[server] idle_timeout_jitter_pct` | `15` | Jitter ±% trên mỗi kết nối cho thời gian chờ nhàn rỗi để một giá trị cố định không trở thành dấu vân tay (`0` để tắt) |
+| `[server] max_connection_lifetime_sec` | `0` | Tái tạo một relay đã thiết lập cũ hơn N giây bằng một TCP RST, buộc client kết nối lại sạch sẽ. Sửa lỗi treo "đang cập nhật" trên di động khi khôi phục sau thời gian dài chạy nền (một TCP sống lâu làm sụp đổ cửa sổ tắc nghẽn và việc đồng bộ lại nhỏ giọt). `0` = không giới hạn; thử `1800`–`3600` |
 | `[server] handshake_timeout_sec` | `15` | Thời gian chờ hoàn tất bắt tay |
 | `[server] graceful_shutdown_timeout_sec` | `15` | Thời gian chờ rút cạn khi SIGTERM trước khi buộc đóng |
 | `[server] middleproxy_buffer_kb` | `1024` | Bộ đệm ME cho mỗi kết nối (KiB). Dưới 1024 có thể gây tràn với lưu lượng media |

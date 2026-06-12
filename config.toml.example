@@ -71,6 +71,15 @@ port = 443
 # constant timeout isn't itself a behavioral fingerprint. 0 disables. Default 15.
 # idle_timeout_jitter_pct = 15
 
+# Recycle an established relay older than this many seconds with a TCP RST, forcing
+# the client to open a fresh connection. Fixes the mobile "updating" hang on resume
+# after a long background: a TCP kept alive for hours collapses its congestion window
+# (heavy retransmits/reordering), so on resume the client reuses that degraded socket
+# and the re-sync trickles. The RST makes it reconnect cleanly; Telegram resumes
+# transparently across the brief drop. 0 = unlimited (default). Try 1800-3600 for
+# mobile-heavy deployments.
+# max_connection_lifetime_sec = 0
+
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # handshake_timeout_sec = 15
 

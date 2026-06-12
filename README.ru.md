@@ -362,6 +362,7 @@ port = 443
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll-воркеры: 1 = однопоточно (дефолт); 0 = по числу CPU; N распределяет нагрузку по ядрам
 idle_timeout_sec = 120
+# max_connection_lifetime_sec = 0   # Пересоздавать релей старше N сек (TCP RST), чтобы мобильный клиент чисто реконнектился после долгого фона — фиксит зависание в «обновлении». 0 = без лимита; пробуйте 1800-3600
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"
@@ -412,6 +413,7 @@ alice = true
 | `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | Длительность временного deny для шумного IP |
 | `[server] idle_timeout_jitter_pct` | `15` | Джиттер ±% на idle-таймаут соединения, чтобы константа не была сигнатурой (`0` — выключить) |
+| `[server] max_connection_lifetime_sec` | `0` | Пересоздавать установленный релей старше N секунд через TCP RST, заставляя клиента чисто переподключиться. Фиксит зависание мобильного клиента в «обновлении» при возврате после долгого фона (долгоживущий TCP схлопывает congestion window, ресинк еле ползёт). `0` = без лимита; пробуйте `1800`–`3600` |
 | `[censorship] tls_domain` | `"google.com"` | Домен для TLS-маскировки |
 | `[censorship] mask` | `true` | Forward invalid clients на `tls_domain` |
 | `[censorship] unknown_sni_action` | `"mask"` | ClientHello с чужим SNI: `mask` (forward), `reject` (фатальный TLS-alert, как отклоняющий сервер) или `drop` |

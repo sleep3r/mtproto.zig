@@ -378,6 +378,7 @@ port = 443
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
+# max_connection_lifetime_sec = 0   # Recycle a relay older than N sec (TCP RST) so mobile clients reconnect cleanly after a long background — fixes the "updating" hang on resume. 0 = unlimited; try 1800-3600
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
@@ -435,6 +436,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] workers` | `1` | SO_REUSEPORT epoll worker threads. `1` = single-threaded; `0` = one per CPU; `N` spreads relay/crypto load across cores. SIGHUP config reload requires a restart when `>1` |
 | `[server] idle_timeout_sec` | `120` | Connection idle timeout |
 | `[server] idle_timeout_jitter_pct` | `15` | Per-connection ±% jitter on the idle timeout so a constant value isn't a fingerprint (`0` disables) |
+| `[server] max_connection_lifetime_sec` | `0` | Recycle an established relay older than N seconds with a TCP RST, forcing a clean client reconnect. Fixes the mobile "updating" hang on resume after a long background (a long-lived mobile TCP collapses its congestion window and the re-sync trickles). `0` = unlimited; try `1800`–`3600` |
 | `[server] handshake_timeout_sec` | `15` | Handshake completion timeout |
 | `[server] graceful_shutdown_timeout_sec` | `15` | SIGTERM drain timeout before force-close |
 | `[server] middleproxy_buffer_kb` | `2048` | ME per-connection buffer (KiB). Must hold one max RPC frame; below 1024 truncates 1 MiB media parts |
