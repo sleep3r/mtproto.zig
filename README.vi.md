@@ -376,7 +376,7 @@ port = 443
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
-# max_connection_lifetime_sec = 0   # Recycle a relay older than N sec (TCP RST) so mobile clients reconnect cleanly after a long background — fixes the "updating" hang on resume. 0 = unlimited; try 1800-3600
+# client_silence_close_sec = 0   # Close a relay whose server reply went unanswered by the client for N sec (breaks an iOS bad_salt wedge where "Updating" hangs ~90-120s) → instant clean reconnect. 0 = off; best-effort, can occasionally close a healthy conn — ~10-15 if you enable it
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
@@ -433,7 +433,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] workers` | `1` | Số luồng worker epoll SO_REUSEPORT. `1` = đơn luồng; `0` = một luồng mỗi CPU; `N` phân tán tải chuyển tiếp/mã hóa qua các nhân. Việc nạp lại cấu hình bằng SIGHUP cần khởi động lại khi `>1` |
 | `[server] idle_timeout_sec` | `120` | Thời gian chờ kết nối nhàn rỗi |
 | `[server] idle_timeout_jitter_pct` | `15` | Jitter ±% trên mỗi kết nối cho thời gian chờ nhàn rỗi để một giá trị cố định không trở thành dấu vân tay (`0` để tắt) |
-| `[server] max_connection_lifetime_sec` | `0` | Tái tạo một relay đã thiết lập cũ hơn N giây bằng một TCP RST, buộc client kết nối lại sạch sẽ. Sửa lỗi treo "đang cập nhật" trên di động khi khôi phục sau thời gian dài chạy nền (một TCP sống lâu làm sụp đổ cửa sổ tắc nghẽn và việc đồng bộ lại nhỏ giọt). `0` = không giới hạn; thử `1800`–`3600` |
+| `[server] client_silence_close_sec` | `0` | Đóng một relay đã thiết lập mà phản hồi cuối của máy chủ không được client trả lời trong N giây, kích hoạt kết nối lại sạch tức thì (~450ms). Khắc phục một lỗi treo của iOS MtProtoKit: sau khi bị từ chối do salt cũ, client vứt bỏ salt và ngừng gửi, "Đang cập nhật" treo ~90-120s cho đến khi DC đóng socket. Chỉ kích hoạt khi payload cuối là server→client (một kết nối idle khỏe mạnh mà động thái cuối là ping/ack của chính nó sẽ không bị đụng tới). Đây là giải pháp tạm thời best-effort: giá trị thấp hơn phản hồi hợp lệ chậm nhất đôi khi cũng đóng một kết nối khỏe mạnh (chỉ ~450ms kết nối lại). `0` = tắt (mặc định); nếu bật, ~`10`–`15` là điểm khởi đầu hợp lý, tự điều chỉnh |
 | `[server] handshake_timeout_sec` | `15` | Thời gian chờ hoàn tất bắt tay |
 | `[server] graceful_shutdown_timeout_sec` | `15` | Thời gian chờ rút cạn khi SIGTERM trước khi buộc đóng |
 | `[server] middleproxy_buffer_kb` | `1024` | Bộ đệm ME cho mỗi kết nối (KiB). Dưới 1024 có thể gây tràn với lưu lượng media |

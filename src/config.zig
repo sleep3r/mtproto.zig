@@ -237,13 +237,21 @@ pub const Config = struct {
     workers: u16 = 1,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
-    /// Max lifetime (seconds) of an established relay connection; 0 = unlimited. When set,
-    /// a relay older than this is recycled with a TCP RST so the client immediately makes a
-    /// fresh connection. Mobile clients that keep one TCP alive for hours accumulate a
-    /// collapsed congestion window (heavy retransmits/reordering); on resume they reuse that
-    /// degraded connection and the re-sync trickles ("updating" hangs). Recycling forces a
-    /// clean reconnect. Telegram resumes transparently across the brief drop. Try 1800-3600.
-    max_connection_lifetime_sec: u32 = 0,
+    /// Close an established relay where the server's last reply has gone UNANSWERED by the
+    /// client for this many seconds; 0 = disabled. Targets an iOS MtProtoKit wedge: after a
+    /// stale-salt rejection the client discards the server-supplied salt, gets stuck in
+    /// AwaitingTimeFixAndSalts and stops sending entirely (even queued pings/acks never go out),
+    /// so "Updating" hangs ~90-120s until the DC closes the socket. The check fires only when the
+    /// last relayed payload was server->client and the client has been silent since (a healthy
+    /// client confirms any incoming message immediately, so an unanswered reply is a wedge); a
+    /// connection whose last word was its own ping/ack is never touched, however long it idles.
+    /// Closing triggers an instant (~450ms) clean reconnect. This is a best-effort workaround,
+    /// not a clean fix: the proxy can't read the encrypted stream, so a value lower than the
+    /// slowest legitimate server response (a big getDifference, or a server ack with no client
+    /// reply) will occasionally close a healthy connection too (just a ~450ms reconnect). Off by
+    /// default; if you enable it, something in the low tens of seconds (e.g. ~10-15) is a sane
+    /// starting point, and keep it well above your slowest response. Tune to taste.
+    client_silence_close_sec: u32 = 0,
     /// Per-connection random jitter (± percent, 0-100) applied to the effective idle
     /// timeout, so a constant timeout isn't itself a behavioral fingerprint. Computed
     /// once per slot. 0 disables jitter.
@@ -681,8 +689,8 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
                         cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
-                    } else if (std.mem.eql(u8, key, "max_connection_lifetime_sec")) {
-                        cfg.max_connection_lifetime_sec = std.fmt.parseInt(u32, value, 10) catch cfg.max_connection_lifetime_sec;
+                    } else if (std.mem.eql(u8, key, "client_silence_close_sec")) {
+                        cfg.client_silence_close_sec = std.fmt.parseInt(u32, value, 10) catch cfg.client_silence_close_sec;
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.handshake_timeout_sec;
                         cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);

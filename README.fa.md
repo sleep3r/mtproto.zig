@@ -375,7 +375,7 @@ port = 443
 max_connections = 512
 # workers = 1            # SO_REUSEPORT epoll workers: 1 = single-threaded (default); 0 = one per CPU; N spreads load across cores
 idle_timeout_sec = 120
-# max_connection_lifetime_sec = 0   # Recycle a relay older than N sec (TCP RST) so mobile clients reconnect cleanly after a long background — fixes the "updating" hang on resume. 0 = unlimited; try 1800-3600
+# client_silence_close_sec = 0   # Close a relay whose server reply went unanswered by the client for N sec (breaks an iOS bad_salt wedge where "Updating" hangs ~90-120s) → instant clean reconnect. 0 = off; best-effort, can occasionally close a healthy conn — ~10-15 if you enable it
 handshake_timeout_sec = 15
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
@@ -432,7 +432,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] workers` | `1` | نخ‌های کارگرِ epoll با SO_REUSEPORT. `1` = تک‌نخی؛ `0` = یکی به ازای هر CPU؛ `N` بار رله/رمزنگاری را روی هسته‌ها پخش می‌کند. وقتی `>1` باشد، بارگذاری مجدد پیکربندی با SIGHUP نیازمند ری‌استارت است |
 | `[server] idle_timeout_sec` | `120` | مهلت بی‌کاریِ اتصال |
 | `[server] idle_timeout_jitter_pct` | `15` | لرزش ±٪ به ازای هر اتصال روی مهلت بی‌کاری تا یک مقدار ثابت به اثر انگشت تبدیل نشود (`0` غیرفعال می‌کند) |
-| `[server] max_connection_lifetime_sec` | `0` | بازیافت یک ریلهٔ برقرارشدهٔ قدیمی‌تر از N ثانیه با یک TCP RST، تا کلاینت تمیز دوباره وصل شود. هنگ «در حال به‌روزرسانی» موبایل پس از بازگشت از پس‌زمینهٔ طولانی را برطرف می‌کند (یک TCP طولانی‌عمر پنجرهٔ ازدحام را فرومی‌ریزد و همگام‌سازی کند می‌شود). `0` = نامحدود؛ `1800`–`3600` را امتحان کنید |
+| `[server] client_silence_close_sec` | `0` | بستن ریلهٔ برقرارشده‌ای که آخرین پاسخ سرور N ثانیه بدون پاسخِ کلاینت مانده — که اتصال مجدد تمیز و فوری (~۴۵۰ms) را راه می‌اندازد. یک گیر iOS MtProtoKit را برطرف می‌کند: پس از رد شدن به‌خاطر نمک کهنه، کلاینت نمک را دور می‌اندازد و ارسال را متوقف می‌کند و «در حال به‌روزرسانی» ~۹۰-۱۲۰ ثانیه گیر می‌کند تا DC سوکت را ببندد. فقط وقتی فعال می‌شود که آخرین بستهٔ منتقل‌شده server→client باشد (اتصال idle سالمی که آخرین کارش ping/ack خودش بوده دست‌نخورده می‌ماند). یک راه‌حل موقتِ تلاش‌محور است: مقداری کمتر از کندترین پاسخ مجاز گاهی یک اتصال سالم را هم می‌بندد (فقط ~۴۵۰ms اتصال مجدد). `0` = خاموش (پیش‌فرض)؛ در صورت فعال‌سازی، ~`10`–`15` نقطهٔ شروع منطقی است، به سلیقهٔ خود تنظیم کنید |
 | `[server] handshake_timeout_sec` | `15` | مهلت تکمیل هندشیک |
 | `[server] graceful_shutdown_timeout_sec` | `15` | مهلت تخلیه‌ی SIGTERM پیش از بستن اجباری |
 | `[server] middleproxy_buffer_kb` | `1024` | بافر ME برای هر اتصال (KiB). کمتر از 1024 ممکن است در ترافیک رسانه‌ای باعث سرریز شود |

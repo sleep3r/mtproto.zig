@@ -71,14 +71,19 @@ port = 443
 # constant timeout isn't itself a behavioral fingerprint. 0 disables. Default 15.
 # idle_timeout_jitter_pct = 15
 
-# Recycle an established relay older than this many seconds with a TCP RST, forcing
-# the client to open a fresh connection. Fixes the mobile "updating" hang on resume
-# after a long background: a TCP kept alive for hours collapses its congestion window
-# (heavy retransmits/reordering), so on resume the client reuses that degraded socket
-# and the re-sync trickles. The RST makes it reconnect cleanly; Telegram resumes
-# transparently across the brief drop. 0 = unlimited (default). Try 1800-3600 for
-# mobile-heavy deployments.
-# max_connection_lifetime_sec = 0
+# Close an established relay where the server's last reply has gone UNANSWERED by the client
+# for this many seconds; 0 = disabled (default). Breaks an iOS MtProtoKit wedge: after a
+# stale-salt rejection the client discards the server-supplied salt, gets stuck and stops
+# sending entirely (even queued pings/acks never go out), so "Updating" hangs ~90-120s until
+# the data center closes the socket. Fires only when the last relayed payload was server->client
+# and the client has been silent since (a healthy client confirms incoming messages instantly);
+# a connection whose last word was its own ping/ack is never touched, however long it idles.
+# Closing triggers an instant (~450ms) clean reconnect. This is a best-effort workaround, not a
+# clean fix: a value lower than your slowest legitimate server response (a big getDifference, or
+# a server ack with no client reply) will occasionally close a healthy connection too (just a
+# ~450ms reconnect). Off by default; if you turn it on, something in the low tens of seconds
+# (e.g. ~10-15) is a sane starting point. Tune to taste.
+# client_silence_close_sec = 0
 
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # handshake_timeout_sec = 15

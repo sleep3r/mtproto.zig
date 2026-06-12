@@ -482,6 +482,12 @@ const ConnectionSlot = struct {
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
     last_activity_ms: i64 = 0,
+    /// Last time client->server payload was relayed (0 until the client first speaks while
+    /// relaying), and last time server->client payload was relayed. When the server spoke more
+    /// recently than the client (last_server_byte_ms > last_client_byte_ms) the client has an
+    /// unanswered reply — the iOS bad_salt "Updating" wedge. Drives client_silence_close_sec.
+    last_client_byte_ms: i64 = 0,
+    last_server_byte_ms: i64 = 0,
     /// Per-connection idle timeout in ms, with random jitter applied once at setup
     /// so a constant idle timeout isn't itself a behavioral fingerprint. 0 until set.
     idle_timeout_ms: i64 = 0,
@@ -2519,6 +2525,8 @@ const EventLoop = struct {
             slot.handshake_pos = 0;
             slot.created_at_ms = nowMs();
             slot.last_activity_ms = slot.created_at_ms;
+            slot.last_client_byte_ms = 0;
+            slot.last_server_byte_ms = 0;
             slot.idle_timeout_ms = jitteredIdleTimeoutMs(
                 self.state.config.idle_timeout_sec,
                 self.state.config.idle_timeout_jitter_pct,
@@ -4040,6 +4048,7 @@ const EventLoop = struct {
         };
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = nowMs();
+            slot.last_client_byte_ms = slot.last_activity_ms;
         }
     }
 
@@ -4069,6 +4078,7 @@ const EventLoop = struct {
         };
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = nowMs();
+            slot.last_server_byte_ms = slot.last_activity_ms;
         }
     }
 
@@ -4118,6 +4128,7 @@ const EventLoop = struct {
 
         slot.c2s_bytes += payload.len;
         slot.last_activity_ms = nowMs();
+        slot.last_client_byte_ms = slot.last_activity_ms;
     }
 
     fn relayObfuscatedUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -4161,6 +4172,7 @@ const EventLoop = struct {
         }
 
         slot.last_activity_ms = nowMs();
+        slot.last_server_byte_ms = slot.last_activity_ms;
     }
 
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -4304,16 +4316,28 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
-                // Recycle a too-long-lived relay with a TCP RST so the client makes a fresh
-                // connection. A mobile TCP kept alive for hours collapses its congestion
-                // window; on resume the client reuses it and the re-sync trickles. The RST
-                // makes the client reconnect cleanly (Telegram resumes across the drop).
-                if (self.state.config.max_connection_lifetime_sec > 0 and
-                    now_ms - slot.created_at_ms > secondsToMs(self.state.config.max_connection_lifetime_sec))
+                // Break an iOS MtProtoKit bad_salt wedge. After a stale-salt rejection the
+                // client discards the server-supplied salt, gets stuck in
+                // AwaitingTimeFixAndSalts and stops sending entirely (even queued pings/acks
+                // never go out), so "Updating" hangs ~90-120s until the DC closes the socket.
+                // We detect the wedge precisely (not by plain idle, which a healthy connection
+                // does for ~45-60s between pings): the last relayed payload was server->client
+                // and the client has not answered for the threshold. A healthy client confirms
+                // any incoming message immediately (MtProtoKit schedules the ack + requests a
+                // transaction on receipt), so an unanswered server reply past the threshold is a
+                // wedge; a healthy connection whose last word was its own ping/ack
+                // (last_client_byte_ms >= last_server_byte_ms) is never touched, however long it
+                // idles. The threshold must exceed the slowest legitimate server response time
+                // (a big getDifference) or it would tear down slow-but-healthy requests. A
+                // graceful close triggers a ~450ms clean reconnect. Gated on
+                // last_client_byte_ms>0 so a fresh/never-spoke connection is never touched.
+                if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
+                    slot.last_client_byte_ms > 0 and
+                    slot.last_server_byte_ms > slot.last_client_byte_ms and
+                    now_ms - slot.last_server_byte_ms > secondsToMs(self.state.config.client_silence_close_sec))
                 {
-                    log.info("[{d}] recycling relay: lifetime cap {d}s reached (RST -> fresh reconnect)", .{ slot.conn_id, self.state.config.max_connection_lifetime_sec });
-                    setLingerReset(slot.client_fd);
-                    self.closeSlot(slot, "max connection lifetime");
+                    log.info("[{d}] closing relay: server reply unanswered {d}s (iOS bad_salt wedge breaker)", .{ slot.conn_id, self.state.config.client_silence_close_sec });
+                    self.closeSlot(slot, "client silence wedge breaker");
                     continue;
                 }
                 if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
