@@ -1,6 +1,6 @@
 .{
     .name = .mtproto_zig,
-    .version = "1.5.0", // x-release-please-version
+    .version = "1.6.0", // x-release-please-version
     .fingerprint = 0x4a7d5f2904e880a5, // Changing this has security and trust implications.
     // Earliest supported Zig. The codebase rides churn-prone std APIs
     // (std.Io.Threaded, CompatRwLock shim), so the toolchain is pinned: a 1.0

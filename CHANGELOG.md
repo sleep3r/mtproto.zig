@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/sleep3r/mtproto.zig/compare/v1.5.0...v1.6.0) (2026-06-12)
+
+
+### Features
+
+* **proxy:** max_connection_lifetime_sec — recycle long-lived relays (RST) to fix resume "updating" hang ([#351](https://github.com/sleep3r/mtproto.zig/issues/351)) ([b31c418](https://github.com/sleep3r/mtproto.zig/commit/b31c41801967fb9e685e7e8f62e092d48f8db6cb))
+
 ## [1.5.0](https://github.com/sleep3r/mtproto.zig/compare/v1.4.4...v1.5.0) (2026-06-11)
 
 
