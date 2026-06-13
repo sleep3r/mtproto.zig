@@ -254,23 +254,36 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
         try items.append(allocator, i18n.get(ui.lang, .menu_exit));
         try actions.append(allocator, .exit);
 
-        const choice_idx = try ui.menu(i18n.get(ui.lang, .menu_title), items.items);
+        const choice_idx = ui.menu(i18n.get(ui.lang, .menu_title), items.items) catch |e| switch (e) {
+            error.GoBack => continue, // top menu: nothing above to go back to, just redraw
+            else => return e,
+        };
         const action = actions.items[choice_idx];
+        if (action == .exit) return;
 
-        switch (action) {
-            .install => try install.runInteractive(ui, allocator),
-            .update => try update.runInteractive(ui, allocator),
-            .masking => try masking.runInteractive(ui, allocator),
-            .tunnel => try tunnelOrEgressInteractive(ui, allocator),
-            .dashboard => try dashboard.runInteractive(ui, allocator),
-            .remove_dashboard => dashboard.removeInteractive(ui),
-            .recovery => try recovery.runInteractive(ui, allocator),
-            .ipv6hop => try ipv6hop.runInteractive(ui, allocator),
-            .status => showStatus(ui, allocator),
-            .restart => restartProxy(ui, allocator),
-            .uninstall => try uninstall.runInteractive(ui, allocator),
-            .exit => return,
-        }
+        // If a sub-flow bubbles error.GoBack all the way up (Esc pressed where it isn't caught
+        // deeper), just return to the main menu instead of aborting mtbuddy.
+        dispatchAction(action, ui, allocator) catch |e| switch (e) {
+            error.GoBack => {},
+            else => return e,
+        };
+    }
+}
+
+fn dispatchAction(action: Action, ui: *Tui, allocator: std.mem.Allocator) !void {
+    switch (action) {
+        .install => try install.runInteractive(ui, allocator),
+        .update => try update.runInteractive(ui, allocator),
+        .masking => try masking.runInteractive(ui, allocator),
+        .tunnel => try tunnelOrEgressInteractive(ui, allocator),
+        .dashboard => try dashboard.runInteractive(ui, allocator),
+        .remove_dashboard => dashboard.removeInteractive(ui),
+        .recovery => try recovery.runInteractive(ui, allocator),
+        .ipv6hop => try ipv6hop.runInteractive(ui, allocator),
+        .status => showStatus(ui, allocator),
+        .restart => restartProxy(ui, allocator),
+        .uninstall => try uninstall.runInteractive(ui, allocator),
+        .exit => {},
     }
 }
 
@@ -279,13 +292,87 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
 // wireguard:// -> native WG tunnel). Dispatched here (not inside tunnel.zig) so tunnel
 // and egress don't import each other.
 fn tunnelOrEgressInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
+    // Management lives above the type choice and is shared by both backends. This level always
+    // shows: "Create new tunnel" is always offered, "Manage existing tunnels" appears only when
+    // there are tunnels to manage.
+    while (true) {
+        var item_buf: [2][]const u8 = undefined;
+        item_buf[0] = i18n.get(ui.lang, .tunnel_pool_action_create); // "Create new tunnel"
+        var count: usize = 1;
+        if (tunnel.hasExistingTunnels(allocator)) {
+            item_buf[1] = tr(ui.lang, "Manage existing tunnels", "Управление туннелями");
+            count = 2;
+        }
+        const idx = ui.menu(tr(ui.lang, "Tunnel", "Туннель"), item_buf[0..count]) catch |e| switch (e) {
+            error.GoBack => return, // back to main menu
+            else => return e,
+        };
+        var went_back = false;
+        if (idx == 0) {
+            createNewTunnel(ui, allocator) catch |e| switch (e) {
+                error.GoBack => went_back = true,
+                else => return e,
+            };
+        } else {
+            manageTunnels(ui, allocator) catch |e| switch (e) {
+                error.GoBack => went_back = true,
+                else => return e,
+            };
+        }
+        if (!went_back) return; // a completed action returns to the main menu; Esc re-shows this
+    }
+}
+
+// The type choice. Esc here propagates GoBack to the caller (back to the Tunnel menu, or the
+// main menu when there were no existing tunnels). Dispatched here — not inside tunnel.zig — so
+// the AmneziaWG and sing-box backends don't have to import each other.
+fn createNewTunnel(ui: *Tui, allocator: std.mem.Allocator) !void {
     const items = [_][]const u8{
-        i18n.get(ui.lang, .tunnel_vpn_amneziawg),
-        tr(ui.lang, "VPN share-link (VLESS-Reality / VMess / Trojan / Shadowsocks / WireGuard)", "VPN-ссылка (VLESS-Reality / VMess / Trojan / Shadowsocks / WireGuard)"),
+        i18n.get(ui.lang, .tunnel_vpn_amneziawg), // "Amnezia (AmneziaWG)"
+        tr(ui.lang, "3x-ui (VLESS-Reality / VMess / Trojan / Shadowsocks / WireGuard)", "3x-ui (VLESS-Reality / VMess / Trojan / Shadowsocks / WireGuard)"),
     };
     const idx = try ui.menu(i18n.get(ui.lang, .tunnel_vpn_type_prompt), &items);
     if (idx == 1) return tunnel_singbox.runInteractive(ui, allocator);
-    return tunnel.runInteractive(ui, allocator);
+    return tunnel.runCreateAmnezia(ui, allocator, null);
+}
+
+// Backend-agnostic management of the existing tunnel pool (any of awg*/wg*/sbx*). Replace
+// routes by interface type; delete is already generic.
+fn manageTunnels(ui: *Tui, allocator: std.mem.Allocator) !void {
+    const pool = try tunnel.loadConfiguredTunnelPool(allocator);
+    defer tunnel.freeInterfaceList(allocator, pool);
+    const known = try tunnel.loadKnownTunnelInterfaces(allocator);
+    defer tunnel.freeInterfaceList(allocator, known);
+
+    if (known.len == 0) {
+        ui.info(i18n.get(ui.lang, .tunnel_pool_empty));
+        return;
+    }
+    ui.info(i18n.get(ui.lang, .tunnel_pool_current));
+    tunnel.printTunnelPoolRuntimeStatus(ui, allocator, known, pool);
+
+    var items: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (items.items) |it| allocator.free(it);
+        items.deinit(allocator);
+    }
+    for (known) |iface| {
+        try items.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ i18n.get(ui.lang, .tunnel_pool_action_replace), iface }));
+    }
+    for (known) |iface| {
+        try items.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ tr(ui.lang, "Delete tunnel", "Удалить туннель"), iface }));
+    }
+
+    const selected = try ui.menu(i18n.get(ui.lang, .tunnel_pool_action_prompt), items.items);
+    if (selected < known.len) {
+        const iface = known[selected];
+        // sing-box egress always owns sbx0 and re-runs its own share-link flow; AmneziaWG/WG
+        // tunnels are replaced in place via the Amnezia create path targeting that interface.
+        if (std.mem.startsWith(u8, iface, "sbx")) return tunnel_singbox.runInteractive(ui, allocator);
+        return tunnel.runCreateAmnezia(ui, allocator, iface);
+    }
+    const del_iface = known[selected - known.len];
+    return tunnel.deleteTunnelInteractive(ui, allocator, del_iface);
 }
 
 fn restartProxy(ui: *Tui, allocator: std.mem.Allocator) void {

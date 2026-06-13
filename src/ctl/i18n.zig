@@ -276,7 +276,7 @@ const en_strings = [_][]const u8{
     // tunnel_vpn_type_prompt
     "VPN type",
     // tunnel_vpn_amneziawg
-    "AmneziaWG",
+    "Amnezia (AmneziaWG)",
     // tunnel_pool_current
     "Configured tunnel pool:",
     // tunnel_pool_empty
@@ -452,7 +452,7 @@ const en_strings = [_][]const u8{
     // install_secret_gen_failed
     "Couldn't generate a secure secret on this system. Pass your own 32-hex secret with --secret instead.",
     // tui_nav_hint_menu
-    "↑↓ navigate  Enter select",
+    "↑↓ navigate  Enter select  Esc back",
     // tui_nav_hint_checkbox
     "↑↓ navigate  Space toggle  Enter confirm",
     // tui_exited
@@ -541,7 +541,7 @@ const ru_strings = [_][]const u8{
     // tunnel_vpn_type_prompt
     "Тип VPN",
     // tunnel_vpn_amneziawg
-    "AmneziaWG",
+    "Amnezia (AmneziaWG)",
     // tunnel_pool_current
     "Настроенный пул туннелей:",
     // tunnel_pool_empty
@@ -717,7 +717,7 @@ const ru_strings = [_][]const u8{
     // install_secret_gen_failed
     "Не удалось сгенерировать безопасный случайный секрет (системный генератор недоступен). Укажите свой 32-hex секрет через --secret.",
     // tui_nav_hint_menu
-    "↑↓ выбор  Enter выбрать",
+    "↑↓ выбор  Enter выбрать  Esc назад",
     // tui_nav_hint_checkbox
     "↑↓ выбор  Space отметить  Enter подтвердить",
     // tui_exited
@@ -747,7 +747,7 @@ test "i18n anchor strings — catches index drift between the S enum and the tab
     try std.testing.expectEqualStrings("English", get(.en, .lang_english));
     try std.testing.expectEqualStrings("Exited", get(.en, .tui_exited));
     try std.testing.expectEqualStrings("Выход", get(.ru, .tui_exited));
-    try std.testing.expectEqualStrings("↑↓ navigate  Enter select", get(.en, .tui_nav_hint_menu));
+    try std.testing.expectEqualStrings("↑↓ navigate  Enter select  Esc back", get(.en, .tui_nav_hint_menu));
     // install_secret_gen_failed sits just before the appended TUI keys.
     try std.testing.expect(std.mem.indexOf(u8, get(.en, .install_secret_gen_failed), "--secret") != null);
     try std.testing.expect(std.mem.indexOf(u8, get(.ru, .install_secret_gen_failed), "--secret") != null);

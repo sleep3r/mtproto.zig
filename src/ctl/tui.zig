@@ -557,6 +557,9 @@ pub const Tui = struct {
             } else if (ev.key == .enter) {
                 self.print("\n", .{});
                 return selected;
+            } else if (ev.key == .escape or ev.key == .left) {
+                self.print("\n", .{});
+                return error.GoBack;
             } else if (ev.key == .ctrl_c) {
                 self.print("\n\n  {s}{s}{s}\n", .{ Color.dim, i18n.get(self.lang, .tui_exited), Color.reset });
                 self.exitRawMode();
@@ -582,7 +585,10 @@ pub const Tui = struct {
         self.print("\n  {s}╭─ {s}{s}\n", .{ Color.gray, prompt, Color.reset });
         self.print("  {s}╰─❯{s} {s}  ", .{ Color.gray, Color.reset, hint_str });
 
-        const line = self.readLine() catch return default;
+        const line = self.readLineOrBack() catch |err| switch (err) {
+            error.GoBack => return error.GoBack,
+            else => return default,
+        };
         const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r', '\n' });
 
         if (trimmed.len == 0) return default;
@@ -630,7 +636,10 @@ pub const Tui = struct {
             self.print("  {s}╰─❯{s} ", .{ Color.gray, Color.reset });
         }
 
-        const line = self.readLine() catch return default orelse error.InputError;
+        const line = self.readLineOrBack() catch |err| switch (err) {
+            error.GoBack => return error.GoBack,
+            else => return default orelse error.InputError,
+        };
         const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t', '\r', '\n' });
 
         if (trimmed.len == 0) {
@@ -918,7 +927,17 @@ pub const Tui = struct {
     // ── Line reading ───────────────────────────────────────────────────────
 
     fn readLine(self: *Self) ![]const u8 {
+        return self.readLineSeeded(null);
+    }
+
+    /// Like readLine, but the buffer can be pre-seeded with a first byte that was already
+    /// consumed in raw mode (see readLineOrBack). The rest of the line is read cooked.
+    fn readLineSeeded(self: *Self, seed: ?u8) ![]const u8 {
         var pos: usize = 0;
+        if (seed) |s| {
+            self.line_buf[0] = s;
+            pos = 1;
+        }
         while (pos < self.line_buf.len) {
             var byte: [1]u8 = undefined;
             const n = std.posix.read(self.in_fd, &byte) catch return error.InputError;
@@ -939,6 +958,52 @@ pub const Tui = struct {
             if (n == 0 or byte[0] == '\n') break;
         }
         return self.line_buf[0..pos];
+    }
+
+    /// Read a line for a prompt, but return error.GoBack if the user presses Esc/← at the
+    /// empty prompt (the natural "I want to step back" moment). The first key is read in raw
+    /// mode: Esc/← → back, Ctrl+C → exit, Enter → empty line. A printable first byte is echoed
+    /// and the rest of the line is read in cooked mode, so UTF-8 input and long pastes behave
+    /// exactly as a normal line read. Non-TTY (piped) input has no "back" — it reads straight.
+    fn readLineOrBack(self: *Self) ![]const u8 {
+        if (!self.is_tty) return self.readLine();
+
+        self.enterRawMode();
+        var seed: ?u8 = null;
+        var got_enter = false;
+        while (true) {
+            const ev = self.readKey() catch |err| {
+                self.exitRawMode();
+                return err;
+            };
+            switch (ev.key) {
+                .escape, .left => {
+                    self.exitRawMode();
+                    return error.GoBack;
+                },
+                .ctrl_c => {
+                    self.exitRawMode();
+                    self.print("\n\n  {s}{s}{s}\n", .{ Color.dim, i18n.get(self.lang, .tui_exited), Color.reset });
+                    std.process.exit(0);
+                },
+                .enter => {
+                    got_enter = true;
+                    break;
+                },
+                .char => {
+                    self.writeRaw(&[_]u8{ev.ch}); // echo the byte we consumed in raw mode
+                    seed = ev.ch;
+                    break;
+                },
+                else => continue, // arrows/space/backspace at an empty prompt: ignore
+            }
+        }
+        self.exitRawMode();
+        if (got_enter) {
+            self.writeRaw("\n");
+            return self.line_buf[0..0];
+        }
+        return self.readLineSeeded(seed);
     }
 };
 

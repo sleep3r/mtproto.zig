@@ -22,17 +22,6 @@ const TUNNEL_POOL_SERVICE = "/etc/systemd/system/mtproto-tunnel-pool.service";
 const TUNNEL_POOL_TIMER = "/etc/systemd/system/mtproto-tunnel-pool.timer";
 const TUNNEL_POOL_STATE = "/run/mtproto-proxy/tunnel-pool.state";
 
-const InteractiveTunnelSelection = struct {
-    iface: []const u8,
-    action: InteractiveTunnelAction,
-};
-
-const InteractiveTunnelAction = enum {
-    create,
-    replace,
-    delete,
-};
-
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = tunnel_wg.TunnelOpts{};
@@ -67,124 +56,87 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
     try tunnel_wg.execute(ui, allocator, opts);
 }
 
-/// Run in interactive mode.
-pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
-    ui.section(i18n.get(ui.lang, .menu_setup_tunnel));
+/// True if any tunnel interface (awg*/wg*/sbx*) is already configured/known.
+pub fn hasExistingTunnels(allocator: std.mem.Allocator) bool {
+    const known = loadKnownTunnelInterfaces(allocator) catch return false;
+    defer freeInterfaceList(allocator, known);
+    return known.len > 0;
+}
 
-    const selection = chooseInteractiveTunnelTarget(ui, allocator) catch |err| {
-        switch (err) {
-            error.InvalidInterfaceName => ui.fail("Invalid tunnel interface name. Use names like awg0, awg1, wg0."),
-            error.NoFreeInterface => ui.fail("No free awgN interface name found"),
-            else => ui.fail("Failed to prepare tunnel pool selection"),
-        }
-        return;
-    };
-    defer allocator.free(selection.iface);
+/// Free a list returned by loadKnownTunnelInterfaces / loadConfiguredTunnelPool. Exposed so
+/// the main.zig orchestrator (which owns the manage/create menus) can hold these lists without
+/// importing tunnel_wg directly.
+pub fn freeInterfaceList(allocator: std.mem.Allocator, list: []const []const u8) void {
+    tunnel_wg.freeOwnedStringSlice(allocator, list);
+}
 
-    if (selection.action == .delete) {
-        try deleteTunnelInteractive(ui, allocator, selection.iface);
-        return;
-    }
+/// Create (iface_opt == null → next free interface) or replace (iface_opt set) an AmneziaWG /
+/// WireGuard tunnel from a pasted config or vpn:// share link. The management/type menus that
+/// reach this live in main.zig; this is just the AmneziaWG create wizard. Esc steps back one
+/// field (confirm → config), and Esc at the config prompt returns error.GoBack to the caller.
+pub fn runCreateAmnezia(ui: *Tui, allocator: std.mem.Allocator, iface_opt: ?[]const u8) !void {
+    // Header names the chosen type so the two create flows (this and 3x-ui) read consistently.
+    ui.section(i18n.get(ui.lang, .tunnel_vpn_amneziawg));
 
-    // VPN type was already chosen in the interactive menu (AmneziaWG vs share-link); this
-    // path is the AmneziaWG flow.
-    if (selection.action == .replace) {
+    const iface: []u8 = if (iface_opt) |i|
+        try allocator.dupe(u8, i)
+    else
+        tunnel_wg.selectTunnelInterface(allocator, "") catch |err| {
+            switch (err) {
+                error.InvalidInterfaceName => ui.fail("Invalid tunnel interface name. Use names like awg0, awg1, wg0."),
+                error.NoFreeInterface => ui.fail("No free awgN interface name found"),
+                else => ui.fail("Failed to pick a tunnel interface"),
+            }
+            return;
+        };
+    defer allocator.free(iface);
+
+    // On a fresh create the auto-picked awgN is an internal detail (the share-link flow doesn't
+    // surface its sbx0 either) — only show the target interface when replacing a specific one.
+    if (iface_opt != null) {
         ui.warn(i18n.get(ui.lang, .tunnel_pool_replace_warn));
+        ui.stepOk(i18n.get(ui.lang, .tunnel_pool_selected_iface), iface);
     }
-    ui.stepOk(i18n.get(ui.lang, .tunnel_pool_selected_iface), selection.iface);
 
     var conf_buf: [16 * 1024]u8 = undefined;
-    const conf_source = try ui.input(
-        i18n.get(ui.lang, .tunnel_conf_prompt),
-        i18n.get(ui.lang, .tunnel_conf_help),
-        null,
-        &conf_buf,
-    );
-
-    if (!try ui.confirm(i18n.get(ui.lang, .confirm_proceed), true)) {
-        ui.info(i18n.get(ui.lang, .aborting));
-        return;
-    }
-
-    try tunnel_wg.execute(ui, allocator, .{ .awg_source = conf_source, .iface = selection.iface });
+    var conf_source: []const u8 = "";
+    var step: usize = 0;
+    while (true) switch (step) {
+        0 => {
+            conf_source = ui.input(
+                i18n.get(ui.lang, .tunnel_conf_prompt),
+                i18n.get(ui.lang, .tunnel_conf_help),
+                null,
+                &conf_buf,
+            ) catch |e| switch (e) {
+                error.GoBack => return error.GoBack,
+                else => return e,
+            };
+            step = 1;
+        },
+        1 => {
+            const ok = ui.confirm(i18n.get(ui.lang, .confirm_proceed), true) catch |e| {
+                if (e == error.GoBack) {
+                    step = 0;
+                    continue;
+                }
+                return e;
+            };
+            if (!ok) {
+                ui.info(i18n.get(ui.lang, .aborting));
+                return;
+            }
+            step = 2;
+        },
+        else => {
+            try tunnel_wg.execute(ui, allocator, .{ .awg_source = conf_source, .iface = iface });
+            return;
+        },
+    };
 }
 
 fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
     return if (lang == .ru) ru else en;
-}
-
-fn chooseInteractiveTunnelTarget(ui: *Tui, allocator: std.mem.Allocator) !InteractiveTunnelSelection {
-    const pool = try loadConfiguredTunnelPool(allocator);
-    defer tunnel_wg.freeOwnedStringSlice(allocator, pool);
-    const known = try loadKnownTunnelInterfaces(allocator);
-    defer tunnel_wg.freeOwnedStringSlice(allocator, known);
-
-    if (known.len == 0) {
-        ui.info(i18n.get(ui.lang, .tunnel_pool_empty));
-    } else {
-        ui.info(i18n.get(ui.lang, .tunnel_pool_current));
-        printTunnelPoolRuntimeStatus(ui, allocator, known, pool);
-    }
-
-    const next_iface = try tunnel_wg.selectTunnelInterface(allocator, "");
-    defer allocator.free(next_iface);
-
-    var items: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (items.items) |item| allocator.free(item);
-        items.deinit(allocator);
-    }
-
-    try items.append(
-        allocator,
-        try std.fmt.allocPrint(
-            allocator,
-            "{s} ({s})",
-            .{ i18n.get(ui.lang, .tunnel_pool_action_create), next_iface },
-        ),
-    );
-
-    for (known) |iface| {
-        try items.append(
-            allocator,
-            try std.fmt.allocPrint(
-                allocator,
-                "{s}: {s}",
-                .{ i18n.get(ui.lang, .tunnel_pool_action_replace), iface },
-            ),
-        );
-    }
-
-    for (known) |iface| {
-        try items.append(
-            allocator,
-            try std.fmt.allocPrint(
-                allocator,
-                "{s}: {s}",
-                .{ tr(ui.lang, "Delete tunnel", "Удалить туннель"), iface },
-            ),
-        );
-    }
-
-    const selected = try ui.menu(i18n.get(ui.lang, .tunnel_pool_action_prompt), items.items);
-    if (selected == 0) {
-        return .{
-            .iface = try allocator.dupe(u8, next_iface),
-            .action = .create,
-        };
-    }
-
-    if (selected <= known.len) {
-        return .{
-            .iface = try allocator.dupe(u8, known[selected - 1]),
-            .action = .replace,
-        };
-    }
-
-    return .{
-        .iface = try allocator.dupe(u8, known[selected - known.len - 1]),
-        .action = .delete,
-    };
 }
 
 fn tunnelShowTool(iface: []const u8) ?[]const u8 {
@@ -239,7 +191,7 @@ fn tunnelRuntimeStatus(allocator: std.mem.Allocator, iface: []const u8) []const 
     return "up, no endpoint";
 }
 
-fn printTunnelPoolRuntimeStatus(ui: *Tui, allocator: std.mem.Allocator, interfaces: []const []const u8, pool: []const []const u8) void {
+pub fn printTunnelPoolRuntimeStatus(ui: *Tui, allocator: std.mem.Allocator, interfaces: []const []const u8, pool: []const []const u8) void {
     for (interfaces, 0..) |iface, idx| {
         const status = tunnelRuntimeStatus(allocator, iface);
         const source = if (tunnel_wg.containsInterface(pool, iface)) "pool" else "config";
@@ -258,7 +210,7 @@ const TunnelDeleteResult = struct {
     remaining_count: usize,
 };
 
-fn deleteTunnelInteractive(ui: *Tui, allocator: std.mem.Allocator, iface: []const u8) !void {
+pub fn deleteTunnelInteractive(ui: *Tui, allocator: std.mem.Allocator, iface: []const u8) !void {
     if (!sys.isRoot()) {
         ui.fail(i18n.get(ui.lang, .error_not_root));
         return;
@@ -405,14 +357,14 @@ fn refreshTunnelPoolRuntime(allocator: std.mem.Allocator) void {
     sys.execSilent(allocator, &.{TUNNEL_SCRIPT});
 }
 
-fn loadConfiguredTunnelPool(allocator: std.mem.Allocator) ![]const []const u8 {
+pub fn loadConfiguredTunnelPool(allocator: std.mem.Allocator) ![]const []const u8 {
     var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return &.{};
     defer doc.deinit();
 
     return try tunnel_wg.loadTunnelPoolFromDoc(allocator, &doc);
 }
 
-fn loadKnownTunnelInterfaces(allocator: std.mem.Allocator) ![]const []const u8 {
+pub fn loadKnownTunnelInterfaces(allocator: std.mem.Allocator) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (list.items) |item| allocator.free(item);

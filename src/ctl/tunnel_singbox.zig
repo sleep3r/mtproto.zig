@@ -219,28 +219,51 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 /// Interactive entry: prompt for a share-link (or several, for a failover pool), then run
 /// the same dispatch as `run`. Reached from the interactive "Setup tunnel" VPN-type chooser.
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
-    ui.info(trL(ui, "VPN share-link egress — paste a link. Several links (space/newline/comma-separated) form a failover pool.", "Egress из VPN-ссылки — вставь ссылку. Несколько ссылок (через пробел/перенос/запятую) образуют failover-пул."));
-    var buf: [16 * 1024]u8 = undefined;
-    const input = ui.input(
-        trL(ui, "Share-link(s)", "Ссылка(и)"),
-        trL(ui, "vless:// vmess:// trojan:// ss://  (sing-box tunnel)  |  wireguard://  (native tunnel)", "vless:// vmess:// trojan:// ss://  (sing-box-туннель)  |  wireguard://  (нативный туннель)"),
-        null,
-        &buf,
-    ) catch return;
+    // Header names the chosen type so this reads consistently with the Amnezia create flow.
+    ui.section(trL(ui, "3x-ui", "3x-ui"));
+    ui.info(trL(ui, "Paste a share-link. Several links (space/newline/comma-separated) form a failover pool.", "Вставь ссылку. Несколько ссылок (через пробел/перенос/запятую) образуют failover-пул."));
 
+    var buf: [16 * 1024]u8 = undefined;
     var links: std.ArrayListUnmanaged([]const u8) = .empty;
     defer links.deinit(allocator);
-    var it = std.mem.tokenizeAny(u8, input, " \t\r\n,");
-    while (it.next()) |tok| links.append(allocator, tok) catch {};
-    if (links.items.len == 0) {
-        ui.fail(trL(ui, "No share-link provided.", "Ссылка не введена."));
-        return;
-    }
-    if (!(ui.confirm(trL(ui, "Proceed?", "Продолжить?"), true) catch false)) {
-        ui.info(trL(ui, "Aborting.", "Отмена."));
-        return;
-    }
-    return dispatchLinks(ui, allocator, links.items);
+
+    var step: usize = 0;
+    while (true) switch (step) {
+        0 => {
+            const input = ui.input(
+                trL(ui, "Share-link(s)", "Ссылка(и)"),
+                trL(ui, "vless:// vmess:// trojan:// ss://  (sing-box tunnel)  |  wireguard://  (native tunnel)", "vless:// vmess:// trojan:// ss://  (sing-box-туннель)  |  wireguard://  (нативный туннель)"),
+                null,
+                &buf,
+            ) catch |e| {
+                if (e == error.GoBack) return error.GoBack; // back to the type choice
+                return; // EOF / no input — abort
+            };
+            links.clearRetainingCapacity();
+            var it = std.mem.tokenizeAny(u8, input, " \t\r\n,");
+            while (it.next()) |tok| links.append(allocator, tok) catch {};
+            if (links.items.len == 0) {
+                ui.fail(trL(ui, "No share-link provided.", "Ссылка не введена."));
+                continue; // re-prompt
+            }
+            step = 1;
+        },
+        1 => {
+            const ok = ui.confirm(trL(ui, "Proceed?", "Продолжить?"), true) catch |e| {
+                if (e == error.GoBack) {
+                    step = 0;
+                    continue; // step back to the link prompt
+                }
+                return;
+            };
+            if (!ok) {
+                ui.info(trL(ui, "Aborting.", "Отмена."));
+                return;
+            }
+            step = 2;
+        },
+        else => return dispatchLinks(ui, allocator, links.items),
+    };
 }
 
 /// wireguard:// links -> native L3 tunnel. Convert each link to a WG/AmneziaWG .conf
