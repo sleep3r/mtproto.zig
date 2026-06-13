@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import os
@@ -192,6 +193,33 @@ def _dashboard_auth_ok(authorization) -> bool:
         return False
     _, _, pw = raw.partition(":")
     return hmac.compare_digest(pw, DASHBOARD_TOKEN)
+
+
+# Safari/WebKit does not replay cached HTTP Basic credentials on a WebSocket handshake (Chrome
+# and Firefox do). So the log WS also accepts a short-lived signed ticket that an already-
+# authenticated page fetches over a normal request (which DOES replay Basic auth everywhere) and
+# passes in the handshake URL. The ticket is a stateless HMAC over its own expiry under the
+# dashboard token — no server-side storage, ~30s validity.
+_WS_TICKET_TTL = 30  # seconds
+
+
+def _make_ws_ticket() -> str:
+    exp = str(int(time.time()) + _WS_TICKET_TTL)
+    sig = hmac.new(DASHBOARD_TOKEN.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _ws_ticket_ok(ticket) -> bool:
+    if not ticket or "." not in ticket:
+        return False
+    exp_s, _, sig = ticket.partition(".")
+    try:
+        if int(exp_s) < int(time.time()):
+            return False
+    except ValueError:
+        return False
+    expected = hmac.new(DASHBOARD_TOKEN.encode(), exp_s.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 def _host_hostname(host_header: str) -> str:
@@ -2966,6 +2994,14 @@ def api_logs():
         return JSONResponse(list(_recent_logs))
 
 
+@app.get("/api/ws-ticket")
+async def ws_ticket():
+    # Gated by _dashboard_security (Basic auth) like every other route. The authenticated page
+    # fetches this, then opens /ws/logs with ?ticket=... — required for browsers (Safari) that
+    # don't replay Basic auth on the WebSocket handshake.
+    return {"ticket": _make_ws_ticket()}
+
+
 @app.websocket("/ws/logs")
 async def ws_logs(ws: WebSocket):
     # WebSocket upgrades bypass HTTP middleware, so enforce the same gates here as
@@ -2981,7 +3017,9 @@ async def ws_logs(ws: WebSocket):
     if ws_origin and urlparse(ws_origin).netloc != ws.headers.get("host", ""):
         await ws.close(code=1008)
         return
-    if not _dashboard_auth_ok(ws.headers.get("authorization")):
+    # Accept either replayed Basic auth (Chrome/Firefox) or a signed ticket from /api/ws-ticket
+    # (Safari, which doesn't replay Basic on WS handshakes).
+    if not (_dashboard_auth_ok(ws.headers.get("authorization")) or _ws_ticket_ok(ws.query_params.get("ticket"))):
         await ws.close(code=1008)
         return
     await ws.accept()

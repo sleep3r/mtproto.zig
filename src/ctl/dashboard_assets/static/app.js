@@ -1678,9 +1678,21 @@ function esc(s) {
   return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-function connectWS() {
+async function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(proto + '://' + location.host + '/ws/logs');
+  // Safari does not replay cached HTTP Basic credentials on a WebSocket handshake (Chrome and
+  // Firefox do), so the server would reject it. Fetch a short-lived ticket over a normal request
+  // (which replays Basic auth in every browser) and pass it in the URL. Falls back gracefully to
+  // the Basic-replay path if the ticket fetch fails.
+  let q = '';
+  try {
+    const r = await fetch('/api/ws-ticket', { cache: 'no-store' });
+    if (r.ok) {
+      const j = await r.json();
+      if (j && j.ticket) q = '?ticket=' + encodeURIComponent(j.ticket);
+    }
+  } catch (e) { /* fall back to Basic-auth replay */ }
+  const ws = new WebSocket(proto + '://' + location.host + '/ws/logs' + q);
   let initialBacklog = true;
 
   ws.onopen = () => {

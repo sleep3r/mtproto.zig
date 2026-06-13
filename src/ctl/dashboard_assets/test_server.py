@@ -88,6 +88,36 @@ def test_same_origin_mutation_allowed_through_guard(client):
     assert r.status_code not in (401, 403)
 
 
+def test_ws_ticket_roundtrip():
+    # A freshly minted ticket validates; tampered / garbage / wrong-token tickets do not.
+    t = server._make_ws_ticket()
+    assert server._ws_ticket_ok(t)
+    assert not server._ws_ticket_ok(t[:-1] + ("0" if t[-1] != "0" else "1"))
+    assert not server._ws_ticket_ok("nope")
+    assert not server._ws_ticket_ok("")
+    assert not server._ws_ticket_ok(None)
+    exp = t.split(".")[0]
+    import hmac as _hmac
+    import hashlib as _hashlib
+    forged = exp + "." + _hmac.new(b"other-token", exp.encode(), _hashlib.sha256).hexdigest()
+    assert not server._ws_ticket_ok(forged)
+
+
+def test_ws_ticket_endpoint_requires_auth(client):
+    assert client.get("/api/ws-ticket").status_code == 401
+    r = client.get("/api/ws-ticket", headers=_auth())
+    assert r.status_code == 200
+    assert server._ws_ticket_ok(r.json()["ticket"])
+
+
+def test_ws_rejects_unauthenticated(client):
+    # No Basic auth and no ticket → the handshake is closed before accept (Safari with neither
+    # would see this; with a ticket it connects). TestClient raises when the server denies.
+    with pytest.raises(Exception):
+        with client.websocket_connect("/ws/logs"):
+            pass
+
+
 def test_logs_fanout_is_per_client_cursor():
     # Regression for the destructive-drain bug: two independent cursors over the same recent
     # ring must each see all entries (no stealing between concurrent /ws/logs viewers).
