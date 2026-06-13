@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/sleep3r/mtproto.zig/compare/v1.7.0...v1.8.0) (2026-06-13)
+
+
+### Features
+
+* **ctl:** tunnel menu redesign + Esc/← "back" navigation in the TUI ([#357](https://github.com/sleep3r/mtproto.zig/issues/357)) ([3b66630](https://github.com/sleep3r/mtproto.zig/commit/3b6663076c180ce4e700d97515185ee2765af423))
+
 ## [1.7.0](https://github.com/sleep3r/mtproto.zig/compare/v1.6.0...v1.7.0) (2026-06-12)
 
 
