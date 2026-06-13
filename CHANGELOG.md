@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/sleep3r/mtproto.zig/compare/v1.8.0...v1.8.1) (2026-06-13)
+
+
+### Bug Fixes
+
+* **dashboard:** accept a signed ticket on the log WebSocket (Safari fix) ([#359](https://github.com/sleep3r/mtproto.zig/issues/359)) ([1830e87](https://github.com/sleep3r/mtproto.zig/commit/1830e87bd1388e5c3d4690366f74b9c470d73b59))
+
 ## [1.8.0](https://github.com/sleep3r/mtproto.zig/compare/v1.7.0...v1.8.0) (2026-06-13)
 
 
