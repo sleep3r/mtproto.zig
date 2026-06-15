@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/sleep3r/mtproto.zig/compare/v1.8.1...v1.9.0) (2026-06-15)
+
+
+### Features
+
+* optional kernel SYN rate-limiter + per-endpoint DC connect timeout ([#363](https://github.com/sleep3r/mtproto.zig/issues/363)) ([b346b75](https://github.com/sleep3r/mtproto.zig/commit/b346b7509da83899eedaf8e8bac101da0f0d5ec7))
+
 ## [1.8.1](https://github.com/sleep3r/mtproto.zig/compare/v1.8.0...v1.8.1) (2026-06-13)
 
 
