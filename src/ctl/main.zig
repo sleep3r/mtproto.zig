@@ -19,6 +19,7 @@ const install = @import("install.zig");
 const update = @import("update.zig");
 const masking = @import("masking.zig");
 const nfqws = @import("nfqws.zig");
+const synlimit = @import("synlimit.zig");
 const tunnel = @import("tunnel.zig");
 const recovery = @import("recovery.zig");
 const dashboard = @import("dashboard.zig");
@@ -133,6 +134,8 @@ pub fn main(init: std.process.Init) !void {
                     return masking.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "nfqws")) {
                     return nfqws.run(&ui, allocator, &remaining_args);
+                } else if (std.mem.eql(u8, sub, "syn-limit")) {
+                    return synlimit.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "tunnel")) {
                     return tunnel.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "egress")) {
@@ -148,11 +151,11 @@ pub fn main(init: std.process.Init) !void {
                         Color.reset,
                         sub,
                     });
-                    ui.hint(tr(ui.lang, "Available: masking, nfqws, tunnel, egress, recovery, dashboard", "Доступно: masking, nfqws, tunnel, egress, recovery, dashboard"));
+                    ui.hint(tr(ui.lang, "Available: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard", "Доступно: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard"));
                     return;
                 }
             } else {
-                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|tunnel|egress|recovery|dashboard>", "Использование: mtbuddy setup <masking|nfqws|tunnel|egress|recovery|dashboard>"));
+                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard>", "Использование: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard>"));
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
@@ -193,6 +196,7 @@ const Action = enum {
     update,
     masking,
     tunnel,
+    synlimit,
     recovery,
     dashboard,
     remove_dashboard,
@@ -225,6 +229,8 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             try actions.append(allocator, .masking);
             try items.append(allocator, i18n.get(ui.lang, .menu_setup_tunnel));
             try actions.append(allocator, .tunnel);
+            try items.append(allocator, tr(ui.lang, "Kernel SYN rate-limit (anti-flood)", "Ограничение SYN на уровне ядра (анти-флуд)"));
+            try actions.append(allocator, .synlimit);
 
             const has_dashboard = sys.isServiceActive("proxy-monitor");
             const has_recovery = sys.isServiceActive("mtproto-mask-health.timer");
@@ -276,6 +282,7 @@ fn dispatchAction(action: Action, ui: *Tui, allocator: std.mem.Allocator) !void 
         .update => try update.runInteractive(ui, allocator),
         .masking => try masking.runInteractive(ui, allocator),
         .tunnel => try tunnelOrEgressInteractive(ui, allocator),
+        .synlimit => try synlimit.runInteractive(ui, allocator),
         .dashboard => try dashboard.runInteractive(ui, allocator),
         .remove_dashboard => dashboard.removeInteractive(ui),
         .recovery => try recovery.runInteractive(ui, allocator),
@@ -435,6 +442,8 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
         ui.info(tr(ui.lang, "Extra TCP protection (nfqws) is not running", "Дополнительная TCP-защита (nfqws) не запущена"));
     }
 
+    synlimit.printStatus(ui, allocator);
+
     const timer_active = sys.isServiceActive("mtproto-mask-health.timer");
     if (timer_active) {
         ui.ok(tr(ui.lang, "DPI auto-recovery is active", "Автовосстановление DPI активно"));
@@ -515,6 +524,7 @@ fn printHelp(lang: i18n.Lang) void {
     printCmd(&ui, "update", tr(lang, "Update to latest GitHub release", "Обновить до последнего GitHub релиза"));
     printCmd(&ui, "setup masking", tr(lang, "Setup local Nginx DPI masking", "Настроить локальную DPI-маскировку через Nginx"));
     printCmd(&ui, "setup nfqws", tr(lang, "Setup nfqws TCP desync (Zapret)", "Настроить nfqws TCP desync (Zapret)"));
+    printCmd(&ui, "setup syn-limit [--preset soft|medium|hard] [--remove]", tr(lang, "Kernel per-IP inbound SYN rate-limit (off by default)", "Ограничение входящих SYN по IP в ядре (по умолчанию выкл)"));
     printCmd(&ui, "setup tunnel [--deps-only] [--iface awgN] <conf|vpn://>", tr(lang, "Setup AmneziaWG tunnel pool member", "Настроить участника пула туннелей AmneziaWG"));
     printCmd(&ui, "setup egress [--deps-only] <share-link...>", tr(lang, "Setup VPN share-link egress", "Настроить egress через VPN-ссылку"));
     printCmd(&ui, "setup dashboard", tr(lang, "Install web monitoring dashboard", "Установить веб-дашборд мониторинга"));
@@ -643,6 +653,7 @@ test {
     _ = @import("tui.zig");
     _ = @import("release.zig");
     _ = @import("nfqws.zig");
+    _ = @import("synlimit.zig");
     _ = @import("masking.zig");
     _ = @import("uninstall.zig");
     _ = @import("update.zig");

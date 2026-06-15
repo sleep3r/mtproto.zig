@@ -74,6 +74,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         "mtproto-proxy",
         "proxy-monitor",
         "nfqws-mtproto",
+        "mtproto-syn-limit",
         "mtproto-mask-health.timer",
         "mtproto-mask-health.service",
         "mtproto-tunnel-pool.timer",
@@ -198,6 +199,24 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         \\fi
     ;
     _ = sys.execForward(&.{ "bash", "-c", tcpmss_cleanup }) catch {};
+
+    // Clear the optional kernel SYN rate-limiter (mtbuddy setup syn-limit). The unit was
+    // already stopped/removed in the services loop above; here we tear down its live
+    // iptables chain (both families) by replay-deleting every INPUT jump to it — robust
+    // to a --dport that changed since apply — then flush + delete the chain and remove
+    // the generated apply/flush script.
+    const synlimit_cleanup =
+        \\for ipt in iptables ip6tables; do
+        \\  "$ipt" -S INPUT 2>/dev/null | grep -- '-j MTPROTO_SYNLIMIT' | while read -r line; do
+        \\    rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
+        \\    "$ipt" $rule 2>/dev/null || true
+        \\  done
+        \\  "$ipt" -F MTPROTO_SYNLIMIT 2>/dev/null || true
+        \\  "$ipt" -X MTPROTO_SYNLIMIT 2>/dev/null || true
+        \\done
+        \\rm -f /usr/local/sbin/mtproto-syn-limit.sh
+    ;
+    _ = sys.execForward(&.{ "bash", "-c", synlimit_cleanup }) catch {};
 
     // Revert the port-specific ufw allow rule the installer added.
     if (sys.commandExists("ufw")) {
