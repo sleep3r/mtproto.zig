@@ -481,6 +481,10 @@ const ConnectionSlot = struct {
 
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
+    /// When the current upstream connect() was initiated (phase .connecting_upstream).
+    /// Reset on every endpoint attempt so dc_connect_timeout_sec is per-endpoint, not
+    /// cumulative across failover. 0 when not connecting upstream.
+    upstream_connect_started_ms: i64 = 0,
     last_activity_ms: i64 = 0,
     /// Last time client->server payload was relayed (0 until the client first speaks while
     /// relaying), and last time server->client payload was relayed. When the server spoke more
@@ -3848,6 +3852,9 @@ const EventLoop = struct {
         slot.upstream_kind = kind;
         slot.current_upstream_addr = addr;
         slot.phase = .connecting_upstream;
+        // Stamp the per-endpoint connect deadline base. tryNextDcEndpoint re-enters here
+        // for each endpoint, so this resets per attempt (see dc_connect_timeout_sec).
+        slot.upstream_connect_started_ms = nowMs();
 
         // For proxy upstreams, stash the real target address for the proxy handshake.
         if (connect_result.proxy_handshake != .none) {
@@ -4276,6 +4283,22 @@ const EventLoop = struct {
 
             if (slot.phase == .closing) {
                 self.closeSlot(slot, "closing phase");
+                continue;
+            }
+
+            // Per-endpoint upstream connect deadline. Fires only while a connect() is still
+            // in flight; lets failover advance to the next DC endpoint quickly instead of
+            // burning the whole (global) handshake_timeout_sec on one black-holed endpoint.
+            if (slot.phase == .connecting_upstream and self.state.config.dc_connect_timeout_sec > 0 and
+                slot.upstream_connect_started_ms > 0 and
+                now_ms - slot.upstream_connect_started_ms > secondsToMs(self.state.config.dc_connect_timeout_sec))
+            {
+                const failed_kind = slot.upstream_kind;
+                self.cleanupFailedUpstreamConnect(slot);
+                // Mirror onUpstreamConnectComplete's failure path: DC endpoints fail over to
+                // the next candidate; any other upstream kind (mask/proxy/middle) just closes.
+                if (failed_kind == .dc and self.tryNextDcEndpoint(slot, error.ConnectTimedOut)) continue;
+                self.closeSlot(slot, "dc connect timeout");
                 continue;
             }
 

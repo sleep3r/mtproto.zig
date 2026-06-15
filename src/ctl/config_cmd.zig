@@ -652,6 +652,7 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     ui.print("max_connections = {d}\n", .{cfg.max_connections});
     ui.print("idle_timeout_sec = {d}\n", .{cfg.idle_timeout_sec});
     ui.print("handshake_timeout_sec = {d}\n", .{cfg.handshake_timeout_sec});
+    ui.print("dc_connect_timeout_sec = {d}\n", .{cfg.dc_connect_timeout_sec});
     ui.print("graceful_shutdown_timeout_sec = {d}\n", .{cfg.graceful_shutdown_timeout_sec});
     ui.print("middleproxy_buffer_kb = {d}\n", .{cfg.middleproxy_buffer_kb});
     ui.print("log_level = \"{s}\"\n", .{@tagName(cfg.log_level)});

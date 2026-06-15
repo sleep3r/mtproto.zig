@@ -88,6 +88,13 @@ port = 443
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # handshake_timeout_sec = 15
 
+# Per-endpoint deadline (seconds) for the TCP connect to a Telegram DC endpoint; 0 = off.
+# A filtered/black-holed endpoint sends no RST, so the kernel sits in SYN_SENT for ~2 min.
+# handshake_timeout_sec caps the whole client handshake, but globally — this fails one dead
+# endpoint fast so failover advances to the next within that ceiling. Keep it below
+# handshake_timeout_sec. Healthy connects finish in <1s, so this never affects them.
+# dc_connect_timeout_sec = 10
+
 # Per-connection MiddleProxy stream buffer size in KiB. Must exceed the largest single
 # RPC_PROXY_ANS frame: a max download part is 1 MiB + framing, so 2048 (default) carries
 # 1 MiB media parts with headroom. 1024 truncates them; oversized frames close the

@@ -258,6 +258,18 @@ pub const Config = struct {
     idle_timeout_jitter_pct: u8 = 15,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
+    /// Per-endpoint deadline for completing the TCP connect to a Telegram DC endpoint;
+    /// 0 = disabled (rely solely on handshake_timeout_sec). When an endpoint is filtered
+    /// / black-holed it sends no RST, so the kernel keeps the connect in SYN_SENT for
+    /// ~2 min. handshake_timeout_sec (measured from the client's first byte) already caps
+    /// the whole client handshake — but it's GLOBAL, so a slow first endpoint can starve
+    /// the failover budget for the remaining endpoints. This fires per endpoint: if the
+    /// connect() hasn't completed within the deadline, the endpoint is abandoned and
+    /// failover advances to the next one (within the overall handshake_timeout_sec ceiling).
+    /// Keep it comfortably below handshake_timeout_sec so a dead first endpoint still
+    /// leaves time to try another. A healthy connect completes in well under a second, so
+    /// this never affects working endpoints; default ON at 10s.
+    dc_connect_timeout_sec: u32 = 10,
     /// Graceful shutdown drain timeout on SIGTERM.
     /// The proxy stops accepting new clients and drains active relays
     /// for this many seconds before forced close.
@@ -694,6 +706,8 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.handshake_timeout_sec;
                         cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
+                    } else if (std.mem.eql(u8, key, "dc_connect_timeout_sec")) {
+                        cfg.dc_connect_timeout_sec = std.fmt.parseInt(u32, value, 10) catch cfg.dc_connect_timeout_sec;
                     } else if (std.mem.eql(u8, key, "graceful_shutdown_timeout_sec")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.graceful_shutdown_timeout_sec;
                         cfg.graceful_shutdown_timeout_sec = @max(@as(u32, 1), parsed);
@@ -936,6 +950,7 @@ test "parse config - valid complete" {
         \\max_connections = 6000
         \\idle_timeout_sec = 180
         \\handshake_timeout_sec = 30
+        \\dc_connect_timeout_sec = 7
         \\fast_mode = true
         \\
         \\[censorship]
@@ -958,6 +973,7 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 7), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
@@ -985,6 +1001,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec); // Default 10s, ON
     try std.testing.expectEqual(@as(u32, 15), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(cfg.mask_target == null);
