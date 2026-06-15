@@ -219,6 +219,13 @@ sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
+# Tùy chọn: giới hạn tốc độ SYN theo mỗi IP ở cấp kernel (chống lụt, MẶC ĐỊNH TẮT).
+# Chặn các đợt SYN-đầu-tiên gây lạm dụng ngay trong kernel TRƯỚC accept(); một systemd
+# oneshot riêng để CAP_NET_ADMIN không bao giờ được cấp cho proxy. Preset mặc định an toàn hơn cho CGNAT.
+sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | hard 1/s·1
+sudo mtbuddy setup syn-limit --status
+sudo mtbuddy setup syn-limit --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 
@@ -378,6 +385,7 @@ max_connections = 512
 idle_timeout_sec = 120
 # client_silence_close_sec = 0   # Close a relay whose server reply went unanswered by the client for N sec (breaks an iOS bad_salt wedge where "Updating" hangs ~90-120s) → instant clean reconnect. 0 = off; best-effort, can occasionally close a healthy conn — ~10-15 if you enable it
 handshake_timeout_sec = 15
+# dc_connect_timeout_sec = 10   # Hạn chót TCP-connect cho mỗi endpoint tới một DC Telegram; làm hỏng nhanh một endpoint bị black-hole để failover chuyển sang endpoint kế tiếp (trong phạm vi handshake_timeout_sec). 0 = tắt; không bao giờ ảnh hưởng các kết nối khỏe mạnh (<1s)
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
@@ -434,6 +442,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] idle_timeout_sec` | `120` | Thời gian chờ kết nối nhàn rỗi |
 | `[server] idle_timeout_jitter_pct` | `15` | Jitter ±% trên mỗi kết nối cho thời gian chờ nhàn rỗi để một giá trị cố định không trở thành dấu vân tay (`0` để tắt) |
 | `[server] client_silence_close_sec` | `0` | Đóng một relay đã thiết lập mà phản hồi cuối của máy chủ không được client trả lời trong N giây, kích hoạt kết nối lại sạch tức thì (~450ms). Khắc phục một lỗi treo của iOS MtProtoKit: sau khi bị từ chối do salt cũ, client vứt bỏ salt và ngừng gửi, "Đang cập nhật" treo ~90-120s cho đến khi DC đóng socket. Chỉ kích hoạt khi payload cuối là server→client (một kết nối idle khỏe mạnh mà động thái cuối là ping/ack của chính nó sẽ không bị đụng tới). Đây là giải pháp tạm thời best-effort: giá trị thấp hơn phản hồi hợp lệ chậm nhất đôi khi cũng đóng một kết nối khỏe mạnh (chỉ ~450ms kết nối lại). `0` = tắt (mặc định); nếu bật, ~`10`–`15` là điểm khởi đầu hợp lý, tự điều chỉnh |
+| `[server] dc_connect_timeout_sec` | `10` | Hạn chót cho mỗi endpoint đối với việc TCP connect tới một endpoint DC Telegram. Một endpoint bị lọc/black-hole không gửi RST, nên kernel nằm chờ ở SYN_SENT ~2 phút; handshake_timeout_sec đã giới hạn toàn bộ bắt tay nhưng theo cách toàn cục, nên một endpoint đầu tiên chậm sẽ bỏ đói failover của phần còn lại. Cái này làm hỏng nhanh một endpoint chết và chuyển sang endpoint kế tiếp (trong phạm vi trần handshake_timeout_sec). Giữ thấp hơn handshake_timeout_sec. 0 = tắt; các kết nối khỏe mạnh hoàn tất trong <1s nên nó không bao giờ ảnh hưởng đến chúng |
 | `[server] handshake_timeout_sec` | `15` | Thời gian chờ hoàn tất bắt tay |
 | `[server] graceful_shutdown_timeout_sec` | `15` | Thời gian chờ rút cạn khi SIGTERM trước khi buộc đóng |
 | `[server] middleproxy_buffer_kb` | `1024` | Bộ đệm ME cho mỗi kết nối (KiB). Dưới 1024 có thể gây tràn với lưu lượng media |
@@ -472,6 +481,8 @@ alice = true   # bypass MiddleProxy for this user
 > **Lớp truyền tải `dd` ("secure"/padded) bị từ chối theo mặc định** (`[censorship].fake_tls_only = true`) — đó là MTProto được làm rối thông thường, **không có ngụy trang TLS**, có thể bị DPI nhận diện trực tiếp là MTProto. Theo mặc định proxy chỉ chấp nhận FakeTLS (`ee`), và `mtbuddy links` chỉ in các liên kết `ee`. Để phát các liên kết `dd` (cho các tình huống ít DPI / tương thích), hãy đặt `fake_tls_only = false`. Xem [THREAT_MODEL.md](THREAT_MODEL.md).
 >
 > Cả hai bộ chống lạm dụng đều **mặc định bị tắt** để các mạng carrier-NAT lớn, mạng VPN-egress hoặc mạng văn phòng dùng chung (nhiều client hợp lệ sau một IP/subnet nguồn) không bị nhận diện nhầm và chặn cùng nhau: giới hạn tốc độ kết nối mới theo mỗi subnet (`rate_limit_per_subnet = 0`) và bộ chống lụt bắt tay theo IP chính xác (`handshake_flood_guard_enabled = false`). Quyền truy cập đã được kiểm soát bởi secret theo từng người dùng, ngân sách bắt tay đang chờ toàn cục và `max_connections`. Trên một máy đơn người thuê / không NAT khi thực sự bị lạm dụng, hãy bật chúng lên: đặt `rate_limit_per_subnet` (ví dụ `30`) và `handshake_flood_guard_enabled = true` (tinh chỉnh `handshake_flood_guard_threshold` / cửa sổ / thời gian chặn).
+>
+> Cả hai bộ ở trên đều chạy sau `accept()` (chúng nằm trong proxy). Để có thêm một lớp ở cấp kernel chặn các đợt SYN-đầu-tiên gây lạm dụng trước khi chúng tốn một socket/`accept()`, có một bộ giới hạn tốc độ SYN theo mỗi IP nguồn tùy chọn: `sudo mtbuddy setup syn-limit --preset soft`. Đó là một quy tắc `iptables hashlimit` được cài như một `mtproto-syn-limit.service` oneshot riêng, nên `CAP_NET_ADMIN` không bao giờ được cấp cho proxy. Cũng mặc định tắt và chịu cùng lưu ý về carrier-NAT (preset soft 2/s·burst-5 là mặc định an toàn hơn cho CGNAT); `--remove` để gỡ bỏ, status + bộ đếm drop trong `mtbuddy status`. Chạy lại nó sau khi thay đổi cổng proxy.
 
 ---
 

@@ -219,6 +219,13 @@ sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
+# Optional kernel-level per-IP SYN rate-limit (anti-flood, OFF by default).
+# Drops abusive first-SYN bursts in the kernel BEFORE accept(); separate systemd
+# oneshot so CAP_NET_ADMIN is never granted to the proxy. Default preset is CGNAT-safer.
+sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | hard 1/s·1
+sudo mtbuddy setup syn-limit --status
+sudo mtbuddy setup syn-limit --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 # Remove just the dashboard (leaves the proxy running)
@@ -380,6 +387,7 @@ max_connections = 512
 idle_timeout_sec = 120
 # client_silence_close_sec = 0   # Close a relay whose server reply went unanswered by the client for N sec (breaks an iOS bad_salt wedge where "Updating" hangs ~90-120s) → instant clean reconnect. 0 = off; best-effort, can occasionally close a healthy conn — ~10-15 if you enable it
 handshake_timeout_sec = 15
+# dc_connect_timeout_sec = 10   # Per-endpoint TCP-connect deadline to a Telegram DC; fails a black-holed endpoint fast so failover advances to the next one (within handshake_timeout_sec). 0 = off; never affects healthy connects (<1s)
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
@@ -438,6 +446,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] idle_timeout_jitter_pct` | `15` | Per-connection ±% jitter on the idle timeout so a constant value isn't a fingerprint (`0` disables) |
 | `[server] client_silence_close_sec` | `0` | Close an established relay where the server's last reply has gone unanswered by the client for N seconds, triggering an instant (~450ms) clean reconnect. Breaks an iOS MtProtoKit wedge: after a stale-salt rejection the client discards the salt and stops sending, so "Updating" hangs ~90-120s until the DC closes the socket. Fires only when the last payload was server→client (a healthy idle connection whose last word was its own ping/ack is untouched). Best-effort, not a clean fix: a value below your slowest legitimate response will occasionally close a healthy connection too (just a ~450ms reconnect). `0` = off (default); if enabled, ~`10`–`15` is a sane starting point, tune to taste |
 | `[server] handshake_timeout_sec` | `15` | Handshake completion timeout |
+| `[server] dc_connect_timeout_sec` | `10` | Per-endpoint deadline for the TCP connect to a Telegram DC endpoint. A filtered/black-holed endpoint sends no RST, so the kernel sits in `SYN_SENT` ~2 min; `handshake_timeout_sec` already caps the whole handshake but globally, so a slow first endpoint starves failover for the rest. This fails one dead endpoint fast and advances to the next (within the `handshake_timeout_sec` ceiling). Keep below `handshake_timeout_sec`. `0` = off; healthy connects finish in <1s so it never affects them |
 | `[server] graceful_shutdown_timeout_sec` | `15` | SIGTERM drain timeout before force-close |
 | `[server] middleproxy_buffer_kb` | `2048` | ME per-connection buffer (KiB). Must hold one max RPC frame; below 1024 truncates 1 MiB media parts |
 | `[server] tag` | — | 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
@@ -476,6 +485,8 @@ alice = true   # bypass MiddleProxy for this user
 > **The `dd` ("secure"/padded) transport is rejected by default** (`[censorship].fake_tls_only = true`) — it is plain obfuscated MTProto with **no TLS disguise**, directly fingerprintable as MTProto by DPI. By default the proxy accepts only FakeTLS (`ee`), and `mtbuddy links` prints only `ee` links. To hand out `dd` links (lower-DPI / compatibility scenarios), set `fake_tls_only = false`. See [THREAT_MODEL.md](THREAT_MODEL.md).
 >
 > Both abuse guards are **off by default** so large carrier-NAT, VPN-egress, or shared-office networks (many legitimate clients behind one source IP/subnet) aren't false-positived and blocked together: the per-subnet new-connection rate limit (`rate_limit_per_subnet = 0`) and the exact-IP handshake flood guard (`handshake_flood_guard_enabled = false`). Access is already gated by the per-user secret, the global handshake-inflight budget, and `max_connections`. On a single-tenant / non-NAT host under real abuse, turn them on: set `rate_limit_per_subnet` (e.g. `30`) and `handshake_flood_guard_enabled = true` (tune `handshake_flood_guard_threshold` / window / block).
+>
+> Both of the above run *after* `accept()` (they're in-proxy). For an additional **kernel-level** layer that drops abusive first-SYN bursts *before* they cost a socket/`accept()`, there's an optional per-source-IP SYN rate-limiter: `sudo mtbuddy setup syn-limit --preset soft`. It's an iptables `hashlimit` rule installed as a **separate** `mtproto-syn-limit.service` oneshot, so `CAP_NET_ADMIN` is never granted to the proxy. Also **off by default** and subject to the same carrier-NAT caveat (the `soft` 2/s·burst-5 preset is the CGNAT-safer default); `--remove` to undo, status + drop counter in `mtbuddy status`. Re-run it after changing the proxy port.
 
 ---
 

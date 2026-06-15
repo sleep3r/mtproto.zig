@@ -37,7 +37,7 @@ Secondary assets:
 `mtproto.zig` aims to:
 - make MTProto traffic resemble common TLS traffic
 - reduce fingerprinting by DPI and active probes
-- enforce connection caps; provide an opt-in per-subnet rate limiter and a per-IP handshake flood guard (both disabled by default to avoid carrier-NAT false positives)
+- enforce connection caps; provide an opt-in per-subnet rate limiter and a per-IP handshake flood guard (both disabled by default to avoid carrier-NAT false positives), plus an opt-in kernel-level per-IP SYN rate-limiter (`mtbuddy setup syn-limit`) that drops abusive first-SYN bursts before `accept()` — installed as a separate systemd unit so `CAP_NET_ADMIN` is not granted to the proxy
 - fail safely on invalid handshakes and malformed frames
 - verify release artifacts (signature + checksum) in default install/update flows
 

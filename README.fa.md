@@ -219,6 +219,13 @@ sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
+# محدودیت نرخ SYN در سطح کرنل به ازای هر IP (ضدسیل، به‌صورت پیش‌فرض خاموش — اختیاری).
+# رگبارهای اولین SYNِ سوءاستفاده‌گرانه را در کرنل و پیش از accept() می‌اندازد؛ یک systemd
+# oneshotِ جداگانه تا CAP_NET_ADMIN هرگز به پراکسی داده نشود. پیش‌فرض، پریست امن‌تر برای CGNAT است.
+sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | hard 1/s·1
+sudo mtbuddy setup syn-limit --status
+sudo mtbuddy setup syn-limit --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 
@@ -377,6 +384,7 @@ max_connections = 512
 idle_timeout_sec = 120
 # client_silence_close_sec = 0   # Close a relay whose server reply went unanswered by the client for N sec (breaks an iOS bad_salt wedge where "Updating" hangs ~90-120s) → instant clean reconnect. 0 = off; best-effort, can occasionally close a healthy conn — ~10-15 if you enable it
 handshake_timeout_sec = 15
+# dc_connect_timeout_sec = 10   # مهلت اتصال TCP به ازای هر endpoint به یک DC تلگرام؛ یک endpoint سیاه‌چاله‌شده را سریع ناموفق می‌کند تا failover به بعدی برود (در محدودهٔ handshake_timeout_sec). 0 = خاموش؛ هرگز روی اتصال‌های سالم (<1s) اثر نمی‌گذارد
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
@@ -434,6 +442,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] idle_timeout_jitter_pct` | `15` | لرزش ±٪ به ازای هر اتصال روی مهلت بی‌کاری تا یک مقدار ثابت به اثر انگشت تبدیل نشود (`0` غیرفعال می‌کند) |
 | `[server] client_silence_close_sec` | `0` | بستن ریلهٔ برقرارشده‌ای که آخرین پاسخ سرور N ثانیه بدون پاسخِ کلاینت مانده — که اتصال مجدد تمیز و فوری (~۴۵۰ms) را راه می‌اندازد. یک گیر iOS MtProtoKit را برطرف می‌کند: پس از رد شدن به‌خاطر نمک کهنه، کلاینت نمک را دور می‌اندازد و ارسال را متوقف می‌کند و «در حال به‌روزرسانی» ~۹۰-۱۲۰ ثانیه گیر می‌کند تا DC سوکت را ببندد. فقط وقتی فعال می‌شود که آخرین بستهٔ منتقل‌شده server→client باشد (اتصال idle سالمی که آخرین کارش ping/ack خودش بوده دست‌نخورده می‌ماند). یک راه‌حل موقتِ تلاش‌محور است: مقداری کمتر از کندترین پاسخ مجاز گاهی یک اتصال سالم را هم می‌بندد (فقط ~۴۵۰ms اتصال مجدد). `0` = خاموش (پیش‌فرض)؛ در صورت فعال‌سازی، ~`10`–`15` نقطهٔ شروع منطقی است، به سلیقهٔ خود تنظیم کنید |
 | `[server] handshake_timeout_sec` | `15` | مهلت تکمیل هندشیک |
+| `[server] dc_connect_timeout_sec` | `10` | مهلت اتصال TCP به ازای هر endpoint به یک endpointِ DC تلگرام. یک endpointِ فیلترشده/سیاه‌چاله‌شده هیچ `RST`ی نمی‌فرستد، پس کرنل حدود ۲ دقیقه در `SYN_SENT` می‌ماند؛ `handshake_timeout_sec` کل هندشیک را سقف می‌زند اما به‌صورت سراسری، پس یک endpointِ کندِ نخست، failover را برای بقیه گرسنه نگه می‌دارد. این مهلت، یک endpointِ مرده را سریع ناموفق می‌کند و به بعدی می‌رود (در محدودهٔ سقفِ `handshake_timeout_sec`). آن را کمتر از `handshake_timeout_sec` نگه دارید. `0` = خاموش؛ اتصال‌های سالم در کمتر از ۱ ثانیه تمام می‌شوند پس هرگز روی آن‌ها اثر نمی‌گذارد |
 | `[server] graceful_shutdown_timeout_sec` | `15` | مهلت تخلیه‌ی SIGTERM پیش از بستن اجباری |
 | `[server] middleproxy_buffer_kb` | `1024` | بافر ME برای هر اتصال (KiB). کمتر از 1024 ممکن است در ترافیک رسانه‌ای باعث سرریز شود |
 | `[server] tag` | — | برچسب تبلیغاتیِ 32 کاراکتر hex از [@MTProxybot](https://t.me/MTProxybot) |
@@ -471,6 +480,8 @@ alice = true   # bypass MiddleProxy for this user
 > **ترابری `dd` («امن»/بالشتک‌دار) به‌صورت پیش‌فرض رد می‌شود** (`[censorship].fake_tls_only = true`) — این فقط MTProto مبهم‌سازی‌شده با **بدون استتار TLS** است که مستقیماً توسط DPI به‌عنوان MTProto قابل‌اثرانگشت‌گیری است. به‌صورت پیش‌فرض پراکسی فقط FakeTLS (`ee`) را می‌پذیرد و `mtbuddy links` فقط لینک‌های `ee` را چاپ می‌کند. برای ارائه‌ی لینک‌های `dd` (سناریوهای سازگاری / DPI ضعیف‌تر)، مقدار `fake_tls_only = false` را تنظیم کنید. به [THREAT_MODEL.md](THREAT_MODEL.md) مراجعه کنید.
 >
 > هر دو نگهبانِ سوءاستفاده **به‌صورت پیش‌فرض خاموش‌اند** تا شبکه‌های بزرگ carrier-NAT، خروجی VPN یا دفاتر اشتراکی (با کلاینت‌های مشروع زیاد پشت یک IP/زیرشبکه) به‌اشتباه شناسایی و یکجا مسدود نشوند: محدودیت نرخ اتصال جدید به ازای هر زیرشبکه (`rate_limit_per_subnet = 0`) و نگهبان سیلِ هندشیکِ مبتنی بر IP دقیق (`handshake_flood_guard_enabled = false`). دسترسی پیشاپیش با secret هر کاربر، بودجهٔ سراسریِ هندشیک‌های در جریان و `max_connections` کنترل می‌شود. روی یک هاست تک‌مستأجر / بدون NAT که زیر سوءاستفادهٔ واقعی است، آن‌ها را روشن کنید: `rate_limit_per_subnet` را تنظیم کنید (مثلاً `30`) و `handshake_flood_guard_enabled = true` را قرار دهید (مقادیر `handshake_flood_guard_threshold` / پنجره / مدت مسدودسازی را تنظیم کنید).
+>
+> هر دوی موارد بالا *پس از* `accept()` اجرا می‌شوند (درون-پراکسی هستند). برای یک لایهٔ اضافیِ **سطح-کرنل** که رگبارهای اولین SYNِ سوءاستفاده‌گرانه را *پیش از* آنکه یک سوکت/`accept()` خرج کنند می‌اندازد، یک محدودکنندهٔ نرخ SYN به ازای هر IP مبدأ به‌صورت اختیاری وجود دارد: `sudo mtbuddy setup syn-limit --preset soft`. این یک قانونِ `hashlimit` در iptables است که به‌عنوان یک `mtproto-syn-limit.service` oneshotِ **جداگانه** نصب می‌شود، پس `CAP_NET_ADMIN` هرگز به پراکسی داده نمی‌شود. این نیز **به‌صورت پیش‌فرض خاموش** است و مشمول همان احتیاطِ carrier-NAT می‌شود (پریستِ `soft` با ۲/ثانیه·رگبار-۵ پیش‌فرضِ امن‌تر برای CGNAT است)؛ برای لغوْ `--remove`، وضعیت + شمارندهٔ drop در `mtbuddy status`. پس از تغییر پورت پراکسی، آن را دوباره اجرا کنید.
 
 ---
 

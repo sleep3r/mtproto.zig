@@ -218,6 +218,12 @@ sudo mtbuddy reload
 sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
+# 可选的内核级每 IP SYN 速率限制（防洪水，默认关闭）。
+# 在 accept() 之前就在内核里丢弃滥用性的首个 SYN 突发；用独立的 systemd
+# oneshot 实现，因此从不授予代理 CAP_NET_ADMIN。默认预设对 CGNAT 更安全。
+sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | hard 1/s·1
+sudo mtbuddy setup syn-limit --status
+sudo mtbuddy setup syn-limit --remove
 
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
@@ -377,6 +383,7 @@ max_connections = 512
 idle_timeout_sec = 120
 # client_silence_close_sec = 0   # Close a relay whose server reply went unanswered by the client for N sec (breaks an iOS bad_salt wedge where "Updating" hangs ~90-120s) → instant clean reconnect. 0 = off; best-effort, can occasionally close a healthy conn — ~10-15 if you enable it
 handshake_timeout_sec = 15
+# dc_connect_timeout_sec = 10   # 连接到某个 Telegram DC 端点的每端点 TCP-connect 截止时间；让被黑洞的端点快速失败，从而（在 handshake_timeout_sec 内）让故障转移推进到下一个。0 = 关闭；从不影响健康连接（<1 秒）
 graceful_shutdown_timeout_sec = 15
 log_level = "info"        # debug | info | warn | err
 rate_limit_per_subnet = 0   # 0 = disabled (default; avoids carrier-NAT false positives). Set e.g. 30 for non-NAT hosts
@@ -432,6 +439,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] workers` | `1` | SO_REUSEPORT epoll 工作线程数。`1` = 单线程；`0` = 每个 CPU 一个；`N` 将中继/加密负载分散到多个核心。当 `>1` 时，SIGHUP 配置重载需要重启 |
 | `[server] idle_timeout_sec` | `120` | 连接空闲超时 |
 | `[server] idle_timeout_jitter_pct` | `15` | 对空闲超时施加每连接 ±% 的抖动，避免固定值成为指纹（`0` 表示禁用） |
+| `[server] dc_connect_timeout_sec` | `10` | 连接到某个 Telegram DC 端点的每端点 TCP-connect 截止时间。被过滤/黑洞的端点不会发送 RST，因此内核会在 SYN_SENT 状态停留约 2 分钟；handshake_timeout_sec 虽已对整个握手设上限，但那是全局的，所以一个慢的首个端点会让其余的故障转移挨饿。该项让单个失效端点快速失败并推进到下一个（在 handshake_timeout_sec 上限之内）。保持低于 handshake_timeout_sec。`0` = 关闭；健康连接在 <1 秒内完成，因此从不受其影响 |
 | `[server] client_silence_close_sec` | `0` | 当服务器最后一条回复已 N 秒未被客户端应答时关闭该已建立中继，触发即时（~450 毫秒）干净重连。修复 iOS MtProtoKit 卡死：盐过期被拒后客户端丢弃盐、停止发送，"更新中"卡住 ~90-120 秒直到 DC 关闭套接字。仅当最后一个负载是 server→client 时才触发（最后一次动作是自身 ping/ack 的健康空闲连接不受影响）。尽力而为的权宜之计：低于最慢合法响应的值偶尔也会关掉健康连接（仅 ~450ms 重连）。`0` = 关闭（默认）；如启用，~`10`–`15` 为合理起点，自行调整 |
 | `[server] handshake_timeout_sec` | `15` | 握手完成超时 |
 | `[server] graceful_shutdown_timeout_sec` | `15` | 强制关闭前 SIGTERM 排空超时 |
@@ -471,6 +479,8 @@ alice = true   # bypass MiddleProxy for this user
 > **`dd`（“安全”/填充）传输默认被拒绝**（`[censorship].fake_tls_only = true`）—— 它是纯粹混淆的 MTProto，**没有任何 TLS 伪装**，可被 DPI 直接识别为 MTProto 特征。默认情况下代理只接受 FakeTLS（`ee`），且 `mtbuddy links` 只打印 `ee` 链接。若要发放 `dd` 链接（低 DPI / 兼容性场景），请设置 `fake_tls_only = false`。参见 [THREAT_MODEL.md](THREAT_MODEL.md)。
 >
 > 两个滥用防护默认均关闭，以免大型运营商 NAT、VPN 出口或共享办公网络（许多合法客户端共用一个源 IP/子网）被误判并一起拦截：每子网的新建连接速率限制（`rate_limit_per_subnet = 0`）与精确 IP 的握手洪水防护（`handshake_flood_guard_enabled = false`）。访问本就已由每用户密钥、全局握手在途预算以及 `max_connections` 把关。在遭受真实滥用的单租户 / 非 NAT 主机上，请将它们开启：设置 `rate_limit_per_subnet`（如 `30`）并设 `handshake_flood_guard_enabled = true`（调整 `handshake_flood_guard_threshold` / 窗口 / 拦截时长）。
+>
+> 上述两者都在 accept() 之后运行（它们在代理进程内）。如果还需要一个内核级的层级，在滥用性的首个 SYN 突发耗费 socket/accept() 之前就将其丢弃，可使用一个可选的每源 IP SYN 速率限制器：`sudo mtbuddy setup syn-limit --preset soft`。它是一条 iptables hashlimit 规则，作为独立的 mtproto-syn-limit.service oneshot 安装，因此从不授予代理 CAP_NET_ADMIN。同样默认关闭，并受同样的运营商 NAT 注意事项约束（soft 2/s·burst-5 预设是对 CGNAT 更安全的默认值）；用 --remove 撤销，drop 计数与状态见 mtbuddy status。更改代理端口后请重新运行它。
 
 ---
 

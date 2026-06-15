@@ -213,6 +213,13 @@ sudo mtbuddy setup masking --domain rutube.ru
 sudo mtbuddy setup nfqws
 sudo mtbuddy setup recovery
 
+# Опциональное ограничение SYN на уровне ядра (анти-флуд, по умолчанию ВЫКЛ).
+# Дропает абьюзные SYN-всплески в ядре ДО accept(); отдельный systemd-oneshot,
+# поэтому CAP_NET_ADMIN не выдаётся прокси. Пресет по умолчанию безопаснее для CGNAT.
+sudo mtbuddy setup syn-limit --preset soft   # soft 2/с·5 | medium 1/с·3 | hard 1/с·1
+sudo mtbuddy setup syn-limit --status
+sudo mtbuddy setup syn-limit --remove
+
 # Установить web dashboard
 sudo mtbuddy setup dashboard
 # Удалить только дашборд (прокси продолжит работать)
@@ -364,6 +371,7 @@ max_connections = 512
 idle_timeout_sec = 120
 # client_silence_close_sec = 0   # Закрывать релей, где ответ сервера остался без ответа клиента N сек (ломает iOS-затык на bad_salt, где «обновление» висит ~90-120с) → мгновенный чистый реконнект. 0 = выкл; best-effort, изредка закрывает и здоровый коннект — ~10-15 если включаете
 handshake_timeout_sec = 15
+# dc_connect_timeout_sec = 10   # Дедлайн TCP-connect до эндпоинта Telegram DC; быстро отбрасывает заблэкхоленный эндпоинт, чтобы failover перешёл к следующему (в рамках handshake_timeout_sec). 0 = выкл; на здоровые коннекты (<1с) не влияет
 graceful_shutdown_timeout_sec = 15
 log_level = "info"
 rate_limit_per_subnet = 0   # 0 = выключено (по умолчанию; не ложно-срабатывает на carrier-NAT). Для не-NAT хостов задайте напр. 30
@@ -413,6 +421,7 @@ alice = true
 | `[server] handshake_flood_guard_window_sec` | `30` | Окно подсчёта для `handshake_flood_guard_threshold` |
 | `[server] handshake_flood_guard_block_sec` | `120` | Длительность временного deny для шумного IP |
 | `[server] idle_timeout_jitter_pct` | `15` | Джиттер ±% на idle-таймаут соединения, чтобы константа не была сигнатурой (`0` — выключить) |
+| `[server] dc_connect_timeout_sec` | `10` | Per-endpoint дедлайн TCP-connect до эндпоинта Telegram DC. Заблэкхоленный эндпоинт не шлёт RST, и ядро держит `SYN_SENT` ~2 мин; `handshake_timeout_sec` уже ограничивает весь handshake, но глобально, поэтому медленный первый эндпоинт съедает бюджет failover для остальных. Это быстро отбрасывает один мёртвый эндпоинт и переходит к следующему (в пределах `handshake_timeout_sec`). Держите ниже `handshake_timeout_sec`. `0` = выкл; здоровые коннекты (<1с) не затрагиваются |
 | `[server] client_silence_close_sec` | `0` | Закрывать установленный релей, где последний ответ сервера остался без ответа клиента N секунд — это даёт мгновенный (~450мс) чистый реконнект. Ломает затык iOS MtProtoKit: после отказа по протухшей соли клиент выбрасывает соль и перестаёт слать, и «обновление» висит ~90-120с, пока DC сам не закроет сокет. Срабатывает только когда последним по проводу был s2c (здоровый idle-коннект, чьё последнее слово — свой пинг/ack, не трогается). Best-effort, не полное лечение: значение ниже самого медленного легитимного ответа изредка закроет и здоровый коннект (лишний ~450мс реконнект). `0` = выкл (дефолт); если включаете, ~`10`–`15` разумная отправная точка, дальше под себя |
 | `[censorship] tls_domain` | `"google.com"` | Домен для TLS-маскировки |
 | `[censorship] mask` | `true` | Forward invalid clients на `tls_domain` |
@@ -432,6 +441,8 @@ alice = true
 > **Транспорт `dd` («secure»/padded) по умолчанию отключён** (`[censorship].fake_tls_only = true`) — это обычный обфусцированный MTProto **без TLS-маскировки**, который DPI фингерпринтит напрямую как MTProto. По умолчанию прокси принимает только FakeTLS (`ee`), и `mtbuddy links` печатает только `ee`-ссылки. Чтобы раздавать `dd`-ссылки (сценарии с низким DPI / совместимость), задайте `fake_tls_only = false`. См. [THREAT_MODEL.md](THREAT_MODEL.md).
 >
 > Оба стража **по умолчанию выключены**, чтобы carrier-NAT, VPN-egress и офисные сети (много легитимных клиентов за одним IP/подсетью) не получали ложных блокировок скопом: per-subnet rate limit (`rate_limit_per_subnet = 0`) и exact-IP handshake flood guard (`handshake_flood_guard_enabled = false`). Доступ и так закрыт per-user secret, глобальным handshake-inflight бюджетом и `max_connections`. На single-tenant / не-NAT хосте под реальным абьюзом включите: задайте `rate_limit_per_subnet` (например `30`) и `handshake_flood_guard_enabled = true` (настройте `handshake_flood_guard_threshold` / window / block).
+>
+> Оба стража выше работают *после* `accept()` (внутри прокси). Для дополнительного **уровня ядра**, который дропает абьюзные SYN-всплески *до* того, как они займут сокет/`accept()`, есть опциональный лимитер SYN по IP-источнику: `sudo mtbuddy setup syn-limit --preset soft`. Это правило iptables `hashlimit`, поставленное как **отдельный** oneshot `mtproto-syn-limit.service`, поэтому `CAP_NET_ADMIN` прокси не выдаётся. Тоже **выключен по умолчанию** и с той же оговоркой про carrier-NAT (пресет `soft` 2/с·burst-5 — безопаснее для CGNAT); `--remove` для отката, статус + счётчик дропов в `mtbuddy status`. Перезапустите после смены порта прокси.
 
 ---
 
