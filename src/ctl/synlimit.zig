@@ -12,6 +12,14 @@
 //!
 //! Default OFF and gated behind a loud CGNAT/VPN warning: like the in-proxy guards,
 //! a per-IP SYN limiter false-positives when many real users share one egress IP.
+//!
+//! Over-limit action is DROP by default (correct for pure flood defense: don't waste
+//! a reply packet per abusive SYN, don't confirm the port to a scanner). `--reject`
+//! switches it to REJECT --reject-with tcp-reset, which is what you want when the
+//! limiter is used to survive the June-2026 TSPU parallel-connect block rather than a
+//! flood: a silent DROP makes a throttled client wait a full TCP retransmit (~20s to
+//! connect), whereas an RST lets it retry immediately (~5s). See
+//! blocking-2026-06 notes / THREAT_MODEL.md.
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -58,7 +66,16 @@ pub const SynLimitOpts = struct {
     action: Action = .status,
     rate: []const u8 = "2/second",
     burst: []const u8 = "5",
+    /// Over-limit action: false = DROP (flood defense), true = REJECT --reject-with
+    /// tcp-reset (faster client reconnect when limiting for TSPU-evasion).
+    reject: bool = false,
 };
+
+/// The iptables `-j` target for over-limit SYNs. A fixed internal string (never user
+/// input), baked verbatim into the generated script.
+fn overLimitTarget(reject: bool) []const u8 {
+    return if (reject) "REJECT --reject-with tcp-reset" else "DROP";
+}
 
 /// Run in CLI mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
@@ -94,6 +111,12 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             }
             opts.burst = val;
             opts.action = .apply;
+        } else if (std.mem.eql(u8, arg, "--reject")) {
+            // Over-limit SYNs get an RST instead of a silent drop (faster reconnect
+            // for TSPU-evasion). Combine with --preset/--rate/--burst to apply.
+            opts.reject = true;
+        } else if (std.mem.eql(u8, arg, "--drop")) {
+            opts.reject = false;
         }
     }
     try execute(ui, allocator, opts);
@@ -228,6 +251,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: SynLimitOpts) !void
         .port = port,
         .rate = opts.rate,
         .burst = opts.burst,
+        .target = overLimitTarget(opts.reject),
         .iptables = ipt.iptables,
         .ip6tables = ipt.ip6tables,
     }) catch {
@@ -250,7 +274,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: SynLimitOpts) !void
     // Verify the rule actually landed: if xt_hashlimit is missing the script's strict
     // IPv4 lines fail and the oneshot is marked failed — surface that instead of a
     // silent no-op that looks installed.
-    if (!sys.isServiceActive(SERVICE_NAME) or !chainHasDrop(allocator, ipt.iptables)) {
+    if (!sys.isServiceActive(SERVICE_NAME) or !chainHasLimitRule(allocator, ipt.iptables)) {
         ui.fail(tr(ui, "SYN rate-limit did not apply (is the hashlimit iptables module available?)", "Ограничение SYN не применилось (доступен ли модуль iptables hashlimit?)"));
         ui.hint("journalctl -u " ++ SERVICE_NAME ++ " --no-pager -n 20");
         return;
@@ -261,6 +285,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: SynLimitOpts) !void
         .{ .label = tr(ui, "Port:", "Порт:"), .value = port, .style = .label_value },
         .{ .label = tr(ui, "Rate:", "Частота:"), .value = opts.rate, .style = .label_value },
         .{ .label = tr(ui, "Burst:", "Burst:"), .value = opts.burst, .style = .label_value },
+        .{ .label = tr(ui, "Action:", "Действие:"), .value = if (opts.reject) "REJECT (tcp-reset)" else "DROP", .style = .label_value },
         .{ .label = tr(ui, "Service:", "Сервис:"), .value = SERVICE_NAME, .style = .label_value },
         .{ .label = "", .value = "", .style = .blank },
         .{ .label = tr(ui, "Per source-IP, dropped pre-accept() in the kernel", "По каждому IP-источнику, дроп до accept() в ядре"), .style = .success },
@@ -272,13 +297,13 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: SynLimitOpts) !void
 /// and by `mtbuddy status`.
 pub fn printStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     if (sys.isServiceActive(SERVICE_NAME)) {
-        const drops = dropCount(allocator);
+        const drops = limitedCount(allocator);
         if (drops) |d| {
             var buf: [96]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "{s} ({s} {s})", .{
                 tr(ui, "Kernel SYN rate-limit is active", "Ограничение SYN на уровне ядра активно"),
                 d,
-                tr(ui, "SYNs dropped", "SYN дропнуто"),
+                tr(ui, "SYNs blocked", "SYN заблокировано"),
             }) catch tr(ui, "Kernel SYN rate-limit is active", "Ограничение SYN на уровне ядра активно");
             ui.ok(msg);
             allocator.free(d);
@@ -296,6 +321,9 @@ const ScriptParams = struct {
     port: []const u8,
     rate: []const u8,
     burst: []const u8,
+    /// iptables `-j` target for over-limit SYNs — "DROP" or "REJECT --reject-with
+    /// tcp-reset". Internal constant (see overLimitTarget), never user input.
+    target: []const u8 = "DROP",
     iptables: []const u8,
     ip6tables: []const u8,
 };
@@ -319,6 +347,8 @@ pub fn renderScript(buf: []u8, p: ScriptParams) ![]const u8 {
         \\IPT={[iptables]s}
         \\IP6T={[ip6tables]s}
         \\MODE="$1"
+        \\# Over-limit target (DROP for flood defense, or REJECT --reject-with tcp-reset).
+        \\ACTION="{[target]s}"
         \\
         \\# Idempotent reset: drop the jump, flush + delete the chain (both families).
         \\for T in "$IPT" "$IP6T"; do
@@ -331,13 +361,13 @@ pub fn renderScript(buf: []u8, p: ScriptParams) ![]const u8 {
         \\
         \\# IPv4 (required — a failure here fails the unit so the operator notices).
         \\"$IPT" -N "$CHAIN" 2>/dev/null || true
-        \\"$IPT" -A "$CHAIN" -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j DROP
+        \\"$IPT" -A "$CHAIN" -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION
         \\"$IPT" -A "$CHAIN" -j RETURN
         \\"$IPT" -I INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN"
         \\
         \\# IPv6 (best-effort — hosts without IPv6 must not fail the unit).
         \\"$IP6T" -N "$CHAIN" 2>/dev/null || true
-        \\"$IP6T" -A "$CHAIN" -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j DROP 2>/dev/null || true
+        \\"$IP6T" -A "$CHAIN" -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION 2>/dev/null || true
         \\"$IP6T" -A "$CHAIN" -j RETURN 2>/dev/null || true
         \\"$IP6T" -I INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null || true
         \\exit 0
@@ -348,6 +378,7 @@ pub fn renderScript(buf: []u8, p: ScriptParams) ![]const u8 {
         .port = p.port,
         .rate = p.rate,
         .burst = p.burst,
+        .target = p.target,
         .iptables = p.iptables,
         .ip6tables = p.ip6tables,
     });
@@ -395,29 +426,35 @@ fn flushChain(allocator: std.mem.Allocator, ipt: []const u8) void {
     sys.execSilent(allocator, &.{ "bash", "-c", cmd });
 }
 
-fn chainHasDrop(allocator: std.mem.Allocator, ipt: []const u8) bool {
+/// True if the chain carries our over-limit rule, whichever target it uses (DROP for
+/// flood defense, REJECT for the --reject / TSPU-evasion mode).
+fn chainHasLimitRule(allocator: std.mem.Allocator, ipt: []const u8) bool {
     const result = sys.exec(allocator, &.{ ipt, "-nL", CHAIN }) catch return false;
     defer result.deinit();
     if (result.exit_code != 0) return false;
-    return std.mem.indexOf(u8, result.stdout, "DROP") != null;
+    return lineHasLimitTarget(result.stdout);
 }
 
-/// Sum the DROP rule's packet counter from `iptables -nvxL CHAIN`. Returns an owned
-/// slice (caller frees) or null when unavailable.
-fn dropCount(allocator: std.mem.Allocator) ?[]const u8 {
+/// Sum the limit rule's packet counter from `iptables -nvxL CHAIN`. Returns an owned
+/// slice (caller frees) or null when unavailable. Matches either DROP or REJECT.
+fn limitedCount(allocator: std.mem.Allocator) ?[]const u8 {
     const ipt = iptablesCommands().iptables;
     const result = sys.exec(allocator, &.{ ipt, "-nvxL", CHAIN }) catch return null;
     defer result.deinit();
     if (result.exit_code != 0) return null;
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "DROP") == null) continue;
+        if (!lineHasLimitTarget(line)) continue;
         var tok = std.mem.tokenizeAny(u8, line, " \t");
         const pkts = tok.next() orelse continue;
         if (!isValidNumber(pkts)) continue;
         return allocator.dupe(u8, pkts) catch null;
     }
     return null;
+}
+
+fn lineHasLimitTarget(s: []const u8) bool {
+    return std.mem.indexOf(u8, s, "DROP") != null or std.mem.indexOf(u8, s, "REJECT") != null;
 }
 
 fn parsePreset(s: []const u8) ?Preset {
@@ -487,7 +524,34 @@ test "renderScript bakes params and stays brace-free for std.fmt" {
     try std.testing.expect(std.mem.indexOf(u8, out, "BURST=5") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "CHAIN=MTPROTO_SYNLIMIT") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "-I INPUT -p tcp --dport \"$PORT\" --syn -j \"$CHAIN\"") != null);
+    // Default over-limit target is DROP.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ACTION=\"DROP\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-j $ACTION") != null);
     // No raw curly braces should survive into the generated script.
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '{') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '}') == null);
+}
+
+test "renderScript uses REJECT tcp-reset when requested" {
+    var buf: [2048]u8 = undefined;
+    const out = try renderScript(&buf, .{
+        .port = "443",
+        .rate = "54/minute",
+        .burst = "1",
+        .target = overLimitTarget(true),
+        .iptables = "/usr/sbin/iptables",
+        .ip6tables = "/usr/sbin/ip6tables",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "ACTION=\"REJECT --reject-with tcp-reset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "RATE=54/minute") != null);
+    // The over-limit rule references the ACTION variable, never a hard-coded DROP.
+    try std.testing.expect(std.mem.indexOf(u8, out, "-j $ACTION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-j DROP") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, '{') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, '}') == null);
+}
+
+test "overLimitTarget maps the reject flag" {
+    try std.testing.expectEqualStrings("DROP", overLimitTarget(false));
+    try std.testing.expectEqualStrings("REJECT --reject-with tcp-reset", overLimitTarget(true));
 }
