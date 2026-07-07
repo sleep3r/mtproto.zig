@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.0](https://github.com/sleep3r/mtproto.zig/compare/v1.9.0...v1.10.0) (2026-07-07)
+
+
+### Features
+
+* respond to the June-2026 TSPU block (PQ fronting-domain marker + SYN REJECT mode) ([#375](https://github.com/sleep3r/mtproto.zig/issues/375)) ([3ca5450](https://github.com/sleep3r/mtproto.zig/commit/3ca54502dd1db5006bec53b19fdccff973df395c))
+
 ## [1.9.0](https://github.com/sleep3r/mtproto.zig/compare/v1.8.1...v1.9.0) (2026-06-15)
 
 
