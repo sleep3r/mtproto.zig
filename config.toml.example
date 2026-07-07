@@ -210,9 +210,12 @@ port = 443
 
 [censorship]
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
-# Choose a popular, high-traffic domain that negotiates single-round x25519 (most big
-# sites: rutube.ru, ozon.ru, vk.com, yandex.ru). Avoid HRR/secp521r1 domains like
-# wb.ru — our single-round FakeTLS can't match them. ⚠️ Immutable once links ship.
+# Since June 2026 pick a popular domain that negotiates single-round X25519MLKEM768
+# (post-quantum) — a classical-x25519-only domain now marks iOS clients (and everyone
+# on their NAT IP) for blocking. Verify a candidate + the exact IP you'll use with:
+#   openssl s_client -groups X25519MLKEM768 -connect <domain>:443   (needs OpenSSL 3.5+)
+# or @Sni_checker_bot. Avoid HRR/secp521r1 domains (e.g. wb.ru) — our single-round
+# FakeTLS can't match them either way. ⚠️ Immutable once links ship — choose carefully.
 tls_domain = "rutube.ru"
 
 # Forward unauthenticated / invalid connections to tls_domain (active probing defense).

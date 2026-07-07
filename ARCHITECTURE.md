@@ -81,8 +81,9 @@ AES-CTR runs **8-wide** on the block-aligned bulk (`src/crypto/crypto.zig`).
 
 ## FakeTLS fronting & domain selection
 
-The FakeTLS ServerHello is a fixed three-record shape — `ServerHello` (one x25519
-key_share, a client-echoed cipher) + `ChangeCipherSpec` + one `ApplicationData`
+The FakeTLS ServerHello is a fixed three-record shape — `ServerHello` (one key_share:
+an X25519MLKEM768 `0x11ec` share when the client offered one, else a classical x25519
+share, plus a client-echoed cipher) + `ChangeCipherSpec` + one `ApplicationData`
 "certificate" record — validated by the Telegram client only for framing + the HMAC
 in `server-random`. Two hard constraints follow:
 
@@ -92,23 +93,32 @@ in `server-random`. Two hard constraints follow:
    Treat it as frozen the moment a link is shared. (See `config.zig` /
    [COMPATIBILITY.md](COMPATIBILITY.md).)
 
-2. **We can only mimic a domain whose genuine TLS 1.3 is single-round x25519.** Our
-   FakeTLS emits exactly one ServerHello with an **x25519** key_share and cannot
-   replicate a `HelloRetryRequest` or a non-x25519 group. So a *good* fronting
-   domain negotiates **x25519 in one round** for a modern (Chrome-shaped, MLKEM-
-   offering) ClientHello — the client offers key_shares for both MLKEM and x25519,
-   and such a server simply picks x25519, which is exactly what we emit. Big RU
-   sites like `rutube.ru`, `ozon.ru`, `vk.com`, `yandex.ru`, `dzen.ru` do this.
+2. **We can only mimic a domain whose genuine TLS 1.3 is single-round, and since June
+   2026 it must support X25519MLKEM768.** Our FakeTLS emits exactly one ServerHello,
+   with either an X25519MLKEM768 (`0x11ec`) key_share (when the client offered it) or a
+   classical x25519 key_share — never an HRR, never a group the client didn't offer.
+   Two things make a domain a *good* target:
 
-   Some domains do **not**: e.g. `wb.ru` and `mail.ru` prefer `secp521r1` and send a
-   `HelloRetryRequest` (they even fail an x25519-only hello). For such a domain a
-   genuine handshake is `ClientHello → HRR → ClientHello#2 → ServerHello(secp521r1)`
-   while ours is a single `ServerHello(x25519)` — a **passive ServerHello mismatch we
-   cannot fix without changing `tls_domain`**, which constraint (1) forbids. The
-   installer therefore probes the chosen domain and **warns** if it is a poor mimicry
-   target, so the choice is made well *before* the link is locked. There is no
-   runtime fix for an already-distributed link pointed at a poor domain — it is an
-   accepted residual.
+   - **Single round, no HRR.** For a modern (Chrome-shaped, MLKEM-offering) ClientHello
+     the domain must answer in one ServerHello. `wb.ru` / `mail.ru` prefer `secp521r1`
+     and send a `HelloRetryRequest` (genuine handshake:
+     `ClientHello → HRR → ClientHello#2 → ServerHello(secp521r1)`) while ours is a
+     single record — an unfixable **passive ServerHello mismatch**.
+   - **Post-quantum capable.** Since the night of 4→5 June 2026 the TSPU flags a domain
+     that negotiates *only* classical x25519 (declining X25519MLKEM768): iOS clients —
+     and everyone on their NAT egress IP — fronting such a domain get blocked. The
+     signal is a property of the **domain** (the censor probes the SNI out-of-band), so
+     our 0x11ec echo can't buy it back; the domain itself must negotiate
+     X25519MLKEM768. A PQ-capable domain that does so in one round is exactly what our
+     FakeTLS mimics via the 0x11ec echo, so it satisfies both requirements at once. See
+     [THREAT_MODEL.md](THREAT_MODEL.md) "Post-quantum key_share".
+
+   The installer probes the chosen domain (`src/ctl/fronting_domain.zig`, offering
+   `X25519MLKEM768:X25519`) and **warns** if it does only classical x25519 or an HRR,
+   so the choice is made well *before* the link is locked. There is no runtime fix for
+   an already-distributed link pointed at a poor domain — it is an accepted residual,
+   and the `tls_domain` immutability in (1) means an existing deploy on a now-marked
+   domain cannot migrate without invalidating every link.
 
 **Masking / active probes** are independent of the link: non-validating (no-secret)
 traffic is transparently relayed to the mask target. Field-verified behavior
@@ -116,9 +126,12 @@ traffic is transparently relayed to the mask target. Field-verified behavior
 
 - Fronting the **real** domain (`mask_port=443` → `tls_domain:443`) makes a prober
   see the genuine site + a CA-chained cert — **verified working** for a single-round
-  domain (probing the proxy fronting `rutube.ru` returned its real GlobalSign cert).
+  domain (probing the proxy fronting `rutube.ru` returned its real GlobalSign cert;
+  note that domain-selection guidance has since tightened to require X25519MLKEM768 —
+  see constraint 2 — so re-probe any candidate for PQ support before committing).
   This requires the proxy to resolve the domain — see the DNS note below.
-- It only works for domains whose TLS 1.3 is **single-round x25519**. Our relay
+- It only works for domains whose TLS 1.3 is **single-round** (x25519 or the PQ
+  hybrid). Our relay
   carries a single ClientHello↔ServerHello exchange, **not** a `HelloRetryRequest`
   multi-round. Fronting an HRR domain (e.g. `wb.ru`) yields an *incomplete* handshake
   (no certificate) — worse than a complete one. This is the same reason such domains

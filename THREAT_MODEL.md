@@ -109,6 +109,23 @@ encapsulation: FakeTLS clients validate only record framing + the HMAC in
 server-random, passive fingerprinting keys on the *group and size*, and we are not a
 TLS terminator — so a cryptographically valid ciphertext is unnecessary.)
 
+**The `tls_domain` must itself support X25519MLKEM768 (June-2026 TSPU marker).** The
+echo above fixes the *connection-level* downgrade tell, but there is a second,
+domain-level check the TSPU rolled out the night of 4→5 June 2026 that the echo does
+**not** address. The censor appears to probe the *SNI domain* out-of-band for
+post-quantum support and blocks the flow when the domain lacks it: a `tls_domain`
+whose real TLS 1.3 negotiates only classical x25519 (no X25519MLKEM768) is a passive
+marker, and iOS clients — plus **everyone sharing their NAT egress IP** — fronting
+such a domain get dropped. Because the signal is a property of the domain (evidence:
+the community's fix is "change the domain", `@Sni_checker_bot` checks a *domain*, a
+self-signed backend must run OpenSSL 3.5+ to offer the group, and one domain's two IPs
+can score differently), our own ServerHello can't buy it back. The only lever is
+choosing a `tls_domain` that genuinely negotiates X25519MLKEM768 in a single round —
+which our FakeTLS then mimics correctly via the 0x11ec echo. `mtbuddy install` /
+`setup masking` now probe for this and warn. This collides with `tls_domain`
+immutability: a live deploy already pinned to a classical-x25519 domain cannot migrate
+without invalidating every distributed link. (See `src/ctl/fronting_domain.zig`.)
+
 It does **not** defend against a third strategy that DPI vendors are now leaning on:
 **SNI ↔ destination-IP consistency.** When `tls_domain` is a well-known third-party
 domain that does not resolve to your proxy's IP, a DPI box can flag the flow *passively*,
@@ -130,18 +147,21 @@ strongest to most practical:
 2. **Prefer a plausible, less-prominent borrowed domain** over a globally famous one. A
    massively popular CDN-hosted domain is the easiest IP↔SNI mismatch to catch; a
    regional / less-watched HTTPS site is a weaker signal. It must still pass the
-   single-round-x25519 ServerHello check below.
+   single-round X25519MLKEM768 ServerHello check below.
 3. **IP and egress hygiene.** Borrowed-SNI FakeTLS is worth most when the *IP itself*
    isn't already burned: prefer a fresh address, and use IPv6 rotation
    (`mtbuddy ipv6-hop`) and/or tunnel egress so the visible endpoint isn't a long-lived,
    reputation-flagged IP.
 
-**Separate but related — ServerHello suitability.** The synthetic ServerHello does a
-single-round x25519 key exchange with no HelloRetryRequest. A `tls_domain` whose real
-TLS 1.3 server prefers a non-x25519 group or issues an HRR (e.g. `wb.ru`, `mail.ru`
-select secp521r1) produces a *passive ServerHello mismatch* independent of the IP↔SNI
-issue. `mtbuddy install` / `setup masking` warn about this; prefer a domain that
-negotiates x25519 in a single round.
+**Separate but related — ServerHello suitability.** The synthetic ServerHello is a
+single-round exchange with no HelloRetryRequest, emitting either an X25519MLKEM768
+(0x11ec) or a classical x25519 key_share depending on what the client offered. A
+`tls_domain` whose real TLS 1.3 server issues an HRR or prefers a group we can't emit
+(e.g. `wb.ru`, `mail.ru` select secp521r1) produces a *passive ServerHello mismatch*
+independent of the IP↔SNI issue. Combined with the June-2026 domain marker above, the
+target to prefer is a domain that negotiates **X25519MLKEM768 in a single round**;
+`mtbuddy install` / `setup masking` warn when a domain does only classical x25519 or
+does an HRR.
 
 Bottom line: FakeTLS with a borrowed SNI is strong camouflage against handshake
 fingerprinting and active probing, but it is **not** a guarantee against IP↔SNI

@@ -281,13 +281,25 @@ pub const Config = struct {
     /// as hex, so the tg:// link is a function of (secret, tls_domain). Changing
     /// tls_domain changes EVERY user's link — never do it on a live deployment.
     ///
-    /// Mimicry note: our 3-record FakeTLS emits ONE ServerHello with an x25519
-    /// key_share and cannot replicate a HelloRetryRequest. Pick a domain whose
-    /// genuine TLS 1.3 negotiates **x25519 in a single round** (most big sites:
-    /// rutube.ru, ozon.ru, vk.com, yandex.ru, dzen.ru). Domains that prefer
-    /// secp521r1 / reject x25519 and HRR (e.g. wb.ru, mail.ru) produce a passive
-    /// ServerHello mismatch that cannot be fixed without changing tls_domain —
-    /// which the immutability rule above forbids. So choose well at install time.
+    /// Mimicry note: our 3-record FakeTLS emits ONE ServerHello, single-round, no
+    /// HelloRetryRequest. It echoes an X25519MLKEM768 (0x11ec) key_share when the
+    /// client offered one and a classical x25519 (0x001d) key_share otherwise — so it
+    /// can mimic a domain that negotiates **either group in a single round**.
+    ///
+    /// Since the June-2026 TSPU rollout, prefer a domain that negotiates
+    /// **X25519MLKEM768** (post-quantum). A domain that only does classical x25519 is
+    /// now a passive marker: iOS clients — and everyone sharing their NAT egress IP —
+    /// fronting such a domain get blocked (the TSPU appears to probe the SNI domain
+    /// out-of-band for PQ support, so this is a property of the *domain*, not of the
+    /// ServerHello we emit). Verify a candidate with:
+    ///   openssl s_client -groups X25519MLKEM768 -connect <domain>:443   (OpenSSL 3.5+)
+    /// or the @Sni_checker_bot. Note one domain can have multiple IPs with mixed PQ
+    /// support (e.g. rutube.ru), giving inconsistent results — check the IP you'll use.
+    ///
+    /// Domains that prefer secp521r1 / reject x25519 and HRR (e.g. wb.ru, mail.ru) stay
+    /// unmimicable regardless (our single-round ServerHello can't match an HRR). None
+    /// of this is fixable without changing tls_domain — which the immutability rule
+    /// above forbids — so choose well at install time.
     /// See ARCHITECTURE.md "FakeTLS fronting & domain selection".
     tls_domain: []const u8 = default_tls_domain,
     users: std.StringHashMap([16]u8),
