@@ -927,17 +927,7 @@ pub const Tui = struct {
     // ── Line reading ───────────────────────────────────────────────────────
 
     fn readLine(self: *Self) ![]const u8 {
-        return self.readLineSeeded(null);
-    }
-
-    /// Like readLine, but the buffer can be pre-seeded with a first byte that was already
-    /// consumed in raw mode (see readLineOrBack). The rest of the line is read cooked.
-    fn readLineSeeded(self: *Self, seed: ?u8) ![]const u8 {
         var pos: usize = 0;
-        if (seed) |s| {
-            self.line_buf[0] = s;
-            pos = 1;
-        }
         while (pos < self.line_buf.len) {
             var byte: [1]u8 = undefined;
             const n = std.posix.read(self.in_fd, &byte) catch return error.InputError;
@@ -961,25 +951,26 @@ pub const Tui = struct {
     }
 
     /// Read a line for a prompt, but return error.GoBack if the user presses Esc/← at the
-    /// empty prompt (the natural "I want to step back" moment). The first key is read in raw
-    /// mode: Esc/← → back, Ctrl+C → exit, Enter → empty line. A printable first byte is echoed
-    /// and the rest of the line is read in cooked mode, so UTF-8 input and long pastes behave
-    /// exactly as a normal line read. Non-TTY (piped) input has no "back" — it reads straight.
+    /// empty prompt (the natural "I want to step back" moment). TTY input stays in raw mode
+    /// until Enter so every byte lives in one editable buffer. Switching to cooked mode after
+    /// the first byte would make that byte invisible to terminal Backspace and FLUSH the rest
+    /// of a paste while restoring termios (#378). Non-TTY input has no "back" — it reads a
+    /// normal cooked line.
     fn readLineOrBack(self: *Self) ![]const u8 {
         if (!self.is_tty) return self.readLine();
 
         self.enterRawMode();
-        var seed: ?u8 = null;
-        var got_enter = false;
+        defer self.exitRawMode();
+
+        var pos: usize = 0;
         while (true) {
             const ev = self.readKey() catch |err| {
-                self.exitRawMode();
+                if (err == error.EndOfStream and pos > 0) return self.line_buf[0..pos];
                 return err;
             };
             switch (ev.key) {
                 .escape, .left => {
-                    self.exitRawMode();
-                    return error.GoBack;
+                    if (pos == 0) return error.GoBack;
                 },
                 .ctrl_c => {
                     self.exitRawMode();
@@ -987,23 +978,39 @@ pub const Tui = struct {
                     std.process.exit(0);
                 },
                 .enter => {
-                    got_enter = true;
-                    break;
+                    self.writeRaw("\n");
+                    return self.line_buf[0..pos];
                 },
                 .char => {
-                    self.writeRaw(&[_]u8{ev.ch}); // echo the byte we consumed in raw mode
-                    seed = ev.ch;
-                    break;
+                    if (pos < self.line_buf.len) {
+                        self.line_buf[pos] = ev.ch;
+                        pos += 1;
+                        self.writeRaw(&[_]u8{ev.ch});
+                    }
                 },
-                else => continue, // arrows/space/backspace at an empty prompt: ignore
+                .space => {
+                    if (pos < self.line_buf.len) {
+                        self.line_buf[pos] = ' ';
+                        pos += 1;
+                        self.writeRaw(" ");
+                    }
+                },
+                .backspace => {
+                    if (pos == 0) continue;
+
+                    // Remove one complete UTF-8 codepoint, not just its last continuation
+                    // byte. VPN links are ASCII, but input() is shared by localized prompts.
+                    var start = pos - 1;
+                    while (start > 0 and self.line_buf[start] & 0xc0 == 0x80) {
+                        start -= 1;
+                    }
+                    const columns = @max(visibleLen(self.line_buf[start..pos]), 1);
+                    pos = start;
+                    for (0..columns) |_| self.writeRaw("\x08 \x08");
+                },
+                else => {}, // Up/down/right do not edit a simple line prompt.
             }
         }
-        self.exitRawMode();
-        if (got_enter) {
-            self.writeRaw("\n");
-            return self.line_buf[0..0];
-        }
-        return self.readLineSeeded(seed);
     }
 };
 
@@ -1039,4 +1046,44 @@ test "visibleLen counts display columns: ASCII=1, emoji/CJK=2, combining/VS=0" {
 
     try std.testing.expectEqual(@as(usize, 1), visibleLen("\xE2\x9C\x94\xEF\xB8\x8F")); // ✔️
 
+}
+
+fn expectRawPromptInput(input: []const u8, expected: []const u8) !void {
+    const input_pipe = try std.Io.Threaded.pipe2(.{});
+    defer std.Io.Threaded.closeFd(input_pipe[0]);
+    defer std.Io.Threaded.closeFd(input_pipe[1]);
+
+    const output_pipe = try std.Io.Threaded.pipe2(.{});
+    defer std.Io.Threaded.closeFd(output_pipe[0]);
+    defer std.Io.Threaded.closeFd(output_pipe[1]);
+
+    var written: usize = 0;
+    while (written < input.len) {
+        const rc = std.posix.system.write(input_pipe[1], input[written..].ptr, input.len - written);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => written += @intCast(rc),
+            .INTR => continue,
+            else => return error.TestInputWriteFailed,
+        }
+    }
+
+    var ui: Tui = .{
+        .out_fd = output_pipe[1],
+        .in_fd = input_pipe[0],
+        .lang = .en,
+        .is_tty = true,
+    };
+    const line = try ui.readLineOrBack();
+    try std.testing.expectEqualStrings(expected, line);
+}
+
+test "raw prompt backspace can erase the first pasted byte" {
+    // Regression for #378: the old raw-to-cooked handoff kept the first byte in an
+    // application-only seed. Terminal backspace could not erase it, so pasting the
+    // link again produced `vvpn://...`.
+    try expectRawPromptInput("v\x7fvpn://example\n", "vpn://example");
+}
+
+test "raw prompt backspace erases a complete UTF-8 codepoint" {
+    try expectRawPromptInput("\xD0\x94\x7fX\n", "X"); // Д, Backspace, X
 }
