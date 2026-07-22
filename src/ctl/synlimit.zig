@@ -361,13 +361,13 @@ pub fn renderScript(buf: []u8, p: ScriptParams) ![]const u8 {
         \\
         \\# IPv4 (required — a failure here fails the unit so the operator notices).
         \\"$IPT" -N "$CHAIN" 2>/dev/null || true
-        \\"$IPT" -A "$CHAIN" -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION
+        \\"$IPT" -A "$CHAIN" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION
         \\"$IPT" -A "$CHAIN" -j RETURN
         \\"$IPT" -I INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN"
         \\
         \\# IPv6 (best-effort — hosts without IPv6 must not fail the unit).
         \\"$IP6T" -N "$CHAIN" 2>/dev/null || true
-        \\"$IP6T" -A "$CHAIN" -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION 2>/dev/null || true
+        \\"$IP6T" -A "$CHAIN" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION 2>/dev/null || true
         \\"$IP6T" -A "$CHAIN" -j RETURN 2>/dev/null || true
         \\"$IP6T" -I INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null || true
         \\exit 0
@@ -549,6 +549,23 @@ test "renderScript uses REJECT tcp-reset when requested" {
     try std.testing.expect(std.mem.indexOf(u8, out, "-j DROP") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '{') == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, out, '}') == null);
+}
+
+test "renderScript marks hashlimit rules as TCP for tcp-reset compatibility" {
+    var buf: [2048]u8 = undefined;
+    const out = try renderScript(&buf, .{
+        .port = "443",
+        .rate = "1/second",
+        .burst = "1",
+        .target = overLimitTarget(true),
+        .iptables = "/usr/sbin/iptables",
+        .ip6tables = "/usr/sbin/ip6tables",
+    });
+
+    // iptables-nft rejects `--reject-with tcp-reset` unless the REJECT rule itself
+    // explicitly matches TCP; a TCP-only jump into the user chain is not sufficient.
+    const tcp_hashlimit = "-A \"$CHAIN\" -p tcp -m hashlimit";
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, tcp_hashlimit));
 }
 
 test "overLimitTarget maps the reject flag" {
