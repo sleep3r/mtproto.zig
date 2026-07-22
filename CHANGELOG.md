@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/sleep3r/mtproto.zig/compare/v1.10.0...v1.10.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* **ctl:** handle TUI paste and nft SYN rules ([#379](https://github.com/sleep3r/mtproto.zig/issues/379)) ([d3ab638](https://github.com/sleep3r/mtproto.zig/commit/d3ab6383876bb633d18f86b6eae9e9726214aacf))
+
 ## [1.10.0](https://github.com/sleep3r/mtproto.zig/compare/v1.9.0...v1.10.0) (2026-07-07)
 
 
