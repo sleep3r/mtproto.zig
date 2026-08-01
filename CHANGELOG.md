@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.2](https://github.com/sleep3r/mtproto.zig/compare/v1.10.1...v1.10.2) (2026-08-01)
+
+
+### Bug Fixes
+
+* **ctl:** repair dead pool-failover timer + auto-heal stale WG sessions ([#384](https://github.com/sleep3r/mtproto.zig/issues/384)) ([58832a5](https://github.com/sleep3r/mtproto.zig/commit/58832a51e20e30e910b6c7890a4deab950910569))
+
 ## [1.10.1](https://github.com/sleep3r/mtproto.zig/compare/v1.10.0...v1.10.1) (2026-07-22)
 
 
