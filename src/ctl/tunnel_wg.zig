@@ -997,8 +997,12 @@ fn installTunnelPoolUnits(ui: *Tui, allocator: std.mem.Allocator) void {
         \\Description=Run MTProto tunnel pool failover checks
         \\
         \\[Timer]
-        \\OnBootSec=30s
-        \\OnUnitInactiveSec=30s
+        \\# OnCalendar (not OnBootSec+OnUnitInactiveSec): the latter never re-arms
+        \\# after a bare `systemctl restart` of just the .timer without a reboot,
+        \\# since OnBootSec already fired for this boot and OnUnitInactiveSec has
+        \\# no fresh unit-inactive transition to key off of. OnCalendar recomputes
+        \\# from wall-clock every time, so it can't get stuck this way.
+        \\OnCalendar=*-*-* *:*:00/30
         \\RandomizedDelaySec=5s
         \\Persistent=true
         \\
@@ -1032,6 +1036,13 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\TABLE=200
         \\RULE_PRIORITY=1200
         \\PROBE_URL="https://core.telegram.org/getProxyConfig"
+        \\# A WG/AWG session can go quietly stale (e.g. after the host or its network
+        \\# path hiccups) without the interface ever going down -- same failure mode as
+        \\# a phone VPN that shows "connected" but passes nothing until toggled off/on.
+        \\# After this many CONSECUTIVE degraded checks for an interface, bounce it
+        \\# (down/up) once to force a fresh handshake before falling back to it. Kept
+        \\# >1 cycle so a single transient probe blip doesn't churn a healthy tunnel.
+        \\BOUNCE_AFTER_DEGRADED_CHECKS=2
         \\
         \\mkdir -p "$STATE_DIR"
         \\
@@ -1147,6 +1158,30 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    "$quick" up "$conf" >/dev/null 2>&1
         \\}
         \\
+        \\degraded_streak_path() {
+        \\    printf '%s/degraded-streak-%s\n' "$STATE_DIR" "$1"
+        \\}
+        \\
+        \\read_degraded_streak() {
+        \\    local f; f="$(degraded_streak_path "$1")"
+        \\    [[ -f "$f" ]] && cat "$f" 2>/dev/null || printf '0\n'
+        \\}
+        \\
+        \\write_degraded_streak() {
+        \\    printf '%s\n' "$2" > "$(degraded_streak_path "$1")" 2>/dev/null || true
+        \\}
+        \\
+        \\bounce_iface() {
+        \\    local iface="$1"
+        \\    local quick conf
+        \\    quick="$(quick_tool_for "$iface")" || return 1
+        \\    conf="$(conf_path_for "$iface")"
+        \\    [[ -f "$conf" ]] || return 1
+        \\    log "tunnel $iface degraded for $BOUNCE_AFTER_DEGRADED_CHECKS consecutive checks; bouncing to force a fresh handshake"
+        \\    "$quick" down "$conf" >/dev/null 2>&1 || true
+        \\    "$quick" up "$conf" >/dev/null 2>&1
+        \\}
+        \\
         \\policy_rule_exists() {
         \\    local mark_hex
         \\    mark_hex="$(printf '0x%x' "$MARK")"
@@ -1195,8 +1230,21 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    route_table_to_iface "$iface" || { reason="failed to install policy route"; return 1; }
         \\    policy_route_matches_iface "$iface" || { reason="policy route check failed"; return 1; }
         \\    if telegram_probe_iface "$iface"; then
+        \\        write_degraded_streak "$iface" 0
         \\        reason="healthy"
         \\        return 0
+        \\    fi
+        \\    local streak
+        \\    streak="$(( $(read_degraded_streak "$iface") + 1 ))"
+        \\    write_degraded_streak "$iface" "$streak"
+        \\    if [[ "$streak" -ge "$BOUNCE_AFTER_DEGRADED_CHECKS" ]]; then
+        \\        if bounce_iface "$iface" && telegram_probe_iface "$iface"; then
+        \\            write_degraded_streak "$iface" 0
+        \\            reason="healthy (recovered after bounce)"
+        \\            return 0
+        \\        fi
+        \\        log "tunnel $iface still unreachable after bounce"
+        \\        write_degraded_streak "$iface" 0
         \\    fi
         \\    # Usable (up + policy route installed) but can't reach Telegram through it.
         \\    # Return 2 ("degraded-usable") so pool selection PREFERS a tunnel that can
@@ -1514,10 +1562,30 @@ test "tunnel pool - script renders failover (prefer reachable, fall back to usab
     try std.testing.expect(std.mem.indexOf(u8, script, "pinned_interface") != null);
 }
 
-test "tunnel pool timer repeats after oneshot service exits" {
+test "tunnel pool script - degraded tunnel bounces after consecutive-failure threshold" {
+    const script = try renderTunnelPoolScript(std.testing.allocator);
+    defer std.testing.allocator.free(script);
+
+    // A stale WG/AWG session (interface up, no traffic passing -- the same failure
+    // mode as a phone VPN that needs a manual toggle) must self-heal via a down/up
+    // bounce, not just get marked degraded and reused forever.
+    try std.testing.expect(std.mem.indexOf(u8, script, "BOUNCE_AFTER_DEGRADED_CHECKS=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "bounce_iface()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\"$quick\" down \"$conf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\"$quick\" up \"$conf\"") != null);
+    // Streak resets on success so only CONSECUTIVE failures trigger a bounce.
+    try std.testing.expect(std.mem.indexOf(u8, script, "write_degraded_streak \"$iface\" 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "recovered after bounce") != null);
+}
+
+test "tunnel pool timer uses OnCalendar for the failover-check schedule" {
+    // A boot-relative + unit-inactive-relative pair was confirmed live to permanently
+    // stop re-arming after a bare `systemctl restart` of just the .timer (no reboot):
+    // OnBootSec only fires once per boot, and the inactive-relative trigger has no
+    // fresh transition to key off of until the paired .service is kicked some other
+    // way. OnCalendar recomputes from wall-clock every time, so it can't get stuck.
     const source = @embedFile("tunnel_wg.zig");
-    const needle = "OnUnitInactiveSec" ++ "=30s";
-    try std.testing.expect(std.mem.indexOf(u8, source, needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "OnCalendar=*-*-* *:*:00/30") != null);
 }
 
 test "tunnel deps - Debian uses explicit Amnezia Launchpad focal source" {
