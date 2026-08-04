@@ -75,6 +75,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         "proxy-monitor",
         "nfqws-mtproto",
         "mtproto-syn-limit",
+        "mtproto-tcpmss",
         "mtproto-mask-health.timer",
         "mtproto-mask-health.service",
         "mtproto-tunnel-pool.timer",
@@ -186,6 +187,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     //    ExecStartPre with no ExecStopPost, so stopping the (now-removed) unit leaves the
     //    `-j NFQUEUE --queue-num 200` rule live — and the iptables-save below would
     //    otherwise re-persist that dead rule across reboots.
+    //    The clamp now also owns mtproto-tcpmss.service (stopped/removed with the other
+    //    units above, which runs its `flush`); this sweep still runs so a rule left by a
+    //    pre-unit install, or by a unit that failed to stop, is removed too.
     const tcpmss_cleanup =
         \\for ipt in iptables ip6tables; do
         \\  "$ipt" -t mangle -S OUTPUT 2>/dev/null | grep -E -- '-j (TCPMSS --set-mss [0-9]+|NFQUEUE --queue-num [0-9]+)' | while read -r line; do
@@ -193,6 +197,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         \\    "$ipt" -t mangle $rule 2>/dev/null || true
         \\  done
         \\done
+        \\rm -f /usr/local/sbin/mtproto-tcpmss.sh
         \\if [ -d /etc/iptables ]; then
         \\  command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         \\  command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true

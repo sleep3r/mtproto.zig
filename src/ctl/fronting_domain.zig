@@ -26,17 +26,45 @@ pub const FrontingCheckResult = enum {
 };
 
 /// Classify an `openssl s_client` transcript. Assumes the hello offered
-/// `X25519MLKEM768:X25519`, so a printed "Server Temp Key" is one of those two
-/// groups: X25519MLKEM768 → post-quantum (good), otherwise x25519 (the iOS marker).
-/// A domain that HRRs / rejects both never prints a temp key.
+/// `X25519MLKEM768:X25519`, so a successfully negotiated group is one of those two:
+/// X25519MLKEM768 → post-quantum (good), plain x25519 → the iOS marker. A domain
+/// that HRRs / shares neither group negotiates nothing at all.
+///
+/// Two output shapes have to be handled, because they differ by OpenSSL build:
+///   - "Server Temp Key: <group>"        — the classic line.
+///   - "Negotiated TLS1.3 group: <group>" — OpenSSL 3.5.x (verified on 3.5.5 /
+///     Ubuntu 26.04) prints this and, for an ML-KEM hybrid, no "Server Temp Key".
+///
+/// The *value* is what matters, not the presence of the line: when the server shares
+/// no group with our offer, OpenSSL still prints the line but completes it with
+/// "<NULL>" and the handshake yields "Cipher is (NONE)". Verified live: wb.ru and
+/// mail.ru (which prefer secp521r1) both report "Negotiated TLS1.3 group: <NULL>".
+/// Keying off the line's presence alone would mislabel those as single-round x25519.
 pub fn classifyOpenSslOutput(output: []const u8) FrontingVerdict {
+    if (lineValue(output, "Negotiated TLS1.3 group:")) |group| {
+        if (std.mem.indexOf(u8, group, "MLKEM") != null) return .pq_capable;
+        if (std.ascii.indexOfIgnoreCase(group, "x25519") != null) return .single_round_x25519;
+        // "<NULL>" (or a group we never offered): our single-round ServerHello can't
+        // reproduce this handshake at all.
+        return if (std.mem.indexOf(u8, output, "CONNECTED") != null)
+            .reachable_without_x25519
+        else
+            .not_reached;
+    }
     if (std.mem.indexOf(u8, output, "Server Temp Key") != null) {
-        // OpenSSL 3.5+ prints the hybrid group as "X25519MLKEM768".
         if (std.mem.indexOf(u8, output, "MLKEM") != null) return .pq_capable;
         return .single_round_x25519;
     }
     if (std.mem.indexOf(u8, output, "CONNECTED") != null) return .reachable_without_x25519;
     return .not_reached;
+}
+
+/// Text following `needle` up to the end of that line, trimmed. Null if absent.
+fn lineValue(output: []const u8, needle: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, output, needle) orelse return null;
+    const rest = output[start + needle.len ..];
+    const line = rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+    return std.mem.trim(u8, line, " \t\r");
 }
 
 /// Best-effort warning if `domain` is a poor FakeTLS fronting target. Two things can
@@ -151,4 +179,41 @@ test "classifyOpenSslOutput detects reachable domain without x25519 temp key" {
 test "classifyOpenSslOutput detects domain that was not reached" {
     const out = "connect:errno=110\n";
     try std.testing.expectEqual(FrontingVerdict.not_reached, classifyOpenSslOutput(out));
+}
+
+test "classifyOpenSslOutput detects post-quantum via 'Negotiated TLS1.3 group' (no Server Temp Key line)" {
+    // Verbatim shape from ozon.ru on OpenSSL 3.5.5 (Ubuntu 26.04): this build prints
+    // no "Server Temp Key" for an ML-KEM hybrid, so matching only that line reported a
+    // genuinely PQ-capable domain as reachable_without_x25519 — exactly backwards.
+    const out =
+        \\CONNECTED(00000003)
+        \\Peer signing digest: SHA256
+        \\Negotiated TLS1.3 group: X25519MLKEM768
+        \\---
+        \\New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+    ;
+    try std.testing.expectEqual(FrontingVerdict.pq_capable, classifyOpenSslOutput(out));
+}
+
+test "classifyOpenSslOutput flags classical x25519 via 'Negotiated TLS1.3 group'" {
+    const out =
+        \\CONNECTED(00000003)
+        \\Negotiated TLS1.3 group: X25519
+        \\---
+    ;
+    try std.testing.expectEqual(FrontingVerdict.single_round_x25519, classifyOpenSslOutput(out));
+}
+
+test "classifyOpenSslOutput treats a '<NULL>' negotiated group as no usable x25519" {
+    // Verbatim shape from wb.ru / mail.ru on OpenSSL 3.5.5: they prefer secp521r1, share
+    // no group with our offer, and the handshake yields no cipher — yet the line is still
+    // printed. Presence alone must not be read as a successful x25519 negotiation.
+    const out =
+        \\CONNECTED(00000003)
+        \\no peer certificate available
+        \\Negotiated TLS1.3 group: <NULL>
+        \\---
+        \\New, (NONE), Cipher is (NONE)
+    ;
+    try std.testing.expectEqual(FrontingVerdict.reachable_without_x25519, classifyOpenSslOutput(out));
 }

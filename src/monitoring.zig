@@ -447,15 +447,28 @@ fn readMaxFds() ?u64 {
     }
 }
 
+/// Read `path` into `buffer`, returning the populated prefix.
+///
+/// Reads to EOF instead of `Reader.allocRemaining`, which sizes its result from
+/// `stat().size`. Every procfs/cgroupfs file reports size 0, so allocRemaining treated
+/// them as empty — meaning every caller below (/proc/self/status → VmRSS, /proc/self/stat
+/// → CPU seconds, and the cgroup memory limits) silently reported nothing. Reading
+/// straight into the caller's buffer also drops the previous allocate-then-memcpy.
 fn readFileAbsolute(path: []const u8, buffer: []u8) ?[]const u8 {
     const io_ctx = std.Io.Threaded.global_single_threaded.io();
     var file = std.Io.Dir.openFileAbsolute(io_ctx, path, .{}) catch return null;
     defer file.close(io_ctx);
-    var reader = file.reader(io_ctx, &.{});
-    const content = reader.interface.allocRemaining(std.heap.page_allocator, .limited(buffer.len)) catch return null;
-    defer std.heap.page_allocator.free(content);
-    @memcpy(buffer[0..content.len], content);
-    return buffer[0..content.len];
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io_ctx, &read_buf);
+
+    var len: usize = 0;
+    while (len < buffer.len) {
+        const n = reader.interface.readSliceShort(buffer[len..]) catch return null;
+        if (n == 0) break;
+        len += n;
+    }
+    return buffer[0..len];
 }
 
 test "metrics output contains required metrics" {

@@ -24,6 +24,9 @@ const SummaryLine = tui_mod.SummaryLine;
 
 const INSTALL_DIR = release.INSTALL_DIR;
 const SERVICE_NAME = release.SERVICE_NAME;
+const TCPMSS_SERVICE_NAME = "mtproto-tcpmss";
+const TCPMSS_SCRIPT_PATH = "/usr/local/sbin/mtproto-tcpmss.sh";
+const TCPMSS_UNIT_PATH = "/etc/systemd/system/" ++ TCPMSS_SERVICE_NAME ++ ".service";
 
 pub const InstallOpts = struct {
     port: u16 = 443,
@@ -192,6 +195,49 @@ test "install - skips apt minisign package when verifier is already on PATH" {
     try std.testing.expect(shouldInstallMinisignPackage(true, false, false));
     try std.testing.expect(!shouldInstallMinisignPackage(true, true, false));
     try std.testing.expect(!shouldInstallMinisignPackage(false, false, false));
+}
+
+test "renderTcpmssScript bakes params and stays brace-free for std.fmt" {
+    var buf: [4096]u8 = undefined;
+    const out = try renderTcpmssScript(&buf, .{
+        .port = "8443",
+        .mss = "92",
+        .iptables = "/usr/sbin/iptables",
+        .ip6tables = "/usr/sbin/ip6tables",
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "PORT=8443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MSS=92") != null);
+    // Absolute paths, not bare names: a minimal root env can spawn without /usr/sbin.
+    try std.testing.expect(std.mem.indexOf(u8, out, "IPT=/usr/sbin/iptables") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "IP6T=/usr/sbin/ip6tables") != null);
+    // `set -e` is what actually makes a failed append fail the unit: without it the
+    // trailing `exit 0` overwrites every earlier status and the oneshot always succeeds.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\nset -eu\n") != null);
+    // The -C read-back is what makes a false "applied" impossible (#383).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"$IPT\" $W -t mangle -C OUTPUT") != null);
+    // IPv4 append must NOT be swallowed, so a missing xt_TCPMSS fails the unit...
+    try std.testing.expect(std.mem.indexOf(u8, out, "--set-mss \"$MSS\"\n\"$IPT\" $W -t mangle -C") != null);
+    // ...while IPv6 stays best-effort.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"$IP6T\" $W -t mangle -A OUTPUT -p tcp --sport \"$PORT\" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss \"$MSS\" 2>/dev/null || true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[ \"$MODE\" = flush ] && exit 0") != null);
+    // Waits for the xtables lock: under set -e a boot-time collision with ufw/docker
+    // would otherwise fail the unit spuriously.
+    try std.testing.expect(std.mem.indexOf(u8, out, "W=\"-w 5\"") != null);
+    // No raw curly braces should survive into the generated script.
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, '{') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, '}') == null);
+}
+
+test "tcpmss unit re-applies at boot and cleans up on stop" {
+    const unit = tcpmssUnitContent();
+    // The whole point of the unit: nothing else restores the clamp across a reboot
+    // (we deliberately don't install iptables-persistent).
+    try std.testing.expect(std.mem.indexOf(u8, unit, "WantedBy=multi-user.target") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "RemainAfterExit=yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "Before=mtproto-proxy.service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "ExecStart=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " apply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit, "ExecStop=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " flush") != null);
 }
 
 /// Run install in CLI (non-interactive) mode.
@@ -741,36 +787,24 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     }
 
     // ── TCPMSS clamping ──
+    var tcpmss_applied = false;
     if (opts.enable_tcpmss) {
         var port_str_buf: [8]u8 = undefined;
         const port_str = std.fmt.bufPrint(&port_str_buf, "{d}", .{opts.port}) catch "443";
         var mss_str_buf: [8]u8 = undefined;
         const mss_str = std.fmt.bufPrint(&mss_str_buf, "{d}", .{opts.tcpmss_value}) catch "88";
 
-        // Delete any identical pre-existing rule first so a re-run of `mtbuddy install`
-        // (a supported idempotent flow) doesn't append duplicate OUTPUT mangle rules that
-        // accumulate without bound. Mirrors nfqws' remove-before-add discipline.
-        deleteTcpmssRule(allocator, "iptables", port_str, mss_str);
-        deleteTcpmssRule(allocator, "ip6tables", port_str, mss_str);
-
-        _ = sys.exec(allocator, &.{
-            "iptables", "-t",      "mangle",  "-A",     "OUTPUT",
-            "-p",       "tcp",     "--sport", port_str, "--tcp-flags",
-            "SYN,ACK",  "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            mss_str,
-        }) catch {};
-        _ = sys.exec(allocator, &.{
-            "ip6tables", "-t",      "mangle",  "-A",     "OUTPUT",
-            "-p",        "tcp",     "--sport", port_str, "--tcp-flags",
-            "SYN,ACK",   "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            mss_str,
-        }) catch {};
-        _ = sys.exec(allocator, &.{
-            "bash",                                                                                                        "-c",
-            "mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ip6tables-save > /etc/iptables/rules.v6",
-        }) catch {};
-
-        ui.ok(ui.str(.install_tcpmss_ok));
+        tcpmss_applied = installTcpmssClamp(ui, allocator, port_str, mss_str);
+        if (tcpmss_applied) {
+            ui.ok(ui.str(.install_tcpmss_ok));
+        } else {
+            ui.warn("TCPMSS clamping did not apply; final summary will show it disabled.");
+        }
+    } else {
+        // Now that the clamp is an enabled unit rather than bare iptables state, "off"
+        // has to actively tear it down: a re-run with --no-tcpmss would otherwise report
+        // it disabled while the unit kept re-applying the rule at every boot.
+        removeTcpmssClamp(allocator);
     }
 
     // IPv6 auto-hopping cannot be configured here (it needs Cloudflare API
@@ -781,6 +815,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     }
 
     var summary_opts = opts;
+    // Same discipline as masking/nfqws below: the summary reports what the host actually
+    // ended up with, not what was requested (#383 — the box claimed "TCPMSS=88" on a
+    // ruleset that never received the rule).
+    summary_opts.enable_tcpmss = tcpmss_applied;
 
     // ── Masking (via Zig module) ──
     if (opts.enable_masking) {
@@ -1343,20 +1381,172 @@ fn groupExists(allocator: std.mem.Allocator, name: []const u8) bool {
     return result.exit_code == 0;
 }
 
-/// Best-effort: delete every copy of our TCPMSS OUTPUT rule for `cmd` (iptables/ip6tables),
-/// looping `-D` until no match remains, so a subsequent `-A` can't create duplicates.
-fn deleteTcpmssRule(allocator: std.mem.Allocator, cmd: []const u8, port_str: []const u8, mss_str: []const u8) void {
-    var i: usize = 0;
-    while (i < 16) : (i += 1) {
-        const r = sys.exec(allocator, &.{
-            cmd,       "-t",      "mangle",  "-D",     "OUTPUT",
-            "-p",      "tcp",     "--sport", port_str, "--tcp-flags",
-            "SYN,ACK", "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-            mss_str,
-        }) catch return;
-        defer r.deinit();
-        if (r.exit_code != 0) return; // no more matching rules
+pub const TcpmssScriptParams = struct {
+    port: []const u8,
+    mss: []const u8,
+    iptables: []const u8,
+    ip6tables: []const u8,
+};
+
+/// Render the apply/flush script for the SYN,ACK MSS clamp. Same constraint as
+/// synlimit.renderScript: NO `{`/`}` anywhere, so std.fmt can produce it. The IPv4 lines
+/// carry no `|| true`, so a missing xt_TCPMSS module fails the systemd oneshot instead of
+/// silently no-op'ing; IPv6 is best-effort (hosts without IPv6 must not fail the unit).
+///
+/// `set -e` is load-bearing, not decoration: without it the failing `-A`/`-C` statuses are
+/// merely overwritten by the trailing `exit 0`, the oneshot always succeeds, and systemd
+/// reports `active (exited)` for the whole uptime over a ruleset that never received the
+/// rule. `[ "$MODE" = flush ] && exit 0` stays safe under errexit because a non-final
+/// member of an AND list is exempt.
+pub fn renderTcpmssScript(buf: []u8, p: TcpmssScriptParams) ![]const u8 {
+    return std.fmt.bufPrint(buf,
+        \\#!/bin/sh
+        \\# Generated by mtbuddy — clamp the MSS we advertise on our SYN,ACK so the
+        \\# client's ClientHello is forced to fragment across TCP segments.
+        \\# Managed by the {[svc]s}.service systemd unit. Do not edit by hand.
+        \\set -eu
+        \\PORT={[port]s}
+        \\MSS={[mss]s}
+        \\IPT={[iptables]s}
+        \\IP6T={[ip6tables]s}
+        \\MODE="$1"
+        \\
+        \\# -w: wait for the xtables lock instead of exiting 4. Under set -e an unlucky
+        \\# boot-time collision with ufw/docker/netfilter-persistent (none of which we are
+        \\# ordered against) would otherwise fail the unit for no real reason.
+        \\W="-w 5"
+        \\
+        \\# Idempotent reset: drop every existing copy (bounded), both families, so a
+        \\# re-apply can never stack duplicate OUTPUT rules.
+        \\for T in "$IPT" "$IP6T"; do
+        \\    N=0
+        \\    while [ "$N" -lt 16 ]; do
+        \\        "$T" $W -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS" 2>/dev/null || break
+        \\        N=$((N + 1))
+        \\    done
+        \\done
+        \\
+        \\[ "$MODE" = flush ] && exit 0
+        \\
+        \\# IPv4 (required). The -C read-back is the authority: an exit-0 append is only
+        \\# believed once the rule is actually present. Combined with set -e this is what
+        \\# makes the unit fail instead of reporting success over an unchanged ruleset.
+        \\"$IPT" $W -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS"
+        \\"$IPT" $W -t mangle -C OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS"
+        \\
+        \\# IPv6 (best-effort — hosts without IPv6 must not fail the unit).
+        \\"$IP6T" $W -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        \\exit 0
+        \\
+    , .{
+        .svc = TCPMSS_SERVICE_NAME,
+        .port = p.port,
+        .mss = p.mss,
+        .iptables = p.iptables,
+        .ip6tables = p.ip6tables,
+    });
+}
+
+fn tcpmssUnitContent() []const u8 {
+    return "[Unit]\n" ++
+        "Description=MTProto proxy TCPMSS clamp (ClientHello fragmentation)\n" ++
+        "Documentation=https://github.com/sleep3r/mtproto.zig\n" ++
+        "After=network.target\n" ++
+        "Before=mtproto-proxy.service\n" ++
+        "\n" ++
+        "[Service]\n" ++
+        "Type=oneshot\n" ++
+        "RemainAfterExit=yes\n" ++
+        "ExecStart=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " apply\n" ++
+        "ExecStop=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " flush\n" ++
+        "\n" ++
+        "[Install]\n" ++
+        "WantedBy=multi-user.target\n";
+}
+
+/// Install the clamp as a systemd oneshot and confirm the rule is really live.
+///
+/// Previously the installer appended the rule inline and fire-and-forget
+/// (`_ = sys.exec(...) catch {}`), which had two consequences reported in #383 and
+/// reproduced on a fresh Ubuntu 26.04 host: a failed append still printed "TCPMSS
+/// clamping applied" over a ruleset that never received the rule, and even a successful
+/// one was lost on the next reboot because nothing re-added it (we deliberately don't
+/// install iptables-persistent — see the note in nfqws.zig). A unit fixes both: it fails
+/// loudly, and it re-applies at every boot, exactly as mtproto-syn-limit.service does.
+fn installTcpmssClamp(ui: *Tui, allocator: std.mem.Allocator, port_str: []const u8, mss_str: []const u8) bool {
+    // Resolve absolute paths the way nfqws.zig does: a minimal root environment can spawn
+    // us without /usr/sbin on PATH, and a bare "iptables" then fails to exec.
+    const iptables = sys.commandOrPath("iptables", &.{ "/usr/sbin/iptables", "/sbin/iptables" });
+    const ip6tables = sys.commandOrPath("ip6tables", &.{ "/usr/sbin/ip6tables", "/sbin/ip6tables" });
+
+    var script_buf: [4096]u8 = undefined;
+    const script = renderTcpmssScript(&script_buf, .{
+        .port = port_str,
+        .mss = mss_str,
+        .iptables = iptables,
+        .ip6tables = ip6tables,
+    }) catch {
+        ui.warn("Failed to render the TCPMSS script");
+        return false;
+    };
+
+    sys.writeFileMode(TCPMSS_SCRIPT_PATH, script, 0o755) catch {
+        ui.warn("Failed to write " ++ TCPMSS_SCRIPT_PATH);
+        return false;
+    };
+    sys.writeFile(TCPMSS_UNIT_PATH, tcpmssUnitContent()) catch {
+        ui.warn("Failed to write " ++ TCPMSS_UNIT_PATH);
+        return false;
+    };
+
+    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+    sys.execSilent(allocator, &.{ "systemctl", "enable", TCPMSS_SERVICE_NAME });
+
+    const start = sys.exec(allocator, &.{ "systemctl", "restart", TCPMSS_SERVICE_NAME }) catch |err| {
+        ui.warn("TCPMSS clamping could not be applied");
+        ui.print("  {s}◆{s} Failed to start {s}: {s}\n", .{ Color.info, Color.reset, TCPMSS_SERVICE_NAME, @errorName(err) });
+        return false;
+    };
+    defer start.deinit();
+
+    if (start.exit_code != 0) {
+        ui.warn("TCPMSS clamping could not be applied");
+        printCommandOutput(ui, &start);
+        // The unit's own stderr carries the real iptables error (#383 asked for exactly
+        // this instead of a bare success line).
+        const status = sys.exec(allocator, &.{ "systemctl", "status", "--no-pager", "-n", "10", TCPMSS_SERVICE_NAME }) catch return false;
+        defer status.deinit();
+        printCommandOutput(ui, &status);
+        return false;
     }
+
+    if (tcpmssRuleExists(allocator, iptables, port_str, mss_str)) return true;
+
+    ui.warn("TCPMSS unit started but the rule is missing from the ruleset");
+    return false;
+}
+
+/// Tear the clamp down: `stop` runs the unit's ExecStop (`flush`), which removes the rule
+/// from both families, then the unit and script are disabled and deleted. Best-effort and
+/// quiet — on the overwhelmingly common path none of this exists.
+fn removeTcpmssClamp(allocator: std.mem.Allocator) void {
+    if (!sys.fileExists(TCPMSS_UNIT_PATH) and !sys.fileExists(TCPMSS_SCRIPT_PATH)) return;
+
+    sys.execSilent(allocator, &.{ "systemctl", "stop", TCPMSS_SERVICE_NAME });
+    sys.execSilent(allocator, &.{ "systemctl", "disable", TCPMSS_SERVICE_NAME });
+    sys.execSilent(allocator, &.{ "rm", "-f", TCPMSS_UNIT_PATH, TCPMSS_SCRIPT_PATH });
+    sys.execSilent(allocator, &.{ "systemctl", "daemon-reload" });
+}
+
+fn tcpmssRuleExists(allocator: std.mem.Allocator, cmd: []const u8, port_str: []const u8, mss_str: []const u8) bool {
+    const result = sys.exec(allocator, &.{
+        cmd,       "-t",      "mangle",  "-C",     "OUTPUT",
+        "-p",      "tcp",     "--sport", port_str, "--tcp-flags",
+        "SYN,ACK", "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
+        mss_str,
+    }) catch return false;
+    defer result.deinit();
+    return result.exit_code == 0;
 }
 
 fn runRequired(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {
