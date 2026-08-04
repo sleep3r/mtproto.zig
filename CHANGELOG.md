@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.3](https://github.com/sleep3r/mtproto.zig/compare/v1.10.2...v1.10.3) (2026-08-04)
+
+
+### Bug Fixes
+
+* **ctl:** read procfs correctly, make the TCPMSS clamp real and persistent ([#386](https://github.com/sleep3r/mtproto.zig/issues/386)) ([920eb2e](https://github.com/sleep3r/mtproto.zig/commit/920eb2e634ae57daa4c9177a50f4a38480186bfb))
+
 ## [1.10.2](https://github.com/sleep3r/mtproto.zig/compare/v1.10.1...v1.10.2) (2026-08-01)
 
 
