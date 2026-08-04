@@ -14,15 +14,47 @@ fn io() std.Io {
 fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
     var file = std.Io.Dir.openFileAbsolute(io(), path, .{}) catch return null;
     defer file.close(io());
-    var reader = file.reader(io(), &.{});
-    return reader.interface.allocRemaining(allocator, .limited(limit)) catch null;
+    return readAllToEof(allocator, &file, limit);
 }
 
 fn readFileAllocCwd(allocator: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
     var file = std.Io.Dir.cwd().openFile(io(), path, .{}) catch return null;
     defer file.close(io());
-    var reader = file.reader(io(), &.{});
-    return reader.interface.allocRemaining(allocator, .limited(limit)) catch null;
+    return readAllToEof(allocator, &file, limit);
+}
+
+/// Read `file` to EOF.
+///
+/// Deliberately NOT `Reader.allocRemaining`, which sizes its result from `stat().size`:
+/// every /proc file reports size 0, so it hands back an empty slice. Verified on Linux —
+/// `/proc/cpuinfo` came back as 0 bytes through allocRemaining while this loop returns
+/// the real 1087. That silently made `supportsV3` see no "flags" line and always answer
+/// false, so the hardware-AES `x86_64_v3` build was never picked on any host and every
+/// x86_64 install fell back to the baseline build (software AES — which the proxy then
+/// warns about as "MiddleProxy video traffic will be CPU-heavy").
+fn readAllToEof(allocator: std.mem.Allocator, file: *std.Io.File, limit: usize) ?[]u8 {
+    return readAllToEofErr(allocator, file, limit) catch null;
+}
+
+fn readAllToEofErr(allocator: std.mem.Allocator, file: *std.Io.File, limit: usize) ![]u8 {
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io(), &read_buf);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    while (true) {
+        var chunk: [4096]u8 = undefined;
+        const n = try reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        try out.appendSlice(allocator, chunk[0..n]);
+        // Overshooting `limit` must fail rather than silently truncate: callers parse
+        // the result (config.toml, os-release), and a half-read file would be treated
+        // as a valid-but-shorter document. This matches allocRemaining's behavior.
+        if (out.items.len > limit) return error.StreamTooLong;
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 pub const ExecResult = struct {
@@ -135,7 +167,11 @@ pub fn getArch() !Arch {
 pub fn supportsV3(allocator: std.mem.Allocator) bool {
     if (@import("builtin").os.tag != .linux) return false;
 
-    const content = readFileAllocAbsolute(allocator, "/proc/cpuinfo", 256 * 1024) orelse return false;
+    // /proc/cpuinfo repeats the full flags block per logical CPU (~1.1 KiB each, measured),
+    // and the read now FAILS rather than truncates when it exceeds the limit — so a cap of
+    // 256 KiB would answer "no v3" on anything past ~235 threads, i.e. exactly the big
+    // hosts where hardware AES matters most. 4 MiB is past any real core count.
+    const content = readFileAllocAbsolute(allocator, "/proc/cpuinfo", 4 * 1024 * 1024) orelse return false;
     defer allocator.free(content);
 
     // Find "flags" line

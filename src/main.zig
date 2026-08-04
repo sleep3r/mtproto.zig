@@ -173,7 +173,7 @@ const CapacityEstimate = struct {
     safe_connections: u32,
 };
 
-fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
+fn detectTotalRamBytes() ?u64 {
     if (builtin.os.tag != .linux) return null;
 
     // Prefer sysinfo(2): no /proc dependency and works under stricter sandboxing.
@@ -181,15 +181,25 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
         return total;
     }
 
-    // Fallback: parse /proc/meminfo.
+    // Fallback: parse /proc/meminfo. Read to EOF rather than Reader.allocRemaining, which
+    // sizes its result from stat().size — always 0 for procfs, so it would hand back an
+    // empty document and this fallback could never find MemTotal. (Masked so far because
+    // sysinfo(2) above normally answers first.)
     const io = std.Io.Threaded.global_single_threaded.io();
-    const content = std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{}) catch return null;
-    defer content.close(io);
-    var reader = content.reader(io, &.{});
-    const bytes = reader.interface.allocRemaining(allocator, .limited(16 * 1024)) catch return null;
-    const data = bytes;
-    defer allocator.free(data);
-    const content_bytes = data;
+    var file = std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{}) catch return null;
+    defer file.close(io);
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+
+    var meminfo_buf: [16 * 1024]u8 = undefined;
+    var len: usize = 0;
+    while (len < meminfo_buf.len) {
+        const n = reader.interface.readSliceShort(meminfo_buf[len..]) catch return null;
+        if (n == 0) break;
+        len += n;
+    }
+    const content_bytes = meminfo_buf[0..len];
 
     const key = "MemTotal:";
     var lines = std.mem.splitScalar(u8, content_bytes, '\n');
@@ -471,7 +481,7 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    const capacity_estimate = if (detectTotalRamBytes(allocator)) |total_ram|
+    const capacity_estimate = if (detectTotalRamBytes()) |total_ram|
         estimateCapacity(&cfg, total_ram)
     else
         null;
