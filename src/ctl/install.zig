@@ -254,6 +254,36 @@ test "tcpmss unit re-applies at boot and cleans up on stop" {
     try std.testing.expect(std.mem.indexOf(u8, unit, "ExecStop=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " flush") != null);
 }
 
+/// `mtbuddy update` path. A host installed before the loopback exclusion still clamps its
+/// own 127.0.0.1 traffic to an 88-byte MSS, which throttles the WEB relay's hop to the
+/// proxy. The script is ours and carries the values it was generated with, so re-render it
+/// from those and let the unit re-apply -- the new reset sweeps both spellings, so the old
+/// rule is removed rather than left beside the new one.
+pub fn refreshTcpmssLoopbackExclusion(ui: *Tui, allocator: std.mem.Allocator) void {
+    if (!sys.fileExists(TCPMSS_SCRIPT_PATH)) return;
+
+    const existing = sys.readFileAllocAbsolute(allocator, TCPMSS_SCRIPT_PATH, 64 * 1024) orelse return;
+    defer allocator.free(existing);
+    if (std.mem.indexOf(u8, existing, "! -o lo") != null) return;
+
+    const port = sys.readEnvFile(allocator, TCPMSS_SCRIPT_PATH, "PORT") orelse return;
+    defer allocator.free(port);
+    const mss = sys.readEnvFile(allocator, TCPMSS_SCRIPT_PATH, "MSS") orelse return;
+    defer allocator.free(mss);
+
+    var buf: [4096]u8 = undefined;
+    const script = renderTcpmssScript(&buf, .{
+        .port = port,
+        .mss = mss,
+        .iptables = sys.commandOrPath("iptables", &.{ "/usr/sbin/iptables", "/sbin/iptables" }),
+        .ip6tables = sys.commandOrPath("ip6tables", &.{ "/usr/sbin/ip6tables", "/sbin/ip6tables" }),
+    }) catch return;
+
+    sys.writeFileMode(TCPMSS_SCRIPT_PATH, script, 0o755) catch return;
+    _ = sys.execForward(&.{ "systemctl", "restart", TCPMSS_SERVICE_NAME }) catch {};
+    ui.ok("TCPMSS clamp no longer applies to loopback");
+}
+
 /// Run install in CLI (non-interactive) mode.
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var opts = InstallOpts{};

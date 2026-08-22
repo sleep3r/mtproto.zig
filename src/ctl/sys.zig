@@ -11,7 +11,7 @@ fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
+pub fn readFileAllocAbsolute(allocator: std.mem.Allocator, path: []const u8, limit: usize) ?[]u8 {
     var file = std.Io.Dir.openFileAbsolute(io(), path, .{}) catch return null;
     defer file.close(io());
     return readAllToEof(allocator, &file, limit);
