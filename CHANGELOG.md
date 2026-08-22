@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.0](https://github.com/sleep3r/mtproto.zig/compare/v1.10.3...v1.11.0) (2026-08-22)
+
+
+### Features
+
+* **web:** WEB proxy support for Telegram Desktop 7.1 ([#390](https://github.com/sleep3r/mtproto.zig/issues/390)) ([47c0912](https://github.com/sleep3r/mtproto.zig/commit/47c0912591678b3eb0c7efae281d74b8d5e0cff1))
+
 ## [1.10.3](https://github.com/sleep3r/mtproto.zig/compare/v1.10.2...v1.10.3) (2026-08-04)
 
 
