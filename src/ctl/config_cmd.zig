@@ -144,6 +144,22 @@ fn validate(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !void {
         else => {},
     }
 
+    if (cfg.web.enabled) {
+        if (cfg.web.domain == null) {
+            ui.fail("[web].enabled is true but [web].domain is unset");
+            errors += 1;
+        }
+        if (cfg.web.port == cfg.port or cfg.web.port == cfg.mask_port) {
+            ui.fail("[web].port collides with server.port or censorship.mask_port");
+            errors += 1;
+        }
+        // A WEB client costs one masked carrier connection plus one per logical stream.
+        const worst = @as(u64, cfg.web.max_sessions) * (@as(u64, cfg.web.max_streams) + 1);
+        if (worst > cfg.max_connections) {
+            ui.warn("[web] caps can exceed [server].max_connections — raise it or lower max_sessions/max_streams");
+        }
+    }
+
     if (errors > 0) return error.ConfigValidationFailed;
     ui.ok("Config is valid");
     ui.hint(path);

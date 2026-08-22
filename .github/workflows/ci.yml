@@ -58,6 +58,9 @@ jobs:
       - name: Run E2E harness
         run: zig build e2e
 
+      - name: Run WEB proxy bridge-page contract tests
+        run: zig build web-bridge
+
   bench:
     name: Bench (No Soak)
     runs-on: ubuntu-latest

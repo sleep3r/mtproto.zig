@@ -220,6 +220,12 @@ sudo mtbuddy setup syn-limit --preset soft   # soft 2/с·5 | medium 1/с·3 | h
 sudo mtbuddy setup syn-limit --status
 sudo mtbuddy setup syn-limit --remove
 
+# WEB-прокси для Telegram Desktop 7.1+ (MTProto внутри обычного HTTPS-сайта).
+# Нужен ваш домен с A-записью на этот хост.
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy setup web --domain relay.example.com --mode behind   # TLS терминируете вы (CDN, отдельный IP)
+sudo mtbuddy setup web --remove
+
 # Установить web dashboard
 sudo mtbuddy setup dashboard
 # Удалить только дашборд (прокси продолжит работать)
@@ -429,6 +435,19 @@ alice = true
 | `[censorship] mask_target` | unset | Optional backend host для masked clients |
 | `[censorship] mask_port` | `443` | Local masking port (`8443` для Nginx zero-RTT) |
 | `[censorship] fast_mode` | `false` | Делегировать S2C encryption DC |
+| `[web] enabled` | `false` | Включить релей WEB-прокси (Telegram Desktop 7.1+) |
+| `[web] domain` | unset | Публичный хост в ссылках `tg://webproxy` — **неизменяем после раздачи ссылок** |
+| `[web] listen` | `"127.0.0.1"` | Адрес релея (TLS терминируется перед ним) |
+| `[web] port` | `8081` | Порт релея |
+| `[web] backend` | `127.0.0.1:<server.port>` | MTProxy, куда релей дозванивается на каждый поток |
+| `[web] mask_backend` | не задан | Терминатор с PROXY-протоколом для masked-соединений к `domain` — чтобы реальный IP клиента пережил masking-хоп |
+| `[web] ws_path` | `"/api/v1/socket"` | Same-origin WebSocket-эндпоинт страницы-моста |
+| `[web] trust_forwarded_for` | `true` | Брать адрес клиента из forwarded-заголовка (только самая правая запись) |
+| `[web] client_ip_header` | `"x-forwarded-for"` | Какой заголовок его несёт (`cf-connecting-ip` за Cloudflare) |
+| `[web] check_origin` | `true` | Требовать `Origin: https://<domain>` при upgrade |
+| `[web] max_sessions` | `64` | Одновременных десктоп-клиентов |
+| `[web] max_streams` | `32` | Логических MTProto-сокетов на клиента |
+| `[web] relay_sources` | `[]` | Дополнительные IP, которым разрешён транспорт `dd` (loopback — всегда) |
 | `[access.users] <name>` | — | 32-hex secret на пользователя |
 | `[access.direct_users] <name>` | — | Bypass MiddleProxy для пользователя |
 | `[access.user_max_conns] <name>` | — | Лимит одновременных соединений на пользователя (меняется рестартом) |
@@ -443,6 +462,70 @@ alice = true
 > Оба стража **по умолчанию выключены**, чтобы carrier-NAT, VPN-egress и офисные сети (много легитимных клиентов за одним IP/подсетью) не получали ложных блокировок скопом: per-subnet rate limit (`rate_limit_per_subnet = 0`) и exact-IP handshake flood guard (`handshake_flood_guard_enabled = false`). Доступ и так закрыт per-user secret, глобальным handshake-inflight бюджетом и `max_connections`. На single-tenant / не-NAT хосте под реальным абьюзом включите: задайте `rate_limit_per_subnet` (например `30`) и `handshake_flood_guard_enabled = true` (настройте `handshake_flood_guard_threshold` / window / block).
 >
 > Оба стража выше работают *после* `accept()` (внутри прокси). Для дополнительного **уровня ядра**, который дропает абьюзные SYN-всплески *до* того, как они займут сокет/`accept()`, есть опциональный лимитер SYN по IP-источнику: `sudo mtbuddy setup syn-limit --preset soft`. Это правило iptables `hashlimit`, поставленное как **отдельный** oneshot `mtproto-syn-limit.service`, поэтому `CAP_NET_ADMIN` прокси не выдаётся. Тоже **выключен по умолчанию** и с той же оговоркой про carrier-NAT (пресет `soft` 2/с·burst-5 — безопаснее для CGNAT); `--remove` для отката, статус + счётчик дропов в `mtbuddy status`. Перезапустите после смены порта прокси.
+
+---
+
+## WEB-прокси (Telegram Desktop 7.1+)
+
+В Telegram Desktop 7.1 появился четвёртый тип прокси — `WEB`. Это обычный MTProxy, у которого
+**транспорт — браузер**: клиент вообще не открывает MTProto-сокет. Скрытый нативный WebView грузит
+`https://<ваш-домен>/?bridge=<capability>`, и страница гоняет мультиплексированные фреймы через
+same-origin WebSocket до релея, а тот на каждый логический поток дозванивается до обычного
+MTProxy — до этого самого.
+
+```
+Telegram Desktop
+  → скрытый WebView (WKWebView / WebView2 / WebKitGTK)
+  → https://relay.example.com/           ← настоящий браузерный TLS к настоящему сайту
+  → mtproto-web-relay
+  → mtproto-proxy
+  → Telegram
+```
+
+Цензор видит настоящий браузерный отпечаток, настоящий TLS-хендшейк с сертификатом от реального CA
+и дальше HTTP — потому что это и есть браузер. Нет ни FakeTLS-ServerHello, который может не совпасть,
+ни MTProto-хендшейка на проводе.
+
+**Установка:**
+
+```bash
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy links          # теперь печатает и ссылки tg://webproxy
+```
+
+Нужен домен под вашим контролем с A-записью на этот хост; `mtbuddy` выпустит сертификат Let's Encrypt
+по HTTP-01 (для этого откроется порт 80) и поставит hook на продление.
+
+**Две топологии**, обе поддерживаются:
+
+| Режим | Что происходит | Когда выбирать |
+|---|---|---|
+| `--mode mask` (по умолчанию) | Релей отдаётся *через собственный masking-бэкенд прокси*. Прокси на `:443` и так пересылает весь не-MTProto TLS в локальный Nginx; второй vhost там, выбираемый по SNI, держит настоящий сертификат вашего домена. Дополнительный публичный порт не нужен. | Один хост, один IP — обычный случай |
+| `--mode behind` | Релей слушает обычный HTTP, а TLS терминирует кто-то другой: Cloudflare, второй хост, отдельный IP. | У вас уже есть веб-присутствие, или хочется, чтобы клиент ходил на адреса CDN, а не на ваши |
+
+**Как это взаимодействует с остальным прокси:**
+
+- **Те же пользователи, те же секреты.** WEB-ссылка несёт тот же 16-байтный секрет, что и FakeTLS,
+  но в кодировке `dd…`, а не `ee…`: секрет `ee` (FakeTLS) Telegram Desktop считает *неподдерживаемым*
+  для WEB-прокси, потому что релей — сырая труба и не добавляет TLS-emulation запись. Каждый из
+  `[access.users]` получает обе ссылки; лимиты соединений и сроки доступа работают как обычно.
+- **`fake_tls_only` остаётся включённым.** Публичный интернет по-прежнему не получает `dd`-респондера
+  для фингерпринтинга. Через этот гейт пускается только адрес самого релея (loopback по умолчанию плюс
+  то, что перечислено в `[web].relay_sources`), и решение принимается по адресу из `accept()` —
+  никогда по заголовку `PROXY`, который прислал клиент.
+- **Реальные IP клиентов сохраняются.** Релей префиксует каждое соединение к бэкенду
+  PROXY-protocol-заголовком с адресом браузера, поэтому per-IP учёт, flood guard и сам Telegram видят
+  настоящего клиента, а не `127.0.0.1`.
+- **Устойчивость к активному пробингу.** Bridge capability — это `HMAC-SHA256(секрет пользователя)`,
+  так что гость, который не может предъявить производную от настоящего секрета, страницу-мост не
+  увидит вообще: ему отдаётся та же обычная страница-прикрытие, что и на любом другом пути.
+- **Ёмкость.** Один WEB-клиент занимает одно masked-соединение плюс по соединению на каждый
+  логический MTProto-поток в счёт `[server].max_connections` — закладывайте примерно 3–5× от прямого
+  клиента и поднимайте `max_connections`.
+
+**Ограничения:** только десктоп (7.1+; у Android тот же контракт моста, но UI ещё не выпущен), звонки
+не поддерживаются, и транспорт чувствительнее к RTT, чем прямое соединение. Это запасной путь на
+случай, когда прямая ссылка заблокирована, а не замена ей.
 
 ---
 

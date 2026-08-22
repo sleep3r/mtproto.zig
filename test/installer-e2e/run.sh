@@ -359,6 +359,9 @@ for f in \
   /etc/systemd/system/mtproto-tunnel-pool.timer \
   /etc/systemd/system/mtproto-tunnel-pool.service \
   /etc/systemd/system/mtproto-proxy.service.d \
+  /etc/systemd/system/mtproto-web-relay.service \
+  /etc/nginx/sites-available/mtproto-web \
+  /etc/nginx/sites-enabled/mtproto-web \
   /usr/local/bin/setup_tunnel.sh \
   /usr/local/bin/sing-box \
   /usr/local/bin/mtproto-singbox-route.sh \
@@ -367,7 +370,7 @@ for f in \
 done
 
 # No mtproto unit files registered with systemd anymore.
-leftover_units="$(systemctl list-unit-files 2>/dev/null | grep -E "mtproto-(proxy|singbox|tunnel-pool|mask)" || true)"
+leftover_units="$(systemctl list-unit-files 2>/dev/null | grep -E "mtproto-(proxy|singbox|tunnel-pool|mask|web)" || true)"
 if [ -n "$leftover_units" ]; then
   echo "FAIL: mtproto unit files still registered:"; printf '%s\n' "$leftover_units"; fail=1
 fi

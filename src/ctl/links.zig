@@ -8,6 +8,7 @@ const std = @import("std");
 const tui_mod = @import("tui.zig");
 const sys = @import("sys.zig");
 const Config = @import("proxy_config").Config;
+const web_capability = @import("web_capability");
 
 const Tui = tui_mod.Tui;
 
@@ -98,6 +99,20 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
     ui.warn("Sensitive output: these links contain user secrets.");
     ui.writeRaw("\n");
 
+    // WEB links are only emitted once the relay is actually configured — a link whose
+    // domain does not serve the bridge is worse than no link at all. The hostname is
+    // normalized exactly as Telegram Desktop normalizes it, because the bridge
+    // capability is an HMAC over that canonical string.
+    var web_domain_buf: [web_capability.max_host_len]u8 = undefined;
+    const web_domain: ?[]const u8 = blk: {
+        if (!cfg.web.enabled) break :blk null;
+        const raw = cfg.web.domain orelse break :blk null;
+        break :blk web_capability.normalizeHost(raw, &web_domain_buf) catch {
+            ui.warn("[web].domain is not a hostname Telegram Desktop accepts — skipping WEB links.");
+            break :blk null;
+        };
+    };
+
     var it = cfg.users.iterator();
     while (it.next()) |entry| {
         var secret_hex: [32]u8 = undefined;
@@ -153,6 +168,30 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
             ui.print("    dd tg:        {s}\n", .{tg_dd_link});
             ui.print("    dd t.me:      {s}\n", .{tme_dd_link});
         }
+
+        // WEB links (Telegram Desktop 7.1+). Same 16-byte user secret, but carried as
+        // `dd…`: the client reports an `ee` FakeTLS secret as Unsupported for a WEB
+        // proxy, because the relay is a raw byte pipe that adds no TLS-emulation record.
+        // Port 443 is implicit and must not appear in the link.
+        if (web_domain) |web_host| {
+            var web_secret_buf: [128]u8 = undefined;
+            const web_secret = buildDdSecret(secret_hex[0..], &web_secret_buf);
+
+            var tg_web_buf: [1024]u8 = undefined;
+            const tg_web_link = std.fmt.bufPrint(&tg_web_buf, "tg://webproxy?server={s}&secret={s}", .{
+                web_host,
+                web_secret,
+            }) catch continue;
+
+            var tme_web_buf: [1024]u8 = undefined;
+            const tme_web_link = std.fmt.bufPrint(&tme_web_buf, "https://t.me/webproxy?server={s}&secret={s}", .{
+                web_host,
+                web_secret,
+            }) catch continue;
+
+            ui.print("    WEB tg:       {s}\n", .{tg_web_link});
+            ui.print("    WEB t.me:     {s}\n", .{tme_web_link});
+        }
         ui.print("\n", .{});
     }
 }
@@ -166,6 +205,7 @@ fn printLinksHelp(ui: *Tui) void {
     ui.writeRaw("\n");
     ui.writeRaw("  mtbuddy links [--config <path>] [--server <host>] [--port <port>] [--domain <tls-domain>]\n\n");
     ui.writeRaw("  Prints tg:// and t.me proxy links from [access.users].\n");
+    ui.writeRaw("  Adds tg://webproxy links when [web] is enabled (Telegram Desktop 7.1+).\n");
     ui.writeRaw("  Link port defaults to [server].public_port, then [server].port.\n");
     ui.writeRaw("  Sensitive output: links contain user secrets.\n\n");
     ui.writeRaw("  mtbuddy secret\n");

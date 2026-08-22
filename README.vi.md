@@ -226,6 +226,11 @@ sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | har
 sudo mtbuddy setup syn-limit --status
 sudo mtbuddy setup syn-limit --remove
 
+# Relay WEB proxy cho Telegram Desktop 7.1+ (MTProto nằm trong một site HTTPS bình thường).
+# Cần một domain của bạn, bản ghi A trỏ về host này.
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy setup web --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 
@@ -467,6 +472,17 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] desync` | `true` | Split-TLS: các bản ghi Application 1 byte |
 | `[censorship] drs` | `false` | Định cỡ bản ghi động (Dynamic Record Sizing) |
 | `[censorship] fast_mode` | `false` | Ủy thác mã hóa S2C cho DC (khuyến nghị) |
+| `[web] enabled` | `false` | Bật relay WEB proxy (Telegram Desktop 7.1+) |
+| `[web] domain` | chưa đặt | Hostname công khai trong link `tg://webproxy` — **không đổi được sau khi phát link** |
+| `[web] listen` | `"127.0.0.1"` | Địa chỉ relay lắng nghe (TLS được kết thúc ở phía trước) |
+| `[web] port` | `8081` | Cổng relay |
+| `[web] backend` | `127.0.0.1:<server.port>` | MTProxy mà relay quay số cho mỗi luồng logic |
+| `[web] ws_path` | `"/api/v1/socket"` | Điểm cuối WebSocket cùng origin của trang bridge |
+| `[web] trust_forwarded_for` | `true` | Lấy địa chỉ client từ `X-Forwarded-For` |
+| `[web] check_origin` | `true` | Yêu cầu `Origin: https://<domain>` khi upgrade |
+| `[web] max_sessions` | `64` | Số client desktop đồng thời |
+| `[web] max_streams` | `32` | Số socket MTProto logic trên mỗi client |
+| `[web] relay_sources` | `[]` | IP bổ sung được phép dùng transport `dd` (loopback luôn được phép) |
 | `[access.users] <name>` | — | Secret 32 ký tự hex cho mỗi người dùng |
 | `[access.direct_users] <name>` | — | Bỏ qua ME cho người dùng này |
 | `[access.user_max_conns] <name>` | — | Giới hạn số kết nối đồng thời cho mỗi người dùng (cần khởi động lại để thay đổi) |
@@ -483,6 +499,43 @@ alice = true   # bypass MiddleProxy for this user
 > Cả hai bộ chống lạm dụng đều **mặc định bị tắt** để các mạng carrier-NAT lớn, mạng VPN-egress hoặc mạng văn phòng dùng chung (nhiều client hợp lệ sau một IP/subnet nguồn) không bị nhận diện nhầm và chặn cùng nhau: giới hạn tốc độ kết nối mới theo mỗi subnet (`rate_limit_per_subnet = 0`) và bộ chống lụt bắt tay theo IP chính xác (`handshake_flood_guard_enabled = false`). Quyền truy cập đã được kiểm soát bởi secret theo từng người dùng, ngân sách bắt tay đang chờ toàn cục và `max_connections`. Trên một máy đơn người thuê / không NAT khi thực sự bị lạm dụng, hãy bật chúng lên: đặt `rate_limit_per_subnet` (ví dụ `30`) và `handshake_flood_guard_enabled = true` (tinh chỉnh `handshake_flood_guard_threshold` / cửa sổ / thời gian chặn).
 >
 > Cả hai bộ ở trên đều chạy sau `accept()` (chúng nằm trong proxy). Để có thêm một lớp ở cấp kernel chặn các đợt SYN-đầu-tiên gây lạm dụng trước khi chúng tốn một socket/`accept()`, có một bộ giới hạn tốc độ SYN theo mỗi IP nguồn tùy chọn: `sudo mtbuddy setup syn-limit --preset soft`. Đó là một quy tắc `iptables hashlimit` được cài như một `mtproto-syn-limit.service` oneshot riêng, nên `CAP_NET_ADMIN` không bao giờ được cấp cho proxy. Cũng mặc định tắt và chịu cùng lưu ý về carrier-NAT (preset soft 2/s·burst-5 là mặc định an toàn hơn cho CGNAT); `--remove` để gỡ bỏ, status + bộ đếm drop trong `mtbuddy status`. Chạy lại nó sau khi thay đổi cổng proxy.
+
+---
+
+## WEB proxy (Telegram Desktop 7.1+)
+
+Telegram Desktop 7.1 thêm loại proxy thứ tư, `WEB`. Đây vẫn là MTProxy thông thường nhưng **vật mang là
+trình duyệt**: client không mở socket MTProto nào cả. Một WebView ẩn tải
+`https://<domain-của-bạn>/?bridge=<capability>`, và trang đó chuyển tiếp các frame ghép kênh qua WebSocket
+cùng origin tới relay; relay quay số tới một MTProxy thông thường — chính là proxy này — cho mỗi luồng logic.
+
+```
+Telegram Desktop → WebView ẩn → https://relay.example.com/   ← bắt tay TLS thật của trình duyệt tới site thật
+  → mtproto-web-relay → mtproto-proxy → Telegram
+```
+
+Kiểm duyệt viên thấy dấu vân tay trình duyệt thật, chứng chỉ có chuỗi CA thật, rồi HTTP — bởi vì đúng là như
+vậy. Không có ServerHello FakeTLS nào có thể lệch, và không có bắt tay MTProto trên đường truyền.
+
+```bash
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy links          # giờ in thêm link tg://webproxy
+```
+
+Bạn cần một domain của mình với bản ghi A trỏ về host này; `mtbuddy` sẽ xin chứng chỉ Let's Encrypt qua HTTP-01
+(nên cổng 80 được mở) và cài hook gia hạn.
+
+- `--mode mask` (mặc định): relay được phục vụ *qua chính masking backend của proxy* — một vhost Nginx thứ hai
+  chọn theo SNI, không cần thêm cổng công khai nào.
+- `--mode behind`: relay lắng nghe HTTP thường và Cloudflare, một host khác hoặc một IP dự phòng kết thúc TLS.
+
+Link WEB mang **cùng secret 16 byte** như link FakeTLS, chỉ mã hoá dạng `dd…` (Telegram Desktop coi secret `ee`
+FakeTLS là *không hỗ trợ* cho WEB proxy). `fake_tls_only` vẫn bật: chỉ địa chỉ nguồn của chính relay được đi qua
+cổng đó, và quyết định dựa trên địa chỉ mà `accept()` báo về. Relay gắn header PROXY protocol mang địa chỉ client
+thật, nên thống kê và giới hạn theo IP vẫn chính xác.
+
+**Giới hạn:** chỉ desktop (7.1+), không hỗ trợ cuộc gọi, và nhạy với RTT hơn kết nối trực tiếp. Đây là phương án
+dự phòng khi link trực tiếp bị chặn, không phải bản thay thế.
 
 ---
 

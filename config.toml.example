@@ -155,6 +155,74 @@ port = 443
 # TCP port for GET /metrics.
 # port = 9400
 
+[web]
+# WEB proxy relay — Telegram Desktop 7.1's fourth proxy type.
+#
+# A WEB proxy carries MTProto inside an ordinary HTTPS website: the client's
+# hidden WebView loads https://<domain>/?bridge=<capability> and tunnels frames
+# over a same-origin WebSocket, so the network sees a browser visiting a site
+# rather than a proxy connection. The relay runs as a separate service
+# (mtproto-web-relay) from the same binary and dials this proxy for every
+# logical stream.
+#
+# Set it up with: sudo mtbuddy setup web --domain relay.example.com
+# enabled = false
+
+# Public hostname that goes into tg://webproxy links.
+# Must be a real DNS name in ASCII (xn-- form for IDN) with an A record pointing
+# at this host — the client rejects IP addresses and single labels outright.
+# ⚠️  Immutable once links are distributed: the bridge capability is an HMAC over
+# this exact string, so changing it invalidates every WEB link, exactly the way
+# changing [censorship].tls_domain invalidates every FakeTLS link.
+# domain = "relay.example.com"
+
+# Relay listener. TLS is always terminated in front of the relay (the local
+# nginx masking backend, or a CDN), so this stays on loopback.
+# listen = "127.0.0.1"
+# port = 8081
+
+# Stock MTProxy the relay dials for every logical stream.
+# Defaults to this proxy on loopback at [server].port.
+# backend = "127.0.0.1:443"
+
+# Same-origin WebSocket endpoint the bridge page connects to.
+# ws_path = "/api/v1/socket"
+
+# Honour a forwarded-client-address header from the TLS terminator, so the proxy
+# sees the real client instead of the relay. Only the RIGHT-MOST entry is read —
+# that is the one the hop in front of us wrote, and the one a client cannot
+# forge by sending its own X-Forwarded-For.
+# trust_forwarded_for = true
+
+# Which header carries it. "x-forwarded-for" matches the vhost mtbuddy writes;
+# use "cf-connecting-ip" behind Cloudflare. Empty disables the lookup.
+# In --mode mask this legitimately resolves to 127.0.0.1: the masking hop inside
+# the proxy is a raw byte pipe and carries no client address, so relayed users
+# are exempt from the per-IP guards instead of sharing one key with them.
+# client_ip_header = "x-forwarded-for"
+
+# Require Origin: https://<domain> on the WebSocket upgrade.
+# check_origin = true
+
+# Concurrency caps. Each session is one desktop client; each stream is one
+# MTProto socket it opens, and each costs a connection against
+# [server].max_connections on the proxy side.
+# max_sessions = 64
+# max_streams = 32
+
+# TLS terminator that accepts a PROXY-protocol header, used ONLY for masked
+# connections whose SNI is `domain`. Without it the masking hop inside the proxy
+# is a raw byte pipe, so the terminator sees 127.0.0.1 and every relayed user
+# reaches Telegram as a loopback client — which costs per-IP accounting and any
+# geo-based routing Telegram does. `mtbuddy setup web --mode mask` sets this up.
+# mask_backend = "127.0.0.1:8444"
+
+# Extra source addresses (plain IP literals, not CIDRs) the *data plane* trusts
+# to speak the direct-obfuscated transport while fake_tls_only is on. Loopback
+# is always trusted while enabled = true; list addresses here only when the
+# relay runs on another host.
+# relay_sources = []
+
 [upstream]
 # Upstream egress mode for outgoing DC connections.
 # "auto"       — direct TCP from host routing (default)

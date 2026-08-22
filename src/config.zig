@@ -196,6 +196,75 @@ pub const Config = struct {
         }
     };
 
+    /// `[web]` — the WEB proxy relay (Telegram Desktop 7.1's fourth proxy type).
+    ///
+    /// A WEB proxy is an ordinary MTProxy whose carrier is a browser: the client's
+    /// hidden WebView loads `https://<domain>/?bridge=<capability>` and shuttles
+    /// multiplexed frames to a relay, which dials this proxy for every logical stream.
+    /// Read by two different processes — the relay itself, and (for `relay_sources`)
+    /// the data plane, which must accept the relay's non-FakeTLS handshakes.
+    pub const Web = struct {
+        /// Master switch. Also what makes the data plane trust a loopback relay.
+        enabled: bool = false,
+        /// Public hostname that goes into `tg://webproxy` links. Must be a real DNS
+        /// name in ASCII/A-label form — the client rejects IPs and single labels, and
+        /// the bridge capability is an HMAC over this exact string, so changing it
+        /// invalidates every WEB link already handed out.
+        domain: ?[]const u8 = null,
+        /// Relay listener. TLS is always terminated in front of the relay (nginx, or a
+        /// CDN), so this defaults to loopback.
+        host: ?[]const u8 = null,
+        port: u16 = 8081,
+        /// `host:port` of the stock MTProxy the relay dials on every OPEN.
+        /// Defaults to this proxy on loopback.
+        backend: ?[]const u8 = null,
+        /// `host:port` of a TLS terminator that accepts a PROXY-protocol header, used
+        /// ONLY for masked connections whose SNI is `domain`.
+        ///
+        /// Without it the masking hop is a raw byte pipe, so the terminator observes
+        /// 127.0.0.1 and every relayed user reaches Telegram as a loopback client. With
+        /// it the proxy prefixes those connections with the real client address, and it
+        /// survives all the way through the relay back into `peer_addr`.
+        mask_backend: ?[]const u8 = null,
+        /// Same-origin WebSocket endpoint the bridge page connects to.
+        ws_path: ?[]const u8 = null,
+        /// Honour a forwarded-client-address header from the TLS terminator in front of
+        /// the relay. Only the right-most entry is used, because that is the one our own
+        /// hop wrote; see `web/http.zig`.
+        trust_forwarded_for: bool = true,
+        /// Which header carries it. `x-forwarded-for` suits our own nginx vhost;
+        /// `cf-connecting-ip` suits Cloudflare. Empty disables the lookup entirely.
+        client_ip_header: ?[]const u8 = null,
+        /// Require `Origin: https://<domain>` on the WebSocket upgrade.
+        check_origin: bool = true,
+        max_sessions: u32 = 32,
+        max_streams: u32 = 32,
+        /// Aggregate ceiling (MiB) on everything the relay has queued across all
+        /// connections. Over budget it stops handing out client credit and stops
+        /// draining backends until the queues fall back below it.
+        max_buffer_mb: u32 = 128,
+        /// Extra addresses the *data plane* trusts to speak the direct-obfuscated (dd)
+        /// transport while `fake_tls_only` is on. Loopback is always trusted when
+        /// `enabled`; list plain IP literals here for a relay on another host.
+        relay_sources: []const []const u8 = &.{},
+
+        /// Bound host, defaulting to loopback.
+        pub fn effectiveHost(self: *const Web) []const u8 {
+            return self.host orelse "127.0.0.1";
+        }
+
+        /// WebSocket path, defaulting to something that reads like an ordinary API.
+        pub fn effectiveWsPath(self: *const Web) []const u8 {
+            return self.ws_path orelse "/api/v1/socket";
+        }
+
+        /// Header carrying the forwarded client address, defaulting to the one our own
+        /// nginx vhost writes.
+        pub fn effectiveClientIpHeader(self: *const Web) []const u8 {
+            return self.client_ip_header orelse "x-forwarded-for";
+        }
+    };
+
     /// Route regular DC traffic via Telegram MiddleProxy transport.
     /// Mirrors telemt's [general].use_middle_proxy behavior.
     use_middle_proxy: bool = false,
@@ -424,6 +493,7 @@ pub const Config = struct {
     /// Parsed from [upstream.tunnel].pinned_interface.
     upstream_tunnel_pinned_interface: ?[]const u8 = null,
     metrics: Metrics = .{},
+    web: Web = .{},
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -510,6 +580,28 @@ pub const Config = struct {
 
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
+        if (self.web.enabled) {
+            const log = std.log.scoped(.config);
+            // Every WEB client costs one masked connection for its carrier plus one per
+            // logical MTProto stream, all against this proxy's own max_connections.
+            const worst = @as(u64, self.web.max_sessions) * (@as(u64, self.web.max_streams) + 1);
+            if (worst > self.max_connections) {
+                log.warn(
+                    "[web] can occupy up to {d} proxy connections (max_sessions {d} x (max_streams {d} + 1)) " ++
+                        "but [server].max_connections is {d}. Raise max_connections, or lower the [web] caps.",
+                    .{ worst, self.web.max_sessions, self.web.max_streams, self.max_connections },
+                );
+            }
+            if (self.web.domain == null) {
+                log.err("[web].enabled is true but [web].domain is unset; the relay will refuse to start.", .{});
+            }
+            if (self.web.port == self.port or self.web.port == self.mask_port) {
+                log.err(
+                    "[web].port ({d}) collides with [server].port ({d}) or [censorship].mask_port ({d}).",
+                    .{ self.web.port, self.port, self.mask_port },
+                );
+            }
+        }
         if (self.hasLocalMaskPortCollision()) {
             const log = std.log.scoped(.config);
             log.err(
@@ -519,12 +611,20 @@ pub const Config = struct {
                 .{ self.port, self.mask_port },
             );
         }
-        if (self.use_middle_proxy and self.middleproxy_buffer_kb < 1024) {
+        // The threshold is the DEFAULT, not some lower "recommended minimum": a max
+        // download part is 1 MiB of payload plus MTProto + RPC framing, so 1024 itself
+        // truncates media (see the field's doc comment). Warning only below 1024 let a
+        // config that predates the default being raised sit at exactly 1024 and silently
+        // fail every 1 MiB-part download for MiddleProxy-routed users, while direct
+        // users were unaffected — a confusing, long-lived misconfiguration.
+        if (self.use_middle_proxy and self.middleproxy_buffer_kb < 2048) {
             const log = std.log.scoped(.config);
             log.warn(
-                "middleproxy_buffer_kb={d} is below recommended minimum (1024). " ++
-                    "This may cause MiddleProxyBufferOverflow errors on media-heavy " ++
-                    "traffic (Stories, video downloads). Consider increasing to 1024+.",
+                "middleproxy_buffer_kb={d} is below the default 2048. A single 1 MiB media " ++
+                    "download part plus MTProto/RPC framing does not fit, so Stories and video " ++
+                    "downloads break for users routed through MiddleProxy (users NOT in " ++
+                    "[access.direct_users]). Raise it to 2048 — note it costs ~2x per-connection " ++
+                    "memory, which lowers the auto-clamped max_connections.",
                 .{self.middleproxy_buffer_kb},
             );
         }
@@ -581,6 +681,7 @@ pub const Config = struct {
         var in_server_section = false;
         var in_general_section = false;
         var in_metrics_section = false;
+        var in_web_section = false;
         var in_upstream_section = false;
         var in_upstream_socks5_section = false;
         var in_upstream_http_section = false;
@@ -610,6 +711,7 @@ pub const Config = struct {
                 in_server_section = std.mem.eql(u8, header, "[server]");
                 in_general_section = std.mem.eql(u8, header, "[general]");
                 in_metrics_section = std.mem.eql(u8, header, "[metrics]");
+                in_web_section = std.mem.eql(u8, header, "[web]");
                 in_upstream_section = std.mem.eql(u8, header, "[upstream]");
                 in_upstream_socks5_section = std.mem.eql(u8, header, "[upstream.socks5]");
                 in_upstream_http_section = std.mem.eql(u8, header, "[upstream.http]");
@@ -826,6 +928,43 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "port")) {
                         cfg.metrics.port = std.fmt.parseInt(u16, value, 10) catch cfg.metrics.port;
                     }
+                } else if (in_web_section) {
+                    if (std.mem.eql(u8, key, "enabled")) {
+                        cfg.web.enabled = parseBool(value);
+                    } else if (std.mem.eql(u8, key, "domain")) {
+                        if (cfg.web.domain) |prev| allocator.free(prev);
+                        cfg.web.domain = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "listen") or std.mem.eql(u8, key, "host")) {
+                        if (cfg.web.host) |prev| allocator.free(prev);
+                        cfg.web.host = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "port")) {
+                        cfg.web.port = std.fmt.parseInt(u16, value, 10) catch cfg.web.port;
+                    } else if (std.mem.eql(u8, key, "backend")) {
+                        if (cfg.web.backend) |prev| allocator.free(prev);
+                        cfg.web.backend = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "mask_backend")) {
+                        if (cfg.web.mask_backend) |prev| allocator.free(prev);
+                        cfg.web.mask_backend = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "ws_path")) {
+                        if (cfg.web.ws_path) |prev| allocator.free(prev);
+                        cfg.web.ws_path = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "trust_forwarded_for")) {
+                        cfg.web.trust_forwarded_for = parseBool(value);
+                    } else if (std.mem.eql(u8, key, "client_ip_header")) {
+                        if (cfg.web.client_ip_header) |prev| allocator.free(prev);
+                        cfg.web.client_ip_header = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "check_origin")) {
+                        cfg.web.check_origin = parseBool(value);
+                    } else if (std.mem.eql(u8, key, "max_sessions")) {
+                        cfg.web.max_sessions = @max(1, std.fmt.parseInt(u32, value, 10) catch cfg.web.max_sessions);
+                    } else if (std.mem.eql(u8, key, "max_streams")) {
+                        cfg.web.max_streams = @max(1, std.fmt.parseInt(u32, value, 10) catch cfg.web.max_streams);
+                    } else if (std.mem.eql(u8, key, "max_buffer_mb")) {
+                        cfg.web.max_buffer_mb = @max(8, std.fmt.parseInt(u32, value, 10) catch cfg.web.max_buffer_mb);
+                    } else if (std.mem.eql(u8, key, "relay_sources")) {
+                        freeStringSlice(allocator, cfg.web.relay_sources);
+                        cfg.web.relay_sources = parseStringArrayValue(allocator, value) catch &.{};
+                    }
                 } else if (in_upstream_section) {
                     if (std.mem.eql(u8, key, "type")) {
                         if (parseUpstreamMode(value)) |mode| {
@@ -932,6 +1071,25 @@ pub const Config = struct {
         if (self.metrics.host) |h| {
             allocator.free(h);
         }
+        if (self.web.domain) |d| {
+            allocator.free(d);
+        }
+        if (self.web.host) |h| {
+            allocator.free(h);
+        }
+        if (self.web.backend) |b| {
+            allocator.free(b);
+        }
+        if (self.web.mask_backend) |b| {
+            allocator.free(b);
+        }
+        if (self.web.ws_path) |wp| {
+            allocator.free(wp);
+        }
+        if (self.web.client_ip_header) |h| {
+            allocator.free(h);
+        }
+        freeStringSlice(allocator, self.web.relay_sources);
     }
 
     /// Get user secrets as a flat slice for handshake validation.

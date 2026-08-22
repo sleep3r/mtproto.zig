@@ -35,6 +35,18 @@ make e2e
 zig build e2e
 ```
 
+### WEB proxy bridge page
+
+The bridge page (`src/web/page.zig`) is the only code here that runs in the user's
+browser, and it talks to Telegram Desktop across two boundaries that fail silently when
+they are wrong. A scripted client drives it:
+
+```bash
+zig build web-bridge
+```
+
+Needs `python3` and `node`; it skips cleanly when node is missing.
+
 ### Bench / soak
 
 ```bash

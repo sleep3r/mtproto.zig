@@ -9,6 +9,7 @@ const i18n = @import("i18n.zig");
 const sys = @import("sys.zig");
 const release = @import("release.zig");
 const dashboard = @import("dashboard.zig");
+const web = @import("web.zig");
 const recovery = @import("recovery.zig");
 const install = @import("install.zig");
 
@@ -243,6 +244,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     // ── Redeploy dashboard (if already installed) ──
     if (sys.isServiceActive("proxy-monitor")) {
         dashboard.execute(ui, allocator, .{ .quiet = true }) catch {};
+    }
+
+    // ── Re-apply the WEB proxy relay (if already installed) ──
+    // Its systemd unit points at the proxy binary we just swapped, so this only
+    // rewrites the unit and restarts it. `web.execute` skips the config.toml write when
+    // nothing changed, which keeps `mtbuddy update` byte-identical on config.toml the
+    // way test/installer-e2e asserts.
+    if (web.isInstalled()) {
+        web.execute(ui, allocator, .{ .quiet = true, .skip_cert = true, .yes = true }) catch {};
     }
 
     // ── Summary ──

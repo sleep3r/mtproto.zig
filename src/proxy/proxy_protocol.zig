@@ -101,6 +101,91 @@ fn parseV2(buf: []const u8) ParseResult {
     }
 }
 
+/// IPv4 embedded in an IPv4-mapped IPv6 address, if any. The proxy's own guards
+/// normalise the same way, so a PROXY header we emit should too.
+fn unmapV4(addr: Address) Address {
+    switch (addr) {
+        .ip4 => return addr,
+        .ip6 => |v6| {
+            const b = v6.bytes;
+            const mapped = std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff;
+            if (!mapped) return addr;
+            return net_helpers.ip4(.{ b[12], b[13], b[14], b[15] }, v6.port);
+        },
+    }
+}
+
+/// Longest header `buildV2` can produce (signature + TCP6 address block).
+pub const max_v2_len: usize = 52;
+
+/// Build a PROXY protocol v2 header announcing `src` as the client of a connection to
+/// `dst`. Binary v2 avoids having to render an IPv6 address as text, and `parse` above
+/// reads it back.
+///
+/// A null `src` (or one we cannot represent) becomes a v2 LOCAL header, which tells the
+/// receiver to keep the address it observed rather than trust a bogus one.
+pub fn buildV2(buf: *[64]u8, src: ?Address, dst: Address) []const u8 {
+    @memcpy(buf[0..12], &v2_sig);
+
+    const source = if (src) |c| unmapV4(c) else null;
+    const target = unmapV4(dst);
+
+    if (source) |s| {
+        switch (s) {
+            .ip4 => |s4| {
+                // Both addresses must share a family; when they do not, the client is
+                // still reported truthfully and the destination becomes same-family
+                // loopback, which no receiver acts on.
+                const d: [4]u8 = switch (target) {
+                    .ip4 => |d4| d4.bytes,
+                    .ip6 => .{ 127, 0, 0, 1 },
+                };
+                const d_port: u16 = switch (target) {
+                    .ip4 => |d4| d4.port,
+                    .ip6 => |d6| d6.port,
+                };
+                buf[12] = 0x21; // version 2, PROXY
+                buf[13] = 0x11; // AF_INET, STREAM
+                std.mem.writeInt(u16, buf[14..16], 12, .big);
+                @memcpy(buf[16..20], &s4.bytes);
+                @memcpy(buf[20..24], &d);
+                std.mem.writeInt(u16, buf[24..26], s4.port, .big);
+                std.mem.writeInt(u16, buf[26..28], d_port, .big);
+                return buf[0..28];
+            },
+            .ip6 => |s6| {
+                var d: [16]u8 = [_]u8{0} ** 16;
+                var d_port: u16 = 0;
+                switch (target) {
+                    .ip6 => |d6| {
+                        d = d6.bytes;
+                        d_port = d6.port;
+                    },
+                    .ip4 => |d4| {
+                        d[10] = 0xff;
+                        d[11] = 0xff;
+                        @memcpy(d[12..16], &d4.bytes);
+                        d_port = d4.port;
+                    },
+                }
+                buf[12] = 0x21;
+                buf[13] = 0x21; // AF_INET6, STREAM
+                std.mem.writeInt(u16, buf[14..16], 36, .big);
+                @memcpy(buf[16..32], &s6.bytes);
+                @memcpy(buf[32..48], &d);
+                std.mem.writeInt(u16, buf[48..50], s6.port, .big);
+                std.mem.writeInt(u16, buf[50..52], d_port, .big);
+                return buf[0..52];
+            },
+        }
+    }
+
+    buf[12] = 0x20; // version 2, LOCAL
+    buf[13] = 0x00;
+    std.mem.writeInt(u16, buf[14..16], 0, .big);
+    return buf[0..16];
+}
+
 test "parse v1 TCP4" {
     const r = parse("PROXY TCP4 1.2.3.4 5.6.7.8 12345 443\r\nGET /");
     try std.testing.expect(r == .ok);
