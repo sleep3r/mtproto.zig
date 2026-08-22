@@ -202,13 +202,20 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     // --queue-bypass: if nfqws is not attached (down/crashed/failed to start),
     // queued packets fall through to ACCEPT instead of the kernel default DROP.
     // Without it, a stopped nfqws silently blackholes ALL proxy egress on this port.
+    //
+    // `! -o lo` keeps loopback out of the queue. Desync exists to defeat DPI on the path
+    // to the client; 127.0.0.1 never crosses a network, and the WEB relay dials the proxy
+    // there, so without this exclusion every relayed byte takes a userspace round trip
+    // through nfqws and the relay's streams crawl.
     if (!runLogged(ui, allocator, &.{
         ipt.iptables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "!",          "-o",          "lo",
         "-p",         "tcp",         "--sport",   port,             "-j",
         "NFQUEUE",    "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }, "Failed to apply IPv4 NFQUEUE rule")) return;
     _ = sys.exec(allocator, &.{
         ipt.ip6tables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "!",           "-o",          "lo",
         "-p",          "tcp",         "--sport",   port,             "-j",
         "NFQUEUE",     "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }) catch {};
@@ -237,8 +244,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         \\Type=simple
         \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
         \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
-        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
-        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
         \\ExecStart={[zapret_dir]s}/nfq/nfqws \
         \\    --qnum={[queue]s} \
         \\    --dpi-desync=fake,split2 \
