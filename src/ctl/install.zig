@@ -17,6 +17,8 @@ const toml = @import("toml.zig");
 const masking = @import("masking.zig");
 const nfqws = @import("nfqws.zig");
 const fronting_domain = @import("fronting_domain.zig");
+const web = @import("web.zig");
+const web_capability = @import("web_capability");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -63,6 +65,10 @@ pub const InstallOpts = struct {
     insecure: bool = false,
     /// Path to an existing config.toml to use.
     config_path: ?[]const u8 = null,
+    /// Set up the WEB proxy relay (Telegram Desktop 7.1+) at this domain. Empty = skip.
+    /// It needs a domain the operator owns, with an A record pointing at this host, so
+    /// it can never be a silent default.
+    web_domain: []const u8 = "",
     /// Internal flags to track if user explicitly provided a value.
     port_provided: bool = false,
     public_port_provided: bool = false,
@@ -163,6 +169,7 @@ pub fn printInstallHelp(ui: *Tui) void {
     ui.writeRaw("    --config, -c <path>        Install using an existing config.toml\n");
     ui.writeRaw("    --max-connections <N>      Max concurrent client connections (default: 512)\n");
     ui.writeRaw("    --middle-proxy             Enable Telegram MiddleProxy relay\n");
+    ui.writeRaw("    --web <domain>             Also set up the WEB proxy relay at this domain (Desktop 7.1+)\n");
     ui.writeRaw("    --no-dpi                   Disable masking, nfqws, and TCPMSS setup\n");
     ui.writeRaw("    --no-masking               Disable local masking setup\n");
     ui.writeRaw("    --no-nfqws                 Disable nfqws setup\n");
@@ -219,7 +226,14 @@ test "renderTcpmssScript bakes params and stays brace-free for std.fmt" {
     // IPv4 append must NOT be swallowed, so a missing xt_TCPMSS fails the unit...
     try std.testing.expect(std.mem.indexOf(u8, out, "--set-mss \"$MSS\"\n\"$IPT\" $W -t mangle -C") != null);
     // ...while IPv6 stays best-effort.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"$IP6T\" $W -t mangle -A OUTPUT -p tcp --sport \"$PORT\" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss \"$MSS\" 2>/dev/null || true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"$IP6T\" $W -t mangle -A OUTPUT ! -o lo -p tcp --sport \"$PORT\" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss \"$MSS\" 2>/dev/null || true") != null);
+    // The clamp must never touch loopback: the WEB relay reaches the proxy over
+    // 127.0.0.1, and an 88-byte MSS there throttles every relayed stream while buying
+    // no censorship resistance. Both appends carry the exclusion...
+    try std.testing.expect(std.mem.indexOf(u8, out, "-A OUTPUT ! -o lo -p tcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-A OUTPUT -p tcp") == null);
+    // ...and the reset sweeps the pre-exclusion spelling too, so an upgrade cleans up.
+    try std.testing.expect(std.mem.indexOf(u8, out, "for M in \"-p tcp --sport $PORT\" \"! -o lo -p tcp --sport $PORT\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[ \"$MODE\" = flush ] && exit 0") != null);
     // Waits for the xtables lock: under set -e a boot-time collision with ufw/docker
     // would otherwise fail the unit spuriously.
@@ -238,6 +252,36 @@ test "tcpmss unit re-applies at boot and cleans up on stop" {
     try std.testing.expect(std.mem.indexOf(u8, unit, "Before=mtproto-proxy.service") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit, "ExecStart=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " apply") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit, "ExecStop=/bin/sh " ++ TCPMSS_SCRIPT_PATH ++ " flush") != null);
+}
+
+/// `mtbuddy update` path. A host installed before the loopback exclusion still clamps its
+/// own 127.0.0.1 traffic to an 88-byte MSS, which throttles the WEB relay's hop to the
+/// proxy. The script is ours and carries the values it was generated with, so re-render it
+/// from those and let the unit re-apply -- the new reset sweeps both spellings, so the old
+/// rule is removed rather than left beside the new one.
+pub fn refreshTcpmssLoopbackExclusion(ui: *Tui, allocator: std.mem.Allocator) void {
+    if (!sys.fileExists(TCPMSS_SCRIPT_PATH)) return;
+
+    const existing = sys.readFileAllocAbsolute(allocator, TCPMSS_SCRIPT_PATH, 64 * 1024) orelse return;
+    defer allocator.free(existing);
+    if (std.mem.indexOf(u8, existing, "! -o lo") != null) return;
+
+    const port = sys.readEnvFile(allocator, TCPMSS_SCRIPT_PATH, "PORT") orelse return;
+    defer allocator.free(port);
+    const mss = sys.readEnvFile(allocator, TCPMSS_SCRIPT_PATH, "MSS") orelse return;
+    defer allocator.free(mss);
+
+    var buf: [4096]u8 = undefined;
+    const script = renderTcpmssScript(&buf, .{
+        .port = port,
+        .mss = mss,
+        .iptables = sys.commandOrPath("iptables", &.{ "/usr/sbin/iptables", "/sbin/iptables" }),
+        .ip6tables = sys.commandOrPath("ip6tables", &.{ "/usr/sbin/ip6tables", "/sbin/ip6tables" }),
+    }) catch return;
+
+    sys.writeFileMode(TCPMSS_SCRIPT_PATH, script, 0o755) catch return;
+    _ = sys.execForward(&.{ "systemctl", "restart", TCPMSS_SERVICE_NAME }) catch {};
+    ui.ok("TCPMSS clamp no longer applies to loopback");
 }
 
 /// Run install in CLI (non-interactive) mode.
@@ -288,6 +332,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             }
         } else if (std.mem.eql(u8, arg, "--user") or std.mem.eql(u8, arg, "-u")) {
             if (args.next()) |val| opts.user = val;
+        } else if (std.mem.eql(u8, arg, "--web")) {
+            if (args.next()) |val| opts.web_domain = val;
         } else if (std.mem.eql(u8, arg, "--yes") or std.mem.eql(u8, arg, "-y")) {
             opts.yes = true;
         } else if (std.mem.eql(u8, arg, "--no-masking")) {
@@ -506,6 +552,34 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     if (!opts.enable_middle_proxy) {
         ui.warn(ui.str(.install_middle_proxy_warn));
     }
+
+    // ── WEB proxy (Telegram Desktop 7.1+) ──
+    // Asked last because it is the only step that needs something the operator must
+    // already own: a domain with an A record pointing at this server. Everything else
+    // in the wizard works on a bare IP.
+    ui.writeRaw("\n");
+    ui.print("  {s}╭─ {s}{s}{s}\n", .{ Color.gray, Color.bold, localized(ui, "WEB proxy for Telegram Desktop 7.1+", "WEB-прокси для Telegram Desktop 7.1+"), Color.reset });
+    {
+        const help = localized(
+            ui,
+            "Reaches Telegram through an ordinary HTTPS website, so a censor sees a\nbrowser visiting a site rather than a proxy connection. Needs a domain you\nown, pointed at this server; it is set up alongside the usual links, not\ninstead of them. Skip with Enter and add it later: mtbuddy setup web",
+            "Ходит в Telegram через обычный HTTPS-сайт: цензор видит визит браузера\nна сайт, а не подключение к прокси. Нужен ваш домен, направленный на этот\nсервер; ставится в дополнение к обычным ссылкам, а не вместо них.\nМожно пропустить (Enter) и добавить позже: mtbuddy setup web",
+        );
+        var help_lines = std.mem.splitScalar(u8, help, '\n');
+        while (help_lines.next()) |line| {
+            ui.print("  {s}│{s}  {s}{s}{s}\n", .{ Color.gray, Color.reset, Color.dim, line, Color.reset });
+        }
+    }
+    ui.print("  {s}╰─{s}\n", .{ Color.gray, Color.reset });
+
+    var web_domain_buf: [256]u8 = undefined;
+    const web_domain = ui.input(
+        localized(ui, "WEB proxy domain (Enter to skip)", "Домен WEB-прокси (Enter — пропустить)"),
+        localized(ui, "A real DNS name you control, e.g. relay.example.com", "Настоящее DNS-имя под вашим контролем, например relay.example.com"),
+        "",
+        &web_domain_buf,
+    ) catch "";
+    opts.web_domain = std.mem.trim(u8, web_domain, " \t");
 
     opts.yes = true; // already confirmed via wizard
 
@@ -845,6 +919,21 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         }
     }
 
+    // ── WEB proxy relay (via Zig module) ──
+    // After masking, because mode "mask" needs the nginx that masking installs and its
+    // `nginx -t` must already see the masking vhost; before the final restart, because
+    // [web].enabled is read once at proxy startup.
+    if (opts.web_domain.len > 0) {
+        web.execute(ui, allocator, .{ .domain = opts.web_domain, .yes = true }) catch {
+            ui.warn("WEB proxy setup failed");
+        };
+        // Report what actually happened, not what was requested.
+        summary_opts.web_domain = if (web.isInstalled() and sys.isServiceActive(web.SERVICE_NAME)) opts.web_domain else "";
+        if (summary_opts.web_domain.len == 0) {
+            ui.warn("WEB proxy setup did not complete; final summary will show it disabled.");
+        }
+    }
+
     // ── Final restart ──
     if (!runRequired(ui, allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }, "Failed to chown install directory")) return;
     if (!runRequired(ui, allocator, &.{ "systemctl", "restart", SERVICE_NAME }, "Failed to restart mtproto-proxy after setup")) return;
@@ -1059,6 +1148,19 @@ fn printLinksFromConfig(
     else
         false;
 
+    // WEB links (Telegram Desktop 7.1+) are printed only once [web] is live: a link
+    // whose domain does not serve the bridge is worse than no link. The hostname is
+    // canonicalised the way the client canonicalises it, since the bridge capability
+    // is an HMAC over that exact string.
+    var web_domain_buf: [web_capability.max_host_len]u8 = undefined;
+    const web_host: ?[]const u8 = blk: {
+        const enabled = cfg_doc.get("web", "enabled") orelse break :blk null;
+        if (!std.mem.eql(u8, std.mem.trim(u8, enabled, " \t\""), "true")) break :blk null;
+        const raw = cfg_doc.get("web", "domain") orelse break :blk null;
+        const trimmed_domain = std.mem.trim(u8, raw, " \t\"");
+        break :blk web_capability.normalizeHost(trimmed_domain, &web_domain_buf) catch null;
+    };
+
     var printed_any = false;
     var in_users_section = false;
 
@@ -1125,6 +1227,21 @@ fn printLinksFromConfig(
         if (with_qr and !qr_done) {
             printQrCode(ui, allocator, tme_link);
             qr_done = true;
+        }
+        if (web_host) |host| {
+            var web_secret_buf: [128]u8 = undefined;
+            const web_secret = buildDdSecret(secret_hex, &web_secret_buf);
+            var web_link_buf: [512]u8 = undefined;
+            const web_link = std.fmt.bufPrint(&web_link_buf, "https://t.me/webproxy?server={s}&secret={s}", .{
+                host,
+                web_secret,
+            }) catch continue;
+            ui.print("  {s}│{s}    {s}{s}{s}  {s}(Desktop 7.1+){s}\n", .{
+                tui_mod.Color.gray,  tui_mod.Color.reset,
+                tui_mod.Color.white, web_link,
+                tui_mod.Color.reset, tui_mod.Color.dim,
+                tui_mod.Color.reset,
+            });
         }
         if (dd_enabled) {
             var dd_buf: [128]u8 = undefined;
@@ -1207,6 +1324,10 @@ fn printSummary(
         .{
             .label = if (opts.enable_middle_proxy) "MiddleProxy (Telegram relay)" else "MiddleProxy: disabled",
             .style = if (opts.enable_middle_proxy) .success else .label_value,
+        },
+        .{
+            .label = if (opts.web_domain.len > 0) "WEB proxy relay (Desktop 7.1+)" else "",
+            .style = if (opts.web_domain.len > 0) .success else .blank,
         },
     });
 
@@ -1402,7 +1523,9 @@ pub fn renderTcpmssScript(buf: []u8, p: TcpmssScriptParams) ![]const u8 {
     return std.fmt.bufPrint(buf,
         \\#!/bin/sh
         \\# Generated by mtbuddy — clamp the MSS we advertise on our SYN,ACK so the
-        \\# client's ClientHello is forced to fragment across TCP segments.
+        \\# client's ClientHello is forced to fragment across TCP segments. `! -o lo` keeps
+        \\# it off loopback: the WEB relay dials the proxy over 127.0.0.1 and an 88-byte MSS
+        \\# there throttles every relayed stream for no censorship benefit.
         \\# Managed by the {[svc]s}.service systemd unit. Do not edit by hand.
         \\set -eu
         \\PORT={[port]s}
@@ -1417,12 +1540,15 @@ pub fn renderTcpmssScript(buf: []u8, p: TcpmssScriptParams) ![]const u8 {
         \\W="-w 5"
         \\
         \\# Idempotent reset: drop every existing copy (bounded), both families, so a
-        \\# re-apply can never stack duplicate OUTPUT rules.
+        \\# re-apply can never stack duplicate OUTPUT rules. Both spellings are swept so
+        \\# an upgrade from the pre-"! -o lo" rule leaves nothing behind.
         \\for T in "$IPT" "$IP6T"; do
-        \\    N=0
-        \\    while [ "$N" -lt 16 ]; do
-        \\        "$T" $W -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS" 2>/dev/null || break
-        \\        N=$((N + 1))
+        \\    for M in "-p tcp --sport $PORT" "! -o lo -p tcp --sport $PORT"; do
+        \\        N=0
+        \\        while [ "$N" -lt 16 ]; do
+        \\            "$T" $W -t mangle -D OUTPUT $M --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS" 2>/dev/null || break
+        \\            N=$((N + 1))
+        \\        done
         \\    done
         \\done
         \\
@@ -1431,11 +1557,11 @@ pub fn renderTcpmssScript(buf: []u8, p: TcpmssScriptParams) ![]const u8 {
         \\# IPv4 (required). The -C read-back is the authority: an exit-0 append is only
         \\# believed once the rule is actually present. Combined with set -e this is what
         \\# makes the unit fail instead of reporting success over an unchanged ruleset.
-        \\"$IPT" $W -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS"
-        \\"$IPT" $W -t mangle -C OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS"
+        \\"$IPT" $W -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS"
+        \\"$IPT" $W -t mangle -C OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS"
         \\
         \\# IPv6 (best-effort — hosts without IPv6 must not fail the unit).
-        \\"$IP6T" $W -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
+        \\"$IP6T" $W -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss "$MSS" 2>/dev/null || true
         \\exit 0
         \\
     , .{

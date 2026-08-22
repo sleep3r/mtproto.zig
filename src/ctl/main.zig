@@ -29,6 +29,7 @@ const version_mod = @import("version");
 const uninstall = @import("uninstall.zig");
 const config_cmd = @import("config_cmd.zig");
 const links = @import("links.zig");
+const web = @import("web.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -144,6 +145,8 @@ pub fn main(init: std.process.Init) !void {
                     return recovery.run(&ui, allocator, &remaining_args);
                 } else if (std.mem.eql(u8, sub, "dashboard")) {
                     return dashboard.run(&ui, allocator, &remaining_args);
+                } else if (std.mem.eql(u8, sub, "web")) {
+                    return web.run(&ui, allocator, &remaining_args);
                 } else {
                     ui.print("\n  {s}{s}:{s} {s}\n", .{
                         Color.err,
@@ -151,11 +154,11 @@ pub fn main(init: std.process.Init) !void {
                         Color.reset,
                         sub,
                     });
-                    ui.hint(tr(ui.lang, "Available: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard", "Доступно: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard"));
+                    ui.hint(tr(ui.lang, "Available: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard, web", "Доступно: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard, web"));
                     return;
                 }
             } else {
-                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard>", "Использование: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard>"));
+                ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard|web>", "Использование: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard|web>"));
                 return;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
@@ -200,6 +203,8 @@ const Action = enum {
     recovery,
     dashboard,
     remove_dashboard,
+    web,
+    remove_web,
     ipv6hop,
     status,
     restart,
@@ -247,6 +252,13 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
                 try items.append(allocator, i18n.get(ui.lang, .menu_setup_recovery));
                 try actions.append(allocator, .recovery);
             }
+            if (!web.isInstalled()) {
+                try items.append(allocator, tr(ui.lang, "WEB proxy for Telegram Desktop (via an HTTPS site)", "WEB-прокси для Telegram Desktop (через HTTPS-сайт)"));
+                try actions.append(allocator, .web);
+            } else {
+                try items.append(allocator, tr(ui.lang, "Remove the WEB proxy relay", "Удалить релей WEB-прокси"));
+                try actions.append(allocator, .remove_web);
+            }
             try items.append(allocator, i18n.get(ui.lang, .menu_ipv6_hop));
             try actions.append(allocator, .ipv6hop);
             try items.append(allocator, i18n.get(ui.lang, .menu_status));
@@ -285,6 +297,8 @@ fn dispatchAction(action: Action, ui: *Tui, allocator: std.mem.Allocator) !void 
         .synlimit => try synlimit.runInteractive(ui, allocator),
         .dashboard => try dashboard.runInteractive(ui, allocator),
         .remove_dashboard => dashboard.removeInteractive(ui),
+        .web => try web.runInteractive(ui, allocator),
+        .remove_web => web.removeInteractive(ui, allocator),
         .recovery => try recovery.runInteractive(ui, allocator),
         .ipv6hop => try ipv6hop.runInteractive(ui, allocator),
         .status => showStatus(ui, allocator),
@@ -442,6 +456,7 @@ fn showStatus(ui: *Tui, allocator: std.mem.Allocator) void {
         ui.info(tr(ui.lang, "Extra TCP protection (nfqws) is not running", "Дополнительная TCP-защита (nfqws) не запущена"));
     }
 
+    web.printStatus(ui, allocator);
     synlimit.printStatus(ui, allocator);
 
     const timer_active = sys.isServiceActive("mtproto-mask-health.timer");
@@ -529,6 +544,7 @@ fn printHelp(lang: i18n.Lang) void {
     printCmd(&ui, "setup egress [--deps-only] <share-link...>", tr(lang, "Setup VPN share-link egress", "Настроить egress через VPN-ссылку"));
     printCmd(&ui, "setup dashboard", tr(lang, "Install web monitoring dashboard", "Установить веб-дашборд мониторинга"));
     printCmd(&ui, "setup recovery", tr(lang, "Install DPI auto-recovery", "Установить авто-восстановление DPI"));
+    printCmd(&ui, "setup web --domain <host> [--mode mask|behind] [--remove]", tr(lang, "WEB proxy relay for Telegram Desktop 7.1+", "Релей WEB-прокси для Telegram Desktop 7.1+"));
     printCmd(&ui, "ipv6-hop", tr(lang, "IPv6 address rotation", "Ротация IPv6 адреса"));
     printCmd(&ui, "update-dns <ip>", tr(lang, "Update Cloudflare DNS A record", "Обновить A-запись Cloudflare DNS"));
     printCmd(&ui, "config <validate|doctor|print-effective>", tr(lang, "Config diagnostics and effective values", "Диагностика и эффективные значения конфига"));
@@ -555,6 +571,7 @@ fn printHelp(lang: i18n.Lang) void {
     printOpt(&ui, "--no-dpi", tr(lang, "Disable all DPI bypass modules", "Отключить все DPI-модули"));
     printOpt(&ui, "--bind,   -b <ip>", tr(lang, "Bind to specific IP (default: all interfaces)", "Слушать конкретный IP (по умолчанию: все интерфейсы)"));
     printOpt(&ui, "--middle-proxy", tr(lang, "Enable Telegram MiddleProxy relay", "Включить Telegram MiddleProxy relay"));
+    printOpt(&ui, "--web <domain>", tr(lang, "Also set up the WEB proxy relay (Desktop 7.1+)", "Дополнительно поднять релей WEB-прокси (Desktop 7.1+)"));
     printOpt(&ui, "--ipv6-hop", tr(lang, "Enable IPv6 auto-hopping", "Включить автоматическую ротацию IPv6"));
     printOpt(&ui, "--version, -v <tag>", tr(lang, "Release version to install (default: latest)", "Версия релиза для установки (по умолчанию: latest)"));
     printOpt(&ui, "--insecure", tr(lang, "Allow unsigned assets (disables minisign verification)", "Разрешить неподписанные артефакты (отключает minisign verification)"));
@@ -657,4 +674,5 @@ test {
     _ = @import("masking.zig");
     _ = @import("uninstall.zig");
     _ = @import("update.zig");
+    _ = @import("web.zig");
 }

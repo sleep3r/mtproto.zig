@@ -225,6 +225,11 @@ sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | har
 sudo mtbuddy setup syn-limit --status
 sudo mtbuddy setup syn-limit --remove
 
+# WEB 代理中继（Telegram Desktop 7.1+，MTProto 承载在普通 HTTPS 站点内）。
+# 需要你拥有的域名，并把 A 记录指向本机。
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy setup web --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 
@@ -465,6 +470,17 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] desync` | `true` | Split-TLS：1 字节的 Application 记录 |
 | `[censorship] drs` | `false` | 动态记录大小调整（Dynamic Record Sizing） |
 | `[censorship] fast_mode` | `false` | 将 S2C 加密委托给 DC（推荐） |
+| `[web] enabled` | `false` | 启用 WEB 代理中继（Telegram Desktop 7.1+） |
+| `[web] domain` | 未设置 | `tg://webproxy` 链接中的公开主机名 —— **分发链接后不可更改** |
+| `[web] listen` | `"127.0.0.1"` | 中继绑定地址（TLS 在其前端终止） |
+| `[web] port` | `8081` | 中继端口 |
+| `[web] backend` | `127.0.0.1:<server.port>` | 中继为每条逻辑流拨号的 MTProxy |
+| `[web] ws_path` | `"/api/v1/socket"` | 桥接页面的同源 WebSocket 端点 |
+| `[web] trust_forwarded_for` | `true` | 从 `X-Forwarded-For` 取客户端地址 |
+| `[web] check_origin` | `true` | 升级时要求 `Origin: https://<domain>` |
+| `[web] max_sessions` | `64` | 并发桌面客户端数 |
+| `[web] max_streams` | `32` | 每客户端的逻辑 MTProto 套接字数 |
+| `[web] relay_sources` | `[]` | 额外允许使用 `dd` 传输的 IP（loopback 始终允许） |
 | `[access.users] <name>` | — | 每个用户的 32 个十六进制字符密钥 |
 | `[access.direct_users] <name>` | — | 为该用户绕过 ME |
 | `[access.user_max_conns] <name>` | — | 每个用户的并发连接上限（更改需重启） |
@@ -481,6 +497,40 @@ alice = true   # bypass MiddleProxy for this user
 > 两个滥用防护默认均关闭，以免大型运营商 NAT、VPN 出口或共享办公网络（许多合法客户端共用一个源 IP/子网）被误判并一起拦截：每子网的新建连接速率限制（`rate_limit_per_subnet = 0`）与精确 IP 的握手洪水防护（`handshake_flood_guard_enabled = false`）。访问本就已由每用户密钥、全局握手在途预算以及 `max_connections` 把关。在遭受真实滥用的单租户 / 非 NAT 主机上，请将它们开启：设置 `rate_limit_per_subnet`（如 `30`）并设 `handshake_flood_guard_enabled = true`（调整 `handshake_flood_guard_threshold` / 窗口 / 拦截时长）。
 >
 > 上述两者都在 accept() 之后运行（它们在代理进程内）。如果还需要一个内核级的层级，在滥用性的首个 SYN 突发耗费 socket/accept() 之前就将其丢弃，可使用一个可选的每源 IP SYN 速率限制器：`sudo mtbuddy setup syn-limit --preset soft`。它是一条 iptables hashlimit 规则，作为独立的 mtproto-syn-limit.service oneshot 安装，因此从不授予代理 CAP_NET_ADMIN。同样默认关闭，并受同样的运营商 NAT 注意事项约束（soft 2/s·burst-5 预设是对 CGNAT 更安全的默认值）；用 --remove 撤销，drop 计数与状态见 mtbuddy status。更改代理端口后请重新运行它。
+
+---
+
+## WEB 代理（Telegram Desktop 7.1+）
+
+Telegram Desktop 7.1 新增了第四种代理类型 `WEB`。它仍然是普通的 MTProxy，但**载体是浏览器**：客户端根本不打开
+MTProto 套接字。隐藏的原生 WebView 加载 `https://<你的域名>/?bridge=<capability>`，页面通过同源 WebSocket
+把复用帧转发给中继，中继再为每条逻辑流拨号到普通 MTProxy —— 也就是本项目。
+
+```
+Telegram Desktop → 隐藏 WebView → https://relay.example.com/  ← 真实浏览器对真实站点的 TLS 握手
+  → mtproto-web-relay → mtproto-proxy → Telegram
+```
+
+审查者看到的是真实的浏览器指纹、真实的 CA 证书链和随后的 HTTP —— 因为它本来就是。没有可能对不上的 FakeTLS
+ServerHello，链路上也没有 MTProto 握手。
+
+```bash
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy links          # 现在也会打印 tg://webproxy 链接
+```
+
+需要你拥有的域名，并把 A 记录指向本机；`mtbuddy` 会通过 HTTP-01 申请 Let's Encrypt 证书（因此会开放 80 端口）
+并安装续期钩子。
+
+- `--mode mask`（默认）：中继通过代理自身的 masking 后端提供服务 —— 本地 Nginx 上按 SNI 选择的第二个 vhost，
+  不需要额外的公开端口。
+- `--mode behind`：中继监听普通 HTTP，由 Cloudflare、另一台主机或备用 IP 终止 TLS。
+
+WEB 链接携带与 FakeTLS 链接**相同的 16 字节密钥**，只是编码为 `dd…`（Telegram Desktop 认为 `ee` FakeTLS 密钥
+对 WEB 代理*不受支持*）。`fake_tls_only` 保持开启：只有中继自身的源地址被允许通过该闸门，且判定依据是 `accept()`
+报告的地址。中继会用 PROXY 协议头转发真实客户端地址，因此按 IP 的统计与限流仍然准确。
+
+**限制：** 仅桌面端（7.1+），不支持通话，且比直连更受 RTT 影响。它是直连链接被封锁时的备用通道，而不是替代品。
 
 ---
 

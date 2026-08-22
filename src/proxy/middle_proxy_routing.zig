@@ -80,7 +80,16 @@ pub fn buildDcConnectPlan(
         return plan;
     }
 
-    if (cfg.userBypassesMiddleProxy(user_name)) {
+    // CDN datacenter 203 has no address of its own in the direct table -- the entry in
+    // constants is a *middle-proxy* IP (proxy_for 203 ...), which speaks RPC and not the
+    // obfuscated client stream. Connecting there directly is a black hole: the TCP session
+    // opens, we push the request in, and nothing ever comes back, so CDN media (what
+    // non-premium accounts get served) silently never loads. CDN DCs are reachable only
+    // through a middle proxy, so direct users take that route for them too.
+    const cdn_dc = (dc_abs == 203);
+    const has_cdn_middle_proxy = cdn_dc and snapshot != null and snapshot.?.getForDc(dc_abs, true) != null;
+
+    if (cfg.userBypassesMiddleProxy(user_name) and !has_cdn_middle_proxy) {
         plan.candidates[0] = constants.getDcAddressV4(dc_abs);
         plan.count = 1;
         plan.use_middle_proxy = false;
@@ -151,7 +160,9 @@ pub fn buildDcConnectPlan(
     // If middle-proxy connect/handshake fails, retry the same DC via direct mode.
     // This keeps media paths functional in environments where middle-proxy transport
     // itself is degraded (for example due to strict NAT behavior in upstream tunnels).
-    plan.direct_fallback = constants.getDcAddressV4(dc_abs);
+    // ...except for CDN DCs, whose "direct" address is a middle proxy (see above): retrying
+    // there would only trade a handshake failure for a silent black hole.
+    plan.direct_fallback = if (cdn_dc) null else constants.getDcAddressV4(dc_abs);
     return plan;
 }
 
@@ -374,7 +385,14 @@ test "direct users bypass middle-proxy routing" {
     try std.testing.expect(regular_media.use_middle_proxy);
     try std.testing.expect(addressEql(regular_media.candidates[0], mp_dc203));
 
+    // CDN DC 203 is the exception to the direct-user bypass: its only reachable address is
+    // a middle proxy, so admin takes that route too rather than black-holing CDN media.
     const admin_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "admin");
-    try std.testing.expect(!admin_media.use_middle_proxy);
-    try std.testing.expect(addressEql(admin_media.candidates[0], constants.getDcAddressV4(203)));
+    try std.testing.expect(admin_media.use_middle_proxy);
+    try std.testing.expect(addressEql(admin_media.candidates[0], mp_dc203));
+    try std.testing.expect(admin_media.direct_fallback == null);
+
+    // With no middle proxy known for 203 there is nothing better than the old behaviour.
+    const admin_media_no_mp = buildDcConnectPlan(&cfg, 203, -203, null, "admin");
+    try std.testing.expect(!admin_media_no_mp.use_middle_proxy);
 }

@@ -226,6 +226,11 @@ sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | har
 sudo mtbuddy setup syn-limit --status
 sudo mtbuddy setup syn-limit --remove
 
+# رله WEB proxy برای تلگرام دسکتاپ ۷.۱+ (MTProto داخل یک سایت HTTPS معمولی).
+# به دامنه‌ای از خودتان با رکورد A به این میزبان نیاز دارد.
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy setup web --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 
@@ -466,6 +471,17 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] desync` | `true` | Split-TLS: رکوردهای Application یک‌بایتی |
 | `[censorship] drs` | `false` | اندازه‌گیری پویای رکورد (Dynamic Record Sizing) |
 | `[censorship] fast_mode` | `false` | واگذاری رمزنگاریِ S2C به DC (توصیه‌شده) |
+| `[web] enabled` | `false` | فعال‌سازی رله WEB proxy (تلگرام دسکتاپ ۷.۱+) |
+| `[web] domain` | تنظیم‌نشده | نام میزبان عمومی در لینک‌های `tg://webproxy` — **پس از توزیع لینک‌ها تغییرناپذیر** |
+| `[web] listen` | `"127.0.0.1"` | آدرس گوش‌دادن رله (TLS جلوتر از آن خاتمه می‌یابد) |
+| `[web] port` | `8081` | پورت رله |
+| `[web] backend` | `127.0.0.1:<server.port>` | همان MTProxy که رله برای هر جریان منطقی به آن وصل می‌شود |
+| `[web] ws_path` | `"/api/v1/socket"` | نقطه پایانی WebSocket هم‌مبدأ صفحه پل |
+| `[web] trust_forwarded_for` | `true` | گرفتن نشانی کلاینت از `X-Forwarded-For` |
+| `[web] check_origin` | `true` | الزام `Origin: https://<domain>` هنگام upgrade |
+| `[web] max_sessions` | `64` | تعداد کلاینت‌های دسکتاپ هم‌زمان |
+| `[web] max_streams` | `32` | تعداد سوکت‌های منطقی MTProto برای هر کلاینت |
+| `[web] relay_sources` | `[]` | نشانی‌های اضافی مجاز به ترابری `dd` (loopback همیشه مجاز است) |
 | `[access.users] <name>` | — | secret‏ 32 کاراکتر hex برای هر کاربر |
 | `[access.direct_users] <name>` | — | دور زدن ME برای این کاربر |
 | `[access.user_max_conns] <name>` | — | سقف اتصال‌های هم‌زمان به ازای هر کاربر (برای تغییر، ری‌استارت لازم است) |
@@ -482,6 +498,43 @@ alice = true   # bypass MiddleProxy for this user
 > هر دو نگهبانِ سوءاستفاده **به‌صورت پیش‌فرض خاموش‌اند** تا شبکه‌های بزرگ carrier-NAT، خروجی VPN یا دفاتر اشتراکی (با کلاینت‌های مشروع زیاد پشت یک IP/زیرشبکه) به‌اشتباه شناسایی و یکجا مسدود نشوند: محدودیت نرخ اتصال جدید به ازای هر زیرشبکه (`rate_limit_per_subnet = 0`) و نگهبان سیلِ هندشیکِ مبتنی بر IP دقیق (`handshake_flood_guard_enabled = false`). دسترسی پیشاپیش با secret هر کاربر، بودجهٔ سراسریِ هندشیک‌های در جریان و `max_connections` کنترل می‌شود. روی یک هاست تک‌مستأجر / بدون NAT که زیر سوءاستفادهٔ واقعی است، آن‌ها را روشن کنید: `rate_limit_per_subnet` را تنظیم کنید (مثلاً `30`) و `handshake_flood_guard_enabled = true` را قرار دهید (مقادیر `handshake_flood_guard_threshold` / پنجره / مدت مسدودسازی را تنظیم کنید).
 >
 > هر دوی موارد بالا *پس از* `accept()` اجرا می‌شوند (درون-پراکسی هستند). برای یک لایهٔ اضافیِ **سطح-کرنل** که رگبارهای اولین SYNِ سوءاستفاده‌گرانه را *پیش از* آنکه یک سوکت/`accept()` خرج کنند می‌اندازد، یک محدودکنندهٔ نرخ SYN به ازای هر IP مبدأ به‌صورت اختیاری وجود دارد: `sudo mtbuddy setup syn-limit --preset soft`. این یک قانونِ `hashlimit` در iptables است که به‌عنوان یک `mtproto-syn-limit.service` oneshotِ **جداگانه** نصب می‌شود، پس `CAP_NET_ADMIN` هرگز به پراکسی داده نمی‌شود. این نیز **به‌صورت پیش‌فرض خاموش** است و مشمول همان احتیاطِ carrier-NAT می‌شود (پریستِ `soft` با ۲/ثانیه·رگبار-۵ پیش‌فرضِ امن‌تر برای CGNAT است)؛ برای لغوْ `--remove`، وضعیت + شمارندهٔ drop در `mtbuddy status`. پس از تغییر پورت پراکسی، آن را دوباره اجرا کنید.
+
+---
+
+## WEB proxy (تلگرام دسکتاپ ۷.۱+)
+
+تلگرام دسکتاپ ۷.۱ نوع چهارم پروکسی را اضافه کرد: `WEB`. این همان MTProxy معمولی است، اما **حاملش مرورگر است**:
+کلاینت اصلاً هیچ سوکت MTProto باز نمی‌کند. یک WebView پنهان آدرس `https://<دامنه شما>/?bridge=<capability>` را
+بارگذاری می‌کند و آن صفحه فریم‌های مالتی‌پلکس‌شده را روی یک WebSocket هم‌مبدأ به رله می‌فرستد؛ رله هم برای هر
+جریان منطقی به یک MTProxy معمولی — همین پروژه — وصل می‌شود.
+
+```
+Telegram Desktop → WebView پنهان → https://relay.example.com/   ← دست‌دادن TLS واقعی مرورگر با یک سایت واقعی
+  → mtproto-web-relay → mtproto-proxy → Telegram
+```
+
+سانسورچی یک اثر انگشت واقعی مرورگر، یک گواهی واقعی با زنجیره CA و سپس HTTP می‌بیند — چون واقعاً همین است. نه
+ServerHello جعلی‌ای هست که ناهماهنگ شود، نه دست‌دادن MTProto روی سیم.
+
+```bash
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy links          # حالا لینک‌های tg://webproxy را هم چاپ می‌کند
+```
+
+به دامنه‌ای نیاز دارید که در اختیار شماست و رکورد A آن به این میزبان اشاره کند؛ `mtbuddy` گواهی Let's Encrypt را
+از راه HTTP-01 می‌گیرد (بنابراین پورت ۸۰ باز می‌شود) و قلاب تمدید را نصب می‌کند.
+
+- `--mode mask` (پیش‌فرض): رله *از طریق همان backend استتار خودِ پروکسی* سرو می‌شود — یک vhost دوم روی Nginx که
+  بر اساس SNI انتخاب می‌شود و به پورت عمومی اضافه‌ای نیاز ندارد.
+- `--mode behind`: رله روی HTTP ساده گوش می‌دهد و Cloudflare، میزبان دیگر یا یک IP یدکی TLS را خاتمه می‌دهد.
+
+لینک WEB **همان secret ۱۶ بایتی** لینک FakeTLS را حمل می‌کند، فقط با کدگذاری `dd…` (تلگرام دسکتاپ secret نوع `ee`
+را برای WEB proxy *پشتیبانی‌نشده* گزارش می‌کند). `fake_tls_only` روشن می‌ماند: فقط نشانی مبدأ خود رله از آن دروازه
+عبور می‌کند و تصمیم بر اساس نشانی‌ای گرفته می‌شود که `accept()` گزارش کرده است. رله هر اتصال را با هدر PROXY
+protocol حاوی نشانی واقعی مرورگر پیشوند می‌دهد، بنابراین حسابداری و محدودسازی بر پایه IP دقیق می‌ماند.
+
+**محدودیت‌ها:** فقط دسکتاپ (۷.۱+)، بدون پشتیبانی از تماس، و حساس‌تر به RTT نسبت به اتصال مستقیم. این یک مسیر
+پشتیبان برای زمانی است که لینک مستقیم مسدود شده، نه جایگزین آن.
 
 ---
 

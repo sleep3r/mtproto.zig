@@ -202,13 +202,20 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     // --queue-bypass: if nfqws is not attached (down/crashed/failed to start),
     // queued packets fall through to ACCEPT instead of the kernel default DROP.
     // Without it, a stopped nfqws silently blackholes ALL proxy egress on this port.
+    //
+    // `! -o lo` keeps loopback out of the queue. Desync exists to defeat DPI on the path
+    // to the client; 127.0.0.1 never crosses a network, and the WEB relay dials the proxy
+    // there, so without this exclusion every relayed byte takes a userspace round trip
+    // through nfqws and the relay's streams crawl.
     if (!runLogged(ui, allocator, &.{
         ipt.iptables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "!",          "-o",          "lo",
         "-p",         "tcp",         "--sport",   port,             "-j",
         "NFQUEUE",    "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }, "Failed to apply IPv4 NFQUEUE rule")) return;
     _ = sys.exec(allocator, &.{
         ipt.ip6tables, "-t",          "mangle",    "-A",             "OUTPUT",
+        "!",           "-o",          "lo",
         "-p",          "tcp",         "--sport",   port,             "-j",
         "NFQUEUE",     "--queue-num", NFQUEUE_NUM, "--queue-bypass",
     }) catch {};
@@ -237,8 +244,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         \\Type=simple
         \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
         \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
-        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
-        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[iptables]s} -t mangle -D OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -D OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre={[iptables]s} -t mangle -A OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
+        \\ExecStartPre=-{[ip6tables]s} -t mangle -A OUTPUT ! -o lo -p tcp --sport {[port]s} -j NFQUEUE --queue-num {[queue]s} --queue-bypass
         \\ExecStart={[zapret_dir]s}/nfq/nfqws \
         \\    --qnum={[queue]s} \
         \\    --dpi-desync=fake,split2 \
@@ -478,4 +487,104 @@ fn printCommandOutput(ui: *Tui, result: *const sys.ExecResult) void {
 fn tailBytes(bytes: []const u8, max_len: usize) []const u8 {
     if (bytes.len <= max_len) return bytes;
     return bytes[bytes.len - max_len ..];
+}
+
+/// Rewrite an existing unit so its NFQUEUE rules skip loopback.
+///
+/// Returns null when the text already carries the exclusion (nothing to do). The caller
+/// owns the result. Each rewritten append is preceded by a matching delete so a restart
+/// cannot stack duplicates, and the pre-existing deletes are left alone: they are what
+/// removes the old loopback-inclusive rule from a host upgrading into this.
+fn rewriteUnitForLoopback(allocator: std.mem.Allocator, unit: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, unit, "! -o lo") != null) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, unit, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.append(allocator, '\n');
+        first = false;
+
+        const is_append = std.mem.startsWith(u8, line, "ExecStartPre=") and
+            std.mem.indexOf(u8, line, "-A OUTPUT -p tcp") != null and
+            std.mem.indexOf(u8, line, "NFQUEUE") != null;
+        if (!is_append) {
+            try out.appendSlice(allocator, line);
+            continue;
+        }
+
+        const body = line["ExecStartPre=".len..];
+        const cmd = if (body.len > 0 and body[0] == '-') body[1..] else body;
+
+        // The idempotency delete for the new spelling, always failure-tolerant.
+        try out.appendSlice(allocator, "ExecStartPre=-");
+        try appendWithExclusion(allocator, &out, cmd, "-D OUTPUT");
+        try out.append(allocator, '\n');
+
+        try out.appendSlice(allocator, "ExecStartPre=");
+        if (body.len > 0 and body[0] == '-') try out.append(allocator, '-');
+        try appendWithExclusion(allocator, &out, cmd, "-A OUTPUT");
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendWithExclusion(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    cmd: []const u8,
+    verb: []const u8,
+) !void {
+    const at = std.mem.indexOf(u8, cmd, "-A OUTPUT ").?;
+    try out.appendSlice(allocator, cmd[0..at]);
+    try out.appendSlice(allocator, verb);
+    try out.appendSlice(allocator, " ! -o lo ");
+    try out.appendSlice(allocator, cmd[at + "-A OUTPUT ".len ..]);
+}
+
+/// `mtbuddy update` path. A host installed before the exclusion still queues every
+/// loopback packet to nfqws, which throttles the WEB relay's hop to the proxy to a crawl.
+/// Repair it in place: the unit is ours, and a restart re-applies both spellings' deletes
+/// before appending the corrected rule.
+pub fn refreshLoopbackExclusion(ui: *Tui, allocator: std.mem.Allocator) void {
+    const path = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
+    if (!sys.fileExists(path)) return;
+
+    const unit = sys.readFileAllocAbsolute(allocator, path, 64 * 1024) orelse return;
+    defer allocator.free(unit);
+
+    const rewritten = (rewriteUnitForLoopback(allocator, unit) catch return) orelse return;
+    defer allocator.free(rewritten);
+
+    sys.writeFile(path, rewritten) catch return;
+    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+    _ = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+    ui.ok("nfqws desync no longer queues loopback traffic");
+}
+
+test "rewriteUnitForLoopback adds the exclusion and keeps the rules idempotent" {
+    const before =
+        \\[Service]
+        \\ExecStartPre=-/usr/sbin/iptables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num 200 --queue-bypass
+        \\ExecStartPre=/usr/sbin/iptables -t mangle -A OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num 200 --queue-bypass
+        \\ExecStart=/opt/zapret/nfq/nfqws --qnum=200
+    ;
+    const out = (try rewriteUnitForLoopback(std.testing.allocator, before)).?;
+    defer std.testing.allocator.free(out);
+
+    // The append now skips loopback...
+    try std.testing.expect(std.mem.indexOf(u8, out, "ExecStartPre=/usr/sbin/iptables -t mangle -A OUTPUT ! -o lo -p tcp --sport 443 -j NFQUEUE --queue-num 200 --queue-bypass") != null);
+    // ...preceded by a failure-tolerant delete of that same spelling, or a restart would
+    // stack a second copy every time.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ExecStartPre=-/usr/sbin/iptables -t mangle -D OUTPUT ! -o lo -p tcp --sport 443 -j NFQUEUE --queue-num 200 --queue-bypass") != null);
+    // The original delete survives: it is what clears the old rule on an upgrading host.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ExecStartPre=-/usr/sbin/iptables -t mangle -D OUTPUT -p tcp --sport 443") != null);
+    // Nothing else is touched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ExecStart=/opt/zapret/nfq/nfqws --qnum=200") != null);
+    // No loopback-inclusive append is left behind.
+    try std.testing.expect(std.mem.indexOf(u8, out, "-A OUTPUT -p tcp") == null);
+
+    // Already-current units are left alone.
+    try std.testing.expect((try rewriteUnitForLoopback(std.testing.allocator, out)) == null);
 }

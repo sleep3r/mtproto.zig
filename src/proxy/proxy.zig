@@ -44,6 +44,7 @@ const middle_proxy_fallback = @import("middle_proxy_fallback.zig");
 const middle_proxy_nat = @import("middle_proxy_nat.zig");
 const dc_nonce = @import("dc_nonce.zig");
 const upstream_failover = @import("upstream_failover.zig");
+const trusted_peers = @import("trusted_peers.zig");
 const runtime_log = @import("../runtime_log.zig");
 
 test {
@@ -64,6 +65,7 @@ test {
     _ = @import("connection_phase.zig");
     _ = @import("net_helpers.zig");
     _ = @import("connection_pool.zig");
+    _ = @import("trusted_peers.zig");
     _ = @import("relay_steps.zig");
     _ = @import("middle_proxy_frames.zig");
     _ = @import("middle_proxy_handshake.zig");
@@ -471,6 +473,16 @@ const ConnectionSlot = struct {
     upstream_kind: UpstreamKind = .none,
     client_transport: ClientTransport = .fake_tls,
     peer_addr: Address = undefined,
+    /// Decided once, at accept, from the address the kernel reported — and never
+    /// revisited. It must NOT be recomputed from `peer_addr`, which a PROXY-protocol
+    /// header overwrites with an address the client chose: gating on that would let
+    /// anyone claim to be loopback and unlock the direct-obfuscated responder.
+    ///
+    /// True means the peer is the WEB proxy relay (see trusted_peers.zig): it may use
+    /// the direct-obfuscated transport under `fake_tls_only`, may announce a real client
+    /// address, and is exempt from the per-IP guards that would otherwise see every
+    /// relayed user as one address.
+    trusted_peer: bool = false,
 
     phase: ConnectionPhase = .idle,
     active_reserved: bool = false,
@@ -577,12 +589,30 @@ const ConnectionSlot = struct {
 
     // Masking: bytes already read from client before deciding to mask
     mask_prebuffer: ?[]u8 = null,
-    /// One-shot override for the next startMasking (SNI-following safelist hit).
-    /// Consumed (read + cleared) inside startMasking so it never leaks to a reused slot.
+    /// One-shot override for the next startMasking (SNI-following safelist hit, or the
+    /// WEB relay's own domain). Consumed (read + cleared) inside startMasking so it never
+    /// leaks to a reused slot.
     mask_addr_override: ?Address = null,
+    /// Prefix the masked connection with a PROXY-protocol header carrying this client's
+    /// address. Set only for the WEB relay's domain, whose terminator expects one — the
+    /// masking hop is otherwise a raw pipe and the relay would see 127.0.0.1 for
+    /// everybody. One-shot, like mask_addr_override.
+    mask_send_proxy_header: bool = false,
     /// Expect a HAProxy PROXY-protocol header before the TLS ClientHello (set at accept
     /// when accept_proxy_protocol is on; cleared once the header is consumed).
     expect_proxy_header: bool = false,
+    /// The header is welcome but not required — set for trusted relay peers so an
+    /// ordinary local connection (a health probe, a curl) is not rejected just because
+    /// the WEB relay is enabled.
+    proxy_header_optional: bool = false,
+    /// Bytes seen by the last PROXY-header peek. MSG_PEEK consumes nothing, so a peer
+    /// that sends a partial header and stops would otherwise keep the socket readable
+    /// forever and spin this level-triggered loop; growth is what proves progress.
+    proxy_header_peeked: u16 = 0,
+    /// Client read interest stays disarmed until this monotonic deadline. Used to back
+    /// off a stalled PROXY header instead of re-peeking the same bytes at full speed;
+    /// the timer scan re-arms it. 0 = not paused.
+    client_read_pause_until_ms: i64 = 0,
 
     // Non-blocking MiddleProxy handshake state
     mp_step: MiddleProxyHandshakeStep = .none,
@@ -892,6 +922,19 @@ test "jitteredIdleTimeoutMs stays within bounds and respects the floor" {
     try std.testing.expect(jitteredIdleTimeoutMs(base_sec, 15, 1) != jitteredIdleTimeoutMs(base_sec, 15, 2));
 }
 
+/// Resolve a `host:port` string to a single address, or null when it is unusable.
+/// Used for the WEB relay's masking target; DNS is allowed so an operator may name a host.
+fn parseHostPort(allocator: std.mem.Allocator, spec: []const u8) ?Address {
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
+    const host = std.mem.trim(u8, spec[0..colon], "[] ");
+    if (host.len == 0) return null;
+    const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
+    const list = getAddressList(allocator, host, port) catch return null;
+    defer list.deinit();
+    if (list.addrs.len == 0) return null;
+    return list.addrs[0];
+}
+
 pub const ProxyState = struct {
     pub const UserMetrics = struct {
         name: []const u8,
@@ -1167,6 +1210,13 @@ pub const ProxyState = struct {
     mask_addr: ?Address,
     /// Opt-in SNI-following mask targets (config.mask_sni_safelist), resolved at boot.
     mask_safelist: []const MaskSafelistEntry,
+    /// Peers allowed to speak the direct-obfuscated transport under `fake_tls_only`
+    /// (the WEB proxy relay), resolved from `[web]` at boot.
+    trusted: trusted_peers.TrustedPeers,
+    /// Masking target for connections whose SNI is the WEB relay's domain — a terminator
+    /// that accepts a PROXY-protocol header, so the real client address survives the
+    /// masking hop. Null keeps the ordinary mask target for them.
+    web_mask_addr: ?Address,
     /// Startup HTTP-Date clock correction (seconds); 0 if disabled or unavailable.
     clock_offset_seconds: i64,
     replay_cache: ReplayCache,
@@ -1296,6 +1346,32 @@ pub const ProxyState = struct {
         }
         const mask_safelist = mask_safelist_buf.toOwnedSlice(allocator) catch &.{};
 
+        // Peers allowed to bypass `fake_tls_only` with the direct-obfuscated transport.
+        // Loopback is implied by [web].enabled; anything else must be named explicitly.
+        const relay_extra = trusted_peers.parseSources(allocator, cfg.web.relay_sources, struct {
+            fn warn(text: []const u8) void {
+                log.warn("[web].relay_sources: '{s}' is not an IP literal, ignoring", .{text});
+            }
+        }.warn) catch &.{};
+        errdefer allocator.free(relay_extra);
+        // Masking target for the relay's own domain. Resolved here so the hot path only
+        // compares an SNI string.
+        var web_mask_addr: ?Address = null;
+        if (cfg.web.enabled and cfg.web.domain != null) {
+            if (cfg.web.mask_backend) |spec| {
+                if (parseHostPort(allocator, spec)) |addr| {
+                    web_mask_addr = addr;
+                    log.info("[web] masked connections for '{s}' are fronted with a PROXY header", .{cfg.web.domain.?});
+                } else {
+                    log.warn("[web].mask_backend '{s}' is not a usable host:port; ignoring", .{spec});
+                }
+            }
+        }
+        const trusted = trusted_peers.TrustedPeers{ .enabled = cfg.web.enabled, .extra = relay_extra };
+        if (trusted.enabled) {
+            log.info("web relay trust: loopback + {d} explicit source(s) may use the direct-obfuscated transport", .{relay_extra.len});
+        }
+
         // Optional startup clock correction from an HTTPS Date header.
         var clock_offset_seconds: i64 = 0;
         if (cfg.clock_sync_url) |url| {
@@ -1357,6 +1433,8 @@ pub const ProxyState = struct {
             .saturation_paused = std.atomic.Value(bool).init(false),
             .mask_addr = resolved_addr,
             .mask_safelist = mask_safelist,
+            .trusted = trusted,
+            .web_mask_addr = web_mask_addr,
             .clock_offset_seconds = clock_offset_seconds,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls_template,
@@ -1482,6 +1560,7 @@ pub const ProxyState = struct {
         }
         self.flood_guard.destroy(self.allocator);
         self.allocator.free(self.mask_safelist);
+        if (self.trusted.extra.len > 0) self.allocator.free(self.trusted.extra);
         self.allocator.free(self.tls_server_hello_template);
         self.allocator.free(self.config_path);
         self.allocator.free(self.user_secrets);
@@ -2472,8 +2551,13 @@ const EventLoop = struct {
             // the LB). They run on the real client address once the PROXY header is parsed
             // (peer_addr) via the per-handshake flood machinery.
             const proxy_proto = self.state.config.accept_proxy_protocol;
+            // The WEB relay multiplexes every one of its users onto one source address,
+            // so the per-IP guards below would rate the relay rather than its clients —
+            // one flaky user would block all of them. The real client address arrives in
+            // the relay's PROXY header and is judged by the per-handshake machinery.
+            const relay_peer = self.state.trusted.contains(client_addr);
             const flood_cfg = floodGuardSettings(&self.state.config);
-            if (!proxy_proto and self.state.floodIsBlocked(client_addr, flood_cfg)) {
+            if (!proxy_proto and !relay_peer and self.state.floodIsBlocked(client_addr, flood_cfg)) {
                 _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
                 closeFd(cfd);
                 continue;
@@ -2483,7 +2567,7 @@ const EventLoop = struct {
             setTcpNoDelay(cfd);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!proxy_proto and !self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
+            if (!proxy_proto and !relay_peer and !self.state.subnetCheck(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
                 _ = self.state.floodRecord(client_addr, .rate_limit, flood_cfg);
                 closeFd(cfd);
@@ -2523,7 +2607,9 @@ const EventLoop = struct {
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
-            slot.expect_proxy_header = proxy_proto;
+            slot.trusted_peer = relay_peer;
+            slot.expect_proxy_header = proxy_proto or relay_peer;
+            slot.proxy_header_optional = relay_peer and !proxy_proto;
             slot.client_transport = .fake_tls;
             slot.phase = .reading_tls_header;
             slot.handshake_pos = 0;
@@ -3256,6 +3342,9 @@ const EventLoop = struct {
         }
     }
 
+    /// How long client reads stay disarmed after a PROXY-header peek made no progress.
+    const proxy_header_stall_backoff_ms: i64 = 25;
+
     const ProxyHeaderStep = enum { done, wait, closed };
 
     /// MSG_PEEK the connection's first bytes, parse a HAProxy PROXY-protocol header, and
@@ -3277,15 +3366,40 @@ const EventLoop = struct {
             self.closeSlot(slot, "client eof before proxy header");
             return .closed;
         }
+        // A peeked byte is still a first byte: without this the handshake clock never
+        // starts and a stalled header would sit for the whole idle timeout.
+        if (slot.first_byte_at_ms == 0 and n > 0) slot.first_byte_at_ms = nowMs();
         switch (proxy_protocol.parse(peek[0..n])) {
             .incomplete => {
                 if (n >= peek.len) {
                     self.closeSlot(slot, "proxy header too long");
                     return .closed;
                 }
+                const seen: u16 = @intCast(@min(n, std.math.maxInt(u16)));
+                if (seen <= slot.proxy_header_peeked) {
+                    // No progress since the last look. MSG_PEEK leaves the bytes in the
+                    // socket, so the fd stays readable and re-peeking at loop speed would
+                    // pin a core until the handshake timeout. Back off and let the timer
+                    // scan re-arm the read interest.
+                    slot.client_read_pause_until_ms = nowMs() + proxy_header_stall_backoff_ms;
+                } else {
+                    slot.proxy_header_peeked = seen;
+                    slot.client_read_pause_until_ms = 0;
+                }
                 return .wait;
             },
             .invalid => {
+                // A trusted relay peer is *allowed* to prefix a PROXY header, not
+                // required to: an ordinary local connection (health probe, curl) must
+                // still work once the WEB relay is enabled. Fall through to the normal
+                // path with the observed address intact.
+                if (slot.proxy_header_optional) {
+                    slot.expect_proxy_header = false;
+                    slot.proxy_header_optional = false;
+                    slot.proxy_header_peeked = 0;
+                    slot.client_read_pause_until_ms = 0;
+                    return .done;
+                }
                 self.closeSlot(slot, "invalid proxy header");
                 return .closed;
             },
@@ -3305,6 +3419,9 @@ const EventLoop = struct {
                 }
                 if (res.src) |real| slot.peer_addr = real;
                 slot.expect_proxy_header = false;
+                slot.proxy_header_optional = false;
+                slot.proxy_header_peeked = 0;
+                slot.client_read_pause_until_ms = 0;
                 slot.last_activity_ms = nowMs();
                 return .done;
             },
@@ -3329,18 +3446,22 @@ const EventLoop = struct {
                 self.closeSlot(slot, "client eof before tls header");
                 return;
             }
-            if (slot.first_byte_at_ms == 0) {
-                slot.first_byte_at_ms = nowMs();
-                // First byte arrived → the connection is now actually
-                // handshaking. Charge it against the handshake-inflight budget
-                // here (not at accept) so pre-first-byte silent sessions never
-                // occupied a budget slot. Covers both FakeTLS and the dd path,
-                // which is entered from this function after the TLS sniff.
+            if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = nowMs();
+            // First byte arrived → the connection is now actually handshaking.
+            // Charge it against the handshake-inflight budget here (not at accept)
+            // so pre-first-byte silent sessions never occupied a budget slot. Covers
+            // both FakeTLS and the dd path, which is entered from this function after
+            // the TLS sniff. Keyed on hs_counted, NOT on first_byte_at_ms: the
+            // PROXY-protocol peek already stamps the first byte, and a connection that
+            // arrived behind such a header must still pay for its handshake.
+            if (!slot.hs_counted) {
                 if (!self.reserveHandshakeBudget(slot)) {
                     // Feed the flood guard so a client that repeatedly burns the budget
                     // accrues a score (and the per-IP handshake_budget column is no longer
                     // dead telemetry). This is a client-driven, first-byte event.
-                    _ = self.state.floodRecord(slot.peer_addr, .handshake_budget, floodGuardSettings(&self.state.config));
+                    if (!slot.trusted_peer) {
+                        _ = self.state.floodRecord(slot.peer_addr, .handshake_budget, floodGuardSettings(&self.state.config));
+                    }
                     self.closeSlot(slot, "handshake budget exhausted");
                     return;
                 }
@@ -3350,7 +3471,11 @@ const EventLoop = struct {
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
-            if (self.state.config.fake_tls_only) {
+            // The WEB proxy relay carries the client's own MTProxy stream verbatim, and
+            // Telegram Desktop refuses `ee` (FakeTLS) secrets for WEB proxies — so a
+            // relayed connection is always direct-obfuscated. Trust is judged on the
+            // accepted address, which no PROXY header can rewrite.
+            if (self.state.config.fake_tls_only and !slot.trusted_peer) {
                 // Strict FakeTLS-only: never accept the non-TLS "direct
                 // obfuscated" (dd) transport. Mask the bytes immediately so a
                 // non-TLS active probe gets the masking cover (matching the old
@@ -3750,11 +3875,12 @@ const EventLoop = struct {
         slot.direct_fallback_used = false;
 
         // Log DC routing decisions at debug level (enable with log_level = "debug" in config)
-        if (plan.is_media_path) {
+        {
             var addr_buf: [64]u8 = undefined;
             const addr_str = formatAddress(plan.candidates[0], &addr_buf);
-            log.debug("[{d}] route: dc_idx={d} dc_abs={d} media={} middle_proxy={} candidates={d} -> {s}", .{
+            log.debug("[{d}] route: user={s} dc_idx={d} dc_abs={d} media={} middle_proxy={} candidates={d} -> {s}", .{
                 slot.conn_id,
+                slot.validation_user[0..slot.validation_user_len],
                 slot.dc_idx,
                 dc_abs,
                 plan.is_media_path,
@@ -3790,10 +3916,24 @@ const EventLoop = struct {
                 // SNI-following: if the probed SNI is safelisted, front to that domain's
                 // own server so the on-wire conversation matches the SNI the prober claimed.
                 if (sni) |s| {
-                    for (self.state.mask_safelist) |entry| {
-                        if (std.ascii.eqlIgnoreCase(s, entry.domain)) {
-                            slot.mask_addr_override = entry.addr;
-                            break;
+                    // The WEB relay's own domain is not a probe: it is a real browser
+                    // fetching the bridge. Front it through the terminator that accepts a
+                    // PROXY header so the relay — and Telegram beyond it — see the actual
+                    // client instead of loopback.
+                    if (self.state.web_mask_addr) |web_addr| {
+                        if (self.state.config.web.domain) |domain| {
+                            if (std.ascii.eqlIgnoreCase(s, domain)) {
+                                slot.mask_addr_override = web_addr;
+                                slot.mask_send_proxy_header = true;
+                            }
+                        }
+                    }
+                    if (!slot.mask_send_proxy_header) {
+                        for (self.state.mask_safelist) |entry| {
+                            if (std.ascii.eqlIgnoreCase(s, entry.domain)) {
+                                slot.mask_addr_override = entry.addr;
+                                break;
+                            }
                         }
                     }
                 }
@@ -3827,8 +3967,17 @@ const EventLoop = struct {
             }
             break :blk self.state.mask_addr orelse return error.NoMaskAddress;
         };
-        const pre = try self.state.allocator.alloc(u8, buffered.len);
-        @memcpy(pre, buffered);
+        // A PROXY header, when the target expects one, must lead the stream — the
+        // terminator reads it before the ClientHello.
+        var header_buf: [64]u8 = undefined;
+        const header: []const u8 = if (slot.mask_send_proxy_header) blk: {
+            slot.mask_send_proxy_header = false;
+            break :blk proxy_protocol.buildV2(&header_buf, slot.peer_addr, addr);
+        } else "";
+
+        const pre = try self.state.allocator.alloc(u8, header.len + buffered.len);
+        if (header.len > 0) @memcpy(pre[0..header.len], header);
+        @memcpy(pre[header.len..], buffered);
         slot.mask_prebuffer = pre;
 
         try self.startConnectUpstream(slot, addr, .mask);
@@ -4309,6 +4458,7 @@ const EventLoop = struct {
                         continue;
                     }
                 } else if (slot.phase == .reading_direct_obfuscated_handshake and
+                    !slot.trusted_peer and
                     now_ms - slot.first_byte_at_ms > dd_handshake_decision_ms)
                 {
                     // A non-TLS (dd) connection that hasn't completed its 64-byte
@@ -4328,7 +4478,7 @@ const EventLoop = struct {
                     // middleproxy secret) is not the client's fault, and feeding it to the
                     // flood guard would block legit secret-holders behind a shared NAT
                     // during an upstream outage.
-                    if (isClientDrivenHandshakePhase(slot.phase) and !slot.mp_step.awaitingMiddleProxy()) {
+                    if (isClientDrivenHandshakePhase(slot.phase) and !slot.mp_step.awaitingMiddleProxy() and !slot.trusted_peer) {
                         _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
                     }
                     // A timeout while still waiting on the middleproxy RPC handshake
@@ -4397,7 +4547,8 @@ const EventLoop = struct {
             .reading_mtproto_tls_header,
             .reading_mtproto_tls_body,
             => {
-                want_client_in = true;
+                want_client_in = slot.client_read_pause_until_ms == 0 or
+                    nowMs() >= slot.client_read_pause_until_ms;
             },
 
             .writing_server_hello_first,
@@ -4539,14 +4690,19 @@ const EventLoop = struct {
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
-        log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
+        // s2c counts payload handed to the client queue, so a large `qlen` here means we
+        // decapsulated the bytes but never got them onto the socket.
+        log.debug("[{d}] closing: user={s} dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d} qlen={d} relay={}", .{
             slot.conn_id,
+            slot.validation_user[0..slot.validation_user_len],
             slot.dc_idx,
             slot.is_media_path,
             @tagName(slot.phase),
             reason,
             slot.c2s_bytes,
             slot.s2c_bytes,
+            slot.client_queue.total_len,
+            slot.trusted_peer,
         });
 
         // Unmap from fd_to_slot immediately so any later stale event in this batch misses,

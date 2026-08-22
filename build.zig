@@ -127,6 +127,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The WEB proxy hostname rules and bridge-capability derivation are shared: the relay
+    // enforces them at runtime and mtbuddy validates a domain against the exact same code
+    // before it ends up baked into links.
+    const web_capability_mod = b.createModule(.{
+        .root_source_file = b.path("src/web/capability.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ctl_mod = b.createModule(.{
         .root_source_file = b.path("src/ctl/main.zig"),
         .target = target,
@@ -138,6 +147,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "proxy_config", .module = proxy_config_mod },
             .{ .name = "proxy_http_fetch", .module = proxy_http_fetch_mod },
             .{ .name = "proxy_net_helpers", .module = proxy_net_helpers_mod },
+            .{ .name = "web_capability", .module = web_capability_mod },
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
@@ -203,4 +213,13 @@ pub fn build(b: *std.Build) void {
 
     const e2e_step = b.step("e2e", "Run E2E/integration tests");
     e2e_step.dependOn(&e2e_cmd.step);
+
+    // WEB proxy bridge-page contract tests. The page in src/web/page.zig is the only
+    // code here that runs in the user's browser, against two Telegram Desktop boundaries
+    // that fail silently when they are wrong — so it is driven by a scripted client in
+    // node rather than left unexercised. Kept out of `test` because it needs python3 and
+    // node; the runner skips cleanly when node is absent.
+    const web_bridge_cmd = b.addSystemCommand(&.{ "python3", "test/web-bridge/run.py" });
+    const web_bridge_step = b.step("web-bridge", "Run WEB proxy bridge-page contract tests");
+    web_bridge_step.dependOn(&web_bridge_cmd.step);
 }

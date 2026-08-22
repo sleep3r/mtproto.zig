@@ -16,6 +16,12 @@ any surface below requires a MAJOR bump; backward-compatible additions are MINOR
   invalidates every distributed link. The fronting domain must be chosen well at install time and then
   treated as frozen; see [ARCHITECTURE.md](ARCHITECTURE.md) "FakeTLS fronting & domain selection".
 
+- The WEB link format (`tg://webproxy?server=<host>&secret=<dd-secret>` and its `https://t.me/webproxy`
+  form) matches Telegram Desktop 7.1's own parser. Port 443 is implicit and must not appear in the
+  link. ⚠️ **`[web].domain` is part of every WEB link's bridge capability** (an HMAC over the
+  canonical hostname), so it is immutable on a live deployment for exactly the same reason
+  `tls_domain` is.
+
 ### 2. Configuration file (`config.toml`)
 - Existing **keys, sections, value semantics, and defaults** are stable. New keys may be added (MINOR);
   existing keys are not removed or repurposed without a MAJOR bump. Deprecated keys keep working for at
@@ -34,7 +40,7 @@ any surface below requires a MAJOR bump; backward-compatible additions are MINOR
   their documented behaviors are stable. New flags/subcommands may be added.
 
 ### 5. systemd units & deployment layout
-- Unit names (`mtproto-proxy.service`) and the install layout (`/opt/mtproto-proxy/…`,
+- Unit names (`mtproto-proxy.service`, `mtproto-web-relay.service` when the WEB relay is installed) and the install layout (`/opt/mtproto-proxy/…`,
   `/usr/local/bin/mtbuddy`) are stable. The installed unit is `Type=simple` (robust in
   containers); `Type=notify`/watchdog is implemented but dormant pending container detection.
   Hardening directives may be tightened in a MINOR release **only if** they do not break a

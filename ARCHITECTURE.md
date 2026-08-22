@@ -146,6 +146,95 @@ traffic is transparently relayed to the mask target. Field-verified behavior
 > SolusVM/VPS images), which silently disables all hostname masking; `getAddressList`
 > falls back to `getent` (NSS) to tolerate that.
 
+## WEB proxy relay (Telegram Desktop 7.1+)
+
+Telegram Desktop 7.1 added a fourth proxy type, `WEB` (serialized type code `4`). It is an ordinary
+MTProxy whose **carrier is a browser**: the client opens no MTProto socket. A hidden native WebView
+loads `https://<domain>/?bridge=<capability>` and the page we serve shuttles multiplexed frames over
+a same-origin WebSocket. We implement the server half.
+
+```text
+Telegram Desktop → hidden WebView → https://relay.example.com/
+  → [TLS terminator: local nginx via the masking path, or a CDN]
+  → mtproto-web-relay  (mtproto-proxy web-relay)
+  → mtproto-proxy      (direct-obfuscated, PROXY-protocol prefixed)
+  → Telegram
+```
+
+**Process model.** The relay is a mode of the *same* binary
+(`mtproto-proxy web-relay <config.toml>`, unit `mtproto-web-relay.service`), because `mtbuddy update`
+swaps exactly one proxy artifact — a separate binary would reach nobody until the already-installed
+mtbuddy learned to fetch it. It is a *separate process* because a fault in it must not abort the data
+plane, which is built ReleaseSafe. It has its own single-threaded, level-triggered epoll loop in
+`src/web/relay.zig`, with the same discipline as `EventLoop` in `src/proxy/proxy.zig` (`data.fd`
+tagging, interest recomputed only on change, `close()` deferred to the top of the next iteration).
+
+**Protocol** (`src/web/frame.zig`, byte-exact with tdesktop's `web_proxy_frame.cpp`):
+
+```text
+type:u8 | stream_id:u24 | length:u32 | payload      (big-endian)
+```
+
+`HELLO(0x10)` from the client, `WELCOME(0x11)` back — alone in its own carrier message, because the
+client requires exactly one WELCOME frame in the first message it parses. Then `OPEN`/`DATA`/`CLOSE`/
+`WINDOW` per stream, `PING`/`PONG` on stream 0 for liveness. Each stream starts with an implicit
+4 MiB window in each direction; we replenish the client's credit only once its bytes have actually
+left for the backend, so a stalled backend throttles the client instead of growing our memory.
+
+**The bridge capability** (`src/web/capability.zig`) is
+`base64url(HMAC-SHA256(key = secret_bytes, "tdesktop-web-proxy-bridge-v1\n" + host))`, computed by the
+client and never carrying the secret itself. Two consequences we lean on: the relay can recompute it
+per configured user and so knows *which* user is connecting without touching the MTProto stream; and a
+visitor who cannot present a capability derived from a real secret never sees the bridge page — they
+get the same cover page every other path returns, so an active prober without a user secret cannot
+distinguish this host from a plain website.
+
+**Why `dd` and not `ee`.** The relay is a raw byte pipe; it adds no TLS-emulation record, so the
+client reports an `ee` FakeTLS secret as `Status::Unsupported` for a WEB proxy. WEB links therefore
+carry the *same* 16-byte user secret encoded as `dd…`. That means the data plane must accept the
+direct-obfuscated transport from the relay while `fake_tls_only` keeps rejecting it for everyone else.
+
+**The trust gate** (`src/proxy/trusted_peers.zig`, `proxy.zig:readTlsHeader`). Trust is decided once,
+at `accept()`, from the address the kernel reported, and stored in `slot.trusted_peer`. It must never
+be recomputed from `peer_addr`, which the PROXY-protocol path overwrites with a client-supplied
+address — gating on that would let anyone on the internet claim `127.0.0.1` and unlock a
+fingerprintable `dd` responder. Loopback is trusted while `[web].enabled`; other relay hosts are named
+in `[web].relay_sources`. Trusted peers are also exempt from the per-IP flood guard, the per-/24
+limiter and the 4-second `dd` decision timer, because every relayed user shares one source address and
+one flaky client would otherwise block them all. The relay prefixes each backend connection with a
+PROXY v2 header carrying the real browser address, so per-IP accounting and the address Telegram sees
+stay honest.
+
+**Topologies.** `mtbuddy setup web --mode mask` (default) serves the relay through the proxy's own
+masking backend: a second nginx vhost on `mask_port`, selected by SNI, holding a Let's Encrypt
+certificate for the relay domain. Unknown-SNI probes keep hitting the masking vhost, which stays the
+default server for that listener. `--mode behind` skips nginx entirely and expects a CDN or another
+host to terminate TLS.
+
+**The client's address across the mask hop.** Masking is a raw byte pipe, so the terminator behind it
+observes `127.0.0.1` and every relayed user would reach Telegram as a loopback client —
+`slot.peer_addr` is what `middle_proxy_handshake.zig` puts in `RPC_PROXY_REQ.remote_ip_port`. So the
+relay vhost carries a *second* listener, `127.0.0.1:8444 ssl proxy_protocol`, named by
+`[web].mask_backend`: when a masked connection's SNI equals `[web].domain` the proxy fronts it there
+and prefixes it with a PROXY v2 header built from the address `accept()` reported
+(`proxy_protocol.buildV2`). nginx passes that on as `X-Forwarded-For $proxy_protocol_addr`, the relay
+reads the right-most entry, and it lands back in `peer_addr` on the backend connection. Every other
+SNI keeps using the plain masking port with no header, so probe behaviour is unchanged.
+
+**Cost.** One WEB client occupies one masked connection plus one connection per logical MTProto
+stream against `[server].max_connections` — budget roughly 3–5× a direct client.
+
+**Testing.** The frame codec, the capability derivation (against tdesktop's own normative vectors),
+the WebSocket and HTTP parsers and the PROXY-header emission are unit-tested in `zig build test`. The
+bridge page is the one piece that runs in the user's browser, so `zig build web-bridge`
+(`test/web-bridge/`) drives it with a scripted stand-in for the client: it asserts the
+`tproxy-android-init` ordering, that WELCOME arrives alone in the first binary message, that a
+post-adoption carrier loss does *not* reconnect, that a pre-adoption retry replays HELLO, and that
+the loopback-iframe path rejects a foreign origin. Against a live deployment, `test/web-e2e/live_check.py`
+is the real end-to-end: it drives the whole chain from the outside (cover/bridge pages, capability
+gate, HELLO→WELCOME, then a genuine `req_pq_multi → res_pq` through relay → proxy → Telegram) and can
+hold a session idle longer than every timeout in the chain to prove the keepalive design.
+
 ## MiddleProxy (media / ad-tag relay)
 
 Event-loop-integrated non-blocking handshake; periodic endpoint/secret metadata refresh; per-DC

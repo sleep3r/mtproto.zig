@@ -226,6 +226,12 @@ sudo mtbuddy setup syn-limit --preset soft   # soft 2/s·5 | medium 1/s·3 | har
 sudo mtbuddy setup syn-limit --status
 sudo mtbuddy setup syn-limit --remove
 
+# WEB proxy relay for Telegram Desktop 7.1+ (MTProto carried inside an ordinary HTTPS site).
+# Needs a domain you own, with an A record pointing at this host.
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy setup web --domain relay.example.com --mode behind   # you terminate TLS (CDN, spare IP)
+sudo mtbuddy setup web --remove
+
 # Install web monitoring dashboard
 sudo mtbuddy setup dashboard
 # Remove just the dashboard (leaves the proxy running)
@@ -462,6 +468,19 @@ alice = true   # bypass MiddleProxy for this user
 | `[metrics] enabled` | `false` | Enable embedded Prometheus `/metrics` endpoint |
 | `[metrics] host` | `"127.0.0.1"` | Metrics bind address |
 | `[metrics] port` | `9400` | Metrics port |
+| `[web] enabled` | `false` | Enable the WEB proxy relay (Telegram Desktop 7.1+) |
+| `[web] domain` | unset | Public hostname in `tg://webproxy` links — **immutable once links are shared** |
+| `[web] listen` | `"127.0.0.1"` | Relay bind address (TLS is terminated in front of it) |
+| `[web] port` | `8081` | Relay port |
+| `[web] backend` | `127.0.0.1:<server.port>` | MTProxy the relay dials per logical stream |
+| `[web] mask_backend` | unset | PROXY-protocol terminator for masked connections to `domain`, so the real client IP survives the mask hop |
+| `[web] ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint of the bridge page |
+| `[web] trust_forwarded_for` | `true` | Take the client address from the forwarded header (right-most entry only) |
+| `[web] client_ip_header` | `"x-forwarded-for"` | Which header carries it (`cf-connecting-ip` behind Cloudflare) |
+| `[web] check_origin` | `true` | Require `Origin: https://<domain>` on the upgrade |
+| `[web] max_sessions` | `64` | Concurrent desktop clients |
+| `[web] max_streams` | `32` | Logical MTProto sockets per client |
+| `[web] relay_sources` | `[]` | Extra IPs allowed to speak the `dd` transport (loopback is implicit) |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
 | `[censorship] fake_tls_only` | `true` | Reject the non-TLS `dd` transport; accept only FakeTLS (`ee`) clients |
 | `[censorship] mask` | `true` | Forward unauthenticated clients to `tls_domain` |
@@ -487,6 +506,71 @@ alice = true   # bypass MiddleProxy for this user
 > Both abuse guards are **off by default** so large carrier-NAT, VPN-egress, or shared-office networks (many legitimate clients behind one source IP/subnet) aren't false-positived and blocked together: the per-subnet new-connection rate limit (`rate_limit_per_subnet = 0`) and the exact-IP handshake flood guard (`handshake_flood_guard_enabled = false`). Access is already gated by the per-user secret, the global handshake-inflight budget, and `max_connections`. On a single-tenant / non-NAT host under real abuse, turn them on: set `rate_limit_per_subnet` (e.g. `30`) and `handshake_flood_guard_enabled = true` (tune `handshake_flood_guard_threshold` / window / block).
 >
 > Both of the above run *after* `accept()` (they're in-proxy). For an additional **kernel-level** layer that drops abusive first-SYN bursts *before* they cost a socket/`accept()`, there's an optional per-source-IP SYN rate-limiter: `sudo mtbuddy setup syn-limit --preset soft`. It's an iptables `hashlimit` rule installed as a **separate** `mtproto-syn-limit.service` oneshot, so `CAP_NET_ADMIN` is never granted to the proxy. Also **off by default** and subject to the same carrier-NAT caveat (the `soft` 2/s·burst-5 preset is the CGNAT-safer default); `--remove` to undo, status + drop counter in `mtbuddy status`. Re-run it after changing the proxy port.
+
+---
+
+## WEB proxy (Telegram Desktop 7.1+)
+
+Telegram Desktop 7.1 added a fourth proxy type, `WEB`. It is an ordinary MTProxy whose
+**carrier is a browser**: the client opens no MTProto socket at all. A hidden native
+WebView loads `https://<your-domain>/?bridge=<capability>`, and the page shuttles
+multiplexed frames over a same-origin WebSocket to a relay, which dials a stock MTProxy —
+this one — for every logical stream.
+
+```
+Telegram Desktop
+  → hidden WebView (WKWebView / WebView2 / WebKitGTK)
+  → https://relay.example.com/           ← a real browser TLS handshake to a real site
+  → mtproto-web-relay
+  → mtproto-proxy
+  → Telegram
+```
+
+What a censor sees is a genuine browser fingerprint completing a genuine TLS handshake
+with a CA-chained certificate, then speaking HTTP — because it is one. There is no FakeTLS
+ServerHello to mismatch and no MTProto handshake on the wire.
+
+**Set it up:**
+
+```bash
+sudo mtbuddy setup web --domain relay.example.com
+sudo mtbuddy links          # now also prints tg://webproxy links
+```
+
+You need a domain you control with an A record pointing at this host; `mtbuddy` issues a
+Let's Encrypt certificate over HTTP-01 (so port 80 is opened) and installs a renewal hook.
+
+**Two topologies**, both supported:
+
+| Mode | What happens | When to pick it |
+|---|---|---|
+| `--mode mask` (default) | The relay is served *through the proxy's own masking backend*. The proxy on `:443` already forwards every non-MTProto TLS connection to local Nginx; a second vhost there, selected by SNI, holds the real certificate for your relay domain. No extra public port. | Single host, single IP — the common case |
+| `--mode behind` | The relay listens on plain HTTP and something else terminates TLS: Cloudflare, a second host, a spare IP. | You already have a web presence, or you want the client to connect to CDN addresses instead of yours |
+
+**How it interacts with the rest of the proxy:**
+
+- **Same users, same secrets.** A WEB link carries the same 16-byte secret as the FakeTLS
+  link, encoded as `dd…` rather than `ee…` — Telegram Desktop reports an `ee` (FakeTLS)
+  secret as *unsupported* for a WEB proxy, because the relay is a raw byte pipe that adds
+  no TLS-emulation record. Everyone in `[access.users]` gets both links; per-user
+  connection caps and expirations apply unchanged.
+- **`fake_tls_only` stays on.** The public internet still never gets a `dd` responder to
+  fingerprint. Only the relay's own source address (loopback by default, plus anything in
+  `[web].relay_sources`) is allowed through that gate, and the decision is made from the
+  address `accept()` reported — never from a client-supplied `PROXY` header.
+- **Real client IPs are preserved.** The relay prefixes each backend connection with a
+  `PROXY` protocol header carrying the browser's address, so per-IP accounting, the flood
+  guard and Telegram itself see the actual client rather than `127.0.0.1`.
+- **Probe resistance.** The bridge capability is `HMAC-SHA256(user secret)`, so a visitor
+  who cannot present one derived from a configured secret never sees the bridge at all —
+  they get the same plain cover page every other path returns.
+- **Capacity.** Each WEB client costs one masked connection plus one connection per logical
+  MTProto stream against `[server].max_connections`. Budget roughly 3–5× a direct client,
+  and raise `max_connections` accordingly.
+
+**Limitations:** desktop only (7.1+; Android has the same bridge contract but no released
+UI yet), no voice calls, and the carrier is more RTT-sensitive than a direct connection.
+It is a fallback for when the direct link is blocked, not a replacement for it.
 
 ---
 

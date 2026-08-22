@@ -250,7 +250,11 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: MaskingOpts) !vo
     // nginx fully down on its next restart — reboot, certbot hook, mask-health timer).
     _ = sys.exec(allocator, &.{ "ln", "-sf", "/etc/nginx/sites-available/mtproto-masking", "/etc/nginx/sites-enabled/" }) catch {};
 
-    const nginx_test = sys.exec(allocator, &.{ "nginx", "-t" }) catch null;
+    // nginx lives in /usr/sbin, which std.process.run's PATH expansion does not find even
+    // when PATH lists it; resolve by absolute path like the other sbin tools, otherwise
+    // the spawn fails and `catch null` below would treat that as a PASSED test.
+    const nginx_bin = sys.commandOrPath("nginx", &.{ "/usr/sbin/nginx", "/sbin/nginx" });
+    const nginx_test = sys.exec(allocator, &.{ nginx_bin, "-t" }) catch null;
     if (nginx_test) |r| {
         defer r.deinit();
         if (r.exit_code != 0) {

@@ -81,6 +81,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         "mtproto-tunnel-pool.timer",
         "mtproto-tunnel-pool.service",
         "mtproto-singbox-egress.service",
+        "mtproto-web-relay",
     };
     for (services) |svc| {
         // Quiet: this runs under a spinner and most of these units aren't present in any
@@ -168,6 +169,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-enabled/mtproto-mask" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-available/mtproto-mask" }) catch {};
     _ = sys.execForward(&.{ "rm", "-rf", "/etc/nginx/ssl/mtproto" }) catch {};
+    // WEB proxy relay vhosts (TLS + the port-80 ACME responder) and its renewal hook.
+    // The Let's Encrypt certificate itself is left alone: it belongs to a domain the
+    // operator owns and may still be in use elsewhere.
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/nginx/sites-enabled/mtproto-web", "/etc/nginx/sites-available/mtproto-web", "/etc/nginx/sites-enabled/mtproto-web-acme", "/etc/nginx/sites-available/mtproto-web-acme", "/etc/letsencrypt/renewal-hooks/deploy/mtproto-web-reload.sh" }) catch {};
     // The masking installer disables the default site; restore it so nginx has a
     // valid vhost again instead of a dangling (now deleted) masking config.
     _ = sys.execForward(&.{ "bash", "-c", "[ -f /etc/nginx/sites-available/default ] && ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default || true" }) catch {};

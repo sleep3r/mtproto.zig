@@ -14,6 +14,8 @@ const proxy = @import("proxy/proxy.zig");
 const linux_io = @import("linux_io");
 const version_mod = @import("version");
 const runtime_log = @import("runtime_log.zig");
+const web_capability = @import("web/capability.zig");
+const web_relay = @import("web/relay.zig");
 
 // Custom lock-free log function: formats into a stack buffer and writes
 // to stderr in a single write() syscall. On Linux, write() is atomic for
@@ -412,6 +414,38 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeRaw("  " ++ B ++ cyan ++ "⏳ Your door is open. Waiting for the people you love..." ++ R ++ "\n\n");
 }
 
+/// Entry point for `mtproto-proxy web-relay`.
+fn runWebRelay(allocator: std.mem.Allocator, config_path: []const u8) !void {
+    var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
+        writeStderr("\x1b[1m\x1b[31m  \u{2717} Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
+        std.process.exit(1);
+    };
+    defer cfg.deinit(allocator);
+    runtime_log.level = cfg.log_level;
+
+    // `opts.domain` borrows this frame, which outlives the relay.
+    var domain_buf: [web_capability.max_host_len]u8 = undefined;
+    var opts = web_relay.Options.fromConfig(&cfg, &domain_buf) catch |err| {
+        const hint = switch (err) {
+            error.WebProxyDisabled => "set [web].enabled = true",
+            error.MissingDomain => "set [web].domain to the public hostname of the relay",
+            error.InvalidDomain => "[web].domain must be a real DNS name in ASCII/xn-- form, never an IP",
+            error.InvalidBackend => "[web].backend must be host:port",
+            error.NoUsersConfigured => "add at least one user to [access.users]",
+        };
+        writeStderr("\x1b[1m\x1b[31m  \u{2717} web relay cannot start: {} \u{2014} {s}\x1b[0m\n", .{ err, hint });
+        std.process.exit(1);
+    };
+    opts.backend = web_relay.resolveBackend(allocator, &cfg) catch |err| {
+        writeStderr("\x1b[1m\x1b[31m  \u{2717} web relay: cannot resolve [web].backend: {}\x1b[0m\n", .{err});
+        std.process.exit(1);
+    };
+
+    var relay = try web_relay.Relay.init(allocator, opts, &cfg);
+    defer relay.deinit();
+    try relay.run();
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     // Parse config path from args
@@ -455,6 +489,14 @@ pub fn main(init: std.process.Init) !void {
             check_cfg.emitWarnings();
             writeStdout("  \x1b[32m✓\x1b[0m config '{s}' is valid ({d} user(s))\n", .{ path, check_cfg.users.count() });
             std.process.exit(0);
+        }
+
+        // `mtproto-proxy web-relay [config.toml]` runs the WEB proxy relay instead of
+        // the data plane: same binary (so `mtbuddy update` ships it for free), separate
+        // process and systemd unit (so a fault there cannot take the proxy down).
+        if (std.mem.eql(u8, arg, "web-relay")) {
+            const path = args.next() orelse "config.toml";
+            return runWebRelay(allocator, path);
         }
     }
 
@@ -518,6 +560,12 @@ test {
     _ = config;
     _ = proxy;
     _ = @import("tunnel.zig");
+    _ = @import("web/frame.zig");
+    _ = @import("web/capability.zig");
+    _ = @import("web/ws.zig");
+    _ = @import("web/http.zig");
+    _ = @import("web/page.zig");
+    _ = web_relay;
 }
 
 test "capacity safety clamp enforces safe cap when override disabled" {

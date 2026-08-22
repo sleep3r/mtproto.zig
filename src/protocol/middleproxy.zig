@@ -488,9 +488,16 @@ pub const MiddleProxyContext = struct {
                 const conn_data = payload[16..];
 
                 var pad_len: usize = 0;
-                var pad_buf: [15]u8 = undefined;
-                if (self.proto_tag == .secure) {
-                    pad_len = crypto.randomRange(usize, 16);
+                var pad_buf: [3]u8 = undefined;
+                // Padded intermediate carries no padding length: the receiver recovers the
+                // payload by truncating the declared length DOWN to a multiple of 4 (the same
+                // rule we apply to c2s above). MTProto bodies are already 4-aligned, so only
+                // 0..3 bytes of padding survive that round-trip -- anything larger leaves
+                // 4, 8 or 12 bytes of random garbage glued to the message and the client
+                // reports "bad SHA256 hash after aesDecrypt". If a body ever arrives
+                // unaligned, truncation would eat real bytes, so do not pad it at all.
+                if (self.proto_tag == .secure and conn_data.len % 4 == 0) {
+                    pad_len = crypto.randomRange(usize, pad_buf.len + 1);
                     if (pad_len > 0) {
                         crypto.randomBytes(pad_buf[0..pad_len]);
                     }
@@ -970,4 +977,66 @@ test "getAesKeyAndIv KAT: v6 with the IPv6 block" {
     const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "SERVER", &clt_ip, &srv_port, &secret, .{ .clt = clt_v6, .srv = srv_v6 });
     try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
     try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);
+}
+
+test "s2c padding on the secure transport survives the receiver's truncate-to-4" {
+    // Padded intermediate has no padding-length field: the peer recovers the payload by
+    // truncating the declared length down to a multiple of 4. Padding wider than 3 bytes
+    // therefore leaves random garbage glued to the MTProto message, which every client
+    // reports as "bad SHA256 hash after aesDecrypt". Exercise enough frames to cover the
+    // whole random range.
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+    const conn_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+
+    var round: usize = 0;
+    while (round < 200) : (round += 1) {
+        var ctx = try MiddleProxyContext.init(
+            allocator,
+            crypto.AesCbc.init(&key, &iv),
+            crypto.AesCbc.init(&key, &iv),
+            [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+            -2,
+            ip4(.{ 10, 20, 30, 40 }, 12345),
+            ip4(.{ 91, 105, 192, 110 }, 443),
+            .secure,
+            null,
+        );
+        defer ctx.deinit(allocator);
+
+        // len(4) + seq(4) + [type(4) + flags(4) + conn_id(8) + conn_data] + crc(4), then
+        // NO-OP words up to the AES block size.
+        const total_len: u32 = 4 + 4 + 16 + conn_data.len + 4;
+        var plain: [48]u8 = undefined;
+        std.mem.writeInt(u32, plain[0..4], total_len, .little);
+        std.mem.writeInt(i32, plain[4..8], 0, .little);
+        @memcpy(plain[8..12], &rpc_proxy_ans);
+        @memset(plain[12..24], 0); // flags + conn_id
+        @memcpy(plain[24 .. 24 + conn_data.len], &conn_data);
+        const crc_at = 24 + conn_data.len;
+        std.mem.writeInt(u32, plain[crc_at..][0..4], crc32(plain[0..crc_at]), .little);
+        var tail = crc_at + 4;
+        while (tail < plain.len) : (tail += 4) {
+            std.mem.writeInt(u32, plain[tail..][0..4], 4, .little);
+        }
+
+        var enc = crypto.AesCbc.init(&key, &iv);
+        var wire = plain;
+        try enc.encryptInPlace(wire[0..]);
+
+        var out_buf: [128]u8 = undefined;
+        const out = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
+
+        const declared = std.mem.readInt(u32, out[0..4], .little);
+        try std.testing.expectEqual(@as(usize, 4 + declared), out.len);
+
+        const pad_len = declared - conn_data.len;
+        try std.testing.expect(pad_len <= 3);
+
+        // What the client actually keeps.
+        const recovered = declared - (declared % 4);
+        try std.testing.expectEqual(@as(u32, conn_data.len), recovered);
+        try std.testing.expectEqualSlices(u8, &conn_data, out[4 .. 4 + recovered]);
+    }
 }
