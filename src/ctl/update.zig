@@ -13,6 +13,7 @@ const web = @import("web.zig");
 const recovery = @import("recovery.zig");
 const install = @import("install.zig");
 const nfqws = @import("nfqws.zig");
+const tunnel_singbox = @import("tunnel_singbox.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -230,6 +231,16 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         release.writeServiceFile();
     }
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+
+    // ── Repair an existing sing-box egress ──
+    // Deliberately BEFORE the restart below, unlike the TCPMSS/nfqws repairs further
+    // down. The drop-in half of this clears the stale
+    // `ExecStartPre=+/usr/local/bin/setup_tunnel.sh` that leaves a host restart-looping
+    // with 203/EXEC — and such a host never reaches the post-restart repairs at all,
+    // because the failed restart returns through the rollback branch. On a healthy host
+    // the ordering is right anyway: sbx0 comes back up with the corrected TUN before the
+    // proxy starts marking DC sockets into it.
+    tunnel_singbox.refreshEgress(ui, allocator);
 
     // ── Start service ──
     ui.step(ui.str(.update_starting));
