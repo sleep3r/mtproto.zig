@@ -53,6 +53,11 @@ pub const TunnelOpts = struct {
 const AwgRepositorySetup = enum {
     ubuntu_add_apt_repository,
     debian_launchpad_focal_source,
+    /// Not a Debian-family host. amneziawg-tools ships only in the Amnezia Launchpad
+    /// PPA (apt), is AUR-only on Arch — where pacman cannot install it and makepkg
+    /// refuses to run as root — and has no Fedora/EPEL package. There is nothing to
+    /// configure here, so say so instead of running apt commands that do not exist.
+    unsupported,
 };
 
 const ubuntu_awg_repo_prereqs = [_][]const u8{
@@ -652,6 +657,31 @@ fn looksLikeAwgConfig(content: []const u8) bool {
     return has_interface and has_peer;
 }
 fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
+    // Decide whether this host can work at all BEFORE running any apt command. Doing it
+    // the other way round reports "Failed to refresh apt package index" on a Fedora or
+    // Arch box, which reads as a transient mirror problem rather than "this feature is
+    // not available here".
+    const os_release = readFileAllocAbsolute(allocator, "/etc/os-release", 16 * 1024) catch null;
+    defer if (os_release) |content| allocator.free(content);
+    const repo_setup = awgRepositorySetupForOsRelease(os_release orelse "");
+
+    if (repo_setup == .unsupported) {
+        const ru = ui.lang == .ru;
+        ui.fail(if (ru)
+            "Туннели AmneziaWG работают только на Debian/Ubuntu"
+        else
+            "AmneziaWG tunnels need a Debian/Ubuntu host");
+        ui.info(if (ru)
+            "amneziawg-tools есть только в Amnezia Launchpad PPA: на Arch — лишь в AUR, в Fedora/EPEL пакета нет."
+        else
+            "amneziawg-tools ships only in the Amnezia Launchpad PPA: it is AUR-only on Arch and absent from Fedora/EPEL.");
+        ui.info(if (ru)
+            "Для VPN-эгресса на этом хосте используйте `mtbuddy setup egress \"<share-link>\"` — sing-box скачивается и работает на любом дистрибутиве."
+        else
+            "For VPN egress on this host use `mtbuddy setup egress \"<share-link>\"` instead — sing-box is a distro-independent download.");
+        return false;
+    }
+
     if (!runCommandChecked(
         ui,
         allocator,
@@ -659,13 +689,12 @@ fn ensureAmneziaWgInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
         "Failed to refresh apt package index",
     )) return false;
 
-    const os_release = readFileAllocAbsolute(allocator, "/etc/os-release", 16 * 1024) catch null;
-    defer if (os_release) |content| allocator.free(content);
-    const repo_setup = awgRepositorySetupForOsRelease(os_release orelse "");
-
     if (!installAwgRepositoryPrerequisites(ui, allocator, repo_setup)) return false;
 
     switch (repo_setup) {
+        // Handled above; `return false` rather than `unreachable`, which is UB in the
+        // ReleaseFast build that actually ships.
+        .unsupported => return false,
         .ubuntu_add_apt_repository => {
             if (!runCommandChecked(
                 ui,
@@ -723,12 +752,43 @@ fn awgRepositoryPrerequisitePackages(repo_setup: AwgRepositorySetup) []const []c
     return switch (repo_setup) {
         .ubuntu_add_apt_repository => &ubuntu_awg_repo_prereqs,
         .debian_launchpad_focal_source => &debian_awg_repo_prereqs,
+        .unsupported => &.{},
     };
 }
+/// Classify the host from /etc/os-release. ID_LIKE carries the derivatives — Raspbian
+/// reports ID=raspbian ID_LIKE=debian, Mint/Pop!_OS report ID_LIKE=ubuntu — so keying on
+/// ID alone would send them down the wrong arm.
+///
+/// An unreadable or unrecognised os-release falls back to apt-get's presence rather than
+/// straight to `.unsupported`: a Debian-family host with an exotic ID still works today,
+/// and this function must not start refusing it. Only a host with no apt at all — where
+/// every command below would fail anyway — is reported as unsupported.
 fn awgRepositorySetupForOsRelease(os_release: []const u8) AwgRepositorySetup {
+    return awgRepositorySetupFor(os_release, sys.commandExists("apt-get"));
+}
+/// The classification itself, with the one environment probe passed in so it stays a
+/// pure function: the tests below must assert the Arch/Fedora outcome unconditionally,
+/// and a `commandExists` call inside here would make them pass only on machines that
+/// happen to lack apt (i.e. skip on the Ubuntu CI runner, exactly where it matters).
+fn awgRepositorySetupFor(os_release: []const u8, apt_available: bool) AwgRepositorySetup {
     const id = osReleaseValue(os_release, "ID") orelse "";
+    const id_like = osReleaseValue(os_release, "ID_LIKE") orelse "";
+
     if (std.ascii.eqlIgnoreCase(id, "debian")) return .debian_launchpad_focal_source;
-    return .ubuntu_add_apt_repository;
+    if (std.ascii.eqlIgnoreCase(id, "ubuntu")) return .ubuntu_add_apt_repository;
+    if (osReleaseListContains(id_like, "ubuntu")) return .ubuntu_add_apt_repository;
+    if (osReleaseListContains(id_like, "debian")) return .debian_launchpad_focal_source;
+
+    return if (apt_available) .ubuntu_add_apt_repository else .unsupported;
+}
+/// ID_LIKE is a space-separated list ("ID_LIKE=ubuntu debian"), so a substring search
+/// would match "notubuntu" too. Compare whole entries.
+fn osReleaseListContains(list: []const u8, needle: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, list, " \t");
+    while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry, needle)) return true;
+    }
+    return false;
 }
 fn osReleaseValue(content: []const u8, key: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -1627,6 +1687,74 @@ test "tunnel deps - Ubuntu keeps add-apt-repository PPA path" {
     const prereqs = awgRepositoryPrerequisitePackages(.ubuntu_add_apt_repository);
     try std.testing.expect(containsString(prereqs, "software-properties-common"));
     try std.testing.expect(containsString(prereqs, "python3-launchpadlib"));
+}
+
+test "tunnel deps - Debian/Ubuntu derivatives follow ID_LIKE" {
+    // Raspbian is Debian with its own ID; Mint and Pop!_OS are Ubuntu with theirs.
+    // Keying on ID alone sent every one of them down the Ubuntu arm.
+    const raspbian =
+        \\PRETTY_NAME="Raspbian GNU/Linux 12 (bookworm)"
+        \\ID=raspbian
+        \\ID_LIKE=debian
+    ;
+    try std.testing.expectEqual(
+        AwgRepositorySetup.debian_launchpad_focal_source,
+        awgRepositorySetupFor(raspbian, false),
+    );
+
+    const mint =
+        \\PRETTY_NAME="Linux Mint 22"
+        \\ID=linuxmint
+        \\ID_LIKE="ubuntu debian"
+    ;
+    try std.testing.expectEqual(
+        AwgRepositorySetup.ubuntu_add_apt_repository,
+        awgRepositorySetupFor(mint, false),
+    );
+
+    // Whole-entry match: a distro whose ID_LIKE merely CONTAINS the substring is not
+    // a Debian derivative.
+    try std.testing.expect(!osReleaseListContains("notubuntu debianish", "ubuntu"));
+    try std.testing.expect(!osReleaseListContains("notubuntu debianish", "debian"));
+    try std.testing.expect(osReleaseListContains("rhel fedora", "fedora"));
+}
+
+test "tunnel deps - Arch and Fedora are reported as unsupported, not run through apt" {
+    // amneziawg-tools is AUR-only on Arch and absent from Fedora/EPEL. Both used to
+    // fall through to the Ubuntu arm and shell out to `add-apt-repository`, a command
+    // that does not exist there.
+    const arch =
+        \\PRETTY_NAME="Arch Linux"
+        \\ID=arch
+    ;
+    const fedora =
+        \\PRETTY_NAME="Fedora Linux 43 (Server Edition)"
+        \\ID=fedora
+        \\ID_LIKE=""
+    ;
+    const rocky =
+        \\PRETTY_NAME="Rocky Linux 9.4 (Blue Onyx)"
+        \\ID="rocky"
+        \\ID_LIKE="rhel centos fedora"
+    ;
+
+    for ([_][]const u8{ arch, fedora, rocky }) |os_release| {
+        try std.testing.expectEqual(AwgRepositorySetup.unsupported, awgRepositorySetupFor(os_release, false));
+    }
+
+    // The apt fallback is deliberately generous: an apt host with an ID we do not know
+    // keeps working exactly as before rather than newly refusing.
+    try std.testing.expectEqual(
+        AwgRepositorySetup.ubuntu_add_apt_repository,
+        awgRepositorySetupFor("ID=someunknownapthost", true),
+    );
+    try std.testing.expectEqual(
+        AwgRepositorySetup.unsupported,
+        awgRepositorySetupFor("", false),
+    );
+
+    // An unsupported host asks for no repository prerequisites at all.
+    try std.testing.expectEqual(@as(usize, 0), awgRepositoryPrerequisitePackages(.unsupported).len);
 }
 
 test "tunnel - converts Amnezia vpn link to AWG config" {

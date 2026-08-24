@@ -58,15 +58,36 @@ install_minisign_if_needed() {
       install_minisign_from_upstream
     fi
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y minisign || fail "dnf could not install minisign"
+    # RHEL/Rocky need EPEL for minisign, which we are not going to enable on someone
+    # else's box — fall through to the pinned upstream binary instead of dying, exactly
+    # like the apt branch does. Same for the rest below.
+    dnf install -y minisign || {
+      step "dnf could not install minisign, using pinned upstream binary"
+      install_minisign_from_upstream
+    }
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y minisign || fail "yum could not install minisign"
+    yum install -y minisign || {
+      step "yum could not install minisign, using pinned upstream binary"
+      install_minisign_from_upstream
+    }
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache minisign || fail "apk could not install minisign"
+    apk add --no-cache minisign || {
+      step "apk could not install minisign, using pinned upstream binary"
+      install_minisign_from_upstream
+    }
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm minisign || fail "pacman could not install minisign"
+    # NOT `pacman -Sy`: syncing the package database without also upgrading is a
+    # partial upgrade, and on a rolling distro it can pull a package whose dependencies
+    # the installed system no longer satisfies — i.e. break the host we came to help.
+    # We will not run a full `-Syu` on someone's machine either, so if the database is
+    # stale and this misses, the upstream binary covers it.
+    pacman -S --needed --noconfirm minisign || {
+      step "pacman could not install minisign, using pinned upstream binary"
+      install_minisign_from_upstream
+    }
   else
-    fail "minisign is required for signature verification, but no supported package manager was found (use --insecure or MTPROTO_INSECURE=1 to bypass)"
+    step "No supported package manager found, using pinned upstream minisign binary"
+    install_minisign_from_upstream
   fi
 
   command -v minisign >/dev/null 2>&1 \
