@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.13.0](https://github.com/sleep3r/mtproto.zig/compare/v1.12.0...v1.13.0) (2026-08-24)
+
+
+### Features
+
+* **egress:** hysteria2 share links + fix the CAP_NET_ADMIN that made `setup egress` a dead proxy ([#398](https://github.com/sleep3r/mtproto.zig/issues/398)) ([426f20e](https://github.com/sleep3r/mtproto.zig/commit/426f20ed0e0e82ad878326edb85d18709290c8b6))
+
+
+### Bug Fixes
+
+* **egress:** repair an existing sing-box egress from `mtbuddy update` ([#396](https://github.com/sleep3r/mtproto.zig/issues/396)) ([973a783](https://github.com/sleep3r/mtproto.zig/commit/973a7839dbe42b4e5e3f39fb17de0044380f664c))
+* **egress:** run the update-time repair before any network work ([#399](https://github.com/sleep3r/mtproto.zig/issues/399)) ([a8476d1](https://github.com/sleep3r/mtproto.zig/commit/a8476d15cd3188f854e595862851b0d2248ebdf7))
+* **egress:** warn that a sing-box TUN egress breaks MiddleProxy ([#400](https://github.com/sleep3r/mtproto.zig/issues/400)) ([c3f218a](https://github.com/sleep3r/mtproto.zig/commit/c3f218aa916da23c16798bbb4f93c7d308d67f12))
+* **uninstall:** remove the egress config backup — it holds the share links ([#401](https://github.com/sleep3r/mtproto.zig/issues/401)) ([4e9ac82](https://github.com/sleep3r/mtproto.zig/commit/4e9ac820b45a764124aedfab20b8e27a3a78944a))
+
 ## [1.12.0](https://github.com/sleep3r/mtproto.zig/compare/v1.11.0...v1.12.0) (2026-08-24)
 
 
