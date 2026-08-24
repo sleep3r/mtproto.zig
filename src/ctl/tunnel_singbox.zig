@@ -46,7 +46,75 @@ const SB_SERVICE_PATH = "/etc/systemd/system/" ++ SB_SERVICE_NAME;
 const SB_ROUTE_SCRIPT = "/usr/local/bin/mtproto-singbox-route.sh";
 const SB_BIN = "/usr/local/bin/sing-box";
 const TUN_IFACE = "sbx0"; // sing-box tun interface; mirrors awg0 as a tunnel egress
-const TUN_ADDR = "172.19.0.1/30";
+/// /32, NOT /30 — a one-bit difference that decides whether the host can resolve DNS.
+///
+/// sing-tun's NativeTun.start() calls setSearchDomainForSystemdResolved() unconditionally
+/// (tun_linux.go:357 — the only AutoRoute guard next to it is Android-only, so
+/// auto_route:false does not stop it). With no explicit DNS servers it synthesises one:
+///
+///     if len(t.options.Inet4Address) > 0 && HasNextAddress(t.options.Inet4Address[0], 1) {
+///         dnsServer = append(dnsServer, t.options.Inet4Address[0].Addr().Next())
+///     }
+///     if len(dnsServer) == 0 { return }
+///     go func() { resolvectl domain <tun> "~."; resolvectl default-route <tun> true;
+///                 resolvectl dns <tun> <dnsServer> }()
+///
+/// Under /30 the next address (172.19.0.2) is inside the prefix, so it becomes sbx0's DNS
+/// server — and `~.` is a route-only domain matching every name, which outranks eth0's
+/// scope in resolved, so EVERY query goes to 172.19.0.2:53 where nothing listens. Total
+/// DNS failure on any host that has resolvectl and systemd-resolved. Under /32 the next
+/// address is outside the prefix, there is no Inet6Address, so dnsServer stays empty and
+/// the function returns before running a single resolvectl command.
+///
+/// The knob that would disable it directly (EXP_DisableDNSHijack) is library-only and has
+/// no JSON tag, so the address IS the lever. Reverting it afterwards from the route helper
+/// would race the detached goroutine above.
+///
+/// Nothing here needs the /30: auto_route is off so sing-tun adds no routes and never
+/// consults the gateway address, and our default route is installed by SB_ROUTE_SCRIPT as
+/// a `dev sbx0` route, which takes no nexthop.
+const TUN_ADDR = "172.19.0.1/32";
+/// An unset `mtu` leaves a Linux TUN at 65535 (sing-box protocol/tun/inbound.go; 9000 is
+/// the Android branch, and was the global default only through v1.11.x). This is NOT an
+/// on-wire size — with a TUN inbound sing-box terminates the TCP flow in its own netstack
+/// and re-dials the outbound on an ordinary kernel socket, so nothing here is
+/// encapsulated and no headroom for the outer TLS transport is involved. It is the
+/// kernel<->netstack framing size, i.e. the MSS the local kernel negotiates on a DC
+/// connection routed via sbx0. Leave it at the default and the handshake and DC connect
+/// (small) sail through while every bulk transfer is silently dropped: the egress comes
+/// up "healthy" and then moves 0 B/s, which reads as a dead upstream rather than a
+/// link-layer problem. Measured on a live host, `"stack": "gvisor"` + `"mtu": 1400` is
+/// the pair that actually passes bulk traffic, so they ship together.
+///
+/// The pair is also what turns on sing-box's TUN GSO offload, which the default misses:
+///   enableGSO := C.IsLinux && options.Stack == "gvisor" && platformInterface == nil &&
+///                tunMTU > 0 && tunMTU < 49152
+/// and upstream's own tun_bench has gvisor at or above the system stack at every MTU, so
+/// the stack choice costs no throughput.
+///
+/// Both values are pinned by a test: sing-box validates `stack` only at Start(), so
+/// `sing-box check` exits 0 on a bogus one and a typo would ship silently.
+const TUN_MTU = "1400";
+const TUN_STACK = "gvisor";
+
+/// Drop-in laid over mtproto-proxy.service once the sing-box egress is up.
+///
+/// `After=`/`Wants=` keep sbx0 and its route present before the proxy starts marking DC
+/// sockets, so a reboot does not race into failing DC connects.
+///
+/// The empty `ExecStartPre=` resets the list, dropping the AmneziaWG unit's
+/// `ExecStartPre=+/usr/local/bin/setup_tunnel.sh`. That line is left behind on any host
+/// that ran `setup tunnel` first, and it breaks two different ways:
+///   * the pool-retire path in `setupSingbox` deletes setup_tunnel.sh, so systemd fails
+///     the unit with 203/EXEC and restart-loops a proxy that is otherwise healthy;
+///   * a single-tunnel host keeps the script, which then re-points table 200 at awg0 on
+///     every proxy start and steals the route from sbx0.
+/// sbx0's own routing is installed by the sing-box unit's ExecStartPost, and the default
+/// (non-tunnel) unit has no ExecStartPre at all, so the reset is a no-op everywhere else.
+/// It lives in the drop-in because that is what survives: a hand-added line is wiped by
+/// the next `setup egress`.
+const PROXY_EGRESS_DROPIN = "[Unit]\nAfter=" ++ SB_SERVICE_NAME ++ "\nWants=" ++ SB_SERVICE_NAME ++ "\n" ++
+    "\n[Service]\nExecStartPre=\n";
 const TUN_TABLE = "200"; // same policy-routing table the AmneziaWG tunnel uses
 const TUN_FWMARK = "200"; // proxy SO_MARK for tunnel egress
 
@@ -159,7 +227,7 @@ pub fn genSingboxConfig(a: std.mem.Allocator, links: []const XrayLink) ![]const 
         selector = try std.fmt.allocPrint(a, ",{{\"type\":\"urltest\",\"tag\":\"egress\",\"outbounds\":[{s}],\"url\":\"https://www.gstatic.com/generate_204\",\"interval\":\"10s\"}}", .{tags.items});
         final_tag = "egress";
     }
-    return std.fmt.allocPrint(a, "{{\"log\":{{\"level\":\"warn\"}},\"inbounds\":[{{\"type\":\"tun\",\"tag\":\"tun-in\",\"interface_name\":\"{s}\",\"address\":[\"{s}\"],\"auto_route\":false,\"stack\":\"system\"}}],\"outbounds\":[{s},{{\"type\":\"direct\",\"tag\":\"direct\"}}{s}],\"route\":{{\"auto_detect_interface\":true,\"final\":\"{s}\"}}}}", .{ TUN_IFACE, TUN_ADDR, outs.items, selector, final_tag });
+    return std.fmt.allocPrint(a, "{{\"log\":{{\"level\":\"warn\"}},\"inbounds\":[{{\"type\":\"tun\",\"tag\":\"tun-in\",\"interface_name\":\"{s}\",\"address\":[\"{s}\"],\"auto_route\":false,\"stack\":\"{s}\",\"mtu\":{s}}}],\"outbounds\":[{s},{{\"type\":\"direct\",\"tag\":\"direct\"}}{s}],\"route\":{{\"auto_detect_interface\":true,\"final\":\"{s}\"}}}}", .{ TUN_IFACE, TUN_ADDR, TUN_STACK, TUN_MTU, outs.items, selector, final_tag });
 }
 
 // ── CLI + provisioning ──────────────────────────────────────────────────────────
@@ -378,7 +446,7 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
         // Order mtproto-proxy after the egress so sbx0 + its route exist before the proxy
         // marks DC sockets — otherwise a reboot races and DC connects fail until retry.
         _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/systemd/system/mtproto-proxy.service.d" }) catch {};
-        sys.writeFile("/etc/systemd/system/mtproto-proxy.service.d/egress.conf", "[Unit]\nAfter=" ++ SB_SERVICE_NAME ++ "\nWants=" ++ SB_SERVICE_NAME ++ "\n") catch {};
+        sys.writeFile("/etc/systemd/system/mtproto-proxy.service.d/egress.conf", PROXY_EGRESS_DROPIN) catch {};
         _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
         wireUpstreamTunnel(allocator, link_texts) catch {
             ui.warn("tunnel is up, but updating config.toml failed — set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE ++ " manually");
@@ -510,6 +578,16 @@ test "genSingboxConfig is valid JSON; urltest only for a pool" {
     try std.testing.expect(std.mem.indexOf(u8, one, "\"reality\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, one, "\"type\":\"tun\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, one, "\"sbx0\"") != null);
+    // The TUN must carry an explicit MTU and the gvisor stack, and a /32 address. An
+    // unset mtu leaves a Linux TUN at 65535, which passes handshakes and drops every bulk
+    // transfer — an egress that looks up and moves 0 B/s. A /30 makes sing-tun hand
+    // 172.19.0.2 to systemd-resolved as sbx0's DNS server and kills all resolution. See
+    // the TUN_ADDR / TUN_MTU doc comments; pin all three so none can regress silently.
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"172.19.0.1/32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "/30") == null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"mtu\":1400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"stack\":\"gvisor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"stack\":\"system\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, one, "xtls-rprx-vision") != null);
     try std.testing.expect(std.mem.indexOf(u8, one, "\"urltest\"") == null);
 
@@ -519,6 +597,20 @@ test "genSingboxConfig is valid JSON; urltest only for a pool" {
     try std.testing.expect(std.mem.indexOf(u8, pool, "egress-0") != null);
     try std.testing.expect(std.mem.indexOf(u8, pool, "egress-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, pool, "shadowsocks") != null);
+}
+
+test "the egress drop-in resets ExecStartPre so a stale tunnel helper can't break the proxy" {
+    // A host that ran `setup tunnel` before `setup egress` carries
+    // `ExecStartPre=+/usr/local/bin/setup_tunnel.sh` in mtproto-proxy.service. The
+    // pool-retire path deletes that script (203/EXEC restart loop), and where it
+    // survives it re-points table 200 at awg0 and steals the route from sbx0.
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "[Service]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "\nExecStartPre=\n") != null);
+    // Empty, not repointed: the sing-box unit's ExecStartPost owns sbx0's routing.
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "setup_tunnel.sh") == null);
+    // And it still orders the proxy after the egress, which is why the drop-in exists.
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "After=" ++ SB_SERVICE_NAME) != null);
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "Wants=" ++ SB_SERVICE_NAME) != null);
 }
 
 test "vmess scy maps to cipher and is emitted" {
