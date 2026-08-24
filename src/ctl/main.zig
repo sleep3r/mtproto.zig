@@ -212,6 +212,24 @@ const Action = enum {
     exit,
 };
 
+/// Main-menu labels that live here instead of in i18n.zig — they are built from runtime
+/// state (which of the two WEB entries to show) rather than a fixed key.
+///
+/// Every entry in the main menu carries an "<emoji><two spaces>" prefix; these three were
+/// the only ones that did not, so the list rendered half-decorated. The emoji reuses the
+/// feature's own icon on both the setup and the remove entry, the way 📊 does for the
+/// dashboard. tui.codepointWidth already counts U+1F300..U+1FAFF as two columns, so the
+/// menu's row accounting is unaffected. Pinned by a test below.
+fn menuSynLimit(lang: i18n.Lang) []const u8 {
+    return tr(lang, "🚦  Kernel SYN rate-limit (anti-flood)", "🚦  Ограничение SYN на уровне ядра (анти-флуд)");
+}
+fn menuWebSetup(lang: i18n.Lang) []const u8 {
+    return tr(lang, "🌐  WEB proxy for Telegram Desktop (via an HTTPS site)", "🌐  WEB-прокси для Telegram Desktop (через HTTPS-сайт)");
+}
+fn menuWebRemove(lang: i18n.Lang) []const u8 {
+    return tr(lang, "🌐  Remove the WEB proxy relay", "🌐  Удалить релей WEB-прокси");
+}
+
 fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
     while (true) {
         const sys = @import("sys.zig");
@@ -234,7 +252,7 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
             try actions.append(allocator, .masking);
             try items.append(allocator, i18n.get(ui.lang, .menu_setup_tunnel));
             try actions.append(allocator, .tunnel);
-            try items.append(allocator, tr(ui.lang, "Kernel SYN rate-limit (anti-flood)", "Ограничение SYN на уровне ядра (анти-флуд)"));
+            try items.append(allocator, menuSynLimit(ui.lang));
             try actions.append(allocator, .synlimit);
 
             const has_dashboard = sys.isServiceActive("proxy-monitor");
@@ -253,10 +271,10 @@ fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
                 try actions.append(allocator, .recovery);
             }
             if (!web.isInstalled()) {
-                try items.append(allocator, tr(ui.lang, "WEB proxy for Telegram Desktop (via an HTTPS site)", "WEB-прокси для Telegram Desktop (через HTTPS-сайт)"));
+                try items.append(allocator, menuWebSetup(ui.lang));
                 try actions.append(allocator, .web);
             } else {
-                try items.append(allocator, tr(ui.lang, "Remove the WEB proxy relay", "Удалить релей WEB-прокси"));
+                try items.append(allocator, menuWebRemove(ui.lang));
                 try actions.append(allocator, .remove_web);
             }
             try items.append(allocator, i18n.get(ui.lang, .menu_ipv6_hop));
@@ -675,4 +693,32 @@ test {
     _ = @import("uninstall.zig");
     _ = @import("update.zig");
     _ = @import("web.zig");
+}
+
+test "every main-menu entry is decorated with an emoji" {
+    // The menu mixes i18n keys with labels built here from runtime state, and the local
+    // ones used to ship undecorated — so the list rendered half with icons, half without.
+    // A leading multi-byte codepoint is the check: every icon in this menu is one.
+    const keyed = [_]i18n.S{
+        .menu_install,          .menu_update,
+        .menu_setup_masking,    .menu_setup_tunnel,
+        .menu_setup_recovery,   .menu_setup_dashboard,
+        .menu_remove_dashboard, .menu_ipv6_hop,
+        .menu_status,           .menu_restart,
+        .menu_uninstall,        .menu_exit,
+    };
+    for ([_]i18n.Lang{ .en, .ru }) |lang| {
+        for (keyed) |k| {
+            const label = i18n.get(lang, k);
+            try std.testing.expect(label.len > 0);
+            try std.testing.expect(label[0] >= 0x80);
+        }
+        for ([_][]const u8{ menuSynLimit(lang), menuWebSetup(lang), menuWebRemove(lang) }) |label| {
+            try std.testing.expect(label.len > 0);
+            try std.testing.expect(label[0] >= 0x80);
+            // "<emoji><two spaces>", matching the i18n entries.
+            const sp = std.mem.indexOf(u8, label, "  ") orelse return error.TestExpectedEqual;
+            try std.testing.expect(sp > 0);
+        }
+    }
 }

@@ -85,6 +85,22 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         return;
     }
 
+    // ── Repair an existing sing-box egress ──
+    // FIRST, before anything that touches the network or the binaries.
+    //
+    // An egress provisioned before the TUN fixes hands 172.19.0.2 to systemd-resolved as
+    // sbx0's DNS server with a `~.` route-only domain, which kills name resolution for
+    // the WHOLE host — including this command. Run the repair any later and update dies
+    // at "Resolving latest release" and never reaches it, so the one symptom that most
+    // needs fixing is the one that prevents the fix. (Same shape as the 203/EXEC case:
+    // a host that cannot start the proxy never reaches a post-restart repair either.)
+    //
+    // Nothing here depends on the new binaries or on the release having been resolved:
+    // it reads config.toml, rewrites the drop-in and the sing-box config, and restarts
+    // the egress. It is idempotent and no-ops when no egress is configured, so running it
+    // even on an update that later fails is free — and leaves the host better off.
+    tunnel_singbox.refreshEgress(ui, allocator);
+
     const insecure_mode = opts.insecure or sys.envFlagSet("MTPROTO_INSECURE");
     const signature_available = release.signatureVerificationAvailable();
     if (!signature_available and !insecure_mode) {
@@ -231,16 +247,6 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
         release.writeServiceFile();
     }
     _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
-
-    // ── Repair an existing sing-box egress ──
-    // Deliberately BEFORE the restart below, unlike the TCPMSS/nfqws repairs further
-    // down. The drop-in half of this clears the stale
-    // `ExecStartPre=+/usr/local/bin/setup_tunnel.sh` that leaves a host restart-looping
-    // with 203/EXEC — and such a host never reaches the post-restart repairs at all,
-    // because the failed restart returns through the rollback branch. On a healthy host
-    // the ordering is right anyway: sbx0 comes back up with the corrected TUN before the
-    // proxy starts marking DC sockets into it.
-    tunnel_singbox.refreshEgress(ui, allocator);
 
     // ── Start service ──
     ui.step(ui.str(.update_starting));
