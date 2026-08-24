@@ -244,6 +244,7 @@ sudo mtbuddy setup tunnel --iface awg1 /path/to/awg1.conf
 #   wireguard://                       -> تونل WG کرنل بومی (مانند `setup tunnel`).
 #   چند لینک                            -> استخر failover با urltest.
 sudo mtbuddy setup egress 'vless://...@host:443?security=reality&pbk=...&sni=...&flow=xtls-rprx-vision'
+# vless / vmess / trojan / ss / hysteria2 — hysteria2 is QUIC, so measure UDP to the endpoint first
 sudo mtbuddy setup egress 'wireguard://<privkey>@host:51820?publickey=...&address=10.0.0.2/32'
 
 # IPv6 hopping
