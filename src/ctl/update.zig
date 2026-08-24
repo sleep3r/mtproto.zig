@@ -98,10 +98,21 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     // ── Ensure signature verifier dependency ──
     if (signature_available and !insecure_mode and !sys.commandExists("minisign")) {
         ui.step("Installing minisign for release signature verification...");
-        _ = sys.exec(allocator, &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
-        _ = sys.exec(allocator, &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "minisign" }) catch {};
+        // apt first where it exists, then the pinned, SHA-256-verified upstream binary —
+        // the same order `mtbuddy install` uses. The fallback is what makes this work on
+        // a host we do not have a package manager for: without it, an apt-less system
+        // (or an apt release with no minisign, e.g. Ubuntu 20.04 focal) could never
+        // update at all, even though nothing else about updating is Debian-specific.
+        if (sys.commandExists("apt-get")) {
+            _ = sys.exec(allocator, &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
+            _ = sys.exec(allocator, &.{ "apt-get", "-o", "DPkg::Lock::Timeout=600", "install", "-y", "minisign" }) catch {};
+        }
+        if (!sys.commandExists("minisign")) {
+            _ = install.installMinisignFromUpstream(allocator);
+        }
         if (!sys.commandExists("minisign")) {
             ui.fail("minisign is required for release signature verification");
+            ui.info("Neither the host package manager nor the pinned upstream binary could provide it (check network / checksum), or re-run with --insecure.");
             return;
         }
         ui.ok("minisign installed");

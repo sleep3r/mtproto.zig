@@ -92,11 +92,15 @@ fn shouldInstallMinisignPackage(signature_available: bool, insecure_mode: bool, 
 const minisign_bootstrap_version = "0.12";
 const minisign_bootstrap_sha256 = "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73";
 
-/// Install the pinned upstream minisign binary when apt has no minisign package.
-/// Mirrors deploy/bootstrap.sh: a SHA-256-verified tarball from the pinned
-/// jedisct1/minisign release, extracted for this CPU arch. Silent (runs under the
-/// deps spinner); returns true iff minisign is now resolvable on PATH.
-fn installMinisignFromUpstream(allocator: std.mem.Allocator) bool {
+/// Install the pinned upstream minisign binary when the host package manager has no
+/// minisign package. Mirrors deploy/bootstrap.sh: a SHA-256-verified tarball from the
+/// pinned jedisct1/minisign release, extracted for this CPU arch. Silent (runs under
+/// the deps spinner); returns true iff minisign is now resolvable on PATH.
+///
+/// Public because `mtbuddy update` needs the same fallback: it is the only path to a
+/// signature verifier on a host whose package manager we do not drive, and without it
+/// update refuses to run at all there.
+pub fn installMinisignFromUpstream(allocator: std.mem.Allocator) bool {
     const arch_name: []const u8 = switch (builtin.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
@@ -635,7 +639,19 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
         sp.start();
         if (!sys.commandExists("apt-get")) {
             sp.stop(false, "");
-            ui.fail("apt-get is required to install system dependencies");
+            // Name the actual constraint instead of a missing binary: the installer is
+            // apt-shaped well past this point (nginx sites-enabled, ufw, the Amnezia
+            // PPA), so "install apt-get" would be actively bad advice.
+            ui.fail(localized(
+                ui,
+                "mtbuddy install supports Debian/Ubuntu hosts only — apt-get was not found",
+                "mtbuddy install пока поддерживает только Debian/Ubuntu — apt-get не найден",
+            ));
+            ui.info(localized(
+                ui,
+                "pacman (Arch) and dnf (RHEL/Fedora) support is tracked in https://github.com/sleep3r/mtproto.zig/issues/374",
+                "Поддержка pacman (Arch) и dnf (RHEL/Fedora) отслеживается в https://github.com/sleep3r/mtproto.zig/issues/374",
+            ));
             return;
         }
         if (!runRequiredWhileSpinning(ui, allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }, "apt-get update failed", &sp)) return;
@@ -647,9 +663,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
             "apt-get",                 "-o",
             "DPkg::Lock::Timeout=600", "install",
             "-y",                      "--no-install-recommends",
-            "iptables",                "xxd",
-            "curl",                    "openssl",
-            "tar",                     "passwd",
+            "iptables",                "curl",
+            "openssl",                 "tar",
+            "passwd",
         };
         if (!runRequiredWhileSpinning(ui, allocator, base_packages, "Failed to install system dependencies", &sp)) return;
         // qrencode powers the optional terminal/dashboard QR; the feature degrades
