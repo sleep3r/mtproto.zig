@@ -247,10 +247,13 @@ fn parseKeyValue(line: []const u8) ?KeyValue {
     return .{ .key = raw_key, .value = raw_value };
 }
 
+/// Allocates rather than formatting through a fixed buffer: a 512-byte ceiling here
+/// silently turned any longer value into error.OutOfMemory at the call site. That is not
+/// theoretical — `[upstream.xray] links` holds the whole share-link array on one line, and
+/// three VLESS-Reality links already exceed it, so a three-endpoint `setup egress` pool
+/// failed to write ANY of its config.toml keys (including `[upstream] type = tunnel`).
 fn formatKv(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]const u8 {
-    var buf: [512]u8 = undefined;
-    const formatted = std.fmt.bufPrint(&buf, "{s} = {s}", .{ key, value }) catch return error.OutOfMemory;
-    return try allocator.dupe(u8, formatted);
+    return std.fmt.allocPrint(allocator, "{s} = {s}", .{ key, value });
 }
 
 test "parseKeyValue: escaped quote does not truncate at a following '#'" {
@@ -294,4 +297,36 @@ test "set/get round-trips a dotted (non-allowlisted) section with brackets" {
         if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "[upstream.xray]")) count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "TomlDoc.set survives a value longer than the old fixed buffer" {
+    // Regression: formatKv used a [512]u8 and reported error.OutOfMemory above it, which
+    // aborted wireUpstreamTunnel for any egress pool of three or more share links.
+    const a = std.testing.allocator;
+    var doc = TomlDoc.initEmpty(a);
+    defer doc.deinit();
+
+    var long: std.ArrayListUnmanaged(u8) = .empty;
+    defer long.deinit(a);
+    try long.append(a, '[');
+    for (0..3) |i| {
+        if (i != 0) try long.append(a, ',');
+        try long.append(a, '"');
+        try long.appendSlice(a, "vless://95e0edb9-4a0b-4312-a71f-1d4b8b6db79b@154.59.110.32:443" ++
+            "?type=tcp&security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ++
+            "&sni=www.microsoft.com&sid=0123456789abcdef&flow=xtls-rprx-vision#endpoint");
+        try long.append(a, '"');
+    }
+    try long.append(a, ']');
+    try std.testing.expect(long.items.len > 512);
+
+    try doc.set("upstream.xray", "links", long.items);
+
+    const rendered = try doc.render(a);
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, long.items) != null);
+
+    // And it is readable back in one piece.
+    const read_back = doc.get("upstream.xray", "links") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(long.items, read_back);
 }

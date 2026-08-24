@@ -445,8 +445,8 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
     if (sys.fileExists(CONFIG_PATH)) {
         // Order mtproto-proxy after the egress so sbx0 + its route exist before the proxy
         // marks DC sockets — otherwise a reboot races and DC connects fail until retry.
-        _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/systemd/system/mtproto-proxy.service.d" }) catch {};
-        sys.writeFile("/etc/systemd/system/mtproto-proxy.service.d/egress.conf", PROXY_EGRESS_DROPIN) catch {};
+        _ = sys.exec(allocator, &.{ "mkdir", "-p", PROXY_DROPIN_DIR }) catch {};
+        sys.writeFile(PROXY_DROPIN_PATH, PROXY_EGRESS_DROPIN) catch {};
         _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
         wireUpstreamTunnel(allocator, link_texts) catch {
             ui.warn("tunnel is up, but updating config.toml failed — set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE ++ " manually");
@@ -481,6 +481,213 @@ fn wireUpstreamTunnel(allocator: std.mem.Allocator, link_texts: []const []const 
     try arr.append(allocator, ']');
     try doc.set("upstream.xray", "links", arr.items);
     try doc.save(CONFIG_PATH);
+}
+
+const PROXY_DROPIN_DIR = "/etc/systemd/system/mtproto-proxy.service.d";
+const PROXY_DROPIN_PATH = PROXY_DROPIN_DIR ++ "/egress.conf";
+
+/// Split a TOML string-array value (`["a","b"]`) into its elements, as slices INTO
+/// `value`. Deliberately forgiving rather than a real TOML array parser: the only value
+/// it reads is `[upstream.xray] links`, which wireUpstreamTunnel writes itself as plain
+/// quoted share links with no escaping, so nothing fancier can be in there.
+fn parseTomlStringArray(a: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(a);
+
+    var i: usize = 0;
+    while (i < value.len) {
+        const open = std.mem.indexOfScalarPos(u8, value, i, '"') orelse break;
+        const close = std.mem.indexOfScalarPos(u8, value, open + 1, '"') orelse break;
+        if (close > open + 1) try out.append(a, value[open + 1 .. close]);
+        i = close + 1;
+    }
+    return out.toOwnedSlice(a);
+}
+
+const SB_SERVER_KEY = "\"server\":\"";
+const SB_PORT_KEY = "\"server_port\":";
+
+/// The `"server":"H","server_port":N` descriptor `sbOutbound` emits, spanning from
+/// `start` to the end of the port digits. Returns null when the pair is malformed.
+fn egressEndpointAt(cfg: []const u8, start: usize) ?[]const u8 {
+    const port_at = std.mem.indexOfPos(u8, cfg, start + SB_SERVER_KEY.len, SB_PORT_KEY) orelse return null;
+    var end = port_at + SB_PORT_KEY.len;
+    while (end < cfg.len and std.ascii.isDigit(cfg[end])) end += 1;
+    if (end == port_at + SB_PORT_KEY.len) return null;
+    return cfg[start..end];
+}
+
+fn countEgressEndpoints(cfg: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, cfg, i, SB_SERVER_KEY)) |at| : (n += 1) {
+        i = at + SB_SERVER_KEY.len;
+    }
+    return n;
+}
+
+/// Do `existing` and `cfg` describe the same set of egress endpoints?
+///
+/// `[upstream.xray] links` is a best-effort RECORD, not the source of truth:
+/// setupSingboxTunnel writes singbox-egress.json and starts the egress BEFORE it updates
+/// config.toml, and a failure there is a warning, not a rollback. So a host can genuinely
+/// be running endpoints the recorded links no longer mention — growing a single-endpoint
+/// egress into a pool used to do exactly that, because the old formatKv ceiling aborted
+/// the config.toml write once the link array passed 512 bytes.
+///
+/// Regenerating blindly there would swap a live pool for a dead endpoint, restart into
+/// it, and report success. So repair only what we can prove is the same egress: every
+/// endpoint currently configured must survive into the new config, and the count must
+/// match so nothing is added either. Both sides come from the same generator, so an
+/// in-sync host compares equal by construction.
+fn sameEgressEndpoints(existing: []const u8, cfg: []const u8) bool {
+    if (countEgressEndpoints(existing) != countEgressEndpoints(cfg)) return false;
+
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, existing, i, SB_SERVER_KEY)) |at| {
+        const descriptor = egressEndpointAt(existing, at) orelse return false;
+        if (std.mem.indexOf(u8, cfg, descriptor) == null) return false;
+        i = at + descriptor.len;
+    }
+    return true;
+}
+
+/// Does this sing-box config already carry the repaired TUN shape?
+fn singboxConfigIsCurrent(cfg: []const u8) bool {
+    return std.mem.indexOf(u8, cfg, "\"" ++ TUN_ADDR ++ "\"") != null and
+        std.mem.indexOf(u8, cfg, "\"stack\":\"" ++ TUN_STACK ++ "\"") != null and
+        std.mem.indexOf(u8, cfg, "\"mtu\":" ++ TUN_MTU) != null;
+}
+
+fn egressManualHint(ui: *Tui) void {
+    ui.warn(trL(
+        ui,
+        "The sing-box egress predates the TUN fixes and could not be regenerated automatically.",
+        "sing-box egress создан до починки TUN, и перегенерировать его автоматически не вышло.",
+    ));
+    ui.info(trL(
+        ui,
+        // -F, because in a POSIX regex `[upstream.xray]` is a bracket EXPRESSION: it
+        // matches one character from that set, so `^[upstream.xray]` never matches the
+        // section header and does match `user1 = "<secret>"` — printing secrets instead
+        // of links.
+        "Re-run: mtbuddy setup egress '<share-link>' [...]  (recover the links with: grep -A2 -F '[upstream.xray]' " ++ CONFIG_PATH ++ ")",
+        "Запустите заново: mtbuddy setup egress '<share-link>' [...]  (ссылки можно достать: grep -A2 -F '[upstream.xray]' " ++ CONFIG_PATH ++ ")",
+    ));
+}
+
+/// Repair an egress provisioned before the TUN fixes, in place — the `mtbuddy update`
+/// counterpart of install.refreshTcpmssLoopbackExclusion / nfqws.refreshLoopbackExclusion.
+///
+/// The files `setup egress` writes are created once, at setup time, and an ordinary
+/// update regenerates none of them. Without this an upgraded host keeps the /30 address
+/// (whose next address sing-tun hands to systemd-resolved as sbx0's DNS server, killing
+/// all resolution), the system stack and the default MTU (every bulk transfer dropped
+/// while the egress reports itself up), and the orphaned
+/// `ExecStartPre=+/usr/local/bin/setup_tunnel.sh` that restart-loops the proxy with
+/// 203/EXEC — until somebody happens to re-run `setup egress` by hand.
+///
+/// No-op when no egress is configured, and no-op again once repaired.
+pub fn refreshEgress(ui: *Tui, allocator: std.mem.Allocator) void {
+    if (!sys.fileExists(SB_SERVICE_PATH)) return;
+    refreshProxyDropin(ui, allocator);
+    refreshSingboxConfig(ui, allocator);
+}
+
+/// Repairs an EXISTING drop-in only. A host whose egress predates this never had the
+/// ordering either, and quietly adding an After=/Wants= to a unit during an update is a
+/// bigger step than clearing a line that is actively breaking it.
+fn refreshProxyDropin(ui: *Tui, allocator: std.mem.Allocator) void {
+    const existing = sys.readFileAllocAbsolute(allocator, PROXY_DROPIN_PATH, 16 * 1024) orelse return;
+    defer allocator.free(existing);
+    if (std.mem.indexOf(u8, existing, "\nExecStartPre=\n") != null) return;
+
+    sys.writeFile(PROXY_DROPIN_PATH, PROXY_EGRESS_DROPIN) catch return;
+    _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
+    ui.ok(trL(
+        ui,
+        "egress drop-in no longer runs a stale tunnel helper",
+        "egress drop-in больше не запускает устаревший tunnel-хелпер",
+    ));
+}
+
+fn refreshSingboxConfig(ui: *Tui, allocator: std.mem.Allocator) void {
+    const existing = sys.readFileAllocAbsolute(allocator, SB_CONFIG_PATH, 1024 * 1024) orelse return;
+    defer allocator.free(existing);
+    if (singboxConfigIsCurrent(existing)) return;
+
+    // The share links wireUpstreamTunnel recorded are the only way to rebuild the
+    // outbounds. Anything missing or unparseable here means we cannot regenerate
+    // faithfully — say so and change nothing rather than write a config that drops
+    // somebody's egress.
+    var doc = toml.TomlDoc.load(allocator, CONFIG_PATH) catch {
+        egressManualHint(ui);
+        return;
+    };
+    defer doc.deinit();
+    const raw = doc.get("upstream.xray", "links") orelse {
+        egressManualHint(ui);
+        return;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const texts = parseTomlStringArray(a, raw) catch {
+        egressManualHint(ui);
+        return;
+    };
+    if (texts.len == 0) {
+        egressManualHint(ui);
+        return;
+    }
+
+    const parsed = a.alloc(XrayLink, texts.len) catch return;
+    for (texts, 0..) |t, i| {
+        parsed[i] = parseXrayLink(a, t) catch {
+            egressManualHint(ui);
+            return;
+        };
+        var vbuf: [256]u8 = undefined;
+        if (validateLink(parsed[i], &vbuf) != null) {
+            egressManualHint(ui);
+            return;
+        }
+    }
+
+    const cfg = genSingboxConfig(a, parsed) catch {
+        egressManualHint(ui);
+        return;
+    };
+
+    if (!sameEgressEndpoints(existing, cfg)) {
+        ui.warn(trL(
+            ui,
+            "The sing-box egress is running endpoints that [upstream.xray] links no longer describes — leaving it alone.",
+            "sing-box egress работает на эндпоинтах, которых уже нет в [upstream.xray] links — не трогаю его.",
+        ));
+        egressManualHint(ui);
+        return;
+    }
+
+    // Keep the file we are about to replace. The endpoints match, so this should never be
+    // needed — but it is one copy of the only on-disk record of a working egress.
+    _ = sys.exec(allocator, &.{ "cp", "-f", SB_CONFIG_PATH, SB_CONFIG_PATH ++ ".bak" }) catch {};
+
+    sys.writeFileMode(SB_CONFIG_PATH, cfg, 0o600) catch {
+        egressManualHint(ui);
+        return;
+    };
+    // A restart, not `enable --now`: sing-box parses its config only at startup, and
+    // `--now` is a no-op on a unit that is already running — which is exactly the host
+    // this repair exists for.
+    _ = sys.execForward(&.{ "systemctl", "restart", SB_SERVICE_NAME }) catch {};
+    ui.ok(trL(
+        ui,
+        "sing-box egress tun repaired (" ++ TUN_ADDR ++ ", stack " ++ TUN_STACK ++ ", mtu " ++ TUN_MTU ++ ")",
+        "sing-box egress tun починен (" ++ TUN_ADDR ++ ", stack " ++ TUN_STACK ++ ", mtu " ++ TUN_MTU ++ ")",
+    ));
 }
 
 fn ensureSingboxInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
@@ -611,6 +818,98 @@ test "the egress drop-in resets ExecStartPre so a stale tunnel helper can't brea
     // And it still orders the proxy after the egress, which is why the drop-in exists.
     try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "After=" ++ SB_SERVICE_NAME) != null);
     try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "Wants=" ++ SB_SERVICE_NAME) != null);
+}
+
+test "egress auto-repair: detects a stale config and accepts a freshly generated one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const vless = try parseXrayLink(a, "vless://95e0edb9-4a0b-4312-a71f-1d4b8b6db79b@154.59.110.32:443?type=tcp&security=reality&pbk=PBK&sni=www.microsoft.com&sid=SID&flow=xtls-rprx-vision#v");
+    const fresh = try genSingboxConfig(a, &.{vless});
+    try std.testing.expect(singboxConfigIsCurrent(fresh));
+
+    // What `setup egress` wrote before v1.12.0: /30 address, system stack, no mtu. Each
+    // of the three defects on its own must be enough to trigger a regeneration, or a
+    // partially-repaired host is left in place.
+    const legacy = "{\"inbounds\":[{\"type\":\"tun\",\"interface_name\":\"sbx0\",\"address\":[\"172.19.0.1/30\"],\"auto_route\":false,\"stack\":\"system\"}]}";
+    try std.testing.expect(!singboxConfigIsCurrent(legacy));
+
+    const only_addr_stale = "{\"address\":[\"172.19.0.1/30\"],\"stack\":\"gvisor\",\"mtu\":1400}";
+    try std.testing.expect(!singboxConfigIsCurrent(only_addr_stale));
+
+    const only_stack_stale = "{\"address\":[\"172.19.0.1/32\"],\"stack\":\"system\",\"mtu\":1400}";
+    try std.testing.expect(!singboxConfigIsCurrent(only_stack_stale));
+
+    const only_mtu_missing = "{\"address\":[\"172.19.0.1/32\"],\"stack\":\"gvisor\"}";
+    try std.testing.expect(!singboxConfigIsCurrent(only_mtu_missing));
+}
+
+test "egress auto-repair: refuses to regenerate when the recorded links moved on" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const A = try parseXrayLink(a, "vless://95e0edb9-4a0b-4312-a71f-1d4b8b6db79b@154.59.110.32:443?type=tcp&security=reality&pbk=P&sni=s.example&sid=S&flow=xtls-rprx-vision#A");
+    const B = try parseXrayLink(a, "vless://95e0edb9-4a0b-4312-a71f-1d4b8b6db79b@198.51.100.7:443?type=tcp&security=reality&pbk=P&sni=s.example&sid=S&flow=xtls-rprx-vision#B");
+    const C = try parseXrayLink(a, "ss://YWVzLTI1Ni1nY206ZzdaR000c0JwNUZ1elBndktRZ1lnQQ==@203.0.113.9:9443#C");
+
+    const only_a = try genSingboxConfig(a, &.{A});
+    const pool_bc = try genSingboxConfig(a, &.{ B, C });
+
+    // Same egress, regenerated: every endpoint survives, so the repair may proceed.
+    try std.testing.expect(sameEgressEndpoints(only_a, try genSingboxConfig(a, &.{A})));
+    try std.testing.expect(sameEgressEndpoints(pool_bc, try genSingboxConfig(a, &.{ B, C })));
+
+    // The dangerous case: config.toml still records A while the host actually runs B+C
+    // (setup egress writes the JSON and starts the egress BEFORE updating config.toml,
+    // and that write used to abort on a long link array). Regenerating from A would
+    // replace a live pool with one dead endpoint.
+    try std.testing.expect(!sameEgressEndpoints(pool_bc, only_a));
+
+    // And the other direction: never quietly ADD endpoints the host was not running.
+    try std.testing.expect(!sameEgressEndpoints(only_a, try genSingboxConfig(a, &.{ A, B })));
+
+    // Same count, different host — a bare count check would let this through.
+    try std.testing.expect(!sameEgressEndpoints(only_a, try genSingboxConfig(a, &.{B})));
+
+    // A legacy (pre-1.12.0) config compares by endpoint, not by TUN shape: the outbound
+    // JSON is byte-identical across the TUN fix, so an in-sync host still matches.
+    const legacy_a = "{\"inbounds\":[{\"type\":\"tun\",\"address\":[\"172.19.0.1/30\"],\"stack\":\"system\"}]," ++
+        "\"outbounds\":[{\"type\":\"vless\",\"tag\":\"egress-0\",\"server\":\"154.59.110.32\",\"server_port\":443,\"uuid\":\"u\"}]}";
+    try std.testing.expect(!singboxConfigIsCurrent(legacy_a));
+    try std.testing.expect(sameEgressEndpoints(legacy_a, only_a));
+    try std.testing.expect(!sameEgressEndpoints(legacy_a, pool_bc));
+}
+
+test "egress auto-repair: reads the share links back out of [upstream.xray]" {
+    const a = std.testing.allocator;
+
+    // Exactly what wireUpstreamTunnel writes, as TomlDoc.get hands it back.
+    const one = try parseTomlStringArray(a, "[\"vless://a@1.2.3.4:443#x\"]");
+    defer a.free(one);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("vless://a@1.2.3.4:443#x", one[0]);
+
+    const pool = try parseTomlStringArray(a, "[\"vless://a@1.2.3.4:443#x\",\"ss://b@5.6.7.8:9443#y\"]");
+    defer a.free(pool);
+    try std.testing.expectEqual(@as(usize, 2), pool.len);
+    try std.testing.expectEqualStrings("ss://b@5.6.7.8:9443#y", pool[1]);
+
+    // Whitespace the operator may have introduced by hand, and the empty forms: an empty
+    // list must come back empty so the caller falls through to the manual hint rather
+    // than regenerating an outbound-less config.
+    const spaced = try parseTomlStringArray(a, "[ \"vless://a@1.2.3.4:443\" , \"trojan://c@9.9.9.9:443\" ]");
+    defer a.free(spaced);
+    try std.testing.expectEqual(@as(usize, 2), spaced.len);
+
+    const empty = try parseTomlStringArray(a, "[]");
+    defer a.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const blank_entry = try parseTomlStringArray(a, "[\"\"]");
+    defer a.free(blank_entry);
+    try std.testing.expectEqual(@as(usize, 0), blank_entry.len);
 }
 
 test "vmess scy maps to cipher and is emitted" {
