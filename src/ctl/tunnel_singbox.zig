@@ -119,10 +119,21 @@ const TUN_STACK = "gvisor";
 ///     every proxy start and steals the route from sbx0.
 /// sbx0's own routing is installed by the sing-box unit's ExecStartPost, and the default
 /// (non-tunnel) unit has no ExecStartPre at all, so the reset is a no-op everywhere else.
+/// CAP_NET_ADMIN is the other half, and without it `setup egress` produces a proxy that
+/// accepts clients and fails EVERY DC connection. Wiring the egress sets
+/// `[upstream] type = tunnel`, so the proxy starts SO_MARKing its DC sockets — and
+/// SO_MARK needs CAP_NET_ADMIN. Only the AmneziaWG unit ever granted it, so a host that
+/// went straight to `setup egress` without ever running `setup tunnel` ran under the
+/// default unit's CAP_NET_BIND_SERVICE alone and every connect failed with EPERM
+/// ("upstream connect start failed"), while setup still printed "egress up". Reproduced
+/// and fixed on a live host. systemd MERGES these two directives across drop-ins, so the
+/// unit's own CAP_NET_BIND_SERVICE is kept rather than replaced.
+///
 /// It lives in the drop-in because that is what survives: a hand-added line is wiped by
 /// the next `setup egress`.
 const PROXY_EGRESS_DROPIN = "[Unit]\nAfter=" ++ SB_SERVICE_NAME ++ "\nWants=" ++ SB_SERVICE_NAME ++ "\n" ++
-    "\n[Service]\nExecStartPre=\n";
+    "\n[Service]\nExecStartPre=\n" ++
+    "AmbientCapabilities=CAP_NET_ADMIN\nCapabilityBoundingSet=CAP_NET_ADMIN\n";
 const TUN_TABLE = "200"; // same policy-routing table the AmneziaWG tunnel uses
 const TUN_FWMARK = "200"; // proxy SO_MARK for tunnel egress
 
@@ -643,7 +654,10 @@ pub fn refreshEgress(ui: *Tui, allocator: std.mem.Allocator) void {
 fn refreshProxyDropin(ui: *Tui, allocator: std.mem.Allocator) void {
     const existing = sys.readFileAllocAbsolute(allocator, PROXY_DROPIN_PATH, 16 * 1024) orelse return;
     defer allocator.free(existing);
-    if (std.mem.indexOf(u8, existing, "\nExecStartPre=\n") != null) return;
+    // Content comparison, not a marker search: the drop-in has grown twice now (the
+    // ExecStartPre reset, then CAP_NET_ADMIN), and a marker check would have skipped a
+    // host that already had the first and still needed the second.
+    if (std.mem.eql(u8, existing, PROXY_EGRESS_DROPIN)) return;
 
     sys.writeFile(PROXY_DROPIN_PATH, PROXY_EGRESS_DROPIN) catch return;
     _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
@@ -890,6 +904,15 @@ test "the egress drop-in resets ExecStartPre so a stale tunnel helper can't brea
     // And it still orders the proxy after the egress, which is why the drop-in exists.
     try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "After=" ++ SB_SERVICE_NAME) != null);
     try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "Wants=" ++ SB_SERVICE_NAME) != null);
+
+    // And it grants CAP_NET_ADMIN. Wiring the egress sets [upstream] type = tunnel, so
+    // the proxy SO_MARKs its DC sockets — which needs that capability. Without it a host
+    // that never ran `setup tunnel` runs under the default unit (CAP_NET_BIND_SERVICE
+    // only) and EVERY DC connect fails with EPERM while setup reports success.
+    // Verified on a live host: adding it turned "upstream connect start failed" into a
+    // relaying connection.
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "AmbientCapabilities=CAP_NET_ADMIN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "CapabilityBoundingSet=CAP_NET_ADMIN") != null);
 }
 
 test "egress auto-repair: detects a stale config and accepts a freshly generated one" {
