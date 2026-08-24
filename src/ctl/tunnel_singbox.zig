@@ -508,9 +508,49 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
         };
         _ = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
         ui.ok("upstream set to tunnel via " ++ TUN_IFACE ++ "; mtproto-proxy restarted");
+        warnMiddleProxyOverTun(ui, allocator);
     } else {
         ui.warn("mtproto-proxy not installed here — the sing-box tunnel is up on " ++ TUN_IFACE ++ "; set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE);
     }
+}
+
+/// A sing-box TUN egress and MiddleProxy do not work together, and the failure is silent
+/// where it matters: every connection still works, it just loses the ad-tag and ME media.
+///
+/// Measured on a live host — 3 clients, `use_middle_proxy = true`:
+///   upstream = tunnel  ->  middleproxy_fallback_total 3 / 3
+///   upstream = direct  ->  middleproxy_fallback_total 0 / 3
+/// The RPC_NONCE exchange succeeds and the middle proxy then drops the connection at
+/// `waiting_rpc_handshake_response`. That is the documented signature of an egress which
+/// rewrites the source PORT (see [server].middle_proxy_nat_ip): sing-box terminates the
+/// proxy's TCP in its netstack and re-dials on its own socket, so the port Telegram
+/// observes is not the one the handshake announced. `middle_proxy_nat_ip` fixes the
+/// address half; there is no port equivalent, and there cannot be one.
+///
+/// The runtime already warns once connections start falling back ("ad-tag likely
+/// inactive"), but by then the operator has left the terminal. Say it while they are
+/// still here.
+fn warnMiddleProxyOverTun(ui: *Tui, allocator: std.mem.Allocator) void {
+    var doc = toml.TomlDoc.load(allocator, CONFIG_PATH) catch return;
+    defer doc.deinit();
+    const v = doc.get("general", "use_middle_proxy") orelse return;
+    if (!(std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "yes"))) return;
+
+    ui.warn(trL(
+        ui,
+        "[general] use_middle_proxy = true, but a sing-box TUN egress breaks the MiddleProxy handshake.",
+        "[general] use_middle_proxy = true, но sing-box TUN-egress ломает хендшейк MiddleProxy.",
+    ));
+    ui.info(trL(
+        ui,
+        "Every connection will fall back to a direct DC path: it still works, but carries no ad-tag and no MiddleProxy media (photos/videos/stories for non-Premium users).",
+        "Все соединения будут откатываться на прямой путь к DC: связь работает, но без ad-tag и без медиа через MiddleProxy (фото/видео/истории у не-Premium).",
+    ));
+    ui.info(trL(
+        ui,
+        "The egress re-dials on its own socket, so the source port Telegram sees is not the one the handshake announced — [server].middle_proxy_nat_ip fixes the address, not the port. Use a native WireGuard/AmneziaWG tunnel, or set use_middle_proxy = false.",
+        "Egress передиаливает своим сокетом, поэтому Telegram видит не тот source-порт, который объявлен в хендшейке — [server].middle_proxy_nat_ip чинит адрес, но не порт. Используйте нативный WireGuard/AmneziaWG-туннель или выставьте use_middle_proxy = false.",
+    ));
 }
 
 fn wireUpstreamTunnel(allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
