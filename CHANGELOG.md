@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.12.0](https://github.com/sleep3r/mtproto.zig/compare/v1.11.0...v1.12.0) (2026-08-24)
+
+
+### Features
+
+* **access:** per-user concurrent unique-IP quota ([access.user_max_ips]) ([#392](https://github.com/sleep3r/mtproto.zig/issues/392)) ([a0a9955](https://github.com/sleep3r/mtproto.zig/commit/a0a9955a7d70824ec484650e8a3ad84274a3a2df))
+
+
+### Bug Fixes
+
+* **ctl:** make the already-multi-distro paths work, and fail honestly where they don't ([#394](https://github.com/sleep3r/mtproto.zig/issues/394)) ([a2cb76c](https://github.com/sleep3r/mtproto.zig/commit/a2cb76c3e625a4b36d54e05041e6233bb25859cc))
+* **egress:** repair the sing-box TUN — bulk transfers, host DNS, and a 203/EXEC loop ([#395](https://github.com/sleep3r/mtproto.zig/issues/395)) ([dbae511](https://github.com/sleep3r/mtproto.zig/commit/dbae5118e12488e21950d8dac14ff515762adef1))
+
 ## [1.11.0](https://github.com/sleep3r/mtproto.zig/compare/v1.10.3...v1.11.0) (2026-08-22)
 
 
