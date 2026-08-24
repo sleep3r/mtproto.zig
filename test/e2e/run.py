@@ -267,6 +267,23 @@ def perform_direct_obfuscated_handshake(sock: socket.socket, secret_hex: str, dc
     sock.sendall(generate_obf_handshake(secret_hex, dc_idx, "secure"))
 
 
+def connect_from(source_ip: str, host: str, port: int, timeout_sec: float = 2.0) -> socket.socket:
+    """Open a connection with an explicit source address.
+
+    All of 127.0.0.0/8 is local on Linux, so this is how a scenario produces several
+    distinct client networks on one machine.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout_sec)
+        sock.bind((source_ip, 0))
+        sock.connect((host, port))
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 def wait_socket_closed(sock: socket.socket, timeout_sec: float = 2.0) -> bool:
     deadline = time.time() + timeout_sec
     sock.setblocking(False)
@@ -1106,6 +1123,70 @@ def scenario_replay_attack_rejected() -> None:
         socks.stop()
 
 
+def scenario_user_max_ips_distinct_client_networks() -> None:
+    """[access.user_max_ips]: one link, capped at 2 concurrent client networks.
+
+    Two source IPs get in; a third is refused at handshake completion and never
+    reaches a DC. Extra sockets from an ALREADY admitted network stay free — a
+    Telegram client opens several by itself, so the quota counts networks, not
+    sockets, and conflating the two would break every real client.
+    """
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    ) + "\n[access.user_max_ips]\nuser1 = 2\n"
+    proxy = start_proxy(cfg, proxy_port)
+    clients: list[socket.socket] = []
+    try:
+        def handshake_from(source_ip: str) -> socket.socket:
+            c = connect_from(source_ip, "127.0.0.1", proxy_port)
+            clients.append(c)
+            c.settimeout(2.0)
+            perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            return c
+
+        # An admitted handshake dials the DC straight away (no payload needed), so the
+        # upstream CONNECT count is the admission signal.
+        def expect_connects(n: int, what: str) -> None:
+            assert wait_for_condition(
+                lambda: len(socks.connect_targets) == n, timeout_sec=3.0
+            ), f"{what}: expected {n} upstream connects, got {socks.connect_targets}"
+
+        handshake_from("127.0.0.1")
+        expect_connects(1, "first network")
+
+        handshake_from("127.0.0.2")
+        expect_connects(2, "second network (at quota)")
+
+        handshake_from("127.0.0.1")
+        expect_connects(3, "second socket from an already-admitted network")
+
+        over_quota = connect_from("127.0.0.3", "127.0.0.1", proxy_port)
+        clients.append(over_quota)
+        over_quota.settimeout(2.0)
+        perform_valid_client_handshake(over_quota, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+        assert_socket_closed_soon(over_quota, timeout_sec=2.0)
+
+        # Settle, then assert the refusal never reached a DC (the actual property).
+        time.sleep(0.4)
+        assert len(socks.connect_targets) == 3, (
+            f"over-quota network was relayed upstream: {socks.connect_targets}"
+        )
+    finally:
+        for c in clients:
+            try:
+                c.close()
+            except OSError:
+                pass
+        proxy.stop()
+        socks.stop()
+
+
 def scenario_slowloris_partial_clienthello() -> None:
     proxy_port = free_port()
     cfg = base_config(
@@ -1245,6 +1326,7 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "mask_fallback_custom_target": scenario_mask_fallback_custom_target,
     "invalid_tls_and_mtproto": scenario_invalid_tls_and_mtproto,
     "replay_attack_rejected": scenario_replay_attack_rejected,
+    "user_max_ips_distinct_client_networks": scenario_user_max_ips_distinct_client_networks,
     "slowloris_partial_clienthello": scenario_slowloris_partial_clienthello,
     "connection_churn_10k": scenario_connection_churn_10k,
     "sigterm_during_active_relay": scenario_sigterm_during_active_relay,

@@ -45,6 +45,7 @@ const middle_proxy_nat = @import("middle_proxy_nat.zig");
 const dc_nonce = @import("dc_nonce.zig");
 const upstream_failover = @import("upstream_failover.zig");
 const trusted_peers = @import("trusted_peers.zig");
+pub const UserIpLimit = @import("user_ip_limit.zig").UserIpLimit;
 const runtime_log = @import("../runtime_log.zig");
 
 test {
@@ -66,6 +67,7 @@ test {
     _ = @import("net_helpers.zig");
     _ = @import("connection_pool.zig");
     _ = @import("trusted_peers.zig");
+    _ = @import("user_ip_limit.zig");
     _ = @import("relay_steps.zig");
     _ = @import("middle_proxy_frames.zig");
     _ = @import("middle_proxy_handshake.zig");
@@ -582,6 +584,11 @@ const ConnectionSlot = struct {
     traffic_client_to_upstream_counter: ?*std.atomic.Value(u64) = null,
     traffic_upstream_to_client_counter: ?*std.atomic.Value(u64) = null,
     user_metrics: ?*ProxyState.UserMetrics = null,
+    /// The [access.user_max_ips] table key this connection holds, when the user has a
+    /// quota. Captured at admission and released verbatim on close: peer_addr must NOT
+    /// be re-keyed later, or a PROXY-protocol/forwarded-for rewrite would release a
+    /// different slot than the one that was taken.
+    user_ip_key: ?[16]u8 = null,
 
     // Non-blocking write queues (slab-like chain buffers)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
@@ -717,6 +724,7 @@ const ConnectionSlot = struct {
         self.dc_abs = 0;
         self.is_media_path = false;
         self.user_metrics = null;
+        self.user_ip_key = null;
 
         if (self.mp_frame_buf) |buf| allocator.free(buf);
         self.mp_frame_buf = null;
@@ -941,6 +949,15 @@ pub const ProxyState = struct {
         connections_active: std.atomic.Value(u32),
         client_to_upstream_bytes_total: std.atomic.Value(u64),
         upstream_to_client_bytes_total: std.atomic.Value(u64),
+        /// [access.user_max_ips] quota, present only for users that configure one.
+        /// Lives here because it must survive a SIGHUP that keeps the user (the
+        /// entry is matched by name and reused), exactly like connections_active.
+        ip_limit: ?UserIpLimit = null,
+        /// Connections refused because the user's unique-IP quota was full. Without
+        /// this the feature's whole failure mode ("my client stopped connecting") is
+        /// invisible: the refusal only reaches a debug log, and a full quota is also
+        /// the intended steady state, so the gauge alone cannot tell the two apart.
+        ip_limit_refused_total: std.atomic.Value(u64) = .init(0),
     };
 
     pub const MetricsSnapshot = struct {
@@ -991,20 +1008,35 @@ pub const ProxyState = struct {
         return try secrets.toOwnedSlice(allocator);
     }
 
-    fn createUserMetrics(allocator: std.mem.Allocator, user_name: []const u8) !*UserMetrics {
+    fn createUserMetrics(allocator: std.mem.Allocator, user_name: []const u8, max_ips: ?u32) !*UserMetrics {
         const entry = try allocator.create(UserMetrics);
         errdefer allocator.destroy(entry);
 
+        const name = try allocator.dupe(u8, user_name);
+        errdefer allocator.free(name);
+
         entry.* = .{
-            .name = try allocator.dupe(u8, user_name),
+            .name = name,
             .connections_active = std.atomic.Value(u32).init(0),
             .client_to_upstream_bytes_total = std.atomic.Value(u64).init(0),
             .upstream_to_client_bytes_total = std.atomic.Value(u64).init(0),
+            .ip_limit = if (max_ips) |cap| try UserIpLimit.init(allocator, cap) else null,
+            .ip_limit_refused_total = .init(0),
         };
         return entry;
     }
 
+    /// The per-user unique-IP cap for `user_name`, or null when the user has none.
+    /// Always read from the STARTUP config: a SIGHUP reload only swaps user secrets
+    /// (see moveAccessMapsFrom), so the caps a running process enforces are the ones
+    /// it booted with — the same rule user_max_conns and user_expirations follow.
+    fn userMaxIps(cfg: *const Config, user_name: []const u8) ?u32 {
+        const map = cfg.user_max_ips orelse return null;
+        return map.get(user_name);
+    }
+
     fn destroyUserMetrics(allocator: std.mem.Allocator, entry: *UserMetrics) void {
+        if (entry.ip_limit) |*limit| limit.deinit(allocator);
         allocator.free(entry.name);
         allocator.destroy(entry);
     }
@@ -1027,7 +1059,7 @@ pub const ProxyState = struct {
 
         var it = @constCast(&cfg.users).iterator();
         while (it.next()) |entry| {
-            const metric = try createUserMetrics(allocator, entry.key_ptr.*);
+            const metric = try createUserMetrics(allocator, entry.key_ptr.*, userMaxIps(cfg, entry.key_ptr.*));
             errdefer destroyUserMetrics(allocator, metric);
             try metrics.append(allocator, metric);
         }
@@ -1042,6 +1074,12 @@ pub const ProxyState = struct {
         return null;
     }
 
+    /// Reclaim retired entries whose connections have drained. This mutates an
+    /// unsynchronised ArrayList from every worker's closeSlot, which is safe ONLY
+    /// because reloadConfigFromDisk refuses to reload with workers > 1 — so the list
+    /// stays permanently empty in the multi-threaded configuration and retirement is
+    /// single-threaded. Anyone relaxing that refusal must lock this list first: it frees
+    /// UserMetrics, and with it the user_max_ips table a concurrent release() touches.
     fn collectRetiredUserMetrics(self: *ProxyState) void {
         var idx: usize = 0;
         while (idx < self.retired_user_metrics.items.len) {
@@ -1128,7 +1166,7 @@ pub const ProxyState = struct {
                 if (findMetricInSlice(self.user_metrics, user_name)) |metrics| {
                     try new_metrics.append(self.allocator, metrics);
                 } else {
-                    const metrics = try createUserMetrics(self.allocator, user_name);
+                    const metrics = try createUserMetrics(self.allocator, user_name, userMaxIps(&self.config, user_name));
                     errdefer destroyUserMetrics(self.allocator, metrics);
                     try new_metrics.append(self.allocator, metrics);
                 }
@@ -2604,6 +2642,7 @@ const EventLoop = struct {
             slot.traffic_client_to_upstream_counter = &self.state.client_to_upstream_bytes_total;
             slot.traffic_upstream_to_client_counter = &self.state.upstream_to_client_bytes_total;
             slot.user_metrics = null;
+            slot.user_ip_key = null;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
@@ -2936,7 +2975,8 @@ const EventLoop = struct {
         };
         if (access_applied > 0) {
             log.info(
-                "SIGHUP: access users reloaded users={d} direct_users={d} retired_metrics={d}",
+                "SIGHUP: access users reloaded users={d} direct_users={d} retired_metrics={d} " ++
+                    "(per-user max_conns / expirations / max_ips are NOT reloaded — restart to change them)",
                 .{ self.state.user_secrets.len, self.state.config.direct_users.count(), self.state.retired_user_metrics.items.len },
             );
             applied += access_applied;
@@ -3864,7 +3904,40 @@ const EventLoop = struct {
                     }
                 }
             }
+            // Published BEFORE the unique-IP acquire below, so the pair can never
+            // desynchronise in the direction that leaks: closeSlot releases the IP
+            // reference only when user_metrics is set, and a leaked reference is
+            // permanent (nothing sweeps the table). The refusal path below unwinds
+            // both together.
             slot.user_metrics = entry;
+
+            // [access.user_max_ips]: how many distinct client networks may hold this
+            // user's link at once. peer_addr is final here — the PROXY-protocol /
+            // forwarded-for rewrite happens before the handshake completes.
+            //
+            // A relay connection still sitting on loopback is exempt, for the same
+            // reason relay peers are already exempt from the per-IP flood guard and the
+            // /24 limiter: without a PROXY-protocol terminator in front of it the WEB
+            // relay hands us every browser as 127.0.0.1 (it announces its own peer, so
+            // "did a header arrive" cannot tell the two apart — the ADDRESS can), and
+            // every browser behind it would collapse onto one key. Counting that would
+            // crowd out the user's real devices while limiting nothing. With a terminator
+            // (`[web].mask_backend`) peer_addr is the browser's own address, not
+            // loopback, and the quota applies as usual.
+            if (entry.ip_limit) |*limit| {
+                const relay_hid_the_client = slot.trusted_peer and trusted_peers.isLoopback(slot.peer_addr);
+                if (!relay_hid_the_client) {
+                    const ip_key = UserIpLimit.addrKey(slot.peer_addr);
+                    if (!limit.acquire(ip_key)) {
+                        _ = entry.ip_limit_refused_total.fetchAdd(1, .monotonic);
+                        _ = entry.connections_active.fetchSub(1, .monotonic);
+                        slot.user_metrics = null;
+                        self.closeSlot(slot, "user ip limit");
+                        return;
+                    }
+                    slot.user_ip_key = ip_key;
+                }
+            }
         }
 
         slot.dc_abs = @intCast(dc_abs);
@@ -4723,12 +4796,20 @@ const EventLoop = struct {
         }
 
         const user_metrics = slot.user_metrics;
+        const user_ip_key = slot.user_ip_key;
         slot.resetOwnedBuffers(self.state.allocator);
 
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
             _ = self.state.closed_count.fetchAdd(1, .monotonic);
             if (user_metrics) |entry| {
+                // Release the unique-IP slot BEFORE dropping connections_active: a
+                // retired entry is reclaimed the moment that counter reaches zero
+                // (collectRetiredUserMetrics), so touching ip_limit afterwards would
+                // race a free.
+                if (user_ip_key) |ip_key| {
+                    if (entry.ip_limit) |*limit| limit.release(ip_key);
+                }
                 _ = entry.connections_active.fetchSub(1, .monotonic);
             }
             // RED errors + evasion signal: bucket the close reason once per slot.
@@ -5075,6 +5156,68 @@ test "ProxyState access reload keeps active metrics safe" {
         }
     }
     try std.testing.expect(saw_alice_new_secret);
+}
+
+test "ProxyState per-user unique-IP quota is allocated per config and survives reload" {
+    const allocator = std.testing.allocator;
+
+    // `later` has a cap but no secret yet: it is added by the reload below, which
+    // proves the quota comes from the STARTUP config rather than from the reloaded one.
+    const initial_cfg = try Config.parse(allocator,
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "00000000000000000000000000000001"
+        \\bob = "00000000000000000000000000000002"
+        \\
+        \\[access.user_max_ips]
+        \\alice = 2
+        \\later = 1
+    );
+    var state = try ProxyState.init(allocator, initial_cfg, "/tmp/mtproto-test.toml");
+    defer state.deinit();
+
+    const alice = state.findUserMetrics("alice") orelse return error.TestExpectedEqual;
+    const bob = state.findUserMetrics("bob") orelse return error.TestExpectedEqual;
+
+    try std.testing.expect(bob.ip_limit == null); // no cap configured → untracked
+    if (alice.ip_limit == null) return error.TestExpectedEqual;
+    const alice_limit = &alice.ip_limit.?;
+    try std.testing.expectEqual(@as(usize, 2), alice_limit.slots.len);
+
+    const home = UserIpLimit.addrKey(.{ .ip4 = .{ .bytes = .{ 203, 0, 113, 1 }, .port = 443 } });
+    const office = UserIpLimit.addrKey(.{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 443 } });
+    const cafe = UserIpLimit.addrKey(.{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 443 } });
+
+    try std.testing.expect(alice_limit.acquire(home));
+    try std.testing.expect(alice_limit.acquire(office));
+    try std.testing.expect(!alice_limit.acquire(cafe));
+
+    var next_cfg = try Config.parse(allocator,
+        \\[server]
+        \\port = 443
+        \\
+        \\[access.users]
+        \\alice = "00000000000000000000000000000001"
+        \\later = "00000000000000000000000000000003"
+    );
+    defer next_cfg.deinit(allocator);
+    try state.reloadAccessUsersForTest(&next_cfg);
+
+    // Alice keeps the very same entry, so the networks she already holds keep
+    // their slots across the reload instead of silently resetting the quota.
+    try std.testing.expect(alice == state.findUserMetrics("alice").?);
+    try std.testing.expectEqual(@as(u32, 2), alice_limit.activeCount());
+    try std.testing.expect(!alice_limit.acquire(cafe));
+
+    const later = state.findUserMetrics("later") orelse return error.TestExpectedEqual;
+    if (later.ip_limit == null) return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), later.ip_limit.?.slots.len);
+
+    alice_limit.release(home);
+    alice_limit.release(office);
+    try std.testing.expectEqual(@as(u32, 0), alice_limit.activeCount());
 }
 
 fn reloadAccessUsersInThread(

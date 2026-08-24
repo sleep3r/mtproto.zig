@@ -485,6 +485,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[access.direct_users] <name>` | — | 为该用户绕过 ME |
 | `[access.user_max_conns] <name>` | — | 每个用户的并发连接上限（更改需重启） |
 | `[access.user_expirations] <name>` | — | 每个用户的到期日期 `"YYYY-MM-DD"`（更改需重启） |
+| `[access.user_max_ips] <name>` | — | 每个用户同时使用该链接的不同客户端网络（IPv4 地址 / IPv6 /64）数量上限（更改需重启） |
 
 </details>
 

@@ -486,6 +486,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[access.direct_users] <name>` | — | دور زدن ME برای این کاربر |
 | `[access.user_max_conns] <name>` | — | سقف اتصال‌های هم‌زمان به ازای هر کاربر (برای تغییر، ری‌استارت لازم است) |
 | `[access.user_expirations] <name>` | — | تاریخ انقضای هر کاربر `"YYYY-MM-DD"` (برای تغییر، ری‌استارت لازم است) |
+| `[access.user_max_ips] <name>` | — | سقف شبکه‌های متمایز (نشانی IPv4 / پیشوند IPv6 /64) که هم‌زمان از لینک هر کاربر استفاده می‌کنند (برای تغییر، ری‌استارت لازم است) |
 
 </details>
 

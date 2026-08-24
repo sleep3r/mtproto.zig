@@ -351,3 +351,41 @@ user2 = "ffeeddccbbaa99887766554433221100"
 # Optional per-user expiry (name = "YYYY-MM-DD", UTC midnight). Absent = never expires.
 # After the date the user's new connections are refused. Read at startup; restart to change.
 # user1 = "2026-12-31"
+
+[access.user_max_ips]
+# Optional per-user cap on how many DISTINCT client networks may use that link AT THE
+# SAME TIME (name = N, names match [access.users]). Absent / 0 = unlimited; max 256.
+# This is the "how many places can share this link" knob; [access.user_max_conns] cannot
+# express it, because one Telegram client already opens several connections by itself.
+# A connection from an N+1-th network is refused ("user ip limit"); the client is not
+# told why, and it will keep retrying.
+#
+# A "network" is one IPv4 address, or one IPv6 /64 — a /64 is what SLAAC hands a whole
+# home LAN and what IPv6 privacy extensions rotate inside, so keying on the full address
+# would burn the quota in minutes. Counting is concurrent, never historical: a network
+# holds its slot only while it has at least one live connection, so a user may roam
+# between networks freely.
+#
+# Pick N with room to spare — a single phone can legitimately need more than one slot:
+#   * On a dual-stack host its IPv4 address and its IPv6 /64 are separate networks.
+#   * After a Wi-Fi <-> mobile handover the old sockets are not closed by the handover;
+#     they linger until idle_timeout_sec, so the abandoned network keeps its slot for
+#     up to ~2 minutes.
+#   * Some carriers hand out a fresh /64 on every reattach.
+# N = 3-4 per device is a sane starting point; N = 1 will refuse its own user.
+#
+# What it is NOT: a defence against resale. There is no eviction — the first N networks
+# win, so whoever the link was passed to can lock the owner out simply by being online
+# first. Carrier-grade NAT also puts thousands of subscribers behind one IPv4 address,
+# so a whole reseller's customer base on one carrier can share a single slot. Treat this
+# as a guard against casual sharing, and rotate the secret when a link really leaks.
+#
+# WEB proxy: without [web].mask_backend the relay hands every browser to the proxy as
+# 127.0.0.1, so those connections are exempt from the quota rather than crowding into
+# one slot. With a PROXY-protocol terminator the real client addresses are counted.
+#
+# Read at startup; changing them requires a restart (SIGHUP does not pick them up).
+# Exported per user as mtproto_user_unique_ips_active / _max / mtproto_user_ip_limit_refused_total.
+# [access.users_max_unique_ips] is accepted as an alias for this section header.
+# user1 = 4
+# user2 = 2

@@ -150,7 +150,10 @@ fn closeFd(fd: posix.fd_t) void {
 }
 
 fn writeMetricsResponse(fd: posix.fd_t, state: *proxy.ProxyState) !void {
-    var body_buf: [32 * 1024]u8 = undefined;
+    // Sized for the per-user families, which dominate: every configured user costs
+    // ~165 bytes, and a user with an [access.user_max_ips] quota ~145 more. A fixed
+    // writer that runs out fails the whole scrape, so keep the headroom generous.
+    var body_buf: [64 * 1024]u8 = undefined;
     var body_writer: std.Io.Writer = .fixed(&body_buf);
     try writeMetrics(&body_writer, state, collectProcessMetrics());
     const body = body_writer.buffered();
@@ -314,6 +317,34 @@ fn writePerUserMetrics(writer: anytype, state: *proxy.ProxyState) !void {
             entry.name,
             entry.upstream_to_client_bytes_total.load(.monotonic),
         );
+    }
+
+    // Emitted only for users that configure [access.user_max_ips]. A user without a
+    // quota is not tracked at all, so a 0 here would read as "nobody connected"
+    // rather than "unlimited" — better to have no series than a lying one.
+    // active == max means the next new network for that user is refused.
+    try writeMetricHeader(writer, "mtproto_user_unique_ips_active", "distinct client networks holding connections, for users with a unique-IP quota", "gauge");
+    for (state.user_metrics) |entry| {
+        if (entry.ip_limit) |*limit| {
+            try writeLabeledMetricLine(writer, "mtproto_user_unique_ips_active", entry.name, limit.activeCount());
+        }
+    }
+
+    try writeMetricHeader(writer, "mtproto_user_unique_ips_max", "configured unique-IP quota by user", "gauge");
+    for (state.user_metrics) |entry| {
+        if (entry.ip_limit) |*limit| {
+            try writeLabeledMetricLine(writer, "mtproto_user_unique_ips_max", entry.name, limit.slots.len);
+        }
+    }
+
+    // The gauge above sitting at its max is the INTENDED steady state for a user at
+    // quota, so it cannot distinguish "configured correctly" from "actively turning
+    // away a legitimate device". This counter is the one that moves when it happens.
+    try writeMetricHeader(writer, "mtproto_user_ip_limit_refused_total", "connections refused because the user's unique-IP quota was full", "counter");
+    for (state.user_metrics) |entry| {
+        if (entry.ip_limit != null) {
+            try writeLabeledMetricLine(writer, "mtproto_user_ip_limit_refused_total", entry.name, entry.ip_limit_refused_total.load(.monotonic));
+        }
     }
 }
 
@@ -490,6 +521,43 @@ test "metrics output contains required metrics" {
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_connections_active") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_build_info") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_client_to_upstream_bytes_total") != null);
+}
+
+test "metrics expose the per-user unique-IP quota only for users that have one" {
+    const cfg = try config.Config.parse(std.testing.allocator,
+        \\[access.users]
+        \\capped = "00000000000000000000000000000001"
+        \\uncapped = "00000000000000000000000000000002"
+        \\
+        \\[access.user_max_ips]
+        \\capped = 2
+    );
+    // ProxyState.init takes ownership of cfg; state.deinit() frees it.
+    var state = try proxy.ProxyState.init(std.testing.allocator, cfg, "test-config.toml");
+    defer state.deinit();
+
+    const capped = state.findUserMetrics("capped") orelse return error.TestExpectedEqual;
+    if (capped.ip_limit == null) return error.TestExpectedEqual;
+    const limit = &capped.ip_limit.?;
+    _ = limit.acquire(proxy.UserIpLimit.addrKey(.{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 443 } }));
+    _ = capped.ip_limit_refused_total.fetchAdd(3, .monotonic);
+
+    var buf: [32 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeMetrics(&writer, &state, .{});
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_user_unique_ips_active{user=\"capped\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_user_unique_ips_max{user=\"capped\"} 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_user_ip_limit_refused_total{user=\"capped\"} 3\n") != null);
+
+    // A user without a quota is not tracked at all, so a 0 series would read as
+    // "nobody connected" rather than "unlimited". Emit nothing for them instead.
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_user_unique_ips_active{user=\"uncapped\"}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_user_unique_ips_max{user=\"uncapped\"}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtproto_user_ip_limit_refused_total{user=\"uncapped\"}") == null);
+
+    limit.release(proxy.UserIpLimit.addrKey(.{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 443 } }));
 }
 
 test "metrics rejects unknown path" {
