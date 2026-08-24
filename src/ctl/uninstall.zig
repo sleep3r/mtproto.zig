@@ -103,9 +103,16 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     // sing-box tunnel egress provider artifacts (upstream.type=tunnel via sbx0).
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-singbox-egress.service" }) catch {};
-    _ = sys.execForward(&.{ "rm", "-f", "/etc/mtproto-proxy/singbox-egress.json" }) catch {};
+    // Both the config and the copy `mtbuddy update`'s egress repair keeps beside it. That
+    // .bak is not clutter: it is a full sing-box config, so it carries the share links —
+    // server addresses, passwords, obfs passwords — and leaving it behind means an
+    // uninstall leaves credentials on disk.
+    _ = sys.execForward(&.{ "rm", "-f", "/etc/mtproto-proxy/singbox-egress.json", "/etc/mtproto-proxy/singbox-egress.json.bak" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtproto-singbox-route.sh" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/sing-box" }) catch {};
+    // rmdir, not rm -rf: it removes the directory only once it is empty, so anything an
+    // operator put there of their own is left alone rather than silently deleted.
+    _ = sys.execForward(&.{ "rmdir", "--ignore-fail-on-non-empty", "/etc/mtproto-proxy" }) catch {};
 
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-mask-health.timer" }) catch {};
     // recovery.zig installs this script; update.zig treats its mere existence as "recovery
