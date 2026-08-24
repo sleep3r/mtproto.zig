@@ -5,8 +5,13 @@
 
 const std = @import("std");
 const net = std.Io.net;
+const UserIpLimit = @import("proxy/user_ip_limit.zig").UserIpLimit;
 const default_tls_domain = "google.com";
 const default_local_mask_target = "127.0.0.1";
+
+/// Ceiling for an [access.user_max_ips] entry. The cap sizes the per-user table the
+/// enforcement side allocates, so the two must agree.
+const max_user_ips: u32 = UserIpLimit.max_cap;
 
 pub const UpstreamMode = enum {
     /// Automatic egress mode (default).
@@ -383,6 +388,14 @@ pub const Config = struct {
     /// end-of-day inclusive). null/absent = never expires. Read at startup; changing it
     /// needs a restart.
     user_expirations: ?std.StringHashMap(i64) = null,
+    /// Optional per-user cap on how many DISTINCT client networks may hold connections
+    /// for that user at the same time. Section [access.user_max_ips] (name = N; alias
+    /// [access.users_max_unique_ips]). null/absent = unlimited. A network is one IPv4
+    /// address or one IPv6 /64 — see src/proxy/user_ip_limit.zig. This is the "how many
+    /// devices/places can share this link" knob that user_max_conns cannot express, since
+    /// one Telegram client already opens several connections by itself. Read at startup;
+    /// changing it needs a restart.
+    user_max_ips: ?std.StringHashMap(u32) = null,
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
     /// Optional backend host for masked clients. When unset, mask_port=443 uses
@@ -651,6 +664,21 @@ pub const Config = struct {
                 }
             }
         }
+
+        // A typo here enforces NOTHING for the user it was meant to restrict, and does
+        // so silently — the worst direction for a limit to fail.
+        if (self.user_max_ips) |maxips| {
+            const log = std.log.scoped(.config);
+            var it = @constCast(&maxips).iterator();
+            while (it.next()) |entry| {
+                if (!self.users.contains(entry.key_ptr.*)) {
+                    log.warn(
+                        "access.user_max_ips contains unknown user '{s}' (missing in [access.users]); no limit will be enforced",
+                        .{entry.key_ptr.*},
+                    );
+                }
+            }
+        }
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
@@ -677,6 +705,7 @@ pub const Config = struct {
         var in_direct_users_section = false;
         var in_user_max_conns_section = false;
         var in_user_expirations_section = false;
+        var in_user_max_ips_section = false;
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
@@ -707,6 +736,10 @@ pub const Config = struct {
                 in_direct_users_section = std.mem.eql(u8, header, "[access.direct_users]") or std.mem.eql(u8, header, "[access.admins]");
                 in_user_max_conns_section = std.mem.eql(u8, header, "[access.user_max_conns]");
                 in_user_expirations_section = std.mem.eql(u8, header, "[access.user_expirations]");
+                // The alias is the name issue #381 asked for; the short form matches the
+                // user_max_conns / user_expirations naming already used by its siblings.
+                in_user_max_ips_section = std.mem.eql(u8, header, "[access.user_max_ips]") or
+                    std.mem.eql(u8, header, "[access.users_max_unique_ips]");
                 in_censorship_section = std.mem.eql(u8, header, "[censorship]");
                 in_server_section = std.mem.eql(u8, header, "[server]");
                 in_general_section = std.mem.eql(u8, header, "[general]");
@@ -772,6 +805,24 @@ pub const Config = struct {
                         try cfg.user_expirations.?.put(key, ts);
                     } else {
                         try cfg.user_expirations.?.put(try allocator.dupe(u8, key), ts);
+                    }
+                } else if (in_user_max_ips_section) {
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch continue;
+                    if (parsed == 0) continue; // 0 == no limit
+                    // The cap sizes a per-user table, so a typo must not turn into a huge
+                    // allocation. Clamp loudly rather than silently honouring nonsense.
+                    const cap = @min(parsed, max_user_ips);
+                    if (cap != parsed) {
+                        std.log.scoped(.config).warn(
+                            "access.user_max_ips.{s} = {d} exceeds the maximum {d}; clamped",
+                            .{ key, parsed, max_user_ips },
+                        );
+                    }
+                    if (cfg.user_max_ips == null) cfg.user_max_ips = std.StringHashMap(u32).init(allocator);
+                    if (cfg.user_max_ips.?.getKey(key)) |_| {
+                        try cfg.user_max_ips.?.put(key, cap);
+                    } else {
+                        try cfg.user_max_ips.?.put(try allocator.dupe(u8, key), cap);
                     }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
@@ -1030,6 +1081,12 @@ pub const Config = struct {
             var eit = e.iterator();
             while (eit.next()) |entry| allocator.free(entry.key_ptr.*);
             e.deinit();
+        }
+        if (self.user_max_ips) |maxips| {
+            var m = @constCast(&maxips);
+            var mit = m.iterator();
+            while (mit.next()) |entry| allocator.free(entry.key_ptr.*);
+            m.deinit();
         }
 
         // Free tls_domain only when it does not point to the compile-time default.
@@ -1662,6 +1719,65 @@ test "parse config - defaults for new knobs" {
     try std.testing.expectEqual(UnknownSniAction.mask, cfg.unknown_sni_action);
     try std.testing.expect(cfg.user_max_conns == null);
     try std.testing.expect(cfg.user_expirations == null);
+    try std.testing.expect(cfg.user_max_ips == null);
+}
+
+test "parse config - per-user unique-IP caps" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\bob = "ffeeddccbbaa99887766554433221100"
+        \\carol = "0123456789abcdef0123456789abcdef"
+        \\[access.user_max_ips]
+        \\alice = 4
+        \\bob = 0
+        \\carol = 999999
+        \\dave = not-a-number
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 4), cfg.user_max_ips.?.get("alice").?);
+    // 0 == "unlimited" → not stored, exactly like user_max_conns.
+    try std.testing.expect(cfg.user_max_ips.?.get("bob") == null);
+    // Clamped: the cap sizes a per-user table, so a typo must not become a huge alloc.
+    try std.testing.expectEqual(max_user_ips, cfg.user_max_ips.?.get("carol").?);
+    // Unparseable values are skipped rather than failing the whole config.
+    try std.testing.expect(cfg.user_max_ips.?.get("dave") == null);
+}
+
+test "parse config - users_max_unique_ips alone configures the quota" {
+    // The section name issue #381 asked for. It must work on its own — an operator
+    // whose config only ever uses this spelling would otherwise get NO limit, and
+    // the fail-open is silent (no warning fires, and no metrics series appears).
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\[access.users_max_unique_ips]
+        \\alice = 2
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), cfg.user_max_ips.?.get("alice").?);
+}
+
+test "parse config - users_max_unique_ips is an alias for user_max_ips" {
+    // The name issue #381 asked for; [access.admins] aliases [access.direct_users]
+    // the same way. A duplicate key across both spellings must not leak its name.
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\[access.users_max_unique_ips]
+        \\alice = 2
+        \\[access.user_max_ips]
+        \\alice = 3
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), cfg.user_max_ips.?.get("alice").?);
+    try std.testing.expectEqual(@as(u32, 1), cfg.user_max_ips.?.count());
 }
 
 test "parseExpiryToUnix" {

@@ -487,6 +487,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[access.direct_users] <name>` | — | Bỏ qua ME cho người dùng này |
 | `[access.user_max_conns] <name>` | — | Giới hạn số kết nối đồng thời cho mỗi người dùng (cần khởi động lại để thay đổi) |
 | `[access.user_expirations] <name>` | — | Ngày hết hạn cho mỗi người dùng `"YYYY-MM-DD"` (cần khởi động lại để thay đổi) |
+| `[access.user_max_ips] <name>` | — | Giới hạn số mạng client khác nhau (địa chỉ IPv4 / IPv6 /64) dùng link đó cùng lúc cho mỗi người dùng (cần khởi động lại để thay đổi) |
 
 </details>
 

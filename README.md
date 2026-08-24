@@ -494,6 +494,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[access.direct_users] <name>` | — | Bypass ME for this user |
 | `[access.user_max_conns] <name>` | — | Per-user concurrent-connection cap (restart to change) |
 | `[access.user_expirations] <name>` | — | Per-user expiry date `"YYYY-MM-DD"` (restart to change) |
+| `[access.user_max_ips] <name>` | — | Per-user cap on distinct client networks (IPv4 address / IPv6 /64) using that link at once (restart to change) |
 
 </details>
 
@@ -553,7 +554,10 @@ Let's Encrypt certificate over HTTP-01 (so port 80 is opened) and installs a ren
   link, encoded as `dd…` rather than `ee…` — Telegram Desktop reports an `ee` (FakeTLS)
   secret as *unsupported* for a WEB proxy, because the relay is a raw byte pipe that adds
   no TLS-emulation record. Everyone in `[access.users]` gets both links; per-user
-  connection caps and expirations apply unchanged.
+  connection caps and expirations apply unchanged. `[access.user_max_ips]` needs
+  `[web].mask_backend` to see real browser addresses — without it every WEB client
+  reaches the proxy as `127.0.0.1`, and those connections are exempt from the quota
+  rather than crowding into one slot.
 - **`fake_tls_only` stays on.** The public internet still never gets a `dd` responder to
   fingerprint. Only the relay's own source address (loopback by default, plus anything in
   `[web].relay_sources`) is allowed through that gate, and the decision is made from the
