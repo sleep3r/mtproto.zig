@@ -102,7 +102,7 @@ fn base64Decode(a: std.mem.Allocator, s_in: []const u8) ![]u8 {
 
 // ── Parsed link model ──────────────────────────────────────────────────────────
 
-pub const Scheme = enum { vless, vmess, trojan, shadowsocks, wireguard, unknown };
+pub const Scheme = enum { vless, vmess, trojan, shadowsocks, hysteria2, wireguard, unknown };
 
 pub fn detectScheme(link_in: []const u8) Scheme {
     const link = std.mem.trim(u8, link_in, " \t\r\n");
@@ -110,6 +110,7 @@ pub fn detectScheme(link_in: []const u8) Scheme {
     if (std.mem.startsWith(u8, link, "vmess://")) return .vmess;
     if (std.mem.startsWith(u8, link, "trojan://")) return .trojan;
     if (std.mem.startsWith(u8, link, "ss://")) return .shadowsocks;
+    if (std.mem.startsWith(u8, link, "hysteria2://") or std.mem.startsWith(u8, link, "hy2://")) return .hysteria2;
     if (std.mem.startsWith(u8, link, "wireguard://") or std.mem.startsWith(u8, link, "wg://")) return .wireguard;
     return .unknown;
 }
@@ -138,6 +139,13 @@ pub const XrayLink = struct {
     fingerprint: ?[]const u8 = null, // utls fp (chrome,...)
     public_key: ?[]const u8 = null, // reality pbk
     short_id: ?[]const u8 = null, // reality sid
+    // hysteria2
+    obfs: ?[]const u8 = null, // only "salamander" exists
+    obfs_password: ?[]const u8 = null,
+    /// hysteria2 `insecure=1`: skip certificate verification. Hysteria servers are
+    /// commonly self-signed, and unlike the Xray family the scheme has no Reality-style
+    /// pinning we can emit faithfully, so the link has to say so explicitly.
+    insecure: bool = false,
 };
 
 fn splitHostPort(hp: []const u8) !struct { host: []const u8, port: u16 } {
@@ -270,6 +278,90 @@ fn parseSs(a: std.mem.Allocator, link: []const u8) !XrayLink {
     };
 }
 
+/// Parse `hysteria2://[auth@]host[:port][/][?params][#name]`.
+///
+/// Deliberately its own parser rather than another `parseUriCred` caller — the grammar
+/// differs in three ways that each silently break that one:
+///   * a PATH. `hysteria share` always emits the trailing `/` before `?`, and
+///     splitHostPort would run parseInt over "443/" and fail the whole link.
+///   * auth is OPTIONAL, while parseUriCred returns error.BadLink without an `@`.
+///   * the port is optional and defaults to 443.
+/// Every test written from the vless template would pass while every real link failed.
+fn parseHysteria2(a: std.mem.Allocator, link: []const u8) !XrayLink {
+    const prefix_len: usize = if (std.mem.startsWith(u8, link, "hysteria2://"))
+        "hysteria2://".len
+    else
+        "hy2://".len;
+    var rest = link[prefix_len..];
+
+    var name: []const u8 = "egress";
+    if (std.mem.indexOfScalar(u8, rest, '#')) |h| {
+        name = try percentDecodeAlloc(a, rest[h + 1 ..]);
+        rest = rest[0..h];
+    }
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        query = rest[q + 1 ..];
+        rest = rest[0..q];
+    }
+
+    // Optional auth, then an optional path we drop (the scheme carries no path semantics
+    // sing-box can use; upstream emits "/" purely so the URI is well-formed).
+    var authority = rest;
+    var auth: ?[]const u8 = null;
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
+        auth = try percentDecodeAlloc(a, authority[0..at]);
+        authority = authority[at + 1 ..];
+    }
+    if (std.mem.indexOfScalar(u8, authority, '/')) |slash| authority = authority[0..slash];
+    if (authority.len == 0) return error.BadAddress;
+
+    const hp = try splitHysteria2HostPort(authority);
+
+    var l = XrayLink{
+        .scheme = .hysteria2,
+        .name = name,
+        .address = try a.dupe(u8, hp.host),
+        .port = hp.port,
+        // QUIC is always TLS; there is no plaintext hysteria2. Recorded so the generator
+        // can key off the same field the rest of the family uses.
+        .security = "tls",
+    };
+    if (auth) |p| l.password = p;
+
+    if (queryParam(query, "sni")) |v| l.sni = try percentDecodeAlloc(a, v);
+    if (queryParam(query, "obfs")) |v| l.obfs = try percentDecodeAlloc(a, v);
+    if (queryParam(query, "obfs-password")) |v| l.obfs_password = try percentDecodeAlloc(a, v);
+    if (queryParam(query, "insecure")) |v| l.insecure = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    // pinSHA256 / ech are carried into validateLink as a rejection, not silently dropped.
+    if (queryParam(query, "pinSHA256")) |v| l.fingerprint = try percentDecodeAlloc(a, v);
+    if (queryParam(query, "ech")) |v| l.path = try percentDecodeAlloc(a, v);
+
+    return l;
+}
+
+/// Host/port for hysteria2: the port is optional (443), and a `,`-separated port-hopping
+/// list is refused here rather than truncated — sing-box wants `server_ports: ["a:b"]`
+/// with a COLON, so quietly keeping the first port would build a config that connects to
+/// the wrong place.
+fn splitHysteria2HostPort(hp: []const u8) !struct { host: []const u8, port: u16 } {
+    if (std.mem.indexOfScalar(u8, hp, ',') != null) return error.UnsupportedPortHopping;
+
+    if (hp.len > 0 and hp[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, hp, ']') orelse return error.BadAddress;
+        const host = hp[1..close];
+        if (host.len == 0) return error.BadAddress;
+        if (close + 1 >= hp.len) return .{ .host = host, .port = 443 };
+        if (hp[close + 1] != ':') return error.BadAddress;
+        return .{ .host = host, .port = std.fmt.parseInt(u16, hp[close + 2 ..], 10) catch return error.BadAddress };
+    }
+
+    const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return .{ .host = hp, .port = 443 };
+    const port = std.fmt.parseInt(u16, hp[colon + 1 ..], 10) catch return error.BadAddress;
+    if (colon == 0) return error.BadAddress;
+    return .{ .host = hp[0..colon], .port = port };
+}
+
 /// Parse any Xray-family share link into an XrayLink (arena-owned strings).
 pub fn parseXrayLink(a: std.mem.Allocator, link_in: []const u8) !XrayLink {
     const link = std.mem.trim(u8, link_in, " \t\r\n");
@@ -278,6 +370,7 @@ pub fn parseXrayLink(a: std.mem.Allocator, link_in: []const u8) !XrayLink {
         .trojan => parseUriCred(a, link, .trojan, "trojan://"),
         .vmess => parseVmess(a, link),
         .shadowsocks => parseSs(a, link),
+        .hysteria2 => parseHysteria2(a, link),
         else => error.UnsupportedScheme,
     };
 }
@@ -307,6 +400,29 @@ pub fn validateLink(l: XrayLink, buf: []u8) ?[]const u8 {
     const net = l.network;
     if (!(net.len == 0 or std.mem.eql(u8, net, "tcp") or std.mem.eql(u8, net, "ws") or std.mem.eql(u8, net, "grpc"))) {
         return std.fmt.bufPrint(buf, "unsupported transport '{s}' for {s} — only tcp/ws/grpc are supported", .{ net, l.address }) catch "unsupported transport";
+    }
+    if (l.scheme == .hysteria2) {
+        // pinSHA256 pins sha256 of the whole DER certificate, colon-hex. sing-box's
+        // nearest field pins the SPKI, base64 — a different preimage AND a different
+        // encoding, not convertible without holding the certificate. Worse, a 64-char hex
+        // pin decodes as valid base64 into 48 wrong bytes, so `sing-box check` passes and
+        // every handshake fails. Refuse rather than emit something that looks fine.
+        if (l.fingerprint != null) {
+            return std.fmt.bufPrint(buf, "pinSHA256 has no sing-box equivalent ({s}) — use a link with a real certificate, or insecure=1", .{l.address}) catch "pinSHA256 unsupported";
+        }
+        if (l.path != null) {
+            return std.fmt.bufPrint(buf, "hysteria2 ECH is not supported ({s})", .{l.address}) catch "hysteria2 ech unsupported";
+        }
+        if (l.obfs) |o| {
+            if (!std.ascii.eqlIgnoreCase(o, "salamander")) {
+                return std.fmt.bufPrint(buf, "unknown hysteria2 obfs '{s}' for {s} — only salamander exists", .{ o, l.address }) catch "unknown hysteria2 obfs";
+            }
+            const pw = l.obfs_password orelse "";
+            if (pw.len == 0) {
+                return std.fmt.bufPrint(buf, "hysteria2 obfs=salamander needs obfs-password ({s})", .{l.address}) catch "missing obfs-password";
+            }
+        }
+        return null;
     }
     if (l.scheme == .shadowsocks) {
         const m = l.method orelse "";

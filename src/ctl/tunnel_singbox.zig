@@ -8,10 +8,18 @@
 //!   wireguard://                         -> native kernel WG/AmneziaWG tunnel (reuses
 //!                                           tunnel_wg.zig: policy routing + pool)
 //!   vless:// vmess:// trojan:// ss://     -> a local sing-box client in TUN mode (sbx0);
-//!                                           the proxy's SO_MARK'd DC traffic is policy-
+//!   hysteria2:// (hy2://)                    the proxy's SO_MARK'd DC traffic is policy-
 //!                                           routed through it (fwmark 200 -> table 200 ->
 //!                                           sbx0). >1 link -> a sing-box urltest failover
 //!                                           pool. VLESS-Reality camouflages the hop as TLS.
+//!
+//! hysteria2 is QUIC, i.e. the ONLY scheme here whose egress leg is UDP. That matters on
+//! the hosts this command exists for: providers that block the Telegram DCs commonly also
+//! police UDP hard (measured: WireGuard capped near 1.5 Mbit/s on any port), and the
+//! failure looks like a healthy tunnel moving no bytes. Measure the path before choosing
+//! it. Note also that its headline congestion control (Brutal) needs a bandwidth the
+//! share-link grammar deliberately does not carry, so a link-provisioned hysteria2 egress
+//! runs BBR — the same algorithm the TCP schemes already get.
 //!
 //! The proxy relay is unchanged (it just SO_MARKs, as for any tunnel). The two providers
 //! are mutually exclusive on table 200 — setting one up retires the other. Share-link
@@ -111,10 +119,21 @@ const TUN_STACK = "gvisor";
 ///     every proxy start and steals the route from sbx0.
 /// sbx0's own routing is installed by the sing-box unit's ExecStartPost, and the default
 /// (non-tunnel) unit has no ExecStartPre at all, so the reset is a no-op everywhere else.
+/// CAP_NET_ADMIN is the other half, and without it `setup egress` produces a proxy that
+/// accepts clients and fails EVERY DC connection. Wiring the egress sets
+/// `[upstream] type = tunnel`, so the proxy starts SO_MARKing its DC sockets — and
+/// SO_MARK needs CAP_NET_ADMIN. Only the AmneziaWG unit ever granted it, so a host that
+/// went straight to `setup egress` without ever running `setup tunnel` ran under the
+/// default unit's CAP_NET_BIND_SERVICE alone and every connect failed with EPERM
+/// ("upstream connect start failed"), while setup still printed "egress up". Reproduced
+/// and fixed on a live host. systemd MERGES these two directives across drop-ins, so the
+/// unit's own CAP_NET_BIND_SERVICE is kept rather than replaced.
+///
 /// It lives in the drop-in because that is what survives: a hand-added line is wiped by
 /// the next `setup egress`.
 const PROXY_EGRESS_DROPIN = "[Unit]\nAfter=" ++ SB_SERVICE_NAME ++ "\nWants=" ++ SB_SERVICE_NAME ++ "\n" ++
-    "\n[Service]\nExecStartPre=\n";
+    "\n[Service]\nExecStartPre=\n" ++
+    "AmbientCapabilities=CAP_NET_ADMIN\nCapabilityBoundingSet=CAP_NET_ADMIN\n";
 const TUN_TABLE = "200"; // same policy-routing table the AmneziaWG tunnel uses
 const TUN_FWMARK = "200"; // proxy SO_MARK for tunnel egress
 
@@ -180,6 +199,24 @@ fn sbTls(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
     return "";
 }
 
+/// TLS block for hysteria2. Separate from sbTls on purpose, and the separation is
+/// load-bearing twice over:
+///   * a hy2 link carries no `security=` param, so l.security would leave sbTls returning
+///     "" — and sing-box's hysteria2 outbound refuses to load without TLS at all;
+///   * both of sbTls's branches emit `"utls"`, which cannot work over QUIC — sing-box's
+///     uTLS client has no STDConfig, so sing-quic fails every connection with
+///     "unsupported usage for uTLS". And `sing-box check` PASSES, the unit starts, the
+///     ok line prints: a green deploy on a 100%-dead egress.
+/// A test pins the absence of "utls" so a future refactor cannot merge these back.
+fn sbTlsHy2(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
+    const sni = l.sni orelse l.address;
+    return std.fmt.allocPrint(
+        a,
+        ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"insecure\":{s}}}",
+        .{ js(a, sni), if (l.insecure) "true" else "false" },
+    );
+}
+
 fn sbTransport(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
     const sni = l.sni orelse l.host orelse l.address;
     if (std.mem.eql(u8, l.network, "ws")) {
@@ -191,6 +228,8 @@ fn sbTransport(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
 }
 
 fn sbOutbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
+    // The Xray-family TLS/transport blocks. The hysteria2 arm below uses neither — it
+    // builds its own TLS and has no transport concept.
     const tls = try sbTls(a, l);
     const tr = try sbTransport(a, l);
     return switch (l.scheme) {
@@ -201,6 +240,16 @@ fn sbOutbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
         .vmess => std.fmt.allocPrint(a, "{{\"type\":\"vmess\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s},\"alter_id\":{d},\"security\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), l.alter_id, js(a, l.cipher), tls, tr }),
         .trojan => std.fmt.allocPrint(a, "{{\"type\":\"trojan\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"password\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.password.?), tls, tr }),
         .shadowsocks => std.fmt.allocPrint(a, "{{\"type\":\"shadowsocks\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"method\":{s},\"password\":{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.method.?), js(a, l.password.?) }),
+        .hysteria2 => blk: {
+            // No `tr`: hysteria2 is QUIC end to end, it has no ws/grpc transport to carry.
+            const hy_tls = try sbTlsHy2(a, l);
+            const pw = if (l.password) |p| try std.fmt.allocPrint(a, ",\"password\":{s}", .{js(a, p)}) else "";
+            const obfs = if (l.obfs) |o|
+                try std.fmt.allocPrint(a, ",\"obfs\":{{\"type\":{s},\"password\":{s}}}", .{ js(a, o), js(a, l.obfs_password orelse "") })
+            else
+                "";
+            break :blk std.fmt.allocPrint(a, "{{\"type\":\"hysteria2\",\"tag\":{s},\"server\":{s},\"server_port\":{d}{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, pw, obfs, hy_tls });
+        },
         else => error.UnsupportedScheme,
     };
 }
@@ -244,7 +293,7 @@ fn dispatchLinks(ui: *Tui, allocator: std.mem.Allocator, link_list: []const []co
     for (link_list) |l| {
         const s = detectScheme(l);
         if (s == .unknown) {
-            ui.fail("Unrecognized share-link scheme (want vless/vmess/trojan/ss/wireguard)");
+            ui.fail("Unrecognized share-link scheme (want vless/vmess/trojan/ss/hysteria2/wireguard)");
             return;
         }
         if (schemeFamily(s) != fam0) {
@@ -277,7 +326,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
     }
     if (links.items.len == 0) {
         ui.fail("Usage: mtbuddy setup egress [--deps-only] <share-link> [<share-link>...]");
-        ui.hint("vless:// vmess:// trojan:// ss://  ->  sing-box TUN tunnel (upstream.type=tunnel)");
+        ui.hint("vless:// vmess:// trojan:// ss:// hysteria2://  ->  sing-box TUN tunnel (upstream.type=tunnel)");
         ui.hint("wireguard://                       ->  native kernel WG tunnel");
         return;
     }
@@ -300,7 +349,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         0 => {
             const input = ui.input(
                 trL(ui, "Share-link(s)", "Ссылка(и)"),
-                trL(ui, "vless:// vmess:// trojan:// ss://  (sing-box tunnel)  |  wireguard://  (native tunnel)", "vless:// vmess:// trojan:// ss://  (sing-box-туннель)  |  wireguard://  (нативный туннель)"),
+                trL(ui, "vless:// vmess:// trojan:// ss:// hysteria2://  (sing-box tunnel)  |  wireguard://  (native tunnel)", "vless:// vmess:// trojan:// ss:// hysteria2://  (sing-box-туннель)  |  wireguard://  (нативный туннель)"),
                 null,
                 &buf,
             ) catch |e| {
@@ -438,6 +487,11 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
         ui.fail("Failed to write the systemd unit");
         return;
     };
+    if (!singboxConfigLoads(allocator, sb_bin, SB_CONFIG_PATH)) {
+        ui.fail("The installed sing-box rejects the generated config — the egress was NOT started");
+        ui.info("Run `" ++ SB_CONFIG_PATH ++ "` through `sing-box check -c` for the reason. An outbound type this build does not know (hysteria2 needs sing-box 1.5.0+) rejects the whole file, including the other endpoints in a pool.");
+        return;
+    }
     _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
     _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", SB_SERVICE_NAME }) catch {};
     ui.ok("sing-box tunnel egress up (tun " ++ TUN_IFACE ++ ")");
@@ -600,7 +654,10 @@ pub fn refreshEgress(ui: *Tui, allocator: std.mem.Allocator) void {
 fn refreshProxyDropin(ui: *Tui, allocator: std.mem.Allocator) void {
     const existing = sys.readFileAllocAbsolute(allocator, PROXY_DROPIN_PATH, 16 * 1024) orelse return;
     defer allocator.free(existing);
-    if (std.mem.indexOf(u8, existing, "\nExecStartPre=\n") != null) return;
+    // Content comparison, not a marker search: the drop-in has grown twice now (the
+    // ExecStartPre reset, then CAP_NET_ADMIN), and a marker check would have skipped a
+    // host that already had the first and still needed the second.
+    if (std.mem.eql(u8, existing, PROXY_EGRESS_DROPIN)) return;
 
     sys.writeFile(PROXY_DROPIN_PATH, PROXY_EGRESS_DROPIN) catch return;
     _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
@@ -679,6 +736,19 @@ fn refreshSingboxConfig(ui: *Tui, allocator: std.mem.Allocator) void {
         egressManualHint(ui);
         return;
     };
+
+    // Never restart into a config this sing-box cannot load: put the old one back first.
+    const sb_bin: []const u8 = if (sys.fileExists(SB_BIN)) SB_BIN else "sing-box";
+    if (!singboxConfigLoads(allocator, sb_bin, SB_CONFIG_PATH)) {
+        _ = sys.exec(allocator, &.{ "cp", "-f", SB_CONFIG_PATH ++ ".bak", SB_CONFIG_PATH }) catch {};
+        ui.warn(trL(
+            ui,
+            "The installed sing-box rejects the repaired egress config — restored the previous one and left the egress running.",
+            "Установленный sing-box не принимает починенный конфиг egress — вернул прежний, egress работает как работал.",
+        ));
+        return;
+    }
+
     // A restart, not `enable --now`: sing-box parses its config only at startup, and
     // `--now` is a no-op on a unit that is already running — which is exactly the host
     // this repair exists for.
@@ -688,6 +758,22 @@ fn refreshSingboxConfig(ui: *Tui, allocator: std.mem.Allocator) void {
         "sing-box egress tun repaired (" ++ TUN_ADDR ++ ", stack " ++ TUN_STACK ++ ", mtu " ++ TUN_MTU ++ ")",
         "sing-box egress tun починен (" ++ TUN_ADDR ++ ", stack " ++ TUN_STACK ++ ", mtu " ++ TUN_MTU ++ ")",
     ));
+}
+
+/// `sing-box check -c <path>`: does the installed binary accept this config at all?
+///
+/// The reason this exists is version skew. ensureSingboxInstalled keeps whatever sing-box
+/// is already on the host, and an outbound type it does not know — hysteria2 needs 1.5.0+
+/// — makes it reject the WHOLE config, taking any co-configured vless/trojan outbound
+/// down with it. Without the probe that lands as "egress up" plus a dead unit.
+///
+/// Returns true when the check passes OR could not be run at all: a missing//unrunnable
+/// binary is ensureSingboxInstalled's problem, and failing closed on it would refuse
+/// configs that are perfectly fine.
+fn singboxConfigLoads(allocator: std.mem.Allocator, sb_bin: []const u8, path: []const u8) bool {
+    const r = sys.exec(allocator, &.{ sb_bin, "check", "-c", path }) catch return true;
+    defer r.deinit();
+    return r.exit_code == 0;
 }
 
 fn ensureSingboxInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
@@ -818,6 +904,15 @@ test "the egress drop-in resets ExecStartPre so a stale tunnel helper can't brea
     // And it still orders the proxy after the egress, which is why the drop-in exists.
     try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "After=" ++ SB_SERVICE_NAME) != null);
     try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "Wants=" ++ SB_SERVICE_NAME) != null);
+
+    // And it grants CAP_NET_ADMIN. Wiring the egress sets [upstream] type = tunnel, so
+    // the proxy SO_MARKs its DC sockets — which needs that capability. Without it a host
+    // that never ran `setup tunnel` runs under the default unit (CAP_NET_BIND_SERVICE
+    // only) and EVERY DC connect fails with EPERM while setup reports success.
+    // Verified on a live host: adding it turned "upstream connect start failed" into a
+    // relaying connection.
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "AmbientCapabilities=CAP_NET_ADMIN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, PROXY_EGRESS_DROPIN, "CapabilityBoundingSet=CAP_NET_ADMIN") != null);
 }
 
 test "egress auto-repair: detects a stale config and accepts a freshly generated one" {
@@ -910,6 +1005,99 @@ test "egress auto-repair: reads the share links back out of [upstream.xray]" {
     const blank_entry = try parseTomlStringArray(a, "[\"\"]");
     defer a.free(blank_entry);
     try std.testing.expectEqual(@as(usize, 0), blank_entry.len);
+}
+
+test "hysteria2: real-world link shapes parse, and the config is QUIC-correct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Exactly what `hysteria share` emits: a trailing '/' before the query. The Xray
+    // parser ran parseInt over "40443/" and failed the whole link.
+    const canonical = try parseXrayLink(a, "hysteria2://letmein@example.com:40443/?sni=cover.example&obfs=salamander&obfs-password=cats#EU");
+    try std.testing.expectEqual(Scheme.hysteria2, canonical.scheme);
+    try std.testing.expectEqualStrings("example.com", canonical.address);
+    try std.testing.expectEqual(@as(u16, 40443), canonical.port);
+    try std.testing.expectEqualStrings("letmein", canonical.password.?);
+    try std.testing.expectEqualStrings("cover.example", canonical.sni.?);
+    try std.testing.expectEqualStrings("salamander", canonical.obfs.?);
+    try std.testing.expectEqualStrings("cats", canonical.obfs_password.?);
+    try std.testing.expectEqualStrings("EU", canonical.name);
+
+    // Auth is optional, and so is the port (443).
+    const bare = try parseXrayLink(a, "hy2://example.com");
+    try std.testing.expectEqualStrings("example.com", bare.address);
+    try std.testing.expectEqual(@as(u16, 443), bare.port);
+    try std.testing.expect(bare.password == null);
+
+    // user:pass@ is one opaque auth string, and percent-decoded.
+    const userpass = try parseXrayLink(a, "hysteria2://bob%3As3cret@1.2.3.4:443/#n");
+    try std.testing.expectEqualStrings("bob:s3cret", userpass.password.?);
+
+    // IPv6 literal, with and without a port.
+    const v6 = try parseXrayLink(a, "hysteria2://pw@[2001:db8::1]:8443/?insecure=1#v6");
+    try std.testing.expectEqualStrings("2001:db8::1", v6.address);
+    try std.testing.expectEqual(@as(u16, 8443), v6.port);
+    try std.testing.expect(v6.insecure);
+
+    // Port hopping is refused, not silently truncated to the first port: sing-box wants
+    // server_ports:["a:b"] with a colon, so keeping 40443 would dial the wrong place.
+    try std.testing.expectError(error.UnsupportedPortHopping, parseXrayLink(a, "hysteria2://pw@example.com:40443,50000-60000/#hop"));
+
+    // ── generated config ──
+    const cfg = try genSingboxConfig(a, &.{canonical});
+    _ = try std.json.parseFromSlice(std.json.Value, a, cfg, .{});
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"type\":\"hysteria2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"password\":\"letmein\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"obfs\":{\"type\":\"salamander\",\"password\":\"cats\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"server_name\":\"cover.example\"") != null);
+    // TLS must be present — sing-box's hysteria2 outbound refuses to load without it.
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"tls\":{\"enabled\":true") != null);
+    // And uTLS must NOT be: it has no STDConfig, so sing-quic fails every connection with
+    // "unsupported usage for uTLS" while `sing-box check` still passes.
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "utls") == null);
+    // No ws/grpc transport block on a QUIC outbound either.
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"transport\"") == null);
+
+    // insecure rides through as a real JSON bool.
+    const insecure_cfg = try genSingboxConfig(a, &.{v6});
+    try std.testing.expect(std.mem.indexOf(u8, insecure_cfg, "\"insecure\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg, "\"insecure\":false") != null);
+
+    // Mixed pool with an Xray member: one urltest, both outbound types, utls only on the
+    // vless member.
+    const vless = try parseXrayLink(a, "vless://95e0edb9-4a0b-4312-a71f-1d4b8b6db79b@154.59.110.32:443?type=tcp&security=reality&pbk=P&sni=s.example&sid=S&flow=xtls-rprx-vision#v");
+    const pool = try genSingboxConfig(a, &.{ vless, canonical });
+    _ = try std.json.parseFromSlice(std.json.Value, a, pool, .{});
+    try std.testing.expect(std.mem.indexOf(u8, pool, "\"urltest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pool, "\"type\":\"hysteria2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pool, "\"reality\"") != null);
+}
+
+test "hysteria2: links we cannot emit faithfully are rejected, not degraded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+
+    const ok = try parseXrayLink(a, "hysteria2://pw@example.com:443/#n");
+    try std.testing.expect(validateLink(ok, &buf) == null);
+
+    // pinSHA256: hysteria pins the DER cert (colon-hex), sing-box pins the SPKI (base64).
+    // A 64-char hex pin even decodes as valid base64 into 48 wrong bytes, so a naive
+    // pass-through gives a config that checks clean and fails every handshake.
+    const pinned = try parseXrayLink(a, "hysteria2://pw@example.com:443/?pinSHA256=deadbeef#n");
+    try std.testing.expect(validateLink(pinned, &buf) != null);
+
+    const ech = try parseXrayLink(a, "hysteria2://pw@example.com:443/?ech=AEX+DQBB#n");
+    try std.testing.expect(validateLink(ech, &buf) != null);
+
+    // salamander is the only obfs that exists, and it is useless without its password.
+    const bad_obfs = try parseXrayLink(a, "hysteria2://pw@example.com:443/?obfs=xplus&obfs-password=p#n");
+    try std.testing.expect(validateLink(bad_obfs, &buf) != null);
+
+    const obfs_no_pw = try parseXrayLink(a, "hysteria2://pw@example.com:443/?obfs=salamander#n");
+    try std.testing.expect(validateLink(obfs_no_pw, &buf) != null);
 }
 
 test "vmess scy maps to cipher and is emitted" {
