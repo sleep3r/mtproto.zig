@@ -590,6 +590,21 @@ run_case() {
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-update.log"
   echo "::endgroup::"
 
+  # `mtbuddy update` installs the RELEASED mtbuddy over /usr/local/bin/mtbuddy
+  # (src/ctl/update.zig), so from here on every step would exercise the last release
+  # rather than the build under test — which is how a change to `setup tunnel` or
+  # `uninstall` could pass this whole suite without once being run. Put the local
+  # binary back; the update step above has already proved the self-update path works.
+  echo "::group::Restore the mtbuddy under test after the update ($base_image)"
+  docker cp "$ROOT/zig-out/bin/mtbuddy" "$container:/tmp/mtbuddy"
+  run_in_container "$container" bash -lc '
+    set -Eeuo pipefail
+    install -m 0755 /tmp/mtbuddy /usr/local/bin/mtbuddy
+    mtbuddy --version
+    sha256sum /usr/local/bin/mtbuddy
+  ' | tee "$LOG_DIR/$safe.mtbuddy-restore.log"
+  echo "::endgroup::"
+
   echo "::group::Setup tunnel with failing Telegram probe ($base_image)"
   install_fake_tunnel_tools "$container"
   verify_tunnel_probe_failure_is_nonfatal "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-probe-failure.log"
