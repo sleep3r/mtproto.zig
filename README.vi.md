@@ -474,6 +474,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] drs` | `false` | Định cỡ bản ghi động (Dynamic Record Sizing) |
 | `[censorship] fast_mode` | `false` | Ủy thác mã hóa S2C cho DC (khuyến nghị) |
 | `[web] enabled` | `false` | Bật relay WEB proxy (Telegram Desktop 7.1+) |
+| `[web] only` | `false` | Chỉ phục vụ WEB: MTProto trực tiếp bị đẩy sang backend mask với tất cả trừ relay; cần `mask = true`, bị bỏ qua nếu chưa `enabled` |
 | `[web] domain` | chưa đặt | Hostname công khai trong link `tg://webproxy` — **không đổi được sau khi phát link** |
 | `[web] listen` | `"127.0.0.1"` | Địa chỉ relay lắng nghe (TLS được kết thúc ở phía trước) |
 | `[web] port` | `8081` | Cổng relay |
@@ -484,6 +485,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[web] max_sessions` | `64` | Số client desktop đồng thời |
 | `[web] max_streams` | `32` | Số socket MTProto logic trên mỗi client |
 | `[web] relay_sources` | `[]` | IP bổ sung được phép dùng transport `dd` (loopback luôn được phép) |
+| `[web] cert` / `[web] key` | chưa đặt | Chứng chỉ riêng của bạn cho vhost relay thay cho Let's Encrypt (do `mtbuddy setup web` đọc) |
 | `[access.users] <name>` | — | Secret 32 ký tự hex cho mỗi người dùng |
 | `[access.direct_users] <name>` | — | Bỏ qua ME cho người dùng này |
 | `[access.user_max_conns] <name>` | — | Giới hạn số kết nối đồng thời cho mỗi người dùng (cần khởi động lại để thay đổi) |

@@ -723,8 +723,13 @@ function renderUsers(users, perUserActive, proxyStats) {
   }
   meta.textContent = metaText;
 
+  const webOnly = !!users?.web_only;
   if (!users?.links_ready) {
     note.textContent = "We couldn't detect your server's public IP, so connection links aren't ready yet. Add your server's IP in the config and the links will appear.";
+  } else if (webOnly) {
+    // Under [web].only the proxy masks direct MTProto, so server:port and tls_domain
+    // describe nothing an operator can hand out — the relay domain is the address.
+    note.textContent = 'WEB-only · ' + (users.web_domain || '—') + ' · direct MTProto is masked (Desktop 7.1+)';
   } else {
     note.textContent = users.server + ':' + users.port + ' · tls_domain=' + (users.tls_domain || '—');
   }
@@ -736,8 +741,9 @@ function renderUsers(users, perUserActive, proxyStats) {
 
   list.innerHTML = items.map((u) => {
     const isEnabled = u.enabled !== false;
-    const tg = u.tg_link || '';
-    const tme = u.tme_link || '';
+    // Under WEB-only the ee links are absent server-side; the WEB pair is all there is.
+    const tg = u.tg_link || (webOnly ? (u.web_tg_link || '') : '');
+    const tme = u.tme_link || (webOnly ? (u.web_tme_link || '') : '');
     const preview = isEnabled ? shortProxyLink(tg || tme) : 'disabled';
     const tgData = encodeURIComponent(tg);
     const tmeData = encodeURIComponent(tme);

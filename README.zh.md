@@ -472,6 +472,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] drs` | `false` | 动态记录大小调整（Dynamic Record Sizing） |
 | `[censorship] fast_mode` | `false` | 将 S2C 加密委托给 DC（推荐） |
 | `[web] enabled` | `false` | 启用 WEB 代理中继（Telegram Desktop 7.1+） |
+| `[web] only` | `false` | 仅提供 WEB：除中继外的直连 MTProto 一律转入伪装后端；需要 `mask = true`，未 `enabled` 时忽略 |
 | `[web] domain` | 未设置 | `tg://webproxy` 链接中的公开主机名 —— **分发链接后不可更改** |
 | `[web] listen` | `"127.0.0.1"` | 中继绑定地址（TLS 在其前端终止） |
 | `[web] port` | `8081` | 中继端口 |
@@ -482,6 +483,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[web] max_sessions` | `64` | 并发桌面客户端数 |
 | `[web] max_streams` | `32` | 每客户端的逻辑 MTProto 套接字数 |
 | `[web] relay_sources` | `[]` | 额外允许使用 `dd` 传输的 IP（loopback 始终允许） |
+| `[web] cert` / `[web] key` | 未设置 | 为中继 vhost 自备证书，替代 Let's Encrypt（由 `mtbuddy setup web` 读取） |
 | `[access.users] <name>` | — | 每个用户的 32 个十六进制字符密钥 |
 | `[access.direct_users] <name>` | — | 为该用户绕过 ME |
 | `[access.user_max_conns] <name>` | — | 每个用户的并发连接上限（更改需重启） |

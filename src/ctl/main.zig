@@ -562,7 +562,7 @@ fn printHelp(lang: i18n.Lang) void {
     printCmd(&ui, "setup egress [--deps-only] <share-link...>", tr(lang, "Setup VPN share-link egress", "Настроить egress через VPN-ссылку"));
     printCmd(&ui, "setup dashboard", tr(lang, "Install web monitoring dashboard", "Установить веб-дашборд мониторинга"));
     printCmd(&ui, "setup recovery", tr(lang, "Install DPI auto-recovery", "Установить авто-восстановление DPI"));
-    printCmd(&ui, "setup web --domain <host> [--mode mask|behind] [--remove]", tr(lang, "WEB proxy relay for Telegram Desktop 7.1+", "Релей WEB-прокси для Telegram Desktop 7.1+"));
+    printCmd(&ui, "setup web --domain <host> [--mode mask|behind] [--only] [--cert <pem> --key <pem>] [--remove]", tr(lang, "WEB proxy relay for Telegram Desktop 7.1+ (--only serves nothing else)", "Релей WEB-прокси для Telegram Desktop 7.1+ (--only отдаёт только его)"));
     printCmd(&ui, "ipv6-hop", tr(lang, "IPv6 address rotation", "Ротация IPv6 адреса"));
     printCmd(&ui, "update-dns <ip>", tr(lang, "Update Cloudflare DNS A record", "Обновить A-запись Cloudflare DNS"));
     printCmd(&ui, "config <validate|doctor|print-effective>", tr(lang, "Config diagnostics and effective values", "Диагностика и эффективные значения конфига"));

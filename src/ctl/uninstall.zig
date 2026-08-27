@@ -3,6 +3,8 @@ const tui_mod = @import("tui.zig");
 const sys = @import("sys.zig");
 const i18n = @import("i18n.zig");
 const toml = @import("toml.zig");
+const tunnel = @import("tunnel.zig");
+const tunnel_wg = @import("tunnel_wg.zig");
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -69,6 +71,12 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         }
     }
 
+    // Same reason, same ordering: the tunnel pool lives in that config.toml and is the
+    // only record of which interfaces this proxy ever routed through. `rm -rf /opt`
+    // below would take it with it, and the tunnel teardown runs after that.
+    const tunnel_pool = tunnel.loadConfiguredTunnelPool(allocator) catch &[_][]const u8{};
+    defer tunnel_wg.freeOwnedStringSlice(allocator, tunnel_pool);
+
     // 1. Stop and disable all associated systemd services
     const services = &[_][]const u8{
         "mtproto-proxy",
@@ -112,7 +120,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/sing-box" }) catch {};
     // rmdir, not rm -rf: it removes the directory only once it is empty, so anything an
     // operator put there of their own is left alone rather than silently deleted.
-    _ = sys.execForward(&.{ "rmdir", "--ignore-fail-on-non-empty", "/etc/mtproto-proxy" }) catch {};
+    // Wrapped like the nginx drop-in rmdir below, because a deploy that never created
+    // the directory would otherwise print "No such file or directory" on every uninstall.
+    _ = sys.execForward(&.{ "bash", "-c", "rmdir --ignore-fail-on-non-empty /etc/mtproto-proxy 2>/dev/null || true" }) catch {};
 
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-mask-health.timer" }) catch {};
     // recovery.zig installs this script; update.zig treats its mere existence as "recovery
@@ -150,21 +160,86 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_netns.sh" }) catch {};
     sys.execSilent(allocator, &.{ "ip", "netns", "del", "tg_proxy_ns" });
 
-    // Bring down WG/AmneziaWG tunnel interfaces and remove their configs. The egress
-    // feature writes VPN provider PRIVATE KEYS to /etc/amnezia/**.conf (0600) and brings
-    // up awg0..N; leaving them up keeps live tunnels and leaves the provider's keys on
-    // disk after "uninstall succeeded". Best-effort down + ip link del + rm the configs.
-    const tunnel_teardown =
-        \\for conf in /etc/amnezia/amneziawg/*.conf /etc/amnezia/awg*.conf /etc/wireguard/awg*.conf; do
-        \\  [ -f "$conf" ] || continue
-        \\  iface=$(basename "$conf" .conf)
-        \\  command -v awg-quick >/dev/null 2>&1 && awg-quick down "$conf" 2>/dev/null || true
-        \\  command -v wg-quick  >/dev/null 2>&1 && wg-quick  down "$conf" 2>/dev/null || true
-        \\  ip link del "$iface" 2>/dev/null || true
-        \\done
-        \\rm -rf /etc/amnezia 2>/dev/null || true
-    ;
-    _ = sys.execForward(&.{ "bash", "-c", tunnel_teardown }) catch {};
+    // Bring down the WG/AmneziaWG interfaces mtbuddy set up and remove their configs.
+    // The egress feature writes VPN provider PRIVATE KEYS to /etc/amnezia/**.conf
+    // (0600) and brings up awg0..N; leaving those up keeps live tunnels and leaves the
+    // provider's keys on disk after "uninstall succeeded".
+    //
+    // What this must NOT do is what it used to: glob every *.conf in /etc/amnezia and
+    // /etc/wireguard, tear each interface down, and `rm -rf /etc/amnezia`. mtbuddy
+    // shares AmneziaWG's own directory, so that took an operator's pre-existing awg1 —
+    // its config, its keys, its running interface — with it (issue #402). Scope now: only
+    // configs carrying mtbuddy's ownership banner. Anything else stays exactly as it is,
+    // interface up and file untouched, and is named at the end of the run if this proxy
+    // was routing through it.
+    var kept_configs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (kept_configs.items) |item| allocator.free(item);
+        kept_configs.deinit(allocator);
+    }
+    {
+        // Enumerate the two directories mtbuddy ever writes a tunnel config into rather
+        // than trusting the pool alone: a host whose config.toml was hand-edited or lost
+        // would otherwise leave our own configs — and their private keys — behind. The
+        // banner is what decides, so widening the search cannot widen the damage.
+        const listing = sys.exec(allocator, &.{
+            "find",      "/etc/amnezia/amneziawg", "/etc/wireguard",
+            "-maxdepth", "1",                      "-type",
+            "f",         "-name",                  "*.conf",
+            "-print",
+        }) catch null;
+        defer if (listing) |l| l.deinit();
+
+        const awg_down = sys.commandOrPath("awg-quick", &.{ "/usr/bin/awg-quick", "/usr/local/bin/awg-quick" });
+        const wg_down = sys.commandOrPath("wg-quick", &.{ "/usr/bin/wg-quick", "/usr/local/bin/wg-quick" });
+
+        var lines = std.mem.splitScalar(u8, if (listing) |l| l.stdout else "", '\n');
+        while (lines.next()) |raw| {
+            const conf = std.mem.trim(u8, raw, &[_]u8{ ' ', '\t', '\r' });
+            if (conf.len == 0 or !sys.fileExists(conf)) continue;
+
+            const base = std.fs.path.basename(conf);
+            if (!std.mem.endsWith(u8, base, ".conf")) continue;
+            const iface = base[0 .. base.len - ".conf".len];
+            if (!tunnel_wg.isValidTunnelInterfaceName(iface)) continue;
+
+            if (!tunnel_wg.configIsOwned(allocator, conf)) {
+                // Report only what this proxy actually routed through. A config that was
+                // never in the pool is none of mtbuddy's business, not even to mention.
+                if (tunnel_wg.containsInterface(tunnel_pool, iface)) {
+                    kept_configs.append(allocator, allocator.dupe(u8, conf) catch continue) catch {};
+                }
+                continue;
+            }
+
+            // Quiet: `down` on an interface that is not up is a normal outcome here.
+            sys.execSilent(allocator, &.{ awg_down, "down", conf });
+            sys.execSilent(allocator, &.{ wg_down, "down", conf });
+            sys.execSilent(allocator, &.{ "ip", "link", "del", iface });
+            _ = sys.execForward(&.{ "rm", "-f", conf }) catch {};
+        }
+    }
+    // A pool member whose config is already gone is a leftover of ours — `setup tunnel`
+    // never accepts an interface without a config source, so there is no operator
+    // interface this can be. Drop the dangling link; nothing else will.
+    for (tunnel_pool) |iface| {
+        if (!tunnel_wg.isValidTunnelInterfaceName(iface)) continue;
+        if (tunnel.hasForeignConfig(allocator, iface)) continue;
+        var awg_buf: [256]u8 = undefined;
+        var wg_buf: [256]u8 = undefined;
+        const awg_conf = tunnel_wg.awgConfigPath(&awg_buf, iface) catch "";
+        const wg_conf = std.fmt.bufPrint(&wg_buf, "/etc/wireguard/{s}.conf", .{iface}) catch "";
+        if (sys.fileExists(awg_conf) or sys.fileExists(wg_conf)) continue;
+        sys.execSilent(allocator, &.{ "ip", "link", "del", iface });
+    }
+    // /etc/amnezia/awg0.conf is a symlink `setup tunnel` creates and nothing else does,
+    // and the staging files are ours too — a `setup egress` that failed part-way leaves
+    // one behind, holding a provider private key at 0600.
+    _ = sys.execForward(&.{ "bash", "-c", "[ -L /etc/amnezia/awg0.conf ] && rm -f /etc/amnezia/awg0.conf; rm -f /etc/amnezia/.mtbuddy-stage-*.conf; exit 0" }) catch {};
+    // rmdir, not rm -rf: the directories go only once they are empty, so an operator's
+    // own configs — and the rest of an Amnezia install — survive. Same discipline as
+    // /etc/mtproto-proxy above. Child first, then the parent.
+    _ = sys.execForward(&.{ "bash", "-c", "rmdir --ignore-fail-on-non-empty /etc/amnezia/amneziawg /etc/amnezia 2>/dev/null || true" }) catch {};
 
     // 5. Remove masking config. The site name MUST match masking.zig
     //    ("mtproto-masking"); the old "mtproto-mask" name never matched the
@@ -250,4 +325,31 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     ui.writeRaw("\n");
     ui.print("  {s}{s} {s}{s}\n", .{ Color.ok, "✔", ui.str(.uninstall_success), Color.reset });
+
+    // Said after the spinner, not under it, and deliberately not phrased as a failure:
+    // these files are still there because mtbuddy is not sure it created them, which is
+    // the whole point of the change. An operator who wants them gone needs the paths.
+    if (kept_configs.items.len > 0) {
+        ui.writeRaw("\n");
+        ui.warn(tr(
+            ui,
+            "Left in place — mtbuddy did not create these tunnel configs (adopted with --iface, or set up before ownership was tracked):",
+            "Оставлено без изменений — эти конфиги туннелей mtbuddy не создавал (приняты через --iface или заведены до появления пометки):",
+        ));
+        for (kept_configs.items) |conf| {
+            ui.print("    {s}{s}{s}\n", .{ Color.dim, conf, Color.reset });
+        }
+        ui.hint(tr(
+            ui,
+            "Their interfaces are still up. They may hold VPN private keys — remove them yourself if they were only for the proxy.",
+            "Их интерфейсы всё ещё подняты. В них могут быть приватные ключи VPN — удалите вручную, если они были нужны только для прокси.",
+        ));
+    }
+}
+
+fn tr(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {
+    return switch (ui.lang) {
+        .en => en,
+        .ru => ru,
+    };
 }

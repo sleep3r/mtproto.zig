@@ -127,6 +127,37 @@ const graceful_shutdown_check_ms: i32 = 100;
 
 const upstream_candidates_inline_cap: usize = 4;
 
+/// Inputs to the "does this peer get an MTProto responder at all?" decision.
+pub const AcceptanceGate = struct {
+    /// `[web].only` and `[web].enabled` together (`Config.Web.onlyActive`).
+    web_only: bool,
+    /// `[censorship].fake_tls_only`.
+    fake_tls_only: bool,
+    /// Whether the first bytes looked like a TLS handshake record.
+    transport_is_tls: bool,
+    /// Decided at accept() from the kernel-reported address, never from `peer_addr` —
+    /// the PROXY-protocol path overwrites that with something the client supplied.
+    trusted_peer: bool,
+};
+
+/// True when the connection must be handed to the masking backend instead of served.
+///
+/// Two gates, one shape. `fake_tls_only` (the default) refuses the non-TLS `dd`
+/// transport to the public so there is no `dd` responder to fingerprint. `[web].only`
+/// widens that to *every* transport: under WEB-only the relay is the only party that
+/// gets an MTProto responder, and a real client holding a valid `ee` link is masked
+/// exactly the way a wrong secret is — which is the point, because that is what makes a
+/// WEB-only proxy indistinguishable from the site it fronts.
+///
+/// The relay is exempt from both, and it has to be: it dials this proxy on loopback for
+/// every logical stream (`[web].backend`), so a blanket refusal would take the WEB proxy
+/// down with the direct one.
+pub fn masksInsteadOfServing(gate: AcceptanceGate) bool {
+    if (gate.trusted_peer) return false;
+    if (gate.web_only) return true;
+    return !gate.transport_is_tls and gate.fake_tls_only;
+}
+
 fn floodGuardSettings(cfg: *const Config) HandshakeFloodGuard.Settings {
     return HandshakeFloodGuard.settings(
         cfg.handshake_flood_guard_enabled,
@@ -981,6 +1012,7 @@ pub const ProxyState = struct {
         drops_pool_total: u64,
         replay_hits_total: u64,
         unknown_sni_total: u64,
+        web_only_masked_total: u64,
         close_reasons: [CloseReason.count]u64,
         client_to_upstream_bytes_total: u64,
         upstream_to_client_bytes_total: u64,
@@ -1251,6 +1283,9 @@ pub const ProxyState = struct {
     /// Peers allowed to speak the direct-obfuscated transport under `fake_tls_only`
     /// (the WEB proxy relay), resolved from `[web]` at boot.
     trusted: trusted_peers.TrustedPeers,
+    /// `[web].only`: serve the relay and nobody else. Resolved once at boot (like the
+    /// trusted set it is paired with) — `[web]` is not part of the SIGHUP reload set.
+    web_only: bool,
     /// Masking target for connections whose SNI is the WEB relay's domain — a terminator
     /// that accepts a PROXY-protocol header, so the real client address survives the
     /// masking hop. Null keeps the ordinary mask target for them.
@@ -1275,6 +1310,10 @@ pub const ProxyState = struct {
     /// ClientHello whose SNI did not match tls_domain (active probing / scanners /
     /// borrowed-link misuse) — handled per unknown_sni_action.
     stats_unknown_sni: std.atomic.Value(u64),
+    /// Connections refused because `[web].only` is on and the peer is not the relay.
+    /// These are masked, not dropped, so they are otherwise indistinguishable from a
+    /// wrong-secret probe — this counter is the only way to see them.
+    stats_web_only_masked: std.atomic.Value(u64),
     /// Per-worker connection pool exhausted while the global cap still had room
     /// (SO_REUSEPORT hashes connections to workers, so one pool can fill first).
     stats_dropped_pool: std.atomic.Value(u64),
@@ -1409,6 +1448,9 @@ pub const ProxyState = struct {
         if (trusted.enabled) {
             log.info("web relay trust: loopback + {d} explicit source(s) may use the direct-obfuscated transport", .{relay_extra.len});
         }
+        if (cfg.web.onlyActive()) {
+            log.info("[web].only: direct MTProto is masked for everyone but the relay — only tg://webproxy links work", .{});
+        }
 
         // Optional startup clock correction from an HTTPS Date header.
         var clock_offset_seconds: i64 = 0;
@@ -1472,6 +1514,7 @@ pub const ProxyState = struct {
             .mask_addr = resolved_addr,
             .mask_safelist = mask_safelist,
             .trusted = trusted,
+            .web_only = cfg.web.onlyActive(),
             .web_mask_addr = web_mask_addr,
             .clock_offset_seconds = clock_offset_seconds,
             .replay_cache = ReplayCache.init(),
@@ -1487,6 +1530,7 @@ pub const ProxyState = struct {
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .stats_replay_hits = std.atomic.Value(u64).init(0),
             .stats_unknown_sni = std.atomic.Value(u64).init(0),
+            .stats_web_only_masked = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
@@ -1693,6 +1737,7 @@ pub const ProxyState = struct {
             .drops_pool_total = self.stats_dropped_pool.load(.monotonic),
             .replay_hits_total = self.stats_replay_hits.load(.monotonic),
             .unknown_sni_total = self.stats_unknown_sni.load(.monotonic),
+            .web_only_masked_total = self.stats_web_only_masked.load(.monotonic),
             .close_reasons = close_reasons,
             .client_to_upstream_bytes_total = self.client_to_upstream_bytes_total.load(.monotonic),
             .upstream_to_client_bytes_total = self.upstream_to_client_bytes_total.load(.monotonic),
@@ -2998,6 +3043,11 @@ const EventLoop = struct {
         if (next.force_media_middle_proxy != self.state.config.force_media_middle_proxy) static_changes += 1;
         if (next.middleproxy_buffer_kb != self.state.config.middleproxy_buffer_kb) static_changes += 1;
         if (next.upstream_mode != self.state.config.upstream_mode) static_changes += 1;
+        // `[web]` is resolved once at boot — the trusted-peer set, the mask backend and
+        // the WEB-only gate all with it. Count a change so SIGHUP says "restart
+        // required" instead of leaving the operator to believe it took effect.
+        if (next.web.onlyActive() != self.state.web_only) static_changes += 1;
+        if (next.web.enabled != self.state.config.web.enabled) static_changes += 1;
         if (next.allow_direct_fallback != self.state.config.allow_direct_fallback) static_changes += 1;
 
         if (next.idle_timeout_sec != self.state.config.idle_timeout_sec) {
@@ -3515,12 +3565,23 @@ const EventLoop = struct {
             // Telegram Desktop refuses `ee` (FakeTLS) secrets for WEB proxies — so a
             // relayed connection is always direct-obfuscated. Trust is judged on the
             // accepted address, which no PROXY header can rewrite.
-            if (self.state.config.fake_tls_only and !slot.trusted_peer) {
+            if (masksInsteadOfServing(.{
+                .web_only = self.state.web_only,
+                .fake_tls_only = self.state.config.fake_tls_only,
+                .transport_is_tls = false,
+                .trusted_peer = slot.trusted_peer,
+            })) {
                 // Strict FakeTLS-only: never accept the non-TLS "direct
                 // obfuscated" (dd) transport. Mask the bytes immediately so a
                 // non-TLS active probe gets the masking cover (matching the old
                 // behavior) instead of being read up to 64 bytes — no dd
                 // transport and no dd active-probe distinguisher.
+                // Counted only where WEB-only is what made the difference. With
+                // fake_tls_only on — the default — this dd connection would have been
+                // masked anyway, and attributing it to the new gate would overstate it.
+                if (self.state.web_only and !self.state.config.fake_tls_only) {
+                    _ = self.state.stats_web_only_masked.fetchAdd(1, .monotonic);
+                }
                 self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
                     self.closeSlot(slot, "non-tls masked failed");
                 };
@@ -3619,6 +3680,28 @@ const EventLoop = struct {
         const sni = maybe_sni.?;
         if (!std.ascii.eqlIgnoreCase(sni, self.state.config.tls_domain)) {
             self.handleInvalidSni(slot, client_hello, sni, "tls sni mismatch");
+            return;
+        }
+
+        // `[web].only`: the SNI is ours and the secret may well be valid, but this peer
+        // is not the relay — so we answer the way we answer a wrong secret, by masking
+        // the ClientHello. Byte-identical to the path twenty lines below, deliberately:
+        // a WEB-only proxy must not become distinguishable from an ordinary one.
+        //
+        // It has to sit HERE rather than in readTlsHeader. In `--mode mask` the browser
+        // that fetches the bridge arrives on this same :443 with the relay's domain as
+        // its SNI, and reaches the relay only through handleInvalidSni's web_mask_addr
+        // branch — a gate before SNI extraction would take the WEB proxy down with it.
+        if (masksInsteadOfServing(.{
+            .web_only = self.state.web_only,
+            .fake_tls_only = self.state.config.fake_tls_only,
+            .transport_is_tls = true,
+            .trusted_peer = slot.trusted_peer,
+        })) {
+            _ = self.state.stats_web_only_masked.fetchAdd(1, .monotonic);
+            self.startMasking(slot, client_hello) catch {
+                self.closeSlot(slot, "web-only, masking failed");
+            };
             return;
         }
 
@@ -5271,4 +5354,72 @@ test "ProxyState access reload waits for metrics readers" {
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(state.findUserMetrics("bob") != null);
+}
+
+test "acceptance gate: [web].only serves the relay and masks everyone else" {
+    const G = AcceptanceGate;
+
+    // Today's behaviour, unchanged: FakeTLS is served, dd is masked for the public.
+    try std.testing.expect(!masksInsteadOfServing(G{ .web_only = false, .fake_tls_only = true, .transport_is_tls = true, .trusted_peer = false }));
+    try std.testing.expect(masksInsteadOfServing(G{ .web_only = false, .fake_tls_only = true, .transport_is_tls = false, .trusted_peer = false }));
+    // dd deliberately re-enabled: the public gets a dd responder again.
+    try std.testing.expect(!masksInsteadOfServing(G{ .web_only = false, .fake_tls_only = false, .transport_is_tls = false, .trusted_peer = false }));
+
+    // WEB-only: neither transport is served to the public, whatever fake_tls_only says.
+    // A valid `ee` link from a real Telegram client lands here too — that is the point.
+    try std.testing.expect(masksInsteadOfServing(G{ .web_only = true, .fake_tls_only = true, .transport_is_tls = true, .trusted_peer = false }));
+    try std.testing.expect(masksInsteadOfServing(G{ .web_only = true, .fake_tls_only = true, .transport_is_tls = false, .trusted_peer = false }));
+    try std.testing.expect(masksInsteadOfServing(G{ .web_only = true, .fake_tls_only = false, .transport_is_tls = false, .trusted_peer = false }));
+    try std.testing.expect(masksInsteadOfServing(G{ .web_only = true, .fake_tls_only = false, .transport_is_tls = true, .trusted_peer = false }));
+
+    // The relay is never masked. It dials this proxy on loopback for every logical
+    // stream, so a gate that caught it would take the WEB proxy down with the direct
+    // one — the single way this feature can break the thing it exists to protect.
+    for ([_]bool{ true, false }) |web_only| {
+        for ([_]bool{ true, false }) |fake_tls_only| {
+            for ([_]bool{ true, false }) |is_tls| {
+                try std.testing.expect(!masksInsteadOfServing(G{
+                    .web_only = web_only,
+                    .fake_tls_only = fake_tls_only,
+                    .transport_is_tls = is_tls,
+                    .trusted_peer = true,
+                }));
+            }
+        }
+    }
+}
+
+test "[web].only reaches the data plane only together with [web].enabled" {
+    // ProxyState resolves the gate once at boot from `onlyActive()`, so a config with
+    // `only` but no `enabled` must leave the data plane exactly as it was. Without this
+    // the trusted set would be empty (it is keyed on `enabled`) while the gate was on —
+    // every connection masked, the relay's included.
+    var cfg_on = try Config.parse(std.testing.allocator,
+        \\[server]
+        \\port = 4443
+        \\[censorship]
+        \\tls_domain = "example.com"
+        \\[web]
+        \\enabled = true
+        \\only = true
+        \\domain = "relay.example.com"
+        \\[access.users]
+        \\user1 = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg_on.deinit(std.testing.allocator);
+    try std.testing.expect(cfg_on.web.onlyActive());
+
+    var cfg_off = try Config.parse(std.testing.allocator,
+        \\[server]
+        \\port = 4443
+        \\[censorship]
+        \\tls_domain = "example.com"
+        \\[web]
+        \\enabled = false
+        \\only = true
+        \\[access.users]
+        \\user1 = "00112233445566778899aabbccddeeff"
+    );
+    defer cfg_off.deinit(std.testing.allocator);
+    try std.testing.expect(!cfg_off.web.onlyActive());
 }

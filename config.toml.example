@@ -168,6 +168,25 @@ port = 443
 # Set it up with: sudo mtbuddy setup web --domain relay.example.com
 # enabled = false
 
+# Serve ONLY the WEB proxy. The data plane stops answering direct MTProto on its
+# public port: a FakeTLS (ee) or direct-obfuscated (dd) handshake from anyone but
+# the relay is handed to the masking backend, exactly the way a wrong secret is,
+# so a probe cannot tell a WEB-only proxy from an ordinary website. Only the
+# relay — recognised by the address accept() reports, never by anything the
+# client sends — still gets an MTProto responder.
+#
+# Turn this on if a direct client connection is what gets your IP blocked. After
+# it, `mtbuddy links` prints tg://webproxy links and nothing else, because
+# nothing else connects: every ee/dd link already handed out stops working.
+#
+# Requires [censorship].mask = true — without a cover site the refusal is a bare
+# close, which is a cleaner signal to a prober than answering MTProto ever was.
+# Read at startup only; SIGHUP does not pick it up. Ignored unless `enabled`, so
+# `mtbuddy setup web --remove` can never leave a proxy nobody can reach.
+# Capacity note: every client now arrives through the relay, so max_sessions
+# below becomes the real user ceiling.
+# only = false
+
 # Public hostname that goes into tg://webproxy links.
 # Must be a real DNS name in ASCII (xn-- form for IDN) with an A record pointing
 # at this host — the client rejects IP addresses and single labels outright.
@@ -216,6 +235,29 @@ port = 443
 # reaches Telegram as a loopback client — which costs per-IP accounting and any
 # geo-based routing Telegram does. `mtbuddy setup web --mode mask` sets this up.
 # mask_backend = "127.0.0.1:8444"
+
+# Which topology `mtbuddy setup web` was told to build: "mask" (served through the
+# proxy's own masking backend) or "behind" (someone else terminates TLS). Written
+# only when you actually pass --mode, and read back on `mtbuddy update` so an
+# update re-runs the host as what it is instead of as the default. Read by mtbuddy
+# only; the data plane does not look at it.
+# mode = "mask"
+
+# Bring your own certificate for the relay vhost, instead of the Let's Encrypt
+# lineage `mtbuddy setup web` issues over HTTP-01. Absolute paths to a full chain
+# and its private key, both readable by nginx; set them together or not at all.
+# Written by `mtbuddy setup web --cert <fullchain.pem> --key <privkey.pem>` and
+# re-read on `mtbuddy update`, so an update no longer rewrites the vhost back to
+# the Let's Encrypt paths.
+#
+# Read by mtbuddy only — the relay speaks plain HTTP on loopback and never opens
+# these; whatever terminates TLS does. The certificate still has to be one the
+# client's WebView accepts: a public CA, or a private one only where the
+# terminator in front of you is the one presenting it (a Cloudflare Origin
+# certificate behind Cloudflare, say). A self-signed certificate served straight
+# to clients is refused by the WebView and the bridge never loads.
+# cert = "/etc/ssl/relay/fullchain.pem"
+# key = "/etc/ssl/relay/privkey.pem"
 
 # Extra source addresses (plain IP literals, not CIDRs) the *data plane* trusts
 # to speak the direct-obfuscated transport while fake_tls_only is on. Loopback

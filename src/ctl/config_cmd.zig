@@ -158,6 +158,33 @@ fn validate(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !void {
         if (worst > cfg.max_connections) {
             ui.warn("[web] caps can exceed [server].max_connections — raise it or lower max_sessions/max_streams");
         }
+        if (cfg.web.only) {
+            // Without a cover site the refusal is a bare close, which is a cleaner
+            // active-probe signal than answering MTProto ever was.
+            if (!cfg.mask) {
+                ui.fail("[web].only needs [censorship].mask = true, else every direct connection is closed instead of masked");
+                errors += 1;
+            } else if (!cfg.maskTargetIsLocal()) {
+                ui.warn("[web].only sends every refused MTProto connection to the remote masking target — run `mtbuddy setup masking` for a local one");
+            }
+            if (cfg.accept_proxy_protocol) {
+                ui.warn("[web].only with accept_proxy_protocol: traffic via the load balancer is masked unless its IP is in [web].relay_sources");
+            }
+        }
+        // Warnings, not errors: `validate` is routinely run against a config copied off
+        // the host, where neither path exists, and a missing certificate is already a
+        // hard failure at the point that matters — `mtbuddy setup web`, which refuses to
+        // write a vhost pointing at a file that is not there.
+        if ((cfg.web.cert == null) != (cfg.web.key == null)) {
+            ui.warn("[web].cert and [web].key are only meaningful together — the unpaired one is ignored");
+        } else if (cfg.web.cert) |cert| {
+            if (!sys.fileExists(cert)) ui.warn("[web].cert does not exist here — nginx will refuse the relay vhost on the host that serves it");
+            if (cfg.web.key) |key| {
+                if (!sys.fileExists(key)) ui.warn("[web].key does not exist here — nginx will refuse the relay vhost on the host that serves it");
+            }
+        }
+    } else if (cfg.web.only) {
+        ui.warn("[web].only is set but [web].enabled is false — it is ignored (nothing would be able to connect)");
     }
 
     if (errors > 0) return error.ConfigValidationFailed;
@@ -715,6 +742,35 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     ui.print("desync = {}\n", .{cfg.desync});
     ui.print("drs = {}\n", .{cfg.drs});
     ui.print("fast_mode = {}\n", .{cfg.fast_mode});
+    // Both of these gate which transports the proxy will answer at all, and both are
+    // read only at startup — the two properties that make "I set it, why is nothing
+    // different?" the most common misreading of this config.
+    ui.print("fake_tls_only = {}\n", .{cfg.fake_tls_only});
+    ui.writeRaw("\n");
+
+    ui.writeRaw("[web]\n");
+    ui.print("enabled = {}\n", .{cfg.web.enabled});
+    ui.print("only = {} (in effect: {})\n", .{ cfg.web.only, cfg.web.onlyActive() });
+    if (cfg.web.domain) |domain| {
+        ui.print("domain = \"{s}\"\n", .{domain});
+    }
+    ui.print("listen = \"{s}\"\n", .{cfg.web.effectiveHost()});
+    ui.print("port = {d}\n", .{cfg.web.port});
+    if (cfg.web.mode) |mode| {
+        ui.print("mode = \"{s}\"\n", .{mode});
+    }
+    if (cfg.web.mask_backend) |backend| {
+        ui.print("mask_backend = \"{s}\"\n", .{backend});
+    }
+    if (cfg.web.cert) |cert| {
+        ui.print("cert = \"{s}\"\n", .{cert});
+    }
+    if (cfg.web.key) |key| {
+        ui.print("key = \"{s}\"\n", .{key});
+    }
+    ui.print("max_sessions = {d}\n", .{cfg.web.max_sessions});
+    ui.print("max_streams = {d}\n", .{cfg.web.max_streams});
+    ui.print("relay_sources count = {d}\n", .{cfg.web.relay_sources.len});
     ui.writeRaw("\n");
 
     ui.writeRaw("[metrics]\n");

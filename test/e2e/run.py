@@ -696,6 +696,9 @@ def base_config(
     max_connections: int = 4096,
     desync: bool = False,
     fast_mode: bool = False,
+    web_enabled: bool = False,
+    web_only: bool = False,
+    web_domain: str = "relay.example.com",
 ) -> str:
     lines: list[str] = []
     lines.append("[general]")
@@ -742,6 +745,13 @@ def base_config(
         lines.append("[upstream.http]")
         lines.append(f'host = "{upstream_host}"')
         lines.append(f"port = {upstream_port}")
+        lines.append("")
+
+    if web_enabled:
+        lines.append("[web]")
+        lines.append("enabled = true")
+        lines.append(f'domain = "{web_domain}"')
+        lines.append(f"only = {'true' if web_only else 'false'}")
         lines.append("")
 
     lines.append("[access.users]")
@@ -1031,6 +1041,154 @@ def scenario_mask_fallback_custom_target() -> None:
     finally:
         proxy.stop()
         mask.stop()
+
+
+def scenario_web_only_still_serves_the_relay() -> None:
+    """[web].only must not break the WEB proxy it exists to protect.
+
+    The relay dials this proxy on loopback for every logical stream, and the proxy
+    recognises it by the address accept() reports — so a loopback client is trusted and
+    keeps getting an MTProto responder even though direct MTProto is now masked for
+    everyone else. A gate placed one branch too early would black-hole exactly this
+    path, and nothing else in the suite would notice.
+    """
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    mask = FakeMaskServer()
+    mask.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        mask=True,
+        mask_port=mask.port,
+        web_enabled=True,
+        web_only=True,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(2.0)
+            perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            c.sendall(b"\x44" * 128)
+            connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=3.0)
+            assert connected, "web-only masked the relay's own loopback handshake"
+            forwarded = wait_for_condition(lambda: socks.tunnel_bytes > 0, timeout_sec=2.0)
+            assert forwarded, "web-only relay handshake did not reach the fake DC tunnel"
+        assert not mask.received_bytes(), (
+            f"a trusted loopback peer was sent to the masking backend: {mask.received_bytes()!r}"
+        )
+    finally:
+        proxy.stop()
+        mask.stop()
+        socks.stop()
+
+
+def _local_non_loopback_ipv4() -> Optional[str]:
+    """An address on this host that is NOT 127.0.0.0/8, or None.
+
+    The proxy decides "is this the relay?" from the address accept() reports, and every
+    127.x source is the relay by definition. Proving the refusal therefore needs a client
+    whose source address is not loopback — this is the standard no-traffic UDP-connect
+    trick for finding one.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # TEST-NET-1; connect() on UDP sends nothing
+            addr = s.getsockname()[0]
+    except OSError:
+        return None
+    return None if not addr or addr.startswith("127.") else addr
+
+
+def scenario_web_only_masks_a_direct_client() -> None:
+    """The refusal itself: under [web].only a valid FakeTLS handshake from a peer that
+    is not the relay is handed to the masking backend, and never reaches a DC.
+
+    Skipped where the host has no non-loopback IPv4, because every 127.x source counts
+    as the relay and the gate is invisible from there.
+    """
+    client_ip = _local_non_loopback_ipv4()
+    if client_ip is None:
+        print("      skipped: no non-loopback IPv4 on this host to connect from")
+        return
+
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    mask = FakeMaskServer()
+    mask.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        mask=True,
+        mask_port=mask.port,
+        web_enabled=True,
+        web_only=True,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    )
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as c:
+            c.settimeout(3.0)
+            c.bind((client_ip, 0))
+            c.connect((client_ip, proxy_port))
+            # Only the ClientHello: under WEB-only there is no ServerHello to answer,
+            # so the rest of the handshake has nowhere to go by design.
+            c.sendall(build_tls_auth_client_hello(bytes.fromhex(DEFAULT_SECRET_HEX), DEFAULT_TLS_DOMAIN))
+            masked = wait_for_condition(lambda: len(mask.received_bytes()) > 0, timeout_sec=3.0)
+            assert masked, "a valid FakeTLS handshake was not masked under [web].only"
+        # The ClientHello is forwarded verbatim, exactly as for a wrong secret — that
+        # byte-for-byte sameness is what keeps a WEB-only proxy from being detectable.
+        assert mask.received_bytes().startswith(b"\x16\x03\x01"), (
+            f"masked bytes are not the original ClientHello: {mask.received_bytes()[:8]!r}"
+        )
+        relayed = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=1.5)
+        assert not relayed, f"web-only still relayed a direct client upstream: {socks.connect_targets}"
+    finally:
+        proxy.stop()
+        mask.stop()
+        socks.stop()
+
+
+def scenario_web_only_ignored_without_web_enabled() -> None:
+    """`only = true` with `enabled = false` must be inert.
+
+    The trusted-peer set is keyed on [web].enabled, so honouring `only` on its own would
+    mask every connection — the relay's included — leaving a proxy nobody can reach and
+    nothing in the log to say why. `mtbuddy setup web --remove` clears `enabled`, which
+    is exactly how a deploy would land in that state.
+    """
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    mask = FakeMaskServer()
+    mask.start()
+    proxy_port = free_port()
+    cfg = base_config(
+        port=proxy_port,
+        mask=True,
+        mask_port=mask.port,
+        upstream_type="socks5",
+        upstream_host="127.0.0.1",
+        upstream_port=socks.port,
+    )
+    # [web] disabled entirely, but the gate key left behind by a previous setup.
+    cfg = cfg.replace("[access.users]", "[web]\nenabled = false\nonly = true\n\n[access.users]", 1)
+    proxy = start_proxy(cfg, proxy_port)
+    try:
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
+            c.settimeout(2.0)
+            perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            c.sendall(b"\x44" * 128)
+            connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=3.0)
+            assert connected, "a stale [web].only masked traffic with the relay disabled"
+    finally:
+        proxy.stop()
+        mask.stop()
+        socks.stop()
 
 
 def scenario_invalid_tls_and_mtproto() -> None:
@@ -1324,6 +1482,9 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "middleproxy_fallback_to_direct": scenario_middleproxy_fallback_to_direct,
     "mask_fallback_local_nginx": scenario_mask_fallback_local_nginx,
     "mask_fallback_custom_target": scenario_mask_fallback_custom_target,
+    "web_only_serves_relay": scenario_web_only_still_serves_the_relay,
+    "web_only_masks_direct_client": scenario_web_only_masks_a_direct_client,
+    "web_only_inert_without_web": scenario_web_only_ignored_without_web_enabled,
     "invalid_tls_and_mtproto": scenario_invalid_tls_and_mtproto,
     "replay_attack_rejected": scenario_replay_attack_rejected,
     "user_max_ips_distinct_client_networks": scenario_user_max_ips_distinct_client_networks,

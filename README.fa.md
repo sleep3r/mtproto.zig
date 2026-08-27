@@ -473,6 +473,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[censorship] drs` | `false` | اندازه‌گیری پویای رکورد (Dynamic Record Sizing) |
 | `[censorship] fast_mode` | `false` | واگذاری رمزنگاریِ S2C به DC (توصیه‌شده) |
 | `[web] enabled` | `false` | فعال‌سازی رله WEB proxy (تلگرام دسکتاپ ۷.۱+) |
+| `[web] only` | `false` | فقط WEB سرو شود: MTProto مستقیم برای همه جز رله ماسک می‌شود؛ نیازمند `mask = true` و بدون `enabled` نادیده گرفته می‌شود |
 | `[web] domain` | تنظیم‌نشده | نام میزبان عمومی در لینک‌های `tg://webproxy` — **پس از توزیع لینک‌ها تغییرناپذیر** |
 | `[web] listen` | `"127.0.0.1"` | آدرس گوش‌دادن رله (TLS جلوتر از آن خاتمه می‌یابد) |
 | `[web] port` | `8081` | پورت رله |
@@ -483,6 +484,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[web] max_sessions` | `64` | تعداد کلاینت‌های دسکتاپ هم‌زمان |
 | `[web] max_streams` | `32` | تعداد سوکت‌های منطقی MTProto برای هر کلاینت |
 | `[web] relay_sources` | `[]` | نشانی‌های اضافی مجاز به ترابری `dd` (loopback همیشه مجاز است) |
+| `[web] cert` / `[web] key` | تنظیم‌نشده | گواهی اختصاصی خودتان برای vhost رله به‌جای Let's Encrypt (توسط `mtbuddy setup web` خوانده می‌شود) |
 | `[access.users] <name>` | — | secret‏ 32 کاراکتر hex برای هر کاربر |
 | `[access.direct_users] <name>` | — | دور زدن ME برای این کاربر |
 | `[access.user_max_conns] <name>` | — | سقف اتصال‌های هم‌زمان به ازای هر کاربر (برای تغییر، ری‌استارت لازم است) |

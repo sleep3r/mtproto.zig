@@ -1143,6 +1143,35 @@ fn printQrCode(ui: *Tui, allocator: std.mem.Allocator, text: []const u8) void {
     ui.writeRaw(r.stdout);
 }
 
+/// `[web].only` as the data plane will read it. Mirrors `Config.Web.onlyActive()`:
+/// `only` counts for nothing without `enabled`.
+fn webOnlyRequested(doc: *toml.TomlDoc) bool {
+    const enabled = doc.get("web", "enabled") orelse return false;
+    if (!std.mem.eql(u8, std.mem.trim(u8, enabled, " \t\""), "true")) return false;
+    const raw = doc.get("web", "only") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw, " \t\""), "true");
+}
+
+/// `[web].only` AND a domain a WEB link can actually be built from.
+///
+/// Under WEB-only the proxy masks direct MTProto instead of serving it, so ee and dd
+/// links stop connecting at all and printing them is how an operator ends up debugging
+/// a link that was never going to work. But suppressing them without a WEB link to put
+/// in their place would leave nothing at all, so the domain has to hold up too.
+fn webOnlyFromDoc(doc: *toml.TomlDoc) bool {
+    if (!webOnlyRequested(doc)) return false;
+    const raw = doc.get("web", "domain") orelse return false;
+    var buf: [web_capability.max_host_len]u8 = undefined;
+    _ = web_capability.normalizeHost(std.mem.trim(u8, raw, " \t\""), &buf) catch return false;
+    return true;
+}
+
+fn webOnlyFromConfig(allocator: std.mem.Allocator, config_path: []const u8) bool {
+    var doc = toml.TomlDoc.load(allocator, config_path) catch return false;
+    defer doc.deinit();
+    return webOnlyFromDoc(&doc);
+}
+
 fn printLinksFromConfig(
     ui: *Tui,
     allocator: std.mem.Allocator,
@@ -1164,6 +1193,8 @@ fn printLinksFromConfig(
     else
         false;
 
+    const web_only = webOnlyFromDoc(&cfg_doc);
+
     // WEB links (Telegram Desktop 7.1+) are printed only once [web] is live: a link
     // whose domain does not serve the bridge is worse than no link. The hostname is
     // canonicalised the way the client canonicalises it, since the bridge capability
@@ -1176,6 +1207,19 @@ fn printLinksFromConfig(
         const trimmed_domain = std.mem.trim(u8, raw, " \t\"");
         break :blk web_capability.normalizeHost(trimmed_domain, &web_domain_buf) catch null;
     };
+
+    // WEB-only with an unusable [web].domain has no working link of ANY kind. Rather
+    // than print a user name with nothing under it and then tell the operator to share
+    // "the link above", say what is wrong and fall back to the ordinary links with the
+    // caveat attached. Only reachable by hand-editing config.toml — `setup web`
+    // validates the domain the way Telegram Desktop does.
+    if (webOnlyRequested(&cfg_doc) and web_host == null) {
+        ui.warn(localized(
+            ui,
+            "[web].only is on but [web].domain is not a hostname Telegram Desktop accepts — no WEB link can be built. The links below will NOT connect until you fix the domain or run: sudo mtbuddy setup web --no-only",
+            "[web].only включён, но [web].domain не является именем, которое принимает Telegram Desktop — WEB-ссылку построить нельзя. Ссылки ниже НЕ подключатся, пока вы не исправите домен или не выполните: sudo mtbuddy setup web --no-only",
+        ));
+    }
 
     var printed_any = false;
     var in_users_section = false;
@@ -1228,21 +1272,23 @@ fn printLinksFromConfig(
             tui_mod.Color.white, user_name,
             tui_mod.Color.reset,
         });
-        ui.print("  {s}│{s}    {s}{s}{s}\n", .{
-            tui_mod.Color.gray,  tui_mod.Color.reset,
-            tui_mod.Color.white, tme_link,
-            tui_mod.Color.reset,
-        });
-        ui.print("  {s}│{s}    {s}{s}{s}\n", .{
-            tui_mod.Color.gray,  tui_mod.Color.reset,
-            tui_mod.Color.dim,   ee_link,
-            tui_mod.Color.reset,
-        });
-        // A scannable QR of the share link for the first user — point a phone
-        // camera at it to connect, no copy-paste. Best-effort (needs qrencode).
-        if (with_qr and !qr_done) {
-            printQrCode(ui, allocator, tme_link);
-            qr_done = true;
+        if (!web_only) {
+            ui.print("  {s}│{s}    {s}{s}{s}\n", .{
+                tui_mod.Color.gray,  tui_mod.Color.reset,
+                tui_mod.Color.white, tme_link,
+                tui_mod.Color.reset,
+            });
+            ui.print("  {s}│{s}    {s}{s}{s}\n", .{
+                tui_mod.Color.gray,  tui_mod.Color.reset,
+                tui_mod.Color.dim,   ee_link,
+                tui_mod.Color.reset,
+            });
+            // A scannable QR of the share link for the first user — point a phone
+            // camera at it to connect, no copy-paste. Best-effort (needs qrencode).
+            if (with_qr and !qr_done) {
+                printQrCode(ui, allocator, tme_link);
+                qr_done = true;
+            }
         }
         if (web_host) |host| {
             var web_secret_buf: [128]u8 = undefined;
@@ -1258,8 +1304,14 @@ fn printLinksFromConfig(
                 tui_mod.Color.reset, tui_mod.Color.dim,
                 tui_mod.Color.reset,
             });
+            // Under WEB-only this is the only link there is, so it is the one that
+            // earns the QR.
+            if (web_only and with_qr and !qr_done) {
+                printQrCode(ui, allocator, web_link);
+                qr_done = true;
+            }
         }
-        if (dd_enabled) {
+        if (dd_enabled and !web_only) {
             var dd_buf: [128]u8 = undefined;
             const dd_secret = buildDdSecret(secret_hex, &dd_buf);
             var dd_link_buf: [512]u8 = undefined;
@@ -1385,8 +1437,16 @@ fn printSummary(
     }
 
     ui.writeRaw("\n");
-    ui.hint(localized(ui, "Share with someone you love — send them the top (t.me) link with:", "Поделитесь с близким — отправьте ему верхнюю (t.me) ссылку со словами:"));
-    ui.hint(localized(ui, "\"I set up a private door to Telegram for us. Tap this link, choose Connect, and Telegram will work again.\"", "«Я сделал для нас личный вход в Telegram. Нажми на ссылку, выбери «Подключить» — и Telegram снова заработает.»"));
+    if (webOnlyFromConfig(allocator, config_path)) {
+        // Under WEB-only the only link printed is the WEB one, and it opens in exactly
+        // one client — saying "share the top link" without that caveat sends people to
+        // a phone that cannot use it.
+        ui.hint(localized(ui, "Share the link above — it opens in Telegram Desktop 7.1 or newer only:", "Отправьте ссылку выше — она открывается только в Telegram Desktop 7.1 и новее:"));
+        ui.hint(localized(ui, "\"I set up a private door to Telegram for us. Open this in Telegram Desktop and Telegram will work again.\"", "«Я сделал для нас личный вход в Telegram. Открой это в Telegram Desktop — и Telegram снова заработает.»"));
+    } else {
+        ui.hint(localized(ui, "Share with someone you love — send them the top (t.me) link with:", "Поделитесь с близким — отправьте ему верхнюю (t.me) ссылку со словами:"));
+        ui.hint(localized(ui, "\"I set up a private door to Telegram for us. Tap this link, choose Connect, and Telegram will work again.\"", "«Я сделал для нас личный вход в Telegram. Нажми на ссылку, выбери «Подключить» — и Telegram снова заработает.»"));
+    }
     ui.writeRaw("\n");
     ui.hint(localized(ui, "Print these links again anytime: sudo mtbuddy links", "Показать эти ссылки снова в любой момент: sudo mtbuddy links"));
     ui.hint(localized(ui, "Runtime proxy logs intentionally hide secrets and links.", "Runtime-логи прокси намеренно скрывают секреты и ссылки."));
