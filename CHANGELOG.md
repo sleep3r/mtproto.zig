@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.0](https://github.com/sleep3r/mtproto.zig/compare/v1.13.0...v1.14.0) (2026-08-27)
+
+
+### Features
+
+* **web:** WEB-only mode + bring-your-own cert; stop uninstall deleting tunnel configs mtbuddy never created ([#404](https://github.com/sleep3r/mtproto.zig/issues/404)) ([0ffb4d7](https://github.com/sleep3r/mtproto.zig/commit/0ffb4d7d8400178bfeb1cc0c3a237c8d18d533e7))
+
 ## [1.13.0](https://github.com/sleep3r/mtproto.zig/compare/v1.12.0...v1.13.0) (2026-08-24)
 
 
