@@ -86,7 +86,12 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
         return error.NoUsersConfigured;
     }
 
-    const server = opts.server orelse cfg.public_ip orelse sys.detectPublicIp(allocator) orelse {
+    // Under `[web].only` the proxy answers no direct MTProto at all, so the public
+    // address is not part of any link it can hand out — and a host reached only through
+    // a CDN may have none to detect. Not having one stops being fatal there.
+    const web_only = cfg.web.onlyActive();
+    const server = opts.server orelse cfg.public_ip orelse sys.detectPublicIp(allocator) orelse blk: {
+        if (web_only) break :blk "";
         ui.fail("Could not determine public server address");
         ui.hint("Pass --server <ip-or-domain>, or set [server].public_ip in config.toml");
         return error.PublicAddressUnavailable;
@@ -112,6 +117,15 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
             break :blk null;
         };
     };
+
+    if (web_only) {
+        ui.info("[web].only is on: the proxy masks direct MTProto, so only WEB links are printed.");
+        if (web_domain == null) {
+            ui.fail("[web].only is on but [web].domain is not a hostname Telegram Desktop accepts — there is no working link to print.");
+            ui.hint("Fix [web].domain, or turn WEB-only off with: sudo mtbuddy setup web --no-only");
+            return error.WebOnlyWithoutDomain;
+        }
+    }
 
     var it = cfg.users.iterator();
     while (it.next()) |entry| {
@@ -140,14 +154,19 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
 
         ui.print("  {s}:\n", .{entry.key_ptr.*});
         ui.print("    secret: {s}\n", .{secret_hex[0..]});
-        ui.print("    fakeTLS tg:   {s}\n", .{tg_link});
-        ui.print("    fakeTLS t.me: {s}\n", .{tme_link});
+        // Same rule as the dd block below, for the same reason: under `[web].only` the
+        // proxy masks a FakeTLS handshake instead of serving it, so an ee link would be
+        // a link that silently never connects.
+        if (!web_only) {
+            ui.print("    fakeTLS tg:   {s}\n", .{tg_link});
+            ui.print("    fakeTLS t.me: {s}\n", .{tme_link});
+        }
 
         // dd (non-TLS, DPI-fingerprintable) links are printed ONLY when the
         // operator has explicitly enabled the dd transport. With the secure
         // default (fake_tls_only = true) the proxy rejects dd, so printing dd
         // links would hand out non-working, fingerprintable links.
-        if (!cfg.fake_tls_only) {
+        if (!cfg.fake_tls_only and !web_only) {
             var dd_buf: [128]u8 = undefined;
             const dd_secret = buildDdSecret(secret_hex[0..], &dd_buf);
 
@@ -206,6 +225,7 @@ fn printLinksHelp(ui: *Tui) void {
     ui.writeRaw("  mtbuddy links [--config <path>] [--server <host>] [--port <port>] [--domain <tls-domain>]\n\n");
     ui.writeRaw("  Prints tg:// and t.me proxy links from [access.users].\n");
     ui.writeRaw("  Adds tg://webproxy links when [web] is enabled (Telegram Desktop 7.1+).\n");
+    ui.writeRaw("  With [web].only set, prints the WEB links alone — the others no longer connect.\n");
     ui.writeRaw("  Link port defaults to [server].public_port, then [server].port.\n");
     ui.writeRaw("  Sensitive output: links contain user secrets.\n\n");
     ui.writeRaw("  mtbuddy secret\n");

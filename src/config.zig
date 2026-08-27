@@ -211,6 +211,18 @@ pub const Config = struct {
     pub const Web = struct {
         /// Master switch. Also what makes the data plane trust a loopback relay.
         enabled: bool = false,
+        /// Serve *only* the WEB proxy: the data plane stops answering direct MTProto
+        /// on its public port and masks those connections instead, exactly the way it
+        /// masks a wrong secret. Only the relay — judged by the accepted address, see
+        /// `proxy/trusted_peers.zig` — still gets an MTProto responder.
+        ///
+        /// For operators whose IP gets blocked the moment a Telegram client connects
+        /// to it directly (issue #403): after this, the only way in is a browser
+        /// fetching an ordinary HTTPS site.
+        ///
+        /// Gated on `enabled` at every read (`onlyActive`), so clearing `[web]` can
+        /// never leave a box that trusts nobody and masks everything.
+        only: bool = false,
         /// Public hostname that goes into `tg://webproxy` links. Must be a real DNS
         /// name in ASCII/A-label form — the client rejects IPs and single labels, and
         /// the bridge capability is an HMAC over this exact string, so changing it
@@ -231,6 +243,16 @@ pub const Config = struct {
         /// it the proxy prefixes those connections with the real client address, and it
         /// survives all the way through the relay back into `peer_addr`.
         mask_backend: ?[]const u8 = null,
+        /// Certificate and key the relay vhost should present, when the operator
+        /// brings their own instead of letting `mtbuddy setup web` issue one over
+        /// ACME. Read by mtbuddy only — the relay speaks plain HTTP on loopback and
+        /// never opens these; nginx (or whatever terminates TLS) does.
+        cert: ?[]const u8 = null,
+        key: ?[]const u8 = null,
+        /// Which topology `mtbuddy setup web` built ("mask" | "behind"). Also mtbuddy
+        /// only: it is how `mtbuddy update` re-runs a host as what it is rather than as
+        /// the default. Parsed here so `config print-effective` can show it.
+        mode: ?[]const u8 = null,
         /// Same-origin WebSocket endpoint the bridge page connects to.
         ws_path: ?[]const u8 = null,
         /// Honour a forwarded-client-address header from the TLS terminator in front of
@@ -252,6 +274,14 @@ pub const Config = struct {
         /// transport while `fake_tls_only` is on. Loopback is always trusted when
         /// `enabled`; list plain IP literals here for a relay on another host.
         relay_sources: []const []const u8 = &.{},
+
+        /// True when the data plane must refuse direct MTProto. `only` alone is not
+        /// enough: with `enabled` false the trusted-peer set is empty (the relay is
+        /// not trusted either), so honouring `only` would mask *every* connection —
+        /// a proxy with no way in and nothing in the logs to say why.
+        pub fn onlyActive(self: *const Web) bool {
+            return self.enabled and self.only;
+        }
 
         /// Bound host, defaulting to loopback.
         pub fn effectiveHost(self: *const Web) []const u8 {
@@ -614,6 +644,45 @@ pub const Config = struct {
                     .{ self.web.port, self.port, self.mask_port },
                 );
             }
+            if (self.web.only) {
+                // Masking is what makes the refusal indistinguishable from a wrong
+                // secret: both reach the same startMasking(). Without it every refused
+                // connection is simply closed after the ClientHello, which under
+                // [web].only is 100% of public traffic — a perfect active-probe tell.
+                if (!self.mask) {
+                    log.err(
+                        "[web].only is on but [censorship].mask is off: every direct connection " ++
+                            "will be closed instead of masked, which is itself a distinguisher. " ++
+                            "Set mask = true, or bind the proxy to loopback and front it with a CDN.",
+                        .{},
+                    );
+                } else if (!self.maskTargetIsLocal()) {
+                    // mask_port = 443 means the masking target is the borrowed fronting
+                    // domain, i.e. a third party's server. Under [web].only that stops
+                    // being the occasional probe and becomes every client that still
+                    // holds an ee link.
+                    log.warn(
+                        "[web].only forwards every refused MTProto connection to the remote masking " ++
+                            "target '{s}' — that is now all public traffic, not just probes. Run " ++
+                            "`mtbuddy setup masking` so the cover site is served locally.",
+                        .{self.effectiveMaskTarget()},
+                    );
+                }
+                if (self.accept_proxy_protocol) {
+                    // trusted_peer is judged on the ACCEPTED address, which behind a
+                    // PROXY-protocol load balancer is the balancer's — so the whole
+                    // through-the-LB path is refused unless the LB is a relay source.
+                    log.warn(
+                        "[web].only with [server].accept_proxy_protocol: connections arriving " ++
+                            "through the load balancer are masked unless its address is listed in " ++
+                            "[web].relay_sources (IP literals, not CIDRs).",
+                        .{},
+                    );
+                }
+            }
+        } else if (self.web.only) {
+            const log = std.log.scoped(.config);
+            log.err("[web].only is set but [web].enabled is false — ignoring it; nothing would be able to connect.", .{});
         }
         if (self.hasLocalMaskPortCollision()) {
             const log = std.log.scoped(.config);
@@ -982,6 +1051,8 @@ pub const Config = struct {
                 } else if (in_web_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
                         cfg.web.enabled = parseBool(value);
+                    } else if (std.mem.eql(u8, key, "only") or std.mem.eql(u8, key, "web_only")) {
+                        cfg.web.only = parseBool(value);
                     } else if (std.mem.eql(u8, key, "domain")) {
                         if (cfg.web.domain) |prev| allocator.free(prev);
                         cfg.web.domain = if (value.len > 0) try allocator.dupe(u8, value) else null;
@@ -996,6 +1067,15 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "mask_backend")) {
                         if (cfg.web.mask_backend) |prev| allocator.free(prev);
                         cfg.web.mask_backend = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "cert")) {
+                        if (cfg.web.cert) |prev| allocator.free(prev);
+                        cfg.web.cert = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "key")) {
+                        if (cfg.web.key) |prev| allocator.free(prev);
+                        cfg.web.key = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                    } else if (std.mem.eql(u8, key, "mode")) {
+                        if (cfg.web.mode) |prev| allocator.free(prev);
+                        cfg.web.mode = if (value.len > 0) try allocator.dupe(u8, value) else null;
                     } else if (std.mem.eql(u8, key, "ws_path")) {
                         if (cfg.web.ws_path) |prev| allocator.free(prev);
                         cfg.web.ws_path = if (value.len > 0) try allocator.dupe(u8, value) else null;
@@ -1139,6 +1219,15 @@ pub const Config = struct {
         }
         if (self.web.mask_backend) |b| {
             allocator.free(b);
+        }
+        if (self.web.cert) |c| {
+            allocator.free(c);
+        }
+        if (self.web.key) |k| {
+            allocator.free(k);
+        }
+        if (self.web.mode) |m| {
+            allocator.free(m);
         }
         if (self.web.ws_path) |wp| {
             allocator.free(wp);
@@ -2399,4 +2488,65 @@ test "section header with an inline comment still selects the section" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 9999), cfg.port);
     try std.testing.expect(cfg.mask); // `mask = yes` now parses (parseBool) under a commented header
+}
+
+test "parse config - [web].only parses, aliases web_only, and defaults false" {
+    {
+        var cfg = try Config.parse(std.testing.allocator,
+            \\[web]
+            \\enabled = true
+            \\domain = "relay.example.com"
+        );
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expect(!cfg.web.only);
+        try std.testing.expect(!cfg.web.onlyActive());
+    }
+    {
+        var cfg = try Config.parse(std.testing.allocator,
+            \\[web]
+            \\enabled = true
+            \\only = true
+            \\domain = "relay.example.com"
+        );
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expect(cfg.web.onlyActive());
+    }
+    {
+        // `web_only` is accepted as the spelling an operator is likely to reach for.
+        var cfg = try Config.parse(std.testing.allocator,
+            \\[web]
+            \\enabled = true
+            \\web_only = yes
+        );
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expect(cfg.web.onlyActive());
+    }
+}
+
+test "[web].only without [web].enabled never activates the gate" {
+    // The trusted-peer set is keyed on `enabled` (proxy/trusted_peers.zig), so honouring
+    // `only` on its own would mask every connection including the relay's — a proxy with
+    // no way in. `mtbuddy setup web --remove` clears `enabled`, and this is what keeps
+    // that from bricking a WEB-only deploy.
+    var cfg = try Config.parse(std.testing.allocator,
+        \\[web]
+        \\enabled = false
+        \\only = true
+    );
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.web.only);
+    try std.testing.expect(!cfg.web.onlyActive());
+}
+
+test "parse config - [web] cert/key paths round-trip and free cleanly" {
+    var cfg = try Config.parse(std.testing.allocator,
+        \\[web]
+        \\enabled = true
+        \\domain = "relay.example.com"
+        \\cert = "/etc/ssl/relay/fullchain.pem"
+        \\key = "/etc/ssl/relay/privkey.pem"
+    );
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/etc/ssl/relay/fullchain.pem", cfg.web.cert.?);
+    try std.testing.expectEqualStrings("/etc/ssl/relay/privkey.pem", cfg.web.key.?);
 }

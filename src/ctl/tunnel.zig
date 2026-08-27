@@ -208,6 +208,8 @@ pub fn printTunnelPoolRuntimeStatus(ui: *Tui, allocator: std.mem.Allocator, inte
 const TunnelDeleteResult = struct {
     removed_last: bool,
     remaining_count: usize,
+    /// A config mtbuddy did not write, so the pool entry went and the file stayed.
+    kept_config: bool = false,
 };
 
 pub fn deleteTunnelInteractive(ui: *Tui, allocator: std.mem.Allocator, iface: []const u8) !void {
@@ -223,7 +225,7 @@ pub fn deleteTunnelInteractive(ui: *Tui, allocator: std.mem.Allocator, iface: []
         .{
             tr(ui.lang, "Delete tunnel", "Удалить туннель"),
             iface,
-            tr(ui.lang, "Config file and pool entry will be removed.", "Конфиг и запись в пуле будут удалены."),
+            tr(ui.lang, "The pool entry goes; the config file goes only if mtbuddy created it.", "Запись в пуле удаляется; конфиг — только если его создал mtbuddy."),
         },
     ) catch "Delete tunnel?";
 
@@ -244,6 +246,13 @@ pub fn deleteTunnelInteractive(ui: *Tui, allocator: std.mem.Allocator, iface: []
     };
 
     ui.stepOk(tr(ui.lang, "Tunnel deleted", "Туннель удален"), iface);
+    if (result.kept_config) {
+        ui.warn(tr(
+            ui.lang,
+            "Its config is not marked as mtbuddy-created, so it and the interface were left as they are — remove them yourself if you want them gone.",
+            "Его конфиг не помечен как созданный mtbuddy, поэтому конфиг и интерфейс оставлены как есть — удалите их вручную, если нужно.",
+        ));
+    }
     if (result.removed_last) {
         ui.warn(tr(
             ui.lang,
@@ -285,8 +294,11 @@ fn deleteTunnelPoolMember(allocator: std.mem.Allocator, iface: []const u8) !Tunn
         try doc.save(INSTALL_DIR ++ "/config.toml");
     }
 
-    stopTunnelInterface(allocator, iface);
-    deleteTunnelConfigFiles(allocator, iface);
+    // Only bring the interface down when no config behind it is somebody else's. An
+    // adopted interface was up before mtbuddy touched it and is theirs to run; the pool
+    // entry is gone either way, so nothing of ours routes through it any more.
+    if (!hasForeignConfig(allocator, iface)) stopTunnelInterface(allocator, iface);
+    const removed_config = deleteTunnelConfigFiles(allocator, iface);
 
     if (removed_last) {
         disableTunnelPoolRuntime(allocator);
@@ -301,7 +313,27 @@ fn deleteTunnelPoolMember(allocator: std.mem.Allocator, iface: []const u8) !Tunn
     return .{
         .removed_last = removed_last,
         .remaining_count = remaining_count,
+        .kept_config = !removed_config,
     };
+}
+
+/// True when some config behind `iface` exists and does NOT carry mtbuddy's banner —
+/// an operator's own file, adopted in place or predating the banner.
+///
+/// The absence of any config is deliberately not "foreign": a pool member always had
+/// one when it was set up, so a missing file means a broken leftover of ours, not
+/// somebody else's interface.
+pub fn hasForeignConfig(allocator: std.mem.Allocator, iface: []const u8) bool {
+    var awg_buf: [256]u8 = undefined;
+    const awg_path = tunnel_wg.awgConfigPath(&awg_buf, iface) catch "";
+    var wg_buf: [256]u8 = undefined;
+    const wg_path = std.fmt.bufPrint(&wg_buf, "/etc/wireguard/{s}.conf", .{iface}) catch "";
+
+    for ([_][]const u8{ awg_path, wg_path }) |path| {
+        if (path.len == 0 or !sys.fileExists(path)) continue;
+        if (!tunnel_wg.configIsOwned(allocator, path)) return true;
+    }
+    return false;
 }
 
 fn stopTunnelInterface(allocator: std.mem.Allocator, iface: []const u8) void {
@@ -332,17 +364,34 @@ fn tunnelConfigExists(iface: []const u8) bool {
     return false;
 }
 
-fn deleteTunnelConfigFiles(allocator: std.mem.Allocator, iface: []const u8) void {
+/// Remove the config files for `iface` — but only the ones mtbuddy wrote.
+///
+/// Returns false when a config was left behind because it carries no mtbuddy banner:
+/// either an operator's own file that `--iface` adopted in place, or one predating the
+/// banner. Deleting those is issue #402; the pool entry still goes, so mtbuddy stops
+/// routing through the interface either way.
+fn deleteTunnelConfigFiles(allocator: std.mem.Allocator, iface: []const u8) bool {
     var awg_buf: [256]u8 = undefined;
     const awg_path = tunnel_wg.awgConfigPath(&awg_buf, iface) catch "";
     var wg_buf: [256]u8 = undefined;
     const wg_path = std.fmt.bufPrint(&wg_buf, "/etc/wireguard/{s}.conf", .{iface}) catch "";
 
-    if (awg_path.len > 0) sys.execSilent(allocator, &.{ "rm", "-f", awg_path });
-    if (wg_path.len > 0) sys.execSilent(allocator, &.{ "rm", "-f", wg_path });
-    if (std.mem.eql(u8, iface, "awg0")) {
+    var kept = false;
+    for ([_][]const u8{ awg_path, wg_path }) |path| {
+        if (path.len == 0 or !sys.fileExists(path)) continue;
+        if (tunnel_wg.configIsOwned(allocator, path)) {
+            sys.execSilent(allocator, &.{ "rm", "-f", path });
+        } else {
+            kept = true;
+        }
+    }
+    // The /etc/amnezia/awg0.conf symlink is unambiguously mtbuddy's — it only ever
+    // exists because `setup tunnel` created it — so it goes regardless, unless it is
+    // the only thing still pointing at a config we are leaving behind.
+    if (std.mem.eql(u8, iface, "awg0") and !kept) {
         sys.execSilent(allocator, &.{ "rm", "-f", AWG_IFACE_CONF_PATH });
     }
+    return !kept;
 }
 
 fn disableTunnelPoolRuntime(allocator: std.mem.Allocator) void {

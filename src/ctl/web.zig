@@ -71,11 +71,25 @@ pub const Mode = enum {
 pub const WebOpts = struct {
     domain: []const u8 = "",
     mode: Mode = .mask,
+    /// True when the caller actually named a `--mode`. Without it `execute` recovers the
+    /// mode from config.toml, because `mtbuddy update` re-runs this module with plain
+    /// defaults — and re-running a `behind` host as `mask` used to fail the masking
+    /// precondition and return before the relay unit was rewritten, leaving the relay on
+    /// the pre-upgrade binary.
+    mode_explicit: bool = false,
     port: []const u8 = DEFAULT_PORT,
     /// Contact address for the ACME account; empty registers without one.
     email: []const u8 = "",
-    /// Skip certificate issuance (the operator installed one already).
+    /// Skip ACME issuance and keep whatever certificate is already on disk.
     skip_cert: bool = false,
+    /// Bring your own certificate: absolute paths to a full chain and its private key.
+    /// Empty means the Let's Encrypt lineage for `domain`. These are persisted, so an
+    /// `mtbuddy update` that re-renders the vhost keeps pointing at them.
+    cert: []const u8 = "",
+    key: []const u8 = "",
+    /// Serve only the WEB proxy — mask direct MTProto for everyone but the relay.
+    /// `null` keeps whatever config.toml already says.
+    only: ?bool = null,
     quiet: bool = false,
     yes: bool = false,
 };
@@ -103,6 +117,15 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
                 ui.fail(tr(ui, "Unknown --mode (expected: mask|behind)", "Неизвестный --mode (ожидается: mask|behind)"));
                 return;
             }
+            opts.mode_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--cert")) {
+            opts.cert = args.next() orelse "";
+        } else if (std.mem.eql(u8, arg, "--key")) {
+            opts.key = args.next() orelse "";
+        } else if (std.mem.eql(u8, arg, "--only") or std.mem.eql(u8, arg, "--web-only")) {
+            opts.only = true;
+        } else if (std.mem.eql(u8, arg, "--no-only") or std.mem.eql(u8, arg, "--no-web-only")) {
+            opts.only = false;
         } else if (std.mem.eql(u8, arg, "--port")) {
             opts.port = args.next() orelse DEFAULT_PORT;
         } else if (std.mem.eql(u8, arg, "--email")) {
@@ -154,6 +177,25 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         },
     );
 
+    // Offered only where it can be honoured: WEB-only masks direct MTProto rather than
+    // closing it, and that needs the local masking backend.
+    var only: ?bool = null;
+    if (maskingIsOn(allocator)) {
+        ui.print("  {s}{s}{s}\n", .{
+            Color.dim,
+            tr(
+                ui,
+                "WEB-only serves nothing but the website: a Telegram client that connects to\n  this IP directly gets the cover site instead of the proxy. Turn it on if a direct\n  connection is what gets your IP blocked — it invalidates every ee/dd link you have\n  already handed out.",
+                "WEB-only отдаёт только сайт: клиент Telegram, подключившийся к этому IP напрямую,\n  получит сайт-прикрытие вместо прокси. Включайте, если блокировку вызывает именно\n  прямое подключение — все выданные ранее ee/dd-ссылки перестанут работать.",
+            ),
+            Color.reset,
+        });
+        only = try ui.confirm(
+            tr(ui, "Serve only WEB links (mask direct MTProto)?", "Отдавать только WEB-ссылки (маскировать прямой MTProto)?"),
+            false,
+        );
+    }
+
     if (!try ui.confirm(i18n.get(ui.lang, .confirm_proceed), true)) {
         ui.info(i18n.get(ui.lang, .aborting));
         return;
@@ -162,6 +204,8 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     try execute(ui, allocator, .{
         .domain = domain,
         .mode = if (mode_choice == 1) .behind else .mask,
+        .mode_explicit = true,
+        .only = only,
         .yes = true,
     });
 }
@@ -207,6 +251,42 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
         if (readConfigured(allocator, "port", &port_buf)) |configured| opts.port = configured;
     }
 
+    // Recover the rest of the deployment's shape from config.toml when the caller did
+    // not name it. `mtbuddy update` calls us with bare defaults, and defaults are
+    // `--mode mask` with a Let's Encrypt certificate — re-running a `behind` host or a
+    // bring-your-own-cert host that way rewrote it into a topology it never asked for.
+    if (!opts.mode_explicit and isInstalled()) {
+        var mode_buf: [16]u8 = undefined;
+        if (readConfigured(allocator, "mode", &mode_buf)) |persisted| {
+            opts.mode = if (std.ascii.eqlIgnoreCase(persisted, "behind")) .behind else .mask;
+        } else {
+            // A relay installed before `[web].mode` existed. Only mode "mask" has a
+            // PROXY-protocol terminator to point at, so the presence of `mask_backend`
+            // is the best record of what it was set up as.
+            var mask_backend_buf: [128]u8 = undefined;
+            opts.mode = if (readConfigured(allocator, "mask_backend", &mask_backend_buf) != null) .mask else .behind;
+        }
+    }
+    // Checked on what the CALLER passed, before the config fills in the missing half:
+    // `--cert new.pem` alone would otherwise be silently paired with the key already in
+    // config.toml, which is a mismatched pair nginx accepts at write time and fails on.
+    if ((opts.cert.len == 0) != (opts.key.len == 0)) {
+        ui.fail(tr(ui, "--cert and --key must be given together.", "--cert и --key задаются только вместе."));
+        return;
+    }
+    var cert_buf: [512]u8 = undefined;
+    var key_buf: [512]u8 = undefined;
+    if (opts.cert.len == 0 and opts.key.len == 0) {
+        opts.cert = readConfigured(allocator, "cert", &cert_buf) orelse "";
+        opts.key = readConfigured(allocator, "key", &key_buf) orelse "";
+        // A config carrying only one of the two is not a pair either; ignore both and
+        // fall back to the Let's Encrypt lineage rather than render a mismatch.
+        if (opts.cert.len == 0 or opts.key.len == 0) {
+            opts.cert = "";
+            opts.key = "";
+        }
+    }
+
     // Validate exactly the way the client does, so a domain that would be silently
     // rejected in Telegram Desktop is caught here instead of after the links go out.
     var canonical_buf: [web_capability.max_host_len]u8 = undefined;
@@ -240,10 +320,29 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
         return;
     }
 
+    // WEB-only leans on the masking backend: the refusal has to *look* like the
+    // wrong-secret path, and without a cover site every direct connection is simply
+    // closed — which is a cleaner active-probe signal than serving MTProto ever was.
+    if (opts.only == true and !maskingIsOn(allocator)) {
+        ui.fail(tr(
+            ui,
+            "--only needs the local masking backend: without it every refused connection is closed, not covered. Run: sudo mtbuddy setup masking",
+            "--only требует локального masking-бэкенда: без него отказ выглядит как закрытое соединение, а не как обычный сайт. Выполните: sudo mtbuddy setup masking",
+        ));
+        return;
+    }
+
     checkDns(ui, allocator, domain);
 
     if (opts.mode == .mask) {
-        if (!try prepareMaskTopology(ui, allocator, domain, opts)) return;
+        if (!try prepareMaskTopology(ui, allocator, domain, opts)) {
+            // The relay unit is independent of the nginx front it is served through, and
+            // `mtbuddy update` runs this whole module only to re-point that unit at the
+            // binary it just swapped. Refresh it even when the nginx side is unhappy, so
+            // an unrelated vhost problem cannot strand the relay on the old binary.
+            if (isInstalled()) try installService(ui, allocator);
+            return;
+        }
     } else if (!opts.quiet) {
         ui.info(tr(
             ui,
@@ -252,8 +351,27 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
         ));
     }
 
-    try writeConfig(ui, allocator, domain, opts.port, opts.mode == .mask);
+    // `only` is written LAST, and only after the relay is up. writeConfig restarts the
+    // proxy, and the restart is what starts masking every direct connection — so
+    // enabling WEB-only before `installService` would take the direct door away in the
+    // same breath as failing to open the WEB one, leaving a box that serves nobody.
+    var staged = opts;
+    staged.only = if (opts.only == true) null else opts.only;
+    try writeConfig(ui, allocator, domain, staged);
     try installService(ui, allocator);
+    if (opts.only == true) {
+        if (!sys.isServiceActive(SERVICE_NAME)) {
+            ui.fail(tr(
+                ui,
+                "The relay is not running, so WEB-only was NOT enabled — it would have left this proxy with no working links at all.",
+                "Релей не запущен, поэтому WEB-only НЕ включён — иначе у прокси не осталось бы ни одной рабочей ссылки.",
+            ));
+            ui.hint("journalctl -u " ++ SERVICE_NAME ++ " -n 50 --no-pager");
+            opts.only = false;
+        } else {
+            try writeConfig(ui, allocator, domain, opts);
+        }
+    }
 
     if (opts.mode == .mask and !opts.quiet) verifyEndToEnd(ui, allocator, domain);
     if (!opts.quiet) printSummary(ui, allocator, domain, opts);
@@ -278,10 +396,13 @@ fn prepareMaskTopology(ui: *Tui, allocator: std.mem.Allocator, domain: []const u
         return false;
     }
     if (!try ensureNginx(ui, allocator)) return false;
-    if (!opts.skip_cert) {
+    // A certificate the operator brought is theirs to renew; we neither issue nor touch
+    // it, and we do not install the certbot deploy hook for it either.
+    const byo_cert = opts.cert.len > 0 and opts.key.len > 0;
+    if (!opts.skip_cert and !byo_cert) {
         if (!try ensureCertificate(ui, allocator, domain, opts.email)) return false;
     }
-    if (!try writeVhost(ui, allocator, domain, opts.port)) return false;
+    if (!try writeVhost(ui, allocator, domain, opts)) return false;
     return true;
 }
 
@@ -482,7 +603,19 @@ fn installRenewHook(ui: *Tui, allocator: std.mem.Allocator) !void {
 
 /// Render the relay vhost. Split out from `writeVhost` so its shape is unit-testable —
 /// the two listeners and the X-Forwarded-For rule are both security-relevant.
-fn writeVhostContent(allocator: std.mem.Allocator, domain: []const u8, port: []const u8) ![]u8 {
+///
+/// `cert`/`key` are absolute paths. They used to be hard-coded to the Let's Encrypt
+/// lineage for `domain`, which made `--skip-cert` a trap: it skipped issuance but still
+/// rendered a vhost pointing at a file that was not there, so `nginx -t` failed and the
+/// whole setup rolled back. An operator with a certificate of their own (acme.sh, a
+/// wildcard, a Cloudflare Origin cert behind the CDN) now passes it in.
+fn writeVhostContent(
+    allocator: std.mem.Allocator,
+    domain: []const u8,
+    port: []const u8,
+    cert: []const u8,
+    key: []const u8,
+) ![]u8 {
     // The `map` is http-level; sites-enabled is included inside http{}, so it belongs
     // here. The variable is name-spaced so it cannot collide with an operator's own.
     return std.fmt.allocPrint(allocator,
@@ -504,8 +637,8 @@ fn writeVhostContent(allocator: std.mem.Allocator, domain: []const u8, port: []c
         \\    listen 127.0.0.1:{s} ssl proxy_protocol;
         \\    server_name {s};
         \\
-        \\    ssl_certificate     /etc/letsencrypt/live/{s}/fullchain.pem;
-        \\    ssl_certificate_key /etc/letsencrypt/live/{s}/privkey.pem;
+        \\    ssl_certificate     {s};
+        \\    ssl_certificate_key {s};
         \\    ssl_protocols TLSv1.2 TLSv1.3;
         \\    ssl_prefer_server_ciphers off;
         \\    ssl_session_cache shared:MTPROTOWEB:2m;
@@ -536,11 +669,46 @@ fn writeVhostContent(allocator: std.mem.Allocator, domain: []const u8, port: []c
         \\    error_log /var/log/nginx/mtproto-web-error.log warn;
         \\}}
         \\
-    , .{ domain, masking.NGINX_PORT, PROXY_PROTOCOL_PORT, domain, domain, domain, port });
+    , .{ domain, masking.NGINX_PORT, PROXY_PROTOCOL_PORT, domain, cert, key, port });
 }
 
-fn writeVhost(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, port: []const u8) !bool {
-    const content = writeVhostContent(allocator, domain, port) catch {
+/// Where the relay vhost's certificate lives: the operator's own paths when they gave
+/// us a pair, otherwise the Let's Encrypt lineage `ensureCertificate` maintains.
+fn certPaths(buf: *[1024]u8, domain: []const u8, opts: WebOpts) !struct { cert: []const u8, key: []const u8 } {
+    if (opts.cert.len > 0 and opts.key.len > 0) return .{ .cert = opts.cert, .key = opts.key };
+    var writer: std.Io.Writer = .fixed(buf);
+    try writer.print("/etc/letsencrypt/live/{s}/fullchain.pem", .{domain});
+    const cert_len = writer.buffered().len;
+    try writer.print("/etc/letsencrypt/live/{s}/privkey.pem", .{domain});
+    const all = writer.buffered();
+    return .{ .cert = all[0..cert_len], .key = all[cert_len..] };
+}
+
+fn writeVhost(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: WebOpts) !bool {
+    var paths_buf: [1024]u8 = undefined;
+    const paths = certPaths(&paths_buf, domain, opts) catch {
+        ui.fail(tr(ui, "Certificate path is too long", "Слишком длинный путь к сертификату"));
+        return false;
+    };
+    // nginx would fail its own test on a missing file and we would roll the vhost back
+    // with a message about nginx rather than about the path the operator typed.
+    if (!sys.fileExists(paths.cert) or !sys.fileExists(paths.key)) {
+        var msg_buf: [640]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s}: {s} / {s}", .{
+            tr(ui, "Certificate or key not found", "Сертификат или ключ не найден"),
+            paths.cert,
+            paths.key,
+        }) catch tr(ui, "Certificate or key not found", "Сертификат или ключ не найден");
+        ui.fail(msg);
+        ui.hint(tr(
+            ui,
+            "Issue one by re-running without --skip-cert, or point at your own with --cert <fullchain.pem> --key <privkey.pem>.",
+            "Выпустите сертификат, запустив без --skip-cert, или укажите свой: --cert <fullchain.pem> --key <privkey.pem>.",
+        ));
+        return false;
+    }
+
+    const content = writeVhostContent(allocator, domain, opts.port, paths.cert, paths.key) catch {
         ui.fail(tr(ui, "Could not render the relay vhost", "Не удалось сформировать vhost релея"));
         return false;
     };
@@ -588,7 +756,8 @@ fn nginxTestPasses(allocator: std.mem.Allocator) bool {
 /// `TomlDoc` round-trips add a trailing newline every time it saves, and
 /// `test/installer-e2e` asserts `mtbuddy update` leaves config.toml byte-identical. This
 /// module is re-run from `update`, so an unconditional save would fail that.
-fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, port: []const u8, mask_mode: bool) !void {
+fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: WebOpts) !void {
+    const mask_mode = opts.mode == .mask;
     if (!sys.fileExists(config_path)) {
         ui.warn(tr(ui, "config.toml not found — skipping [web] update", "config.toml не найден — пропускаю обновление [web]"));
         return;
@@ -602,12 +771,33 @@ fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, port:
     var quoted_domain_buf: [300]u8 = undefined;
     const quoted_domain = std.fmt.bufPrint(&quoted_domain_buf, "\"{s}\"", .{domain}) catch return;
     const quoted_mask_backend = "\"127.0.0.1:" ++ PROXY_PROTOCOL_PORT ++ "\"";
+    var quoted_cert_buf: [560]u8 = undefined;
+    var quoted_key_buf: [560]u8 = undefined;
+    const byo_cert = opts.cert.len > 0 and opts.key.len > 0;
+    const quoted_cert = if (byo_cert) std.fmt.bufPrint(&quoted_cert_buf, "\"{s}\"", .{opts.cert}) catch return else "";
+    const quoted_key = if (byo_cert) std.fmt.bufPrint(&quoted_key_buf, "\"{s}\"", .{opts.key}) catch return else "";
+    // `only` is tri-state on the way in: null means "leave whatever is there", so an
+    // `mtbuddy update` (which passes no flags) never flips a WEB-only deploy back.
+    const only_text: ?[]const u8 = if (opts.only) |v| (if (v) "true" else "false") else null;
+
+    // The mode is persisted only when the operator actually named one, or when the key
+    // is already there. An `mtbuddy update` names none, and introducing a key on its own
+    // would rewrite config.toml (and restart the proxy) on every update — which
+    // test/installer-e2e asserts against.
+    const write_mode = opts.mode_explicit or hasValue(&doc, "mode");
+    const mode_text: []const u8 = if (mask_mode) "\"mask\"" else "\"behind\"";
 
     var changed = false;
     changed = needsSet(&doc, "enabled", "true") or changed;
     changed = needsSet(&doc, "domain", quoted_domain) or changed;
-    changed = needsSet(&doc, "port", port) or changed;
+    changed = needsSet(&doc, "port", opts.port) or changed;
     if (mask_mode) changed = needsSet(&doc, "mask_backend", quoted_mask_backend) or changed;
+    if (write_mode) changed = needsSet(&doc, "mode", mode_text) or changed;
+    if (byo_cert) {
+        changed = needsSet(&doc, "cert", quoted_cert) or changed;
+        changed = needsSet(&doc, "key", quoted_key) or changed;
+    }
+    if (only_text) |v| changed = needsSet(&doc, "only", v) or changed;
     if (!changed) {
         ui.ok(tr(ui, "[web] already up to date", "[web] уже актуален"));
         return;
@@ -615,10 +805,16 @@ fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, port:
 
     try doc.set("web", "enabled", "true");
     try doc.set("web", "domain", quoted_domain);
-    try doc.set("web", "port", port);
+    try doc.set("web", "port", opts.port);
     // Only mode "mask" routes through the proxy, so only it has a PROXY-protocol
     // terminator to point at.
     if (mask_mode) try doc.set("web", "mask_backend", quoted_mask_backend);
+    if (write_mode) try doc.set("web", "mode", mode_text);
+    if (byo_cert) {
+        try doc.set("web", "cert", quoted_cert);
+        try doc.set("web", "key", quoted_key);
+    }
+    if (only_text) |v| try doc.set("web", "only", v);
     doc.save(config_path) catch {};
     _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path }) catch {};
 
@@ -631,6 +827,13 @@ fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, port:
 /// True when `[web].key` differs from `value`, comparing without surrounding quotes on
 /// either side — `doc.get` may or may not return them, and a false "changed" here
 /// means an unnecessary config rewrite plus a proxy restart on every `mtbuddy update`.
+/// True when `[web].key` is present with a non-empty value. An empty string is how this
+/// module expresses "unset" (TomlDoc cannot delete a key), so it must not read as set.
+fn hasValue(doc: *toml.TomlDoc, key: []const u8) bool {
+    const current = doc.get("web", key) orelse return false;
+    return std.mem.trim(u8, current, " \t\"").len > 0;
+}
+
 fn needsSet(doc: *toml.TomlDoc, key: []const u8, value: []const u8) bool {
     const current = doc.get("web", key) orelse return true;
     const cur = std.mem.trim(u8, current, " \t\"");
@@ -747,21 +950,48 @@ fn verifyEndToEnd(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) vo
 }
 
 fn printSummary(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: WebOpts) void {
-    _ = allocator;
     var url_buf: [320]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "https://{s}/", .{domain}) catch "";
 
-    const lines = [_]SummaryLine{
-        .{ .label = tr(ui, "Domain", "Домен"), .value = domain },
-        .{ .label = tr(ui, "Site", "Сайт"), .value = url },
-        .{ .label = tr(ui, "Mode", "Режим"), .value = if (opts.mode == .mask) tr(ui, "through the proxy's masking backend", "через masking-бэкенд прокси") else tr(ui, "behind your own TLS terminator", "за вашим TLS-терминатором") },
-        .{ .label = tr(ui, "Listener", "Слушает"), .value = "127.0.0.1:" ++ DEFAULT_PORT },
-        .{ .label = tr(ui, "Service", "Сервис"), .value = SERVICE_NAME },
-        .{ .style = .blank, .label = "" },
-        .{ .label = tr(ui, "Get WEB links: sudo mtbuddy links", "Ссылки WEB: sudo mtbuddy links"), .style = .code },
+    // `only` is tri-state, so the effective value after a run that did not touch it
+    // still has to come from the file we just wrote.
+    var only_buf: [8]u8 = undefined;
+    const only_now = opts.only orelse blk: {
+        const configured = readConfigured(allocator, "only", &only_buf) orelse break :blk false;
+        break :blk std.ascii.eqlIgnoreCase(configured, "true");
     };
-    ui.summaryBox(tr(ui, "WEB proxy relay ready", "Релей WEB-прокси готов"), &lines);
 
+    var lines_buf: [9]SummaryLine = undefined;
+    var n: usize = 0;
+    lines_buf[n] = .{ .label = tr(ui, "Domain", "Домен"), .value = domain };
+    n += 1;
+    lines_buf[n] = .{ .label = tr(ui, "Site", "Сайт"), .value = url };
+    n += 1;
+    lines_buf[n] = .{ .label = tr(ui, "Mode", "Режим"), .value = if (opts.mode == .mask) tr(ui, "through the proxy's masking backend", "через masking-бэкенд прокси") else tr(ui, "behind your own TLS terminator", "за вашим TLS-терминатором") };
+    n += 1;
+    lines_buf[n] = .{ .label = tr(ui, "Serves", "Отдаёт"), .value = if (only_now) tr(ui, "WEB links only — direct MTProto is masked", "только WEB-ссылки — прямой MTProto маскируется") else tr(ui, "WEB links alongside the usual MTProto ones", "WEB-ссылки вместе с обычными MTProto") };
+    n += 1;
+    if (opts.cert.len > 0) {
+        lines_buf[n] = .{ .label = tr(ui, "Certificate", "Сертификат"), .value = opts.cert };
+        n += 1;
+    }
+    lines_buf[n] = .{ .label = tr(ui, "Listener", "Слушает"), .value = "127.0.0.1:" ++ DEFAULT_PORT };
+    n += 1;
+    lines_buf[n] = .{ .label = tr(ui, "Service", "Сервис"), .value = SERVICE_NAME };
+    n += 1;
+    lines_buf[n] = .{ .style = .blank, .label = "" };
+    n += 1;
+    lines_buf[n] = .{ .label = tr(ui, "Get WEB links: sudo mtbuddy links", "Ссылки WEB: sudo mtbuddy links"), .style = .code };
+    n += 1;
+    ui.summaryBox(tr(ui, "WEB proxy relay ready", "Релей WEB-прокси готов"), lines_buf[0..n]);
+
+    if (only_now) {
+        ui.hint(tr(
+            ui,
+            "WEB-only is on: every ee/dd link you handed out before stops working, and one desktop client costs one [web].max_sessions slot.",
+            "WEB-only включён: все выданные ранее ee/dd-ссылки перестают работать, а каждый десктоп-клиент занимает слот [web].max_sessions.",
+        ));
+    }
     if (opts.mode == .behind) {
         ui.hint(tr(
             ui,
@@ -769,11 +999,18 @@ fn printSummary(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts
             "Направьте терминатор на 127.0.0.1:" ++ DEFAULT_PORT ++ ", пробросьте Upgrade/Connection и X-Forwarded-For.",
         ));
     }
-    ui.hint(tr(
-        ui,
-        "WEB links work in Telegram Desktop 7.1+ only; hand them out alongside the usual ones.",
-        "WEB-ссылки работают только в Telegram Desktop 7.1+; раздавайте их вместе с обычными.",
-    ));
+    ui.hint(if (only_now)
+        tr(
+            ui,
+            "WEB links work in Telegram Desktop 7.1+ only — under WEB-only there is no other kind to hand out.",
+            "WEB-ссылки работают только в Telegram Desktop 7.1+ — в режиме WEB-only других ссылок нет.",
+        )
+    else
+        tr(
+            ui,
+            "WEB links work in Telegram Desktop 7.1+ only; hand them out alongside the usual ones.",
+            "WEB-ссылки работают только в Telegram Desktop 7.1+; раздавайте их вместе с обычными.",
+        ));
 }
 
 // ── removal ───────────────────────────────────────────────────────────────────
@@ -817,6 +1054,11 @@ pub fn remove(ui: *Tui, allocator: std.mem.Allocator) void {
         if (doc) |*d| {
             defer d.deinit();
             d.set("web", "enabled", "false") catch {};
+            // Clear the WEB-only gate with it. `Web.onlyActive()` already refuses to
+            // honour `only` without `enabled`, so leaving it could not brick the proxy —
+            // but a stale `only = true` would silently switch WEB-only back on the next
+            // time someone runs `setup web`, which is not what "remove" means.
+            d.set("web", "only", "false") catch {};
             d.save(config_path) catch {};
             _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path }) catch {};
         }
@@ -852,6 +1094,27 @@ pub fn printStatus(ui: *Tui, allocator: std.mem.Allocator) void {
         } else {
             ui.ok(tr(ui, "WEB proxy relay is running", "Релей WEB-прокси работает"));
         }
+        // `[web].only` is read at boot and is not in the SIGHUP reload set, so an
+        // operator who edited config.toml by hand can otherwise believe it took effect.
+        // Say it out loud wherever the proxy's state is printed.
+        var only_buf: [8]u8 = undefined;
+        var enabled_buf: [8]u8 = undefined;
+        const web_enabled = if (readConfigured(allocator, "enabled", &enabled_buf)) |v|
+            std.ascii.eqlIgnoreCase(v, "true")
+        else
+            false;
+        if (readConfigured(allocator, "only", &only_buf)) |value| {
+            // Same gate as Config.Web.onlyActive(): `only` without `enabled` does
+            // nothing, and saying otherwise here would send an operator hunting for a
+            // masking problem that is not there.
+            if (web_enabled and std.ascii.eqlIgnoreCase(value, "true")) {
+                ui.info(tr(
+                    ui,
+                    "WEB-only: direct MTProto is masked — only tg://webproxy links work.",
+                    "WEB-only: прямой MTProto маскируется — работают только ссылки tg://webproxy.",
+                ));
+            }
+        }
     } else {
         ui.fail(tr(ui, "WEB proxy relay is installed but not running", "Релей WEB-прокси установлен, но не работает"));
         ui.hint("journalctl -u " ++ SERVICE_NAME ++ " -n 50 --no-pager");
@@ -871,7 +1134,13 @@ test "the systemd unit runs the relay mode of the proxy binary and drops all cap
 }
 
 test "the relay vhost carries both listeners and never appends to X-Forwarded-For" {
-    const rendered = try writeVhostContent(std.testing.allocator, "relay.example.com", "8081");
+    const rendered = try writeVhostContent(
+        std.testing.allocator,
+        "relay.example.com",
+        "8081",
+        "/etc/letsencrypt/live/relay.example.com/fullchain.pem",
+        "/etc/letsencrypt/live/relay.example.com/privkey.pem",
+    );
     defer std.testing.allocator.free(rendered);
     try std.testing.expect(std.mem.containsAtLeast(u8, rendered, 1, "listen 127.0.0.1:8443 ssl;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, rendered, 1, "listen 127.0.0.1:8444 ssl proxy_protocol;"));
@@ -893,4 +1162,38 @@ test "domain validation matches the client's own rules" {
     try std.testing.expectEqualStrings("relay.example.com", try web_capability.normalizeHost("Relay.Example.COM", &buf));
     try std.testing.expectError(error.IpLiteral, web_capability.normalizeHost("203.0.113.7", &buf));
     try std.testing.expectError(error.NotFullyQualified, web_capability.normalizeHost("relay", &buf));
+}
+
+test "certPaths defaults to the Let's Encrypt lineage and honours a bring-your-own pair" {
+    var buf: [1024]u8 = undefined;
+    const defaulted = try certPaths(&buf, "relay.example.com", .{});
+    try std.testing.expectEqualStrings("/etc/letsencrypt/live/relay.example.com/fullchain.pem", defaulted.cert);
+    try std.testing.expectEqualStrings("/etc/letsencrypt/live/relay.example.com/privkey.pem", defaulted.key);
+
+    const byo = try certPaths(&buf, "relay.example.com", .{
+        .cert = "/etc/ssl/relay/fullchain.pem",
+        .key = "/etc/ssl/relay/privkey.pem",
+    });
+    try std.testing.expectEqualStrings("/etc/ssl/relay/fullchain.pem", byo.cert);
+    try std.testing.expectEqualStrings("/etc/ssl/relay/privkey.pem", byo.key);
+
+    // Only a complete pair counts; a half-configured one falls back rather than
+    // rendering a vhost with one operator path and one Let's Encrypt path.
+    const half = try certPaths(&buf, "relay.example.com", .{ .cert = "/etc/ssl/relay/fullchain.pem" });
+    try std.testing.expectEqualStrings("/etc/letsencrypt/live/relay.example.com/fullchain.pem", half.cert);
+}
+
+test "a bring-your-own certificate reaches the rendered vhost verbatim" {
+    const rendered = try writeVhostContent(
+        std.testing.allocator,
+        "relay.example.com",
+        "8081",
+        "/etc/ssl/relay/fullchain.pem",
+        "/etc/ssl/relay/privkey.pem",
+    );
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.containsAtLeast(u8, rendered, 1, "ssl_certificate     /etc/ssl/relay/fullchain.pem;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, rendered, 1, "ssl_certificate_key /etc/ssl/relay/privkey.pem;"));
+    // The old renderer hard-coded this path; a leak of it back in is the regression.
+    try std.testing.expect(!std.mem.containsAtLeast(u8, rendered, 1, "/etc/letsencrypt/"));
 }
