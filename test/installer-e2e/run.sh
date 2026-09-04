@@ -409,7 +409,7 @@ echo "tunnel ownership: adopted config left unmarked, created configs marked"
 CONTAINER_SCRIPT
 }
 
-# Uninstall must remove every artifact AND do it without spewing expected-failure noise
+# Uninstall must remove owned artifacts AND do it without spewing expected-failure noise
 # (stop/disable of absent units, flushing an absent table 200, deleting an absent netns).
 verify_uninstall() {
   local container="$1"
@@ -418,6 +418,9 @@ verify_uninstall() {
 set -Eeuo pipefail
 
 # Exercise WEB provisioning before asserting that uninstall removes its artifacts.
+# Earlier setup fixtures restart the proxy repeatedly; isolate this scenario
+# from systemd's start-rate counter without changing the installed unit limits.
+systemctl reset-failed mtproto-proxy.service
 mtbuddy setup web --mode behind --domain relay.example.test --yes
 test -f /etc/systemd/system/mtproto-web-relay.service
 # Explicit sing-box cleanup fixtures: these test removal, not a provider connection.
@@ -425,6 +428,10 @@ mkdir -p /etc/mtproto-proxy
 printf '{}\n' > /etc/mtproto-proxy/singbox-egress.json
 printf '[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/mtproto-singbox-egress.service
 systemctl daemon-reload
+shared_singbox_hash=""
+if [ -f /usr/local/bin/sing-box ]; then
+  shared_singbox_hash="$(sha256sum /usr/local/bin/sing-box)"
+fi
 out="$(mtbuddy uninstall --yes 2>&1)"
 printf '%s\n' "$out"
 
@@ -441,7 +448,6 @@ for f in \
   /etc/nginx/sites-available/mtproto-web \
   /etc/nginx/sites-enabled/mtproto-web \
   /usr/local/bin/setup_tunnel.sh \
-  /usr/local/bin/sing-box \
   /usr/local/bin/mtproto-singbox-route.sh \
   /etc/mtproto-proxy/singbox-egress.json \
   /usr/local/sbin/mtproto-tcpmss.sh \
@@ -450,6 +456,11 @@ for f in \
   /usr/local/bin/mtbuddy ; do
   if [ -e "$f" ]; then echo "FAIL: leftover $f"; fail=1; fi
 done
+
+# Shared dependencies can be used by other services and must remain untouched.
+if [ -n "$shared_singbox_hash" ] && ! printf '%s\n' "$shared_singbox_hash" | sha256sum --check --status; then
+  echo "FAIL: uninstall removed or changed shared sing-box"; fail=1
+fi
 
 # No mtproto unit files registered with systemd anymore.
 leftover_units="$(systemctl list-unit-files 2>/dev/null | grep -E "mtproto-(proxy|singbox|tunnel-pool|mask|web|tcpmss|syn-limit)" || true)"
