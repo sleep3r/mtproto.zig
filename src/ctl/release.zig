@@ -105,6 +105,7 @@ pub fn resolveTag(
 ) bool {
     if (version) |v| {
         if (v.len == 0 or std.mem.eql(u8, v, "latest")) return resolveLatest(allocator, tag);
+        if (v.len > tag.buf.len - @intFromBool(v[0] != 'v')) return false;
         if (v[0] != 'v') {
             tag.buf[0] = 'v';
             const n = @min(v.len, tag.buf.len - 1);
@@ -122,9 +123,10 @@ pub fn resolveTag(
 
 /// Download, extract, and validate a proxy binary from GitHub Releases.
 ///
-/// Detects CPU architecture and tries optimised builds first (x86_64_v3),
-/// falling back to the base build. Validates the downloaded binary can
-/// execute on this CPU (catches SIGILL from unsupported instructions).
+/// Detects CPU architecture and tries optimised builds first (x86_64_v3 on x86_64,
+/// aarch64_crypto on ARM64), falling back to the base build. Validates the downloaded
+/// binary can execute on this CPU (catches SIGILL from unsupported instructions), which
+/// is also the safety net if crypto detection above ever mispredicts.
 ///
 /// `label` is used in the temp directory name (e.g. "install", "update").
 /// Returns true on success (artifact is populated), false on failure.
@@ -138,14 +140,10 @@ pub fn downloadProxyArtifact(
     // ── Detect architecture ──
     const arch = sys.getArch() catch return false;
     const supports_v3 = if (arch == .x86_64) sys.supportsV3(allocator) else false;
+    const supports_aarch64_crypto = if (arch == .aarch64) supportsAarch64Aes(allocator) else false;
 
     // ── Build candidate list ──
-    const candidates: []const []const u8 = if (supports_v3)
-        &[_][]const u8{ "mtproto-proxy-linux-x86_64_v3", "mtproto-proxy-linux-x86_64" }
-    else if (arch == .aarch64)
-        &[_][]const u8{"mtproto-proxy-linux-aarch64"}
-    else
-        &[_][]const u8{"mtproto-proxy-linux-x86_64"};
+    const candidates = proxyCandidates(arch, supports_v3, supports_aarch64_crypto);
 
     // ── Prepare extraction directory ──
     // Unpredictable name + create-exclusive 0700 (mkdir without -p): a local unprivileged
@@ -201,7 +199,7 @@ pub fn downloadProxyArtifact(
         // Validate — run with a nonexistent config to check for SIGILL (exit 132)
         const check = sys.exec(allocator, &.{
             bin_path,
-            "/tmp/.mtproto-release-check-nonexistent.toml",
+            "--help",
         }) catch continue;
         defer check.deinit();
 
@@ -213,6 +211,88 @@ pub fn downloadProxyArtifact(
     }
 
     return false;
+}
+
+/// Ordered candidate proxy asset names: best-available first, generic baseline last as the
+/// guaranteed-to-work fallback if the post-download SIGILL exec check rejects everything
+/// ahead of it. `downloadBuddyArtifact` derives the buddy asset name from whichever of
+/// these wins, so a new tuned rung here needs a matching artifact published in
+/// release-please.yml or mtbuddy's own self-update finds no download.
+fn proxyCandidates(arch: sys.Arch, supports_v3: bool, supports_aarch64_crypto: bool) []const []const u8 {
+    if (arch == .x86_64 and supports_v3)
+        return &[_][]const u8{ "mtproto-proxy-linux-x86_64_v3", "mtproto-proxy-linux-x86_64" };
+    if (arch == .aarch64 and supports_aarch64_crypto)
+        return &[_][]const u8{ "mtproto-proxy-linux-aarch64_crypto", "mtproto-proxy-linux-aarch64" };
+    if (arch == .aarch64)
+        return &[_][]const u8{"mtproto-proxy-linux-aarch64"};
+    return &[_][]const u8{"mtproto-proxy-linux-x86_64"};
+}
+
+test "proxyCandidates prefers aarch64_crypto with the plain build as fallback" {
+    const with_crypto = proxyCandidates(.aarch64, false, true);
+    try std.testing.expectEqual(@as(usize, 2), with_crypto.len);
+    try std.testing.expectEqualStrings("mtproto-proxy-linux-aarch64_crypto", with_crypto[0]);
+    try std.testing.expectEqualStrings("mtproto-proxy-linux-aarch64", with_crypto[1]);
+}
+
+test "proxyCandidates has no aarch64_crypto candidate without the aes feature" {
+    const without_crypto = proxyCandidates(.aarch64, false, false);
+    try std.testing.expectEqual(@as(usize, 1), without_crypto.len);
+    try std.testing.expectEqualStrings("mtproto-proxy-linux-aarch64", without_crypto[0]);
+}
+
+test "proxyCandidates leaves x86_64 selection untouched" {
+    const v3 = proxyCandidates(.x86_64, true, false);
+    try std.testing.expectEqual(@as(usize, 2), v3.len);
+    try std.testing.expectEqualStrings("mtproto-proxy-linux-x86_64_v3", v3[0]);
+
+    const baseline = proxyCandidates(.x86_64, false, false);
+    try std.testing.expectEqual(@as(usize, 1), baseline.len);
+    try std.testing.expectEqualStrings("mtproto-proxy-linux-x86_64", baseline[0]);
+}
+
+/// True if this ARM64 host exposes the ARMv8-A crypto extension's AES instructions.
+/// Mirrors sys.supportsV3's shape but reads a different key: aarch64 /proc/cpuinfo
+/// publishes "Features", not x86's "flags", and the token set is unrelated, so this
+/// can't reuse that parser directly. `generic` (what an unpinned aarch64-linux target
+/// builds against) carries `fuse_aes`, a scheduling hint, but not the `aes` feature
+/// itself — without this check every ARM host, crypto-capable or not, kept downloading
+/// the software-AES baseline artifact forever.
+fn supportsAarch64Aes(allocator: std.mem.Allocator) bool {
+    if (@import("builtin").os.tag != .linux) return false;
+
+    const content = sys.readFileAllocAbsolute(allocator, "/proc/cpuinfo", 4 * 1024 * 1024) orelse return false;
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "Features")) continue;
+        return containsFeatureWord(line, "aes");
+    }
+    return false;
+}
+
+fn containsFeatureWord(haystack: []const u8, word: []const u8) bool {
+    var i: usize = 0;
+    while (i + word.len <= haystack.len) {
+        if (std.mem.eql(u8, haystack[i..][0..word.len], word)) {
+            const before_ok = (i == 0) or (haystack[i - 1] == ' ' or haystack[i - 1] == '\t' or haystack[i - 1] == ':');
+            const after_idx = i + word.len;
+            const after_ok = (after_idx >= haystack.len) or (haystack[after_idx] == ' ' or haystack[after_idx] == '\t' or haystack[after_idx] == '\n' or haystack[after_idx] == '\r');
+            if (before_ok and after_ok) return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+test "containsFeatureWord matches aes as a whole Features token only" {
+    const line = "Features\t\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid";
+    try std.testing.expect(containsFeatureWord(line, "aes"));
+    // A feature name that merely contains "aes" as a substring must not match
+    // (guards against false positives from unrelated future feature names).
+    try std.testing.expect(!containsFeatureWord("Features\t\t: fp asimd aesx", "aes"));
+    try std.testing.expect(!containsFeatureWord("Features\t\t: fp asimd evtstrm", "aes"));
 }
 
 /// Download the mtbuddy binary for the same platform as a proxy artifact.
@@ -253,75 +333,8 @@ pub fn downloadBuddyArtifact(
 /// Write the systemd service file from embedded content.
 /// Avoids network dependency on raw.githubusercontent.com which may be
 /// throttled or blocked on some hosting providers.
-pub fn writeServiceFile() void {
-    const content =
-        \\[Unit]
-        \\Description=MTProto Proxy (Zig)
-        \\Documentation=https://github.com/sleep3r/mtproto.zig
-        \\After=network-online.target
-        \\Wants=network-online.target
-        \\
-        \\[Service]
-        \\# Type=simple (not notify): the proxy's sd_notify READY works on bare-metal
-        \\# systemd, but containerized systemd (Docker/LXC) frequently fails to deliver
-        \\# the notify datagram, which would restart-loop a perfectly healthy proxy.
-        \\# simple is robust everywhere; Restart=always still recovers crashes. Re-enable
-        \\# Type=notify + WatchdogSec only behind container detection + ping validation.
-        \\Type=simple
-        \\User=mtproto
-        \\Group=mtproto
-        \\WorkingDirectory=/opt/mtproto-proxy
-        \\ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
-        \\ExecReload=/bin/kill -HUP $MAINPID
-        \\KillSignal=SIGTERM
-        \\TimeoutStopSec=25
-        \\Restart=always
-        \\RestartSec=3
-        \\
-        \\# Security hardening
-        \\NoNewPrivileges=yes
-        \\ProtectSystem=strict
-        \\ProtectHome=yes
-        \\PrivateTmp=yes
-        \\ReadOnlyPaths=/opt/mtproto-proxy
-        \\
-        \\# Syscall + kernel surface reduction (@system-service baseline; AF_NETLINK
-        \\# for glibc getaddrinfo, AF_UNIX for sd_notify). Validate egress modes on a
-        \\# real host before tightening further.
-        \\SystemCallFilter=@system-service
-        \\SystemCallArchitectures=native
-        \\SystemCallErrorNumber=EPERM
-        \\RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-        \\MemoryDenyWriteExecute=yes
-        \\RestrictNamespaces=yes
-        \\LockPersonality=yes
-        \\RestrictRealtime=yes
-        \\RestrictSUIDSGID=yes
-        \\ProtectKernelTunables=yes
-        \\ProtectKernelModules=yes
-        \\ProtectKernelLogs=yes
-        \\ProtectControlGroups=yes
-        \\ProtectClock=yes
-        \\ProtectHostname=yes
-        \\ProtectProc=invisible
-        \\ProcSubset=pid
-        \\PrivateDevices=yes
-        \\RemoveIPC=yes
-        \\UMask=0077
-        \\
-        \\# Allow binding to privileged ports (443)
-        \\AmbientCapabilities=CAP_NET_BIND_SERVICE
-        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-        \\
-        \\# Limits
-        \\LimitNOFILE=131582
-        \\TasksMax=65535
-        \\
-        \\[Install]
-        \\WantedBy=multi-user.target
-        \\
-    ;
-    sys.writeFile(SERVICE_FILE, content) catch {};
+pub fn writeServiceFile() !void {
+    try sys.writeFile(SERVICE_FILE, @import("build_options").proxy_service);
 }
 
 /// Remove temporary files created during download.

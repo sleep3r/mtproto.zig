@@ -49,6 +49,8 @@ const INSTALL_DIR = "/opt/mtproto-proxy";
 const CONFIG_PATH = INSTALL_DIR ++ "/config.toml";
 const SB_CONFIG_DIR = "/etc/mtproto-proxy";
 const SB_CONFIG_PATH = SB_CONFIG_DIR ++ "/singbox-egress.json";
+/// Where a generated config waits while `sing-box check` judges it — see setupSingboxTunnel.
+const SB_CANDIDATE_PATH = SB_CONFIG_PATH ++ ".new";
 const SB_SERVICE_NAME = "mtproto-singbox-egress.service";
 const SB_SERVICE_PATH = "/etc/systemd/system/" ++ SB_SERVICE_NAME;
 const SB_ROUTE_SCRIPT = "/usr/local/bin/mtproto-singbox-route.sh";
@@ -137,13 +139,73 @@ const PROXY_EGRESS_DROPIN = "[Unit]\nAfter=" ++ SB_SERVICE_NAME ++ "\nWants=" ++
 const TUN_TABLE = "200"; // same policy-routing table the AmneziaWG tunnel uses
 const TUN_FWMARK = "200"; // proxy SO_MARK for tunnel egress
 
+/// Policy-routing helper: the sing-box unit runs it after start (`ExecStartPost`) and,
+/// with `down`, after stop (`ExecStopPost`).
+///
+/// It fails CLOSED, and that is the whole point of the blackhole. A policy rule that
+/// matches but resolves nothing does NOT drop the packet — the kernel walks on to the next
+/// rule — so an EMPTY table 200 sends the proxy's SO_MARK'd DC sockets out of the host's
+/// real uplink: the origin the egress exists to hide, leaked with no log line, no metric
+/// and no user-visible symptom. sbx0's route is `dev`-bound, so the kernel purges it the
+/// instant sing-box stops or crashes. The blackhole is therefore installed BEFORE we wait
+/// for the tun and restored when the unit stops; `ip route replace default dev sbx0`
+/// simply overwrites it while the tun is up. The AmneziaWG pool script fails closed the
+/// same way (tunnel_wg.zig, "Fail CLOSED").
+const SB_ROUTE_SCRIPT_BODY = "#!/bin/bash\n" ++
+    "blackhole() {\n" ++
+    "    ip route replace blackhole default table " ++ TUN_TABLE ++ " 2>/dev/null || true\n" ++
+    "    ip -6 route replace blackhole default table " ++ TUN_TABLE ++ " 2>/dev/null || true\n" ++
+    "}\n" ++
+    // `down` only restores the blackhole: re-adding the rule on every stop would stack
+    // duplicate `fwmark 200 lookup 200` entries for the life of the boot.
+    "if [ \"${1:-up}\" = \"down\" ]; then blackhole; exit 0; fi\n" ++
+    "for family in -4 -6; do\n" ++
+    "  while ip $family rule del fwmark " ++ TUN_FWMARK ++ " lookup " ++ TUN_TABLE ++ " 2>/dev/null; do :; done\n" ++
+    "  ip $family rule add fwmark " ++ TUN_FWMARK ++ " lookup " ++ TUN_TABLE ++ " || exit 1\n" ++
+    "done\n" ++
+    "blackhole\n" ++
+    "for i in $(seq 1 60); do ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 && break; sleep 0.25; done\n" ++
+    "ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 || { echo 'mtproto egress: " ++ TUN_IFACE ++ " never appeared (sing-box failed to start the tun?)' >&2; exit 1; }\n" ++
+    "ip route replace default dev " ++ TUN_IFACE ++ " table " ++ TUN_TABLE ++ "\n";
+
+/// The sing-box unit. Rendered rather than a const because ExecStart names the binary we
+/// actually found; `refreshFailClosedRouting` re-renders it to add the ExecStopPost that a
+/// pre-fail-closed host is missing.
+fn renderEgressUnit(a: std.mem.Allocator, sb_bin: []const u8) ![]const u8 {
+    if (!std.fs.path.isAbsolute(sb_bin)) return error.InvalidBinaryPath;
+    return std.fmt.allocPrint(a,
+        \\[Unit]
+        \\Description=mtproto-proxy sing-box tunnel egress
+        \\After=network-online.target
+        \\Wants=network-online.target
+        \\
+        \\[Service]
+        \\ExecStart={s} run -c {s}
+        \\ExecStartPost=+{s}
+        \\ExecStopPost=+{s} down
+        \\Restart=on-failure
+        \\RestartSec=3
+        \\AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+    , .{ sb_bin, SB_CONFIG_PATH, SB_ROUTE_SCRIPT, SB_ROUTE_SCRIPT });
+}
+
+fn sleepSeconds(seconds: u64) void {
+    const req: std.posix.timespec = .{ .sec = @intCast(seconds), .nsec = 0 };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
 // ── Xray client config generation ───────────────────────────────────────────────
 
 /// JSON-escape + quote a string (returns including the surrounding quotes). Control
 /// characters below 0x20 are emitted as \u00XX — a raw control byte (reachable via a
 /// percent-decoded link field) would otherwise produce JSON sing-box rejects.
-fn js(a: std.mem.Allocator, s: []const u8) []const u8 {
-    var buf = a.alloc(u8, s.len * 6 + 2) catch return "\"\"";
+fn js(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+    var buf = try a.alloc(u8, s.len * 6 + 2);
     var w: usize = 0;
     buf[w] = '"';
     w += 1;
@@ -188,13 +250,26 @@ fn js(a: std.mem.Allocator, s: []const u8) []const u8 {
     return buf[0..w];
 }
 
+test "egress generation rejects missing links and invalid JSON text" {
+    try std.testing.expectError(error.NoLinks, genSingboxConfig(std.testing.allocator, &.{}));
+    try std.testing.expectError(error.InvalidUtf8, js(std.testing.allocator, "\xff"));
+}
+
+test "endpoint comparison distinguishes port prefixes" {
+    try std.testing.expect(!sameEgressEndpoints("{\"server\":\"host\",\"server_port\":44,\"uuid\":\"x\"}", "{\"server\":\"host\",\"server_port\":443,\"uuid\":\"x\"}"));
+}
+
 fn sbTls(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
     const sni = l.sni orelse l.host orelse l.address;
     const fp = l.fingerprint orelse "chrome";
     if (std.mem.eql(u8, l.security, "reality")) {
-        return std.fmt.allocPrint(a, ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"utls\":{{\"enabled\":true,\"fingerprint\":{s}}},\"reality\":{{\"enabled\":true,\"public_key\":{s},\"short_id\":{s}}}}}", .{ js(a, sni), js(a, fp), js(a, l.public_key orelse ""), js(a, l.short_id orelse "") });
+        return std.fmt.allocPrint(a, ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"utls\":{{\"enabled\":true,\"fingerprint\":{s}}},\"reality\":{{\"enabled\":true,\"public_key\":{s},\"short_id\":{s}}}}}", .{ try js(a, sni), try js(a, fp), try js(a, l.public_key orelse ""), try js(a, l.short_id orelse "") });
     } else if (std.mem.eql(u8, l.security, "tls")) {
-        return std.fmt.allocPrint(a, ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"utls\":{{\"enabled\":true,\"fingerprint\":{s}}}}}", .{ js(a, sni), js(a, fp) });
+        // `allowInsecure=1` rides through as sing-box's `insecure`, and ONLY when the link
+        // asked for it. Dropped, a self-signed 3x-ui endpoint got an outbound that verifies
+        // strictly: `sing-box check` passes, the unit starts, and every dial dies on x509.
+        const insecure = if (l.insecure) ",\"insecure\":true" else "";
+        return std.fmt.allocPrint(a, ",\"tls\":{{\"enabled\":true,\"server_name\":{s}{s},\"utls\":{{\"enabled\":true,\"fingerprint\":{s}}}}}", .{ try js(a, sni), insecure, try js(a, fp) });
     }
     return "";
 }
@@ -213,16 +288,16 @@ fn sbTlsHy2(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
     return std.fmt.allocPrint(
         a,
         ",\"tls\":{{\"enabled\":true,\"server_name\":{s},\"insecure\":{s}}}",
-        .{ js(a, sni), if (l.insecure) "true" else "false" },
+        .{ try js(a, sni), if (l.insecure) "true" else "false" },
     );
 }
 
 fn sbTransport(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
     const sni = l.sni orelse l.host orelse l.address;
     if (std.mem.eql(u8, l.network, "ws")) {
-        return std.fmt.allocPrint(a, ",\"transport\":{{\"type\":\"ws\",\"path\":{s},\"headers\":{{\"Host\":{s}}}}}", .{ js(a, l.path orelse "/"), js(a, l.host orelse sni) });
+        return std.fmt.allocPrint(a, ",\"transport\":{{\"type\":\"ws\",\"path\":{s},\"headers\":{{\"Host\":{s}}}}}", .{ try js(a, l.path orelse "/"), try js(a, l.host orelse sni) });
     } else if (std.mem.eql(u8, l.network, "grpc")) {
-        return std.fmt.allocPrint(a, ",\"transport\":{{\"type\":\"grpc\",\"service_name\":{s}}}", .{js(a, l.path orelse "")});
+        return std.fmt.allocPrint(a, ",\"transport\":{{\"type\":\"grpc\",\"service_name\":{s}}}", .{try js(a, l.path orelse "")});
     }
     return "";
 }
@@ -230,25 +305,26 @@ fn sbTransport(a: std.mem.Allocator, l: XrayLink) ![]const u8 {
 fn sbOutbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
     // The Xray-family TLS/transport blocks. The hysteria2 arm below uses neither — it
     // builds its own TLS and has no transport concept.
-    const tls = try sbTls(a, l);
-    const tr = try sbTransport(a, l);
+    const uses_xray_transport = l.scheme == .vless or l.scheme == .vmess or l.scheme == .trojan;
+    const tls = if (uses_xray_transport) try sbTls(a, l) else "";
+    const tr = if (uses_xray_transport) try sbTransport(a, l) else "";
     return switch (l.scheme) {
         .vless => blk: {
-            const flow = if (l.flow) |f| try std.fmt.allocPrint(a, ",\"flow\":{s}", .{js(a, f)}) else "";
-            break :blk std.fmt.allocPrint(a, "{{\"type\":\"vless\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s}{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), flow, tls, tr });
+            const flow = if (l.flow) |f| try std.fmt.allocPrint(a, ",\"flow\":{s}", .{try js(a, f)}) else "";
+            break :blk std.fmt.allocPrint(a, "{{\"type\":\"vless\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s}{s}{s}{s}}}", .{ try js(a, tag), try js(a, l.address), l.port, try js(a, l.id.?), flow, tls, tr });
         },
-        .vmess => std.fmt.allocPrint(a, "{{\"type\":\"vmess\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s},\"alter_id\":{d},\"security\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.id.?), l.alter_id, js(a, l.cipher), tls, tr }),
-        .trojan => std.fmt.allocPrint(a, "{{\"type\":\"trojan\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"password\":{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.password.?), tls, tr }),
-        .shadowsocks => std.fmt.allocPrint(a, "{{\"type\":\"shadowsocks\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"method\":{s},\"password\":{s}}}", .{ js(a, tag), js(a, l.address), l.port, js(a, l.method.?), js(a, l.password.?) }),
+        .vmess => std.fmt.allocPrint(a, "{{\"type\":\"vmess\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"uuid\":{s},\"alter_id\":{d},\"security\":{s}{s}{s}}}", .{ try js(a, tag), try js(a, l.address), l.port, try js(a, l.id.?), l.alter_id, try js(a, l.cipher), tls, tr }),
+        .trojan => std.fmt.allocPrint(a, "{{\"type\":\"trojan\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"password\":{s}{s}{s}}}", .{ try js(a, tag), try js(a, l.address), l.port, try js(a, l.password.?), tls, tr }),
+        .shadowsocks => std.fmt.allocPrint(a, "{{\"type\":\"shadowsocks\",\"tag\":{s},\"server\":{s},\"server_port\":{d},\"method\":{s},\"password\":{s}}}", .{ try js(a, tag), try js(a, l.address), l.port, try js(a, l.method.?), try js(a, l.password.?) }),
         .hysteria2 => blk: {
             // No `tr`: hysteria2 is QUIC end to end, it has no ws/grpc transport to carry.
             const hy_tls = try sbTlsHy2(a, l);
-            const pw = if (l.password) |p| try std.fmt.allocPrint(a, ",\"password\":{s}", .{js(a, p)}) else "";
+            const pw = if (l.password) |p| try std.fmt.allocPrint(a, ",\"password\":{s}", .{try js(a, p)}) else "";
             const obfs = if (l.obfs) |o|
-                try std.fmt.allocPrint(a, ",\"obfs\":{{\"type\":{s},\"password\":{s}}}", .{ js(a, o), js(a, l.obfs_password orelse "") })
+                try std.fmt.allocPrint(a, ",\"obfs\":{{\"type\":{s},\"password\":{s}}}", .{ try js(a, o), try js(a, l.obfs_password orelse "") })
             else
                 "";
-            break :blk std.fmt.allocPrint(a, "{{\"type\":\"hysteria2\",\"tag\":{s},\"server\":{s},\"server_port\":{d}{s}{s}{s}}}", .{ js(a, tag), js(a, l.address), l.port, pw, obfs, hy_tls });
+            break :blk std.fmt.allocPrint(a, "{{\"type\":\"hysteria2\",\"tag\":{s},\"server\":{s},\"server_port\":{d}{s}{s}{s}}}", .{ try js(a, tag), try js(a, l.address), l.port, pw, obfs, hy_tls });
         },
         else => error.UnsupportedScheme,
     };
@@ -259,6 +335,7 @@ fn sbOutbound(a: std.mem.Allocator, l: XrayLink, tag: []const u8) ![]const u8 {
 /// one outbound per link. >1 link adds a `urltest` selector (health-based failover — the
 /// analogue of the tunnel pool). VLESS-Reality camouflages the egress hop as real TLS.
 pub fn genSingboxConfig(a: std.mem.Allocator, links: []const XrayLink) ![]const u8 {
+    if (links.len == 0) return error.NoLinks;
     var outs: std.ArrayListUnmanaged(u8) = .empty;
     for (links, 0..) |l, i| {
         const tag = try std.fmt.allocPrint(a, "egress-{d}", .{i});
@@ -273,7 +350,7 @@ pub fn genSingboxConfig(a: std.mem.Allocator, links: []const XrayLink) ![]const 
             if (i != 0) try tags.append(a, ',');
             try tags.appendSlice(a, try std.fmt.allocPrint(a, "\"egress-{d}\"", .{i}));
         }
-        selector = try std.fmt.allocPrint(a, ",{{\"type\":\"urltest\",\"tag\":\"egress\",\"outbounds\":[{s}],\"url\":\"https://www.gstatic.com/generate_204\",\"interval\":\"10s\"}}", .{tags.items});
+        selector = try std.fmt.allocPrint(a, ",{{\"type\":\"urltest\",\"tag\":\"egress\",\"outbounds\":[{s}],\"url\":\"https://www.gstatic.com/generate_204\",\"interval\":\"60s\",\"tolerance\":50}}", .{tags.items});
         final_tag = "egress";
     }
     return std.fmt.allocPrint(a, "{{\"log\":{{\"level\":\"warn\"}},\"inbounds\":[{{\"type\":\"tun\",\"tag\":\"tun-in\",\"interface_name\":\"{s}\",\"address\":[\"{s}\"],\"auto_route\":false,\"stack\":\"{s}\",\"mtu\":{s}}}],\"outbounds\":[{s},{{\"type\":\"direct\",\"tag\":\"direct\"}}{s}],\"route\":{{\"auto_detect_interface\":true,\"final\":\"{s}\"}}}}", .{ TUN_IFACE, TUN_ADDR, TUN_STACK, TUN_MTU, outs.items, selector, final_tag });
@@ -291,6 +368,13 @@ fn dispatchLinks(ui: *Tui, allocator: std.mem.Allocator, link_list: []const []co
     // One egress = one provider family. Reject a mix of wireguard:// and Xray links.
     const fam0 = schemeFamily(detectScheme(link_list[0]));
     for (link_list) |l| {
+        // Before anything else: the pasted text is recorded verbatim in the root-owned
+        // config.toml (`[upstream.xray] links`), so a newline in it injects TOML the proxy
+        // then honours — e.g. an extra [access.users] entry. See sharelink.linkTextIsSafe.
+        if (!sharelink.linkTextIsSafe(l)) {
+            ui.fail("Refusing a share-link containing a newline, control byte or quote — it would inject config into config.toml");
+            return;
+        }
         const s = detectScheme(l);
         if (s == .unknown) {
             ui.fail("Unrecognized share-link scheme (want vless/vmess/trojan/ss/hysteria2/wireguard)");
@@ -316,7 +400,11 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             deps_only = true;
             continue;
         }
-        if (arg.len > 0 and arg[0] != '-') links.append(allocator, arg) catch {};
+        if (arg.len > 0 and arg[0] != '-') {
+            try links.append(allocator, arg);
+        } else {
+            return error.UnknownOption;
+        }
     }
     if (deps_only) {
         ui.step("Checking sing-box dependency...");
@@ -400,14 +488,16 @@ fn setupWireguard(ui: *Tui, allocator: std.mem.Allocator, links: []const []const
         // so a predictable /tmp/mtbuddy-wg-<idx>.conf let a local user pre-create a symlink
         // and have root's write land on an arbitrary file (CWE-59 overwrite-as-root). /etc
         // and /etc/amnezia are root-owned, so no unprivileged user can plant a symlink here.
-        _ = sys.exec(allocator, &.{ "mkdir", "-p", "/etc/amnezia" }) catch {};
+        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), "/etc/amnezia");
         const tmp = try std.fmt.allocPrint(a, "/etc/amnezia/.mtbuddy-stage-{d}.conf", .{idx});
         sys.writeFileMode(tmp, conf, 0o600) catch {
             ui.fail("Failed to stage the WireGuard config");
             return;
         };
+        defer std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), tmp) catch {
+            ui.warn("Failed to remove staged WireGuard credentials");
+        };
         try tunnel_wg.setupFromConf(ui, allocator, tmp);
-        _ = sys.exec(allocator, &.{ "rm", "-f", tmp }) catch {};
     }
 }
 
@@ -428,6 +518,10 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
             return;
         }
         ui.stepOk("Parsed egress", parsed[i].address);
+        if (parsed[i].insecure) {
+            // Faithful to the link, but never silent: the egress hop is then unauthenticated.
+            ui.warn("Certificate verification is DISABLED for this endpoint (the link carries allowInsecure=1)");
+        }
     }
 
     // A sing-box tunnel and the AmneziaWG tunnel pool both own fwmark 200 / table 200 —
@@ -442,64 +536,77 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
     }
 
     if (!ensureSingboxInstalled(ui, allocator)) return;
-    const sb_bin: []const u8 = if (sys.fileExists(SB_BIN)) SB_BIN else "sing-box";
+    const sb_bin = resolveSingboxBinary(allocator) catch {
+        ui.fail("Unable to resolve an absolute sing-box executable path");
+        return;
+    };
+    defer allocator.free(sb_bin);
 
     const cfg = genSingboxConfig(a, parsed) catch {
         ui.fail("Failed to generate sing-box config");
         return;
     };
-    _ = sys.exec(allocator, &.{ "mkdir", "-p", SB_CONFIG_DIR }) catch {};
-    sys.writeFileMode(SB_CONFIG_PATH, cfg, 0o600) catch {
-        ui.fail("Failed to write " ++ SB_CONFIG_PATH);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), SB_CONFIG_DIR);
+
+    // Check the CANDIDATE, then rename it into place. Writing first and checking after
+    // destroyed a working config the moment this sing-box rejected the new one: the
+    // running egress kept serving from memory, so nothing looked broken until the next
+    // reboot, when the unit failed, sbx0 never appeared and table 200 stayed empty.
+    sys.writeFileMode(SB_CANDIDATE_PATH, cfg, 0o600) catch {
+        ui.fail("Failed to write " ++ SB_CANDIDATE_PATH);
         return;
     };
+    if (!singboxConfigLoads(allocator, sb_bin, SB_CANDIDATE_PATH)) {
+        ui.fail("The installed sing-box rejects the generated config — the egress was NOT started");
+        ui.info("The rejected config is at " ++ SB_CANDIDATE_PATH ++ " (the running one is untouched); run it through `sing-box check -c` for the reason. An outbound type this build does not know (hysteria2 needs sing-box 1.5.0+) rejects the whole file, including the other endpoints in a pool.");
+        return;
+    }
+    var installed_config = false;
+    if (sys.exec(allocator, &.{ "mv", "-f", SB_CANDIDATE_PATH, SB_CONFIG_PATH })) |r| {
+        defer r.deinit();
+        installed_config = r.exit_code == 0;
+    } else |_| {}
+    if (!installed_config) {
+        ui.fail("Failed to install " ++ SB_CONFIG_PATH);
+        return;
+    }
 
-    // Policy-routing helper: wait for the tun, then route the proxy's SO_MARK'd egress
-    // (fwmark 200 → table 200 → sbx0) — the same mechanism the AmneziaWG tunnel uses.
-    const route_script = "#!/bin/bash\n" ++
-        "for i in $(seq 1 60); do ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 && break; sleep 0.25; done\n" ++
-        "ip link show " ++ TUN_IFACE ++ " >/dev/null 2>&1 || { echo 'mtproto egress: " ++ TUN_IFACE ++ " never appeared (sing-box failed to start the tun?)' >&2; exit 1; }\n" ++
-        "ip rule add fwmark " ++ TUN_FWMARK ++ " lookup " ++ TUN_TABLE ++ " 2>/dev/null || true\n" ++
-        "ip route replace default dev " ++ TUN_IFACE ++ " table " ++ TUN_TABLE ++ "\n";
-    sys.writeFileMode(SB_ROUTE_SCRIPT, route_script, 0o755) catch {
+    sys.writeFileMode(SB_ROUTE_SCRIPT, SB_ROUTE_SCRIPT_BODY, 0o755) catch {
         ui.fail("Failed to write the routing helper");
         return;
     };
 
-    const unit = try std.fmt.allocPrint(a,
-        \\[Unit]
-        \\Description=mtproto-proxy sing-box tunnel egress
-        \\After=network-online.target
-        \\Wants=network-online.target
-        \\
-        \\[Service]
-        \\ExecStart={s} run -c {s}
-        \\ExecStartPost=+{s}
-        \\Restart=on-failure
-        \\RestartSec=3
-        \\AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-        \\
-        \\[Install]
-        \\WantedBy=multi-user.target
-        \\
-    , .{ sb_bin, SB_CONFIG_PATH, SB_ROUTE_SCRIPT });
+    const unit = try renderEgressUnit(a, sb_bin);
     sys.writeFile(SB_SERVICE_PATH, unit) catch {
         ui.fail("Failed to write the systemd unit");
         return;
     };
-    if (!singboxConfigLoads(allocator, sb_bin, SB_CONFIG_PATH)) {
-        ui.fail("The installed sing-box rejects the generated config — the egress was NOT started");
-        ui.info("Run `" ++ SB_CONFIG_PATH ++ "` through `sing-box check -c` for the reason. An outbound type this build does not know (hysteria2 needs sing-box 1.5.0+) rejects the whole file, including the other endpoints in a pool.");
+    _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
+    var start_ok = false;
+    if (sys.exec(allocator, &.{ "systemctl", "enable", "--now", SB_SERVICE_NAME })) |r| {
+        defer r.deinit();
+        start_ok = r.exit_code == 0;
+    } else |_| {}
+    if (!start_ok or !egressTunIsUp(allocator)) {
+        // Never rewire the proxy onto an egress that did not come up: `sing-box check`
+        // validates the config's SHAPE only, and the run reported "egress up" while every
+        // DC connection failed.
+        ui.fail("sing-box egress did not come up — the proxy was NOT rewired to it");
+        ui.hint("journalctl -u " ++ SB_SERVICE_NAME ++ " -n 50 --no-pager");
+        ui.info("Usual causes: no /dev/net/tun (LXC/OpenVZ container), no CAP_NET_ADMIN, or an option sing-box only validates at Start().");
         return;
     }
-    _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
-    _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", SB_SERVICE_NAME }) catch {};
     ui.ok("sing-box tunnel egress up (tun " ++ TUN_IFACE ++ ")");
+    ui.info(trL(
+        ui,
+        "If the egress ever stops, marked traffic is dropped, not sent out the host's real IP — DC connections fail loudly instead of silently leaking the origin.",
+        "Если egress остановится, помеченный трафик будет отброшен, а не выпущен через реальный IP хоста — соединения с DC упадут, но origin не утечёт.",
+    ));
 
     if (sys.fileExists(CONFIG_PATH)) {
         // Order mtproto-proxy after the egress so sbx0 + its route exist before the proxy
         // marks DC sockets — otherwise a reboot races and DC connects fail until retry.
-        _ = sys.exec(allocator, &.{ "mkdir", "-p", PROXY_DROPIN_DIR }) catch {};
+        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), PROXY_DROPIN_DIR);
         sys.writeFile(PROXY_DROPIN_PATH, PROXY_EGRESS_DROPIN) catch {};
         _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
         wireUpstreamTunnel(allocator, link_texts) catch {
@@ -507,11 +614,35 @@ fn setupSingboxTunnel(ui: *Tui, allocator: std.mem.Allocator, link_texts: []cons
             return;
         };
         _ = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
-        ui.ok("upstream set to tunnel via " ++ TUN_IFACE ++ "; mtproto-proxy restarted");
+        if (sys.isServiceActive("mtproto-proxy")) {
+            ui.ok("upstream set to tunnel via " ++ TUN_IFACE ++ "; mtproto-proxy restarted");
+        } else {
+            ui.fail("config.toml was updated but mtproto-proxy did not come back");
+            ui.hint("journalctl -u mtproto-proxy -n 30 --no-pager");
+        }
         warnMiddleProxyOverTun(ui, allocator);
     } else {
         ui.warn("mtproto-proxy not installed here — the sing-box tunnel is up on " ++ TUN_IFACE ++ "; set [upstream] type=tunnel, [upstream.tunnel] interface=" ++ TUN_IFACE);
     }
+}
+
+/// Did the egress actually come up? A zero exit from `enable --now` does not say so: the
+/// unit is Type=simple, so systemd is satisfied once sing-box has been exec'd and its
+/// ExecStartPost returned, and a sing-box that dies at Start() (no /dev/net/tun in an LXC
+/// container, an option only validated at Start()) leaves a fully green run over a proxy
+/// about to be rewired onto an egress that does not exist. Ask the two questions that do
+/// answer it — the unit is still active, and sbx0 is present — with a few seconds of grace
+/// for a process that exits a moment after being started.
+fn egressTunIsUp(allocator: std.mem.Allocator) bool {
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        if (attempt > 0) sleepSeconds(1);
+        if (!sys.isServiceActive(SB_SERVICE_NAME)) continue;
+        const r = sys.exec(allocator, &.{ "ip", "link", "show", TUN_IFACE }) catch continue;
+        defer r.deinit();
+        if (r.exit_code == 0) return true;
+    }
+    return false;
 }
 
 /// A sing-box TUN egress and MiddleProxy do not work together, and the failure is silent
@@ -556,12 +687,12 @@ fn warnMiddleProxyOverTun(ui: *Tui, allocator: std.mem.Allocator) void {
 fn wireUpstreamTunnel(allocator: std.mem.Allocator, link_texts: []const []const u8) !void {
     var doc = try toml.TomlDoc.load(allocator, CONFIG_PATH);
     defer doc.deinit();
-    try doc.set("upstream", "type", "tunnel");
+    try doc.setString("upstream", "type", "tunnel");
     // Point both the plural pool list (which the proxy reads first) and the singular key
     // at sbx0, and clear any pinned awg interface, so no stale awg name shadows sbx0.
     try doc.set("upstream.tunnel", "interfaces", "[\"" ++ TUN_IFACE ++ "\"]");
-    try doc.set("upstream.tunnel", "pinned_interface", "");
-    try doc.set("upstream.tunnel", "interface", TUN_IFACE);
+    try doc.setString("upstream.tunnel", "pinned_interface", "");
+    try doc.setString("upstream.tunnel", "interface", TUN_IFACE);
     // Persist the links so a reinstall reproduces the egress (config is 0600).
     var arr: std.ArrayListUnmanaged(u8) = .empty;
     defer arr.deinit(allocator);
@@ -608,7 +739,8 @@ fn egressEndpointAt(cfg: []const u8, start: usize) ?[]const u8 {
     var end = port_at + SB_PORT_KEY.len;
     while (end < cfg.len and std.ascii.isDigit(cfg[end])) end += 1;
     if (end == port_at + SB_PORT_KEY.len) return null;
-    return cfg[start..end];
+    if (end == cfg.len or (cfg[end] != ',' and cfg[end] != '}')) return null;
+    return cfg[start .. end + 1];
 }
 
 fn countEgressEndpoints(cfg: []const u8) usize {
@@ -685,7 +817,41 @@ fn egressManualHint(ui: *Tui) void {
 pub fn refreshEgress(ui: *Tui, allocator: std.mem.Allocator) void {
     if (!sys.fileExists(SB_SERVICE_PATH)) return;
     refreshProxyDropin(ui, allocator);
+    refreshFailClosedRouting(ui, allocator);
     refreshSingboxConfig(ui, allocator);
+}
+
+/// Repair an egress provisioned before the routing failed closed. Its helper only ever
+/// installed `default dev sbx0`, so the moment sing-box stopped, table 200 went empty, the
+/// fwmark rule fell through to `main` and every SO_MARK'd DC socket left via the host's
+/// real uplink. Both halves (the helper and the unit's ExecStopPost) take effect on the
+/// next start/stop, so nothing is restarted here.
+fn refreshFailClosedRouting(ui: *Tui, allocator: std.mem.Allocator) void {
+    const script = sys.readFileAllocAbsolute(allocator, SB_ROUTE_SCRIPT, 64 * 1024) orelse return;
+    defer allocator.free(script);
+    const unit = sys.readFileAllocAbsolute(allocator, SB_SERVICE_PATH, 64 * 1024) orelse return;
+    defer allocator.free(unit);
+
+    const script_current = std.mem.eql(u8, script, SB_ROUTE_SCRIPT_BODY);
+    const unit_current = std.mem.indexOf(u8, unit, "ExecStopPost=") != null;
+    if (script_current and unit_current) return;
+
+    if (!script_current) {
+        sys.writeFileMode(SB_ROUTE_SCRIPT, SB_ROUTE_SCRIPT_BODY, 0o755) catch return;
+    }
+    if (!unit_current) {
+        const sb_bin = resolveSingboxBinary(allocator) catch return;
+        defer allocator.free(sb_bin);
+        const rendered = renderEgressUnit(allocator, sb_bin) catch return;
+        defer allocator.free(rendered);
+        sys.writeFile(SB_SERVICE_PATH, rendered) catch return;
+        _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
+    }
+    ui.ok(trL(
+        ui,
+        "egress routing now fails closed — a stopped tunnel drops marked traffic instead of leaking the host's real IP",
+        "маршрутизация egress теперь fail-closed — остановленный туннель отбрасывает помеченный трафик, а не выпускает его с реального IP хоста",
+    ));
 }
 
 /// Repairs an EXISTING drop-in only. A host whose egress predates this never had the
@@ -770,7 +936,10 @@ fn refreshSingboxConfig(ui: *Tui, allocator: std.mem.Allocator) void {
 
     // Keep the file we are about to replace. The endpoints match, so this should never be
     // needed — but it is one copy of the only on-disk record of a working egress.
-    _ = sys.exec(allocator, &.{ "cp", "-f", SB_CONFIG_PATH, SB_CONFIG_PATH ++ ".bak" }) catch {};
+    sys.writeFileMode(SB_CONFIG_PATH ++ ".bak", existing, 0o600) catch {
+        ui.warn("Failed to back up sing-box credentials; repair aborted");
+        return;
+    };
 
     sys.writeFileMode(SB_CONFIG_PATH, cfg, 0o600) catch {
         egressManualHint(ui);
@@ -778,9 +947,13 @@ fn refreshSingboxConfig(ui: *Tui, allocator: std.mem.Allocator) void {
     };
 
     // Never restart into a config this sing-box cannot load: put the old one back first.
-    const sb_bin: []const u8 = if (sys.fileExists(SB_BIN)) SB_BIN else "sing-box";
+    const sb_bin = resolveSingboxBinary(allocator) catch return;
+    defer allocator.free(sb_bin);
     if (!singboxConfigLoads(allocator, sb_bin, SB_CONFIG_PATH)) {
-        _ = sys.exec(allocator, &.{ "cp", "-f", SB_CONFIG_PATH ++ ".bak", SB_CONFIG_PATH }) catch {};
+        sys.writeFileMode(SB_CONFIG_PATH, existing, 0o600) catch {
+            ui.fail("Failed to restore sing-box config from backup");
+            return;
+        };
         ui.warn(trL(
             ui,
             "The installed sing-box rejects the repaired egress config — restored the previous one and left the egress running.",
@@ -793,6 +966,13 @@ fn refreshSingboxConfig(ui: *Tui, allocator: std.mem.Allocator) void {
     // `--now` is a no-op on a unit that is already running — which is exactly the host
     // this repair exists for.
     _ = sys.execForward(&.{ "systemctl", "restart", SB_SERVICE_NAME }) catch {};
+    if (!sys.isServiceActive(SB_SERVICE_NAME)) {
+        ui.fail("sing-box restart failed; the previous credentials remain in the .bak file for recovery");
+        return;
+    }
+    std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), SB_CONFIG_PATH ++ ".bak") catch {
+        ui.warn("Failed to remove the sing-box credentials backup");
+    };
     ui.ok(trL(
         ui,
         "sing-box egress tun repaired (" ++ TUN_ADDR ++ ", stack " ++ TUN_STACK ++ ", mtu " ++ TUN_MTU ++ ")",
@@ -828,8 +1008,17 @@ fn ensureSingboxInstalled(ui: *Tui, allocator: std.mem.Allocator) bool {
     return true;
 }
 
+fn resolveSingboxBinary(allocator: std.mem.Allocator) ![]u8 {
+    if (sys.fileExists(SB_BIN)) return allocator.dupe(u8, SB_BIN);
+    const result = try sys.exec(allocator, &.{ "sh", "-c", "command -v sing-box" });
+    defer result.deinit();
+    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (result.exit_code != 0 or !std.fs.path.isAbsolute(path) or std.mem.indexOfAny(u8, path, " \t\r\n\"%") != null) return error.InvalidBinaryPath;
+    return allocator.dupe(u8, path);
+}
+
 /// Download + install the static sing-box binary for this arch. The release asset name
-/// carries the version, so resolve the latest tag from the API first. Private temp dir.
+/// and SHA-256 digest are pinned; extraction uses a private temporary directory.
 fn installSingbox(allocator: std.mem.Allocator) bool {
     const arch: []const u8 = switch (builtin.cpu.arch) {
         .x86_64 => "amd64",
@@ -840,21 +1029,12 @@ fn installSingbox(allocator: std.mem.Allocator) bool {
         _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600", "update", "-qq" }) catch {};
         _ = sys.exec(allocator, &.{ "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends", "curl", "tar" }) catch {};
     }
-    const ver = blk: {
-        const r = sys.exec(allocator, &.{ "curl", "-fsSL", "--connect-timeout", "30", "https://api.github.com/repos/SagerNet/sing-box/releases/latest" }) catch return false;
-        defer r.deinit();
-        if (r.exit_code != 0) break :blk null;
-        // Tolerate whitespace + the optional leading 'v': `"tag_name": "v1.13.13"`.
-        const key = "\"tag_name\"";
-        const ki = std.mem.indexOf(u8, r.stdout, key) orelse break :blk null;
-        const after = r.stdout[ki + key.len ..];
-        const q1 = std.mem.indexOfScalar(u8, after, '"') orelse break :blk null;
-        var vstart = q1 + 1;
-        if (vstart < after.len and after[vstart] == 'v') vstart += 1;
-        const q2 = std.mem.indexOfScalarPos(u8, after, vstart, '"') orelse break :blk null;
-        break :blk allocator.dupe(u8, after[vstart..q2]) catch null;
-    } orelse return false;
-    defer allocator.free(ver);
+    // Official release asset digests: https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.13.13
+    const ver = "1.13.13";
+    const expected_sha256 = if (std.mem.eql(u8, arch, "amd64"))
+        "bb99cabf47694625db421ee17898f36cdc1f9c2cb5decf65b12bac8d8437e842"
+    else
+        "d7fab87b921933eb281d8ee7bd5377cdd8228089f1f7c807c9363a6a2329286c";
     const td = blk: {
         const r = sys.exec(allocator, &.{ "mktemp", "-d", "/tmp/mtbuddy-singbox.XXXXXX" }) catch return false;
         defer r.deinit();
@@ -877,15 +1057,19 @@ fn installSingbox(allocator: std.mem.Allocator) bool {
         if (r.exit_code != 0) return false;
     }
     {
+        const r = sys.exec(allocator, &.{ "sha256sum", tgz }) catch return false;
+        defer r.deinit();
+        if (r.exit_code != 0 or r.stdout.len < 64 or !std.mem.eql(u8, r.stdout[0..64], expected_sha256)) return false;
+    }
+    {
         const r = sys.exec(allocator, &.{ "tar", "xzf", tgz, "-C", td, "--no-same-owner" }) catch return false;
         defer r.deinit();
         if (r.exit_code != 0) return false;
     }
     const extracted = std.fmt.allocPrint(allocator, "{s}/sing-box-{s}-linux-{s}/sing-box", .{ td, ver, arch }) catch return false;
     defer allocator.free(extracted);
-    // Verify the downloaded artifact actually runs as sing-box before installing it. The
-    // transport is TLS (authenticity); this catches a corrupt/truncated download or a
-    // wrong-arch binary. sing-box publishes no checksums/signatures to verify against.
+    // The archive hash is pinned above and checked before extraction or execution.
+    // Verify that the authenticated binary also runs on this host.
     {
         const r = sys.exec(allocator, &.{ extracted, "version" }) catch return false;
         defer r.deinit();

@@ -61,7 +61,6 @@ pub fn ConnectionPool(comptime SlotType: type) type {
                     self.free_count += 1;
                     return null;
                 };
-                fresh.* = .{};
                 self.slots[idx] = fresh;
                 const hi = idx + 1;
                 if (hi > self.allocated_hi) self.allocated_hi = hi;

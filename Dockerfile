@@ -13,25 +13,47 @@
 ARG ZIG_VERSION=0.16.0
 ARG ZIG_SHA256=
 
-FROM debian:bookworm-slim AS builder
+# CPU profiles, one per published architecture. Every relayed byte goes through AES-CTR
+# twice, so a build that misses std's hardware-AES backend relays with the bitsliced
+# software one and becomes CPU-bound under load. `zig build-obj -mcpu <profile>` with a
+# comptime assert on std.crypto.core.aes.has_hardware_support is what qualifies these two
+# strings; ci.yml re-runs that assert on exactly these lines so neither can regress.
+#
+#   amd64: `+aes` alone is NOT enough — std/crypto/aes.zig selects the AES-NI backend only
+#          when the target has aes AND avx, and the x86_64 baseline model carries neither
+#          (`aes` depends on sse2 only). x86_64+aes+avx is the most conservative pair that
+#          turns it on: AES-NI is Westmere (2010), AVX is Sandy Bridge (2011), so it stays
+#          below the x86_64_v3 (Haswell/AVX2) bar the release artifacts use.
+#   arm64: aarch64's `generic` model carries `fuse_aes` — a scheduling hint, not the `aes`
+#          feature — so the default build has no hardware AES either. `generic+aes` requires
+#          the ARMv8 crypto extensions, which every ARM server part has (Graviton, Ampere,
+#          Neoverse, Apple) but Cortex-A72 (Raspberry Pi 4) does not; build with
+#          `--build-arg ZIG_CPU_ARM64=generic` there.
+ARG ZIG_CPU_AMD64=x86_64+aes+avx
+ARG ZIG_CPU_ARM64=generic+aes
+
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS builder
 ARG ZIG_VERSION
 ARG ZIG_SHA256
 ARG TARGETARCH
+ARG BUILDARCH
+ARG ZIG_CPU_AMD64
+ARG ZIG_CPU_ARM64
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && if [ -z "$TARGETARCH" ]; then \
-        TARGETARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"; \
+    && if [ -z "$BUILDARCH" ]; then \
+        BUILDARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"; \
        fi \
     # Per-arch known-good SHA256 for the default ZIG_VERSION (0.16.0). The Zig
     # toolchain tarball is ALWAYS checksum-verified — a compromised mirror/CDN
     # can't slip in a backdoored compiler. Override ZIG_SHA256 if you bump
     # ZIG_VERSION via --build-arg.
-    && case "$TARGETARCH" in \
+    && case "$BUILDARCH" in \
         amd64|x86_64)  ZIG_ARCH=x86_64;  ZIG_SHA256_DEFAULT=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;; \
         arm64|aarch64) ZIG_ARCH=aarch64; ZIG_SHA256_DEFAULT=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;; \
-        *)      echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+        *)      echo "unsupported BUILDARCH=$BUILDARCH" >&2; exit 1 ;; \
        esac \
     && ZIG_SHA256="${ZIG_SHA256:-$ZIG_SHA256_DEFAULT}" \
     && curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
@@ -47,17 +69,18 @@ WORKDIR /build
 
 COPY build.zig build.zig.zon ./
 COPY src ./src
+COPY deploy ./deploy
 
 RUN set -eu \
     && arch="${TARGETARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}" \
     && case "$arch" in \
         amd64|x86_64) \
             target="x86_64-linux"; \
-            cpu="x86_64+aes"; \
+            cpu="$ZIG_CPU_AMD64"; \
             ;; \
         arm64|aarch64) \
             target="aarch64-linux"; \
-            cpu=""; \
+            cpu="$ZIG_CPU_ARM64"; \
             ;; \
         *) \
             echo "unsupported TARGETARCH=$arch" >&2; \
@@ -70,15 +93,20 @@ RUN set -eu \
          zig build -Doptimize=ReleaseFast -Dtarget="$target"; \
        fi
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/zig-out/bin/mtproto-proxy /usr/local/bin/mtproto-proxy
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN groupadd --gid 10001 mtproto \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin mtproto \
+    && mkdir -p /etc/mtproto-proxy \
+    && chown mtproto:mtproto /etc/mtproto-proxy \
+    && setcap cap_net_bind_service=+ep /usr/local/bin/mtproto-proxy
 
 WORKDIR /etc/mtproto-proxy
 
@@ -87,6 +115,12 @@ WORKDIR /etc/mtproto-proxy
 # publicly-known access secrets as the live config (that would defeat active-probe
 # resistance for everyone running the image unchanged).
 COPY config.toml.example /usr/share/doc/mtproto-proxy/config.toml.example
+
+VOLUME ["/etc/mtproto-proxy"]
+USER 10001:10001
+# Process liveness only; enable/scrape the configured metrics /healthz endpoint for
+# event-loop health. Metrics is optional, so the image must not require port 9400.
+HEALTHCHECK --interval=30s --timeout=3s CMD kill -0 1 || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/etc/mtproto-proxy/config.toml"]

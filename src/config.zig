@@ -9,6 +9,19 @@ const UserIpLimit = @import("proxy/user_ip_limit.zig").UserIpLimit;
 const default_tls_domain = "google.com";
 const default_local_mask_target = "127.0.0.1";
 
+fn parsePort(value: []const u8) !u16 {
+    if (value.len == 0) return error.InvalidPort;
+    for (value) |c| if (!std.ascii.isDigit(c)) return error.InvalidPort;
+    const port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
+    if (port == 0) return error.InvalidPort;
+    return port;
+}
+
+fn warnUnknownKey(key: []const u8) void {
+    if (@import("builtin").is_test) return; // Fuzz inputs intentionally contain arbitrary keys.
+    std.log.scoped(.config).warn("unknown configuration key '{s}'; ignored", .{key});
+}
+
 /// Ceiling for an [access.user_max_ips] entry. The cap sizes the per-user table the
 /// enforcement side allocates, so the two must agree.
 const max_user_ips: u32 = UserIpLimit.max_cap;
@@ -98,8 +111,8 @@ fn parseBool(value: []const u8) bool {
         std.ascii.eqlIgnoreCase(value, "on");
 }
 
-fn stripInlineComment(value: []const u8) []const u8 {
-    var in_quotes = false;
+fn stripInlineComment(value: []const u8) ![]const u8 {
+    var quote: u8 = 0;
     var escaped = false;
     var i: usize = 0;
 
@@ -111,21 +124,26 @@ fn stripInlineComment(value: []const u8) []const u8 {
             continue;
         }
 
-        if (in_quotes and ch == '\\') {
+        if (quote == '"' and ch == '\\') {
             escaped = true;
             continue;
         }
 
-        if (ch == '"') {
-            in_quotes = !in_quotes;
+        if (ch == quote and quote != 0) {
+            quote = 0;
+            continue;
+        }
+        if (quote == 0 and (ch == '"' or ch == '\'')) {
+            quote = ch;
             continue;
         }
 
-        if (!in_quotes and (ch == '#' or ch == ';')) {
+        if (quote == 0 and ch == '#') {
             return std.mem.trim(u8, value[0..i], &[_]u8{ ' ', '\t' });
         }
     }
 
+    if (quote != 0 or escaped) return error.UnterminatedString;
     return std.mem.trim(u8, value, &[_]u8{ ' ', '\t' });
 }
 
@@ -436,9 +454,9 @@ pub const Config = struct {
     /// Max lifetime (seconds) for a masking-relay connection (a probe forwarded to the
     /// backend). 0 = unlimited. Bounds how long an active prober/scanner can hold a
     /// backend connection open through us; idle masking relays are already idle-timed.
-    mask_relay_max_secs: u32 = 0,
+    mask_relay_max_secs: u32 = 300,
     /// Size (bytes) of the fake encrypted-certificate AppData record in the FakeTLS
-    /// ServerHello. 0 = default (~2878, a typical nginx + Let's Encrypt ECDSA chain). Set
+    /// ServerHello. 0 = a per-process random size in 2400..3600. Set
     /// it to the first encrypted-flight record size your masking backend actually serves so
     /// an active prober sees the same cert-record size on both the accept and mask paths
     /// (measure with e.g. `openssl s_client -msg`). Clamped to 256..16384.
@@ -467,7 +485,7 @@ pub const Config = struct {
     /// fatal alert; pick whichever your masked domain actually does. Default off.
     reject_rst: bool = false,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
-    desync: bool = true,
+    desync: bool = false,
     /// Base delay (ms) between the 1-byte desync split and the rest of the ServerHello.
     desync_split_delay_ms: u32 = 3,
     /// Random extra delay (0..jitter ms) added to desync_split_delay_ms per connection.
@@ -540,6 +558,17 @@ pub const Config = struct {
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
+    }
+
+    pub const relay_read_buffer_size: usize = 32 * 1024;
+
+    pub fn middleProxyC2sScratchBytes(self: *const Config) usize {
+        return self.middleProxyBufferBytes() + 108 * (relay_read_buffer_size + 1) + 256;
+    }
+
+    pub fn middleProxySharedBytes(self: *const Config) usize {
+        const workers = if (self.workers == 0) std.Thread.getCpuCount() catch 1 else self.workers;
+        return (self.middleProxyC2sScratchBytes() + self.middleProxyBufferBytes() + relay_read_buffer_size + 16 + 65535 + 2048) * std.math.clamp(workers, 1, 256);
     }
 
     pub fn ownsTlsDomain(self: *const Config) bool {
@@ -621,8 +650,40 @@ pub const Config = struct {
         return self.mask and self.maskTargetIsLocal() and self.port == self.mask_port;
     }
 
+    /// Startup validation shared by the runtime and --check-config.
+    pub fn validate(self: *const Config) !void {
+        if (self.port == 0 or self.mask_port == 0 or self.metrics.port == 0 or self.web.port == 0) return error.InvalidPort;
+        if (self.hasLocalMaskPortCollision()) return error.MaskPortCollision;
+        if (self.bind_address) |host| _ = net.IpAddress.parse(host, self.port) catch return error.InvalidBindAddress;
+        if (self.metrics.enabled) _ = net.IpAddress.parse(self.metrics.effectiveHost(), self.metrics.port) catch return error.InvalidMetricsHost;
+        if (self.web.enabled) {
+            const domain = self.web.domain orelse return error.MissingWebDomain;
+            if (domain.len == 0 or domain.len > 253 or std.mem.indexOfScalar(u8, domain, '.') == null) return error.InvalidWebDomain;
+            for (domain) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return error.InvalidWebDomain;
+            _ = net.IpAddress.parse(self.web.effectiveHost(), self.web.port) catch return error.InvalidWebHost;
+            const path = self.web.effectiveWsPath();
+            if (path.len == 0 or path[0] != '/' or std.mem.startsWith(u8, path, "//") or std.mem.indexOfAny(u8, path, "?#\\\r\n") != null) return error.InvalidWebSocketPath;
+            if (self.web.port == self.port or self.web.port == self.mask_port) return error.WebPortCollision;
+        }
+        const user = self.upstream_proxy_username orelse "";
+        const password = self.upstream_proxy_password orelse "";
+        if (self.upstream_mode == .socks5 or self.upstream_mode == .http) {
+            const host = self.upstream_proxy_host orelse return error.MissingUpstreamHost;
+            if (host.len == 0 or self.upstream_proxy_port == 0) return error.InvalidUpstreamAddress;
+            for (host) |c| if (c <= 0x20 or c == 0x7f) return error.InvalidUpstreamAddress;
+            if (user.len == 0 and password.len > 0) return error.InvalidUpstreamCredentials;
+        }
+        if (self.upstream_mode == .socks5 and (user.len > 255 or password.len > 255)) return error.InvalidUpstreamCredentials;
+        if (self.upstream_mode == .http and (user.len > 511 or password.len > 511 or user.len + password.len > 511 or std.mem.indexOfScalar(u8, user, ':') != null)) return error.InvalidUpstreamCredentials;
+    }
+
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
+        if (self.metrics.enabled and !std.mem.eql(u8, self.metrics.effectiveHost(), "127.0.0.1") and
+            !std.mem.eql(u8, self.metrics.effectiveHost(), "::1"))
+        {
+            std.log.scoped(.config).warn("metrics on {s} has no authentication and exposes user names and traffic counters; restrict access with a firewall", .{self.metrics.effectiveHost()});
+        }
         if (self.web.enabled) {
             const log = std.log.scoped(.config);
             // Every WEB client costs one masked connection for its carrier plus one per
@@ -674,8 +735,8 @@ pub const Config = struct {
                     // through-the-LB path is refused unless the LB is a relay source.
                     log.warn(
                         "[web].only with [server].accept_proxy_protocol: connections arriving " ++
-                            "through the load balancer are masked unless its address is listed in " ++
-                            "[web].relay_sources (IP literals, not CIDRs).",
+                            "through the load balancer are masked. Relay connections must bypass " ++
+                            "the LB; never trust a public LB in [web].relay_sources, which trusts all its clients.",
                         .{},
                     );
                 }
@@ -712,12 +773,12 @@ pub const Config = struct {
         }
         if (self.use_middle_proxy and self.max_connections > 2000) {
             const log = std.log.scoped(.config);
-            const mem_per_conn_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
-            const shared_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
+            const connection_mib = std.math.divCeil(u64, @as(u64, self.middleProxyBufferBytes()) * 2 * self.max_connections, 1024 * 1024) catch unreachable;
+            const shared_mb = std.math.divCeil(u64, self.middleProxySharedBytes(), 1024 * 1024) catch unreachable;
             log.warn(
                 "max_connections={d} with middleproxy_buffer_kb={d} may require " ++
                     "up to {d} MB + {d} MB shared RAM at full capacity. Ensure your VPS has sufficient memory.",
-                .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections, shared_mb },
+                .{ self.max_connections, self.middleproxy_buffer_kb, connection_mib, shared_mb },
             );
         }
 
@@ -759,7 +820,10 @@ pub const Config = struct {
             .limited(1024 * 1024),
         );
         defer allocator.free(content);
-        return parse(allocator, content);
+        const cfg = try parse(allocator, content);
+        errdefer cfg.deinit(allocator);
+        try cfg.validate();
+        return cfg;
     }
 
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
@@ -823,6 +887,9 @@ pub const Config = struct {
                 if (in_upstream_socks5_section or in_upstream_http_section or in_upstream_tunnel_section) {
                     in_upstream_section = false;
                 }
+                if (!(in_users_section or in_direct_users_section or in_user_max_conns_section or in_user_expirations_section or in_user_max_ips_section or in_censorship_section or in_server_section or in_general_section or in_metrics_section or in_web_section or in_upstream_section or in_upstream_socks5_section or in_upstream_http_section or in_upstream_tunnel_section)) {
+                    if (!@import("builtin").is_test) std.log.scoped(.config).warn("unknown configuration section '{s}'; ignored", .{header});
+                }
                 continue;
             }
 
@@ -830,11 +897,11 @@ pub const Config = struct {
             if (std.mem.indexOfScalar(u8, line, '=')) |eq_pos| {
                 const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
                 var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
-                value = stripInlineComment(value);
+                value = try stripInlineComment(value);
                 if (value.len == 0) continue;
 
                 // Strip quotes from value
-                if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                if (value.len >= 2 and (value[0] == '"' or value[0] == '\'') and value[value.len - 1] == value[0]) {
                     value = value[1 .. value.len - 1];
                 }
 
@@ -850,12 +917,14 @@ pub const Config = struct {
                         try cfg.users.put(key, secret);
                     } else {
                         const name = try allocator.dupe(u8, key);
+                        errdefer allocator.free(name);
                         try cfg.users.put(name, secret);
                     }
                 } else if (in_direct_users_section) {
                     if (!parseBool(value)) continue;
                     if (!cfg.direct_users.contains(key)) {
                         const name = try allocator.dupe(u8, key);
+                        errdefer allocator.free(name);
                         try cfg.direct_users.put(name, {});
                     }
                 } else if (in_user_max_conns_section) {
@@ -865,7 +934,9 @@ pub const Config = struct {
                     if (cfg.user_max_conns.?.getKey(key)) |_| {
                         try cfg.user_max_conns.?.put(key, cap);
                     } else {
-                        try cfg.user_max_conns.?.put(try allocator.dupe(u8, key), cap);
+                        const name = try allocator.dupe(u8, key);
+                        errdefer allocator.free(name);
+                        try cfg.user_max_conns.?.put(name, cap);
                     }
                 } else if (in_user_expirations_section) {
                     const ts = parseExpiryToUnix(value) orelse continue;
@@ -873,7 +944,9 @@ pub const Config = struct {
                     if (cfg.user_expirations.?.getKey(key)) |_| {
                         try cfg.user_expirations.?.put(key, ts);
                     } else {
-                        try cfg.user_expirations.?.put(try allocator.dupe(u8, key), ts);
+                        const name = try allocator.dupe(u8, key);
+                        errdefer allocator.free(name);
+                        try cfg.user_expirations.?.put(name, ts);
                     }
                 } else if (in_user_max_ips_section) {
                     const parsed = std.fmt.parseInt(u32, value, 10) catch continue;
@@ -891,7 +964,9 @@ pub const Config = struct {
                     if (cfg.user_max_ips.?.getKey(key)) |_| {
                         try cfg.user_max_ips.?.put(key, cap);
                     } else {
-                        try cfg.user_max_ips.?.put(try allocator.dupe(u8, key), cap);
+                        const name = try allocator.dupe(u8, key);
+                        errdefer allocator.free(name);
+                        try cfg.user_max_ips.?.put(name, cap);
                     }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
@@ -904,29 +979,29 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "ad_tag")) {
                         // telemt compatibility: [general].ad_tag
                         // If [server].tag is present and valid, it has priority.
-                        if (!server_tag_set and value.len == 32) {
+                        if (value.len != 0) {
+                            if (value.len != 32) return error.InvalidAdTag;
                             var tag: [16]u8 = undefined;
-                            if (std.fmt.hexToBytes(&tag, value)) |_| {
-                                cfg.tag = tag;
-                            } else |_| {}
+                            _ = std.fmt.hexToBytes(&tag, value) catch return error.InvalidAdTag;
+                            if (!server_tag_set) cfg.tag = tag;
                         }
-                    }
+                    } else warnUnknownKey(key);
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
-                        cfg.port = std.fmt.parseInt(u16, value, 10) catch blk: {
-                            std.log.scoped(.config).warn("invalid server.port \"{s}\"; falling back to 443", .{value});
-                            break :blk 443;
-                        };
+                        cfg.port = try parsePort(value);
                     } else if (std.mem.eql(u8, key, "bind_address")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.bind_address) |prev| allocator.free(prev);
-                        cfg.bind_address = try allocator.dupe(u8, value);
+                        cfg.bind_address = replacement;
                     } else if (std.mem.eql(u8, key, "clock_sync_url")) {
+                        if (value.len != 0 and !std.mem.startsWith(u8, value, "https://")) return error.InsecureClockSyncUrl;
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.clock_sync_url) |prev| allocator.free(prev);
-                        cfg.clock_sync_url = try allocator.dupe(u8, value);
+                        cfg.clock_sync_url = replacement;
                     } else if (std.mem.eql(u8, key, "accept_proxy_protocol")) {
                         cfg.accept_proxy_protocol = parseBool(value);
                     } else if (std.mem.eql(u8, key, "backlog")) {
-                        cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
+                        cfg.backlog = std.fmt.parseInt(u31, value, 10) catch return error.InvalidBacklog;
                     } else if (std.mem.eql(u8, key, "max_connections")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.max_connections;
                         cfg.max_connections = @max(@as(u32, 32), parsed);
@@ -946,27 +1021,28 @@ pub const Config = struct {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.graceful_shutdown_timeout_sec;
                         cfg.graceful_shutdown_timeout_sec = @max(@as(u32, 1), parsed);
                     } else if (std.mem.eql(u8, key, "tag")) {
-                        if (value.len == 32) {
+                        if (value.len != 0) {
+                            if (value.len != 32) return error.InvalidAdTag;
                             var tag: [16]u8 = undefined;
-                            if (std.fmt.hexToBytes(&tag, value)) |_| {
-                                cfg.tag = tag;
-                                server_tag_set = true;
-                            } else |_| {}
+                            _ = std.fmt.hexToBytes(&tag, value) catch return error.InvalidAdTag;
+                            cfg.tag = tag;
+                            server_tag_set = true;
                         }
                     } else if (std.mem.eql(u8, key, "public_ip")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.public_ip) |prev| allocator.free(prev);
-                        cfg.public_ip = try allocator.dupe(u8, value);
+                        cfg.public_ip = replacement;
                     } else if (std.mem.eql(u8, key, "public_port")) {
-                        const parsed = std.fmt.parseInt(u16, value, 10) catch 0;
-                        if (parsed > 0) cfg.public_port = parsed;
+                        cfg.public_port = try parsePort(value);
                     } else if (std.mem.eql(u8, key, "middle_proxy_nat_ip")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.middle_proxy_nat_ip) |prev| allocator.free(prev);
-                        cfg.middle_proxy_nat_ip = try allocator.dupe(u8, value);
+                        cfg.middle_proxy_nat_ip = replacement;
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = parseBool(value);
                     } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
                         const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.middleproxy_buffer_kb;
-                        cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
+                        cfg.middleproxy_buffer_kb = std.math.clamp(parsed, 64, 16 * 1024);
                     } else if (std.mem.eql(u8, key, "log_level")) {
                         if (std.mem.eql(u8, value, "debug")) {
                             cfg.log_level = .debug;
@@ -995,7 +1071,7 @@ pub const Config = struct {
                         cfg.idle_timeout_jitter_pct = @min(@as(u8, 100), parsed);
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
                         cfg.unsafe_override_limits = parseBool(value);
-                    }
+                    } else warnUnknownKey(key);
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
                         // The top-level empty-value guard runs BEFORE quote
@@ -1006,15 +1082,16 @@ pub const Config = struct {
                         // Free the previous heap dupe (but never the compile-time
                         // default) before overwriting, so a duplicate tls_domain
                         // key does not leak.
+                        const replacement = try allocator.dupe(u8, value);
                         if (cfg.tls_domain.ptr != default_tls_domain.ptr) allocator.free(cfg.tls_domain);
-                        cfg.tls_domain = try allocator.dupe(u8, value);
+                        cfg.tls_domain = replacement;
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = parseBool(value);
                     } else if (std.mem.eql(u8, key, "mask_target")) {
                         if (cfg.mask_target) |target| allocator.free(target);
                         cfg.mask_target = if (value.len > 0) try allocator.dupe(u8, value) else null;
                     } else if (std.mem.eql(u8, key, "mask_port")) {
-                        cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
+                        cfg.mask_port = try parsePort(value);
                     } else if (std.mem.eql(u8, key, "desync")) {
                         cfg.desync = parseBool(value);
                     } else if (std.mem.eql(u8, key, "desync_split_delay_ms")) {
@@ -1032,58 +1109,69 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "reject_rst")) {
                         cfg.reject_rst = parseBool(value);
                     } else if (std.mem.eql(u8, key, "mask_sni_safelist")) {
+                        const replacement = try parseStringArrayValue(allocator, value);
                         freeStringSlice(allocator, cfg.mask_sni_safelist);
-                        cfg.mask_sni_safelist = parseStringArrayValue(allocator, value) catch &.{};
+                        cfg.mask_sni_safelist = replacement;
                     } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
                         cfg.mask_relay_max_secs = std.fmt.parseInt(u32, value, 10) catch cfg.mask_relay_max_secs;
                     } else if (std.mem.eql(u8, key, "fake_cert_size")) {
                         cfg.fake_cert_size = std.fmt.parseInt(u32, value, 10) catch cfg.fake_cert_size;
-                    }
+                    } else warnUnknownKey(key);
                 } else if (in_metrics_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
                         cfg.metrics.enabled = parseBool(value);
                     } else if (std.mem.eql(u8, key, "host")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.metrics.host) |prev| allocator.free(prev);
-                        cfg.metrics.host = try allocator.dupe(u8, value);
+                        cfg.metrics.host = replacement;
                     } else if (std.mem.eql(u8, key, "port")) {
-                        cfg.metrics.port = std.fmt.parseInt(u16, value, 10) catch cfg.metrics.port;
-                    }
+                        cfg.metrics.port = try parsePort(value);
+                    } else warnUnknownKey(key);
                 } else if (in_web_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
                         cfg.web.enabled = parseBool(value);
                     } else if (std.mem.eql(u8, key, "only") or std.mem.eql(u8, key, "web_only")) {
                         cfg.web.only = parseBool(value);
                     } else if (std.mem.eql(u8, key, "domain")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.domain) |prev| allocator.free(prev);
-                        cfg.web.domain = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.domain = replacement;
                     } else if (std.mem.eql(u8, key, "listen") or std.mem.eql(u8, key, "host")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.host) |prev| allocator.free(prev);
-                        cfg.web.host = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.host = replacement;
                     } else if (std.mem.eql(u8, key, "port")) {
-                        cfg.web.port = std.fmt.parseInt(u16, value, 10) catch cfg.web.port;
+                        cfg.web.port = try parsePort(value);
                     } else if (std.mem.eql(u8, key, "backend")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.backend) |prev| allocator.free(prev);
-                        cfg.web.backend = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.backend = replacement;
                     } else if (std.mem.eql(u8, key, "mask_backend")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.mask_backend) |prev| allocator.free(prev);
-                        cfg.web.mask_backend = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.mask_backend = replacement;
                     } else if (std.mem.eql(u8, key, "cert")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.cert) |prev| allocator.free(prev);
-                        cfg.web.cert = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.cert = replacement;
                     } else if (std.mem.eql(u8, key, "key")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.key) |prev| allocator.free(prev);
-                        cfg.web.key = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.key = replacement;
                     } else if (std.mem.eql(u8, key, "mode")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.mode) |prev| allocator.free(prev);
-                        cfg.web.mode = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.mode = replacement;
                     } else if (std.mem.eql(u8, key, "ws_path")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.ws_path) |prev| allocator.free(prev);
-                        cfg.web.ws_path = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.ws_path = replacement;
                     } else if (std.mem.eql(u8, key, "trust_forwarded_for")) {
                         cfg.web.trust_forwarded_for = parseBool(value);
                     } else if (std.mem.eql(u8, key, "client_ip_header")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.client_ip_header) |prev| allocator.free(prev);
-                        cfg.web.client_ip_header = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        cfg.web.client_ip_header = replacement;
                     } else if (std.mem.eql(u8, key, "check_origin")) {
                         cfg.web.check_origin = parseBool(value);
                     } else if (std.mem.eql(u8, key, "max_sessions")) {
@@ -1093,9 +1181,10 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "max_buffer_mb")) {
                         cfg.web.max_buffer_mb = @max(8, std.fmt.parseInt(u32, value, 10) catch cfg.web.max_buffer_mb);
                     } else if (std.mem.eql(u8, key, "relay_sources")) {
+                        const replacement = try parseStringArrayValue(allocator, value);
                         freeStringSlice(allocator, cfg.web.relay_sources);
-                        cfg.web.relay_sources = parseStringArrayValue(allocator, value) catch &.{};
-                    }
+                        cfg.web.relay_sources = replacement;
+                    } else warnUnknownKey(key);
                 } else if (in_upstream_section) {
                     if (std.mem.eql(u8, key, "type")) {
                         if (parseUpstreamMode(value)) |mode| {
@@ -1103,32 +1192,34 @@ pub const Config = struct {
                         }
                     } else if (std.mem.eql(u8, key, "allow_direct_fallback")) {
                         cfg.allow_direct_fallback = parseBool(value);
-                    }
+                    } else warnUnknownKey(key);
                 } else if (in_upstream_socks5_section or in_upstream_http_section) {
                     if (std.mem.eql(u8, key, "host")) {
                         if (cfg.upstream_proxy_host) |h| allocator.free(h);
                         cfg.upstream_proxy_host = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "port")) {
-                        cfg.upstream_proxy_port = std.fmt.parseInt(u16, value, 10) catch 0;
+                        cfg.upstream_proxy_port = try parsePort(value);
                     } else if (std.mem.eql(u8, key, "username")) {
                         if (cfg.upstream_proxy_username) |u| allocator.free(u);
                         cfg.upstream_proxy_username = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "password")) {
                         if (cfg.upstream_proxy_password) |p| allocator.free(p);
                         cfg.upstream_proxy_password = try allocator.dupe(u8, value);
-                    }
+                    } else warnUnknownKey(key);
                 } else if (in_upstream_tunnel_section) {
                     if (std.mem.eql(u8, key, "interface")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.upstream_tunnel_interface) |prev| allocator.free(prev);
-                        cfg.upstream_tunnel_interface = try allocator.dupe(u8, value);
+                        cfg.upstream_tunnel_interface = replacement;
                     } else if (std.mem.eql(u8, key, "interfaces")) {
+                        const replacement = try parseStringArrayValue(allocator, value);
                         freeStringSlice(allocator, cfg.upstream_tunnel_interfaces);
-                        cfg.upstream_tunnel_interfaces = parseStringArrayValue(allocator, value) catch &.{};
+                        cfg.upstream_tunnel_interfaces = replacement;
                     } else if (std.mem.eql(u8, key, "pinned_interface")) {
                         if (cfg.upstream_tunnel_pinned_interface) |iface| allocator.free(iface);
                         cfg.upstream_tunnel_pinned_interface = if (value.len > 0) try allocator.dupe(u8, value) else null;
-                    }
-                }
+                    } else warnUnknownKey(key);
+                } else warnUnknownKey(key);
             }
         }
 
@@ -1241,6 +1332,7 @@ pub const Config = struct {
     /// Get user secrets as a flat slice for handshake validation.
     pub fn getUserSecrets(self: *const Config, allocator: std.mem.Allocator) ![]const UserSecret {
         var list: std.ArrayList(UserSecret) = .empty;
+        errdefer list.deinit(allocator);
         var it = @constCast(&self.users).iterator();
         while (it.next()) |entry| {
             try list.append(allocator, .{
@@ -1323,7 +1415,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(cfg.mask_target == null);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
-    try std.testing.expect(cfg.desync); // Default is true
+    try std.testing.expect(!cfg.desync); // Splitting the first byte is opt-in.
     try std.testing.expect(!cfg.fast_mode); // Default is false
     try std.testing.expect(cfg.fake_tls_only); // Default is true (secure: dd off)
     try std.testing.expectEqual(@as(u32, 2048), cfg.middleproxy_buffer_kb);
@@ -1664,7 +1756,7 @@ test "parse config - tag default null" {
     try std.testing.expect(cfg.tag == null);
 }
 
-test "parse config - invalid tag ignored" {
+test "parse config - invalid tag rejected" {
     const content =
         \\[server]
         \\tag = tooshort
@@ -1673,10 +1765,7 @@ test "parse config - invalid tag ignored" {
         \\alice = "00112233445566778899aabbccddeeff"
     ;
 
-    var cfg = try Config.parse(std.testing.allocator, content);
-    defer cfg.deinit(std.testing.allocator);
-
-    try std.testing.expect(cfg.tag == null);
+    try std.testing.expectError(error.InvalidAdTag, Config.parse(std.testing.allocator, content));
 }
 
 test "parse config - general ad_tag alias" {
@@ -2523,6 +2612,23 @@ test "parse config - [web].only parses, aliases web_only, and defaults false" {
     }
 }
 
+test "optional empty strings are unset and malformed arrays and tags are rejected" {
+    var cfg = try Config.parse(std.testing.allocator,
+        \\[server]
+        \\public_ip = ""
+        \\bind_address = ""
+        \\[metrics]
+        \\host = ""
+    );
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.public_ip == null);
+    try std.testing.expect(cfg.bind_address == null);
+    try std.testing.expect(cfg.metrics.host == null);
+    try std.testing.expectError(error.InvalidStringArray, Config.parse(std.testing.allocator, "[web]\nrelay_sources = [\n"));
+    try std.testing.expectError(error.InvalidAdTag, Config.parse(std.testing.allocator, "[server]\ntag = \"bad\"\n"));
+    try std.testing.expectError(error.InvalidBacklog, Config.parse(std.testing.allocator, "[server]\nbacklog = 4294967295\n"));
+}
+
 test "[web].only without [web].enabled never activates the gate" {
     // The trusted-peer set is keyed on `enabled` (proxy/trusted_peers.zig), so honouring
     // `only` on its own would mask every connection including the relay's — a proxy with
@@ -2536,6 +2642,25 @@ test "[web].only without [web].enabled never activates the gate" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.web.only);
     try std.testing.expect(!cfg.web.onlyActive());
+}
+
+test "startup validation rejects zero ports and invalid upstream credentials" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "[server]\nport = 0", "[metrics]\nport = 0", "[web]\nport = 0", "[censorship]\nmask_port = 0" }) |input| {
+        try std.testing.expectError(error.InvalidPort, Config.parse(allocator, input));
+    }
+    var cfg = try Config.parse(allocator, "[upstream]\ntype = \"socks5\"\n[upstream.socks5]\nhost = \"127.0.0.1\"\nport = 1080\n");
+    defer cfg.deinit(allocator);
+    try cfg.validate();
+    cfg.upstream_proxy_username = try allocator.dupe(u8, &([_]u8{'u'} ** 256));
+    try std.testing.expectError(error.InvalidUpstreamCredentials, cfg.validate());
+}
+
+test "inline comments preserve semicolons and reject unterminated quotes" {
+    try std.testing.expectEqualStrings("abc;def", try stripInlineComment("abc;def # comment"));
+    try std.testing.expectEqualStrings("'a#b'", try stripInlineComment("'a#b' # comment"));
+    try std.testing.expectError(error.UnterminatedString, stripInlineComment("\"unfinished"));
+    try std.testing.expectError(error.UnterminatedString, Config.parse(std.testing.allocator, "[server]\ntls_domain = \"unfinished"));
 }
 
 test "parse config - [web] cert/key paths round-trip and free cleanly" {

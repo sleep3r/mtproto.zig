@@ -51,7 +51,8 @@ pub fn getAesKeyAndIv(
     secret: []const u8,
     clt_ipv6: ?*const [16]u8,
     srv_ipv6: ?*const [16]u8,
-) struct { [32]u8, [16]u8 } {
+) !struct { [32]u8, [16]u8 } {
+    if (secret.len > 392 or purpose.len > 392 - secret.len) return error.InvalidKeyDerivationInput;
     var s_buf: [512]u8 = undefined;
     var s_len: usize = 0;
 
@@ -219,6 +220,10 @@ pub const MiddleProxyContext = struct {
     }
 
     pub fn deinit(self: *MiddleProxyContext, allocator: std.mem.Allocator) void {
+        self.encryptor.wipe();
+        self.decryptor.wipe();
+        std.crypto.secureZero(u8, self.s2c_buf);
+        std.crypto.secureZero(u8, self.c2s_buf);
         allocator.free(self.s2c_buf);
         allocator.free(self.c2s_buf);
     }
@@ -281,6 +286,16 @@ pub const MiddleProxyContext = struct {
                 actual_payload_len -= payload_len % 4;
             }
 
+            // Real MTProto messages are never empty. Without this, an authenticated
+            // client streaming 0x00 bytes (or all-padding "secure" frames) turns each
+            // consumed input byte into a full 80-96 byte RPC_PROXY_REQ frame sent to
+            // Telegram's middle proxy -- a ~96x egress amplifier (audit G01-2). Drop
+            // the frame instead of encapsulating it, but still advance `pos` past it.
+            if (actual_payload_len == 0) {
+                pos += header_len + payload_len;
+                continue;
+            }
+
             const payload = self.c2s_buf[pos + header_len .. pos + header_len + actual_payload_len];
 
             // 3. Pass is_quickack to the encapsulator
@@ -339,7 +354,7 @@ pub const MiddleProxyContext = struct {
         out_len += 4;
         std.mem.writeInt(i32, out_buf[out_len..][0..4], self.seq_no, .little);
         out_len += 4;
-        self.seq_no += 1;
+        self.seq_no +%= 1;
 
         @memcpy(out_buf[out_len .. out_len + 4], &rpc_proxy_req);
         out_len += 4;
@@ -411,6 +426,19 @@ pub const MiddleProxyContext = struct {
     /// Takes raw AES-CBC bytes from DC, decrypts them block by block, parses MTProtoFrames,
     /// strips RPC_PROXY_ANS, and writes the inner payload into `out_buf`.
     pub fn decapsulateS2C(self: *MiddleProxyContext, dc_chunk: []const u8, out_buf: []u8) ![]u8 {
+        var consumed: usize = 0;
+        var written: usize = 0;
+        while (consumed < dc_chunk.len) {
+            const take = @min(dc_chunk.len - consumed, self.s2c_buf.len - self.s2c_len);
+            if (take == 0) return error.MiddleProxyBufferOverflow;
+            const output = try self.decapsulateS2CChunk(dc_chunk[consumed..][0..take], out_buf[written..]);
+            consumed += take;
+            written += output.len;
+        }
+        return out_buf[0..written];
+    }
+
+    fn decapsulateS2CChunk(self: *MiddleProxyContext, dc_chunk: []const u8, out_buf: []u8) ![]u8 {
         if (self.s2c_len + dc_chunk.len > self.s2c_buf.len) return error.MiddleProxyBufferOverflow;
         @memcpy(self.s2c_buf[self.s2c_len .. self.s2c_len + dc_chunk.len], dc_chunk);
         self.s2c_len += dc_chunk.len;
@@ -466,7 +494,7 @@ pub const MiddleProxyContext = struct {
 
             const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[parse_pos + 4 ..][0..4], .little);
             if (frame_seq_no != self.read_seq_no) return error.BadMiddleProxySeqNo;
-            self.read_seq_no += 1;
+            self.read_seq_no +%= 1;
 
             // Payload is after Length (4) and SeqNo (4), and before CRC32 (4)
             const payload = self.s2c_buf[parse_pos + 8 .. frame_end - 4];
@@ -508,6 +536,7 @@ pub const MiddleProxyContext = struct {
 
                 switch (self.proto_tag) {
                     .abridged => {
+                        if (conn_data.len % 4 != 0) return error.InvalidPayloadLength;
                         const len_div_4: usize = (conn_data.len + pad_len) / 4;
                         if (len_div_4 < 127) {
                             header_buf[0] = @intCast(len_div_4);
@@ -710,7 +739,7 @@ test "decapsulate s2c skips noop padding words" {
     const key = [_]u8{0} ** 32;
     const iv = [_]u8{0} ** 16;
 
-    var ctx = try MiddleProxyContext.init(
+    var ctx = try MiddleProxyContext.initWithBuffer(
         allocator,
         crypto.AesCbc.init(&key, &iv),
         crypto.AesCbc.init(&key, &iv),
@@ -720,6 +749,7 @@ test "decapsulate s2c skips noop padding words" {
         ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
+        32,
     );
     defer ctx.deinit(allocator);
 
@@ -871,6 +901,52 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
     try std.testing.expectEqualSlices(u8, &rpc_proxy_req, rpc_payload[0..4]);
 }
 
+test "encapsulate c2s drops zero-length abridged frames instead of amplifying them" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        ip4(.{ 10, 20, 30, 40 }, 12345),
+        ip4(.{ 91, 105, 192, 110 }, 443),
+        .abridged,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    // Three zero-length abridged frames (length byte 0x00, no payload) followed by
+    // one real 4-byte frame (length byte 0x01, then 4 payload bytes). Before the
+    // fix, each 0x00 byte alone produced an 80-byte RPC_PROXY_REQ frame on its own
+    // (a 96x amplifier with an ad_tag) -- see G01-2.
+    const client_data = [_]u8{ 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef };
+    var out_buf: [512]u8 = undefined;
+
+    const written = try ctx.encapsulateC2S(client_data[0..], out_buf[0..]);
+
+    // Only the one real frame produced output: rpc_len = 56 + 4 (client_data),
+    // frame_total_len = rpc_len + 12 = 72, padded to a multiple of 16 -> 80 bytes.
+    try std.testing.expectEqual(@as(usize, 80), written.len);
+
+    // The empty frames advanced seq_no by zero: exactly one message was encapsulated.
+    try std.testing.expectEqual(@as(i32, -1), ctx.seq_no);
+
+    // All input bytes, including the dropped empty frames, were consumed.
+    try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
+
+    var decryptor = crypto.AesCbc.init(&key, &iv);
+    var scratch: [80]u8 = undefined;
+    @memcpy(scratch[0..], written);
+    try decryptor.decryptInPlace(scratch[0..]);
+    const rpc_payload = scratch[8..68];
+    try std.testing.expectEqualSlices(u8, &rpc_proxy_req, rpc_payload[0..4]);
+}
+
 // ── getAesKeyAndIv known-answer tests ──────────────────────────────────────────
 //
 // Independent reference re-derivation of the middle-proxy AES key/iv, mirroring
@@ -938,7 +1014,7 @@ test "getAesKeyAndIv KAT: v4 with both IPs, CLIENT and SERVER" {
     const secret = [_]u8{0x07} ** 16;
 
     inline for (.{ "CLIENT", "SERVER" }) |purpose| {
-        const got = getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, purpose, &clt_ip, &srv_port, &secret, null, null);
+        const got = try getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, purpose, &clt_ip, &srv_port, &secret, null, null);
         const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, purpose, &clt_ip, &srv_port, &secret, null);
         try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
         try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);
@@ -955,7 +1031,7 @@ test "getAesKeyAndIv KAT: v4 with NAT-translated client IP" {
     const srv_port = [_]u8{ 0xBB, 0x01 };
     const secret = [_]u8{0x5a} ** 16;
 
-    const got = getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "CLIENT", &nat_clt_ip, &srv_port, &secret, null, null);
+    const got = try getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "CLIENT", &nat_clt_ip, &srv_port, &secret, null, null);
     const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "CLIENT", &nat_clt_ip, &srv_port, &secret, null);
     try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
     try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);
@@ -973,7 +1049,7 @@ test "getAesKeyAndIv KAT: v6 with the IPv6 block" {
     const clt_v6 = [_]u8{0xab} ** 16;
     const srv_v6 = [_]u8{0xcd} ** 16;
 
-    const got = getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "SERVER", &clt_ip, &srv_port, &secret, &clt_v6, &srv_v6);
+    const got = try getAesKeyAndIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "SERVER", &clt_ip, &srv_port, &secret, &clt_v6, &srv_v6);
     const exp = refKeyIv(&nonce_srv, &nonce_clt, &clt_ts, &srv_ip, &clt_port, "SERVER", &clt_ip, &srv_port, &secret, .{ .clt = clt_v6, .srv = srv_v6 });
     try std.testing.expectEqualSlices(u8, &exp[0], &got[0]);
     try std.testing.expectEqualSlices(u8, &exp[1], &got[1]);

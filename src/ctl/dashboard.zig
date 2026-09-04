@@ -16,7 +16,9 @@ const SummaryLine = tui_mod.SummaryLine;
 
 const INSTALL_DIR = "/opt/mtproto-proxy/monitor";
 const VENV_DIR = INSTALL_DIR ++ "/.venv";
-const VENV_PYTHON = VENV_DIR ++ "/bin/python";
+const STAGED_VENV_DIR = VENV_DIR ++ ".new";
+const VENV_PYTHON = STAGED_VENV_DIR ++ "/bin/python";
+const UV_BIN = INSTALL_DIR ++ "/bin/uv";
 const UV_PYTHON_INSTALL_DIR = INSTALL_DIR ++ "/.uv-python";
 const UV_SUBPROCESS_PATH = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const UV_PYTHON_INSTALL_ENV = "UV_PYTHON_INSTALL_DIR=" ++ UV_PYTHON_INSTALL_DIR;
@@ -27,14 +29,14 @@ const SERVICE_NAME = "proxy-monitor";
 const SERVICE_FILE = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
 
 const VENV_CREATE_ARGV = [_][]const u8{
-    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, "uv", "venv", VENV_DIR, "--python", "python3",
+    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, UV_BIN, "venv", STAGED_VENV_DIR, "--python", "python3",
 };
 
 const PIP_INSTALL_ARGV = [_][]const u8{
     "env",
     UV_SUBPROCESS_PATH,
     UV_PYTHON_INSTALL_ENV,
-    "uv",
+    UV_BIN,
     "pip",
     "install",
     "--python",
@@ -74,6 +76,9 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.quiet = true;
         } else if (std.mem.eql(u8, arg, "--remove") or std.mem.eql(u8, arg, "--uninstall")) {
             do_remove = true;
+        } else {
+            ui.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
     if (do_remove) return removeDashboard(ui);
@@ -137,8 +142,10 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 }
 
 /// Check if `uv` is available on the system.
-fn uvExists() bool {
-    return sys.commandExists("uv");
+fn uvExists(allocator: std.mem.Allocator) bool {
+    const result = sys.exec(allocator, &.{ UV_BIN, "--version" }) catch return false;
+    defer result.deinit();
+    return result.exit_code == 0 and std.mem.eql(u8, std.mem.trim(u8, result.stdout, " \r\n\t"), "uv " ++ UV_VERSION);
 }
 
 /// Install `uv` from GitHub releases (astral.sh is blocked in some regions).
@@ -183,8 +190,8 @@ fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
         \\  exit 1
         \\fi
         \\tar -xzf "$TMP_DIR/uv.tar.gz" -C "$TMP_DIR" --strip-components=1
-        \\install -m 0755 "$TMP_DIR/uv" /usr/local/bin/uv
-        \\if [ -f "$TMP_DIR/uvx" ]; then install -m 0755 "$TMP_DIR/uvx" /usr/local/bin/uvx; fi
+        \\install -d -m 0755 /opt/mtproto-proxy/monitor/bin
+        \\install -m 0755 "$TMP_DIR/uv" /opt/mtproto-proxy/monitor/bin/uv
     ,
         .{uv_url},
     ) catch {
@@ -207,8 +214,8 @@ fn bootstrapUv(ui: *Tui, allocator: std.mem.Allocator) bool {
         return false;
     }
 
-    if (!sys.commandExists("uv")) {
-        ui.fail("uv binary installed but not found on PATH");
+    if (!uvExists(allocator)) {
+        ui.fail("Installed uv version did not match the pinned release");
         return false;
     }
 
@@ -223,7 +230,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     }
 
     // ── Ensure uv is available ──
-    if (!uvExists()) {
+    if (!uvExists(allocator)) {
         if (!bootstrapUv(ui, allocator)) {
             return;
         }
@@ -238,19 +245,21 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
         ui.fail("Failed to write server.py");
         return;
     };
-    sys.writeFile(INSTALL_DIR ++ "/static/index.html", index_html) catch {};
-    sys.writeFile(INSTALL_DIR ++ "/static/style.css", style_css) catch {};
-    sys.writeFile(INSTALL_DIR ++ "/static/app.js", app_js) catch {};
-    sys.writeFile(INSTALL_DIR ++ "/static/logo.svg", logo_svg) catch {};
+    try sys.writeFile(INSTALL_DIR ++ "/proxy.service", @import("build_options").proxy_service);
+    try sys.writeFile(INSTALL_DIR ++ "/static/index.html", index_html);
+    try sys.writeFile(INSTALL_DIR ++ "/static/style.css", style_css);
+    try sys.writeFile(INSTALL_DIR ++ "/static/app.js", app_js);
+    try sys.writeFile(INSTALL_DIR ++ "/static/logo.svg", logo_svg);
 
     ui.ok("Dashboard files extracted to " ++ INSTALL_DIR);
 
     // ── Create virtualenv & install dependencies ──
     ui.step("Setting up Python virtualenv via uv...");
 
-    // Remove stale venv first — `make deploy` chowns everything to mtproto:mtproto,
-    // so `uv venv` (running as root) can fail to overwrite it.
-    _ = sys.exec(allocator, &.{ "rm", "-rf", VENV_DIR }) catch {};
+    // Rebuild only the staging environment; failed downloads leave the live one intact.
+    const cleanup = try sys.exec(allocator, &.{ "rm", "-rf", STAGED_VENV_DIR });
+    defer cleanup.deinit();
+    if (cleanup.exit_code != 0) return error.StagingCleanupFailed;
 
     // The systemd unit uses ProtectHome=yes. uv-managed interpreters installed
     // under /root/.local/share/uv/python become invisible to ExecStart, so keep
@@ -287,6 +296,16 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
     }
 
     ui.ok("Python dependencies installed");
+
+    const activate = try sys.exec(allocator, &.{
+        "sh", "-c",
+        "set -e; rm -rf '" ++ VENV_DIR ++ ".previous'; " ++
+            "if [ -e '" ++ VENV_DIR ++ "' ]; then mv '" ++ VENV_DIR ++ "' '" ++ VENV_DIR ++ ".previous'; fi; " ++
+            "if ! mv '" ++ STAGED_VENV_DIR ++ "' '" ++ VENV_DIR ++ "'; then " ++
+            "mv '" ++ VENV_DIR ++ ".previous' '" ++ VENV_DIR ++ "'; exit 1; fi",
+    });
+    defer activate.deinit();
+    if (activate.exit_code != 0) return error.VenvActivationFailed;
 
     // ── Setup Systemd Service ──
     ui.step("Configuring systemd service...");
@@ -373,5 +392,6 @@ test "dashboard venv keeps uv-managed Python outside ProtectHome paths" {
     try std.testing.expectEqualStrings("env", argv[0]);
     try std.testing.expectEqualStrings("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", argv[1]);
     try std.testing.expectEqualStrings("UV_PYTHON_INSTALL_DIR=/opt/mtproto-proxy/monitor/.uv-python", argv[2]);
-    try std.testing.expectEqualStrings("uv", argv[3]);
+    try std.testing.expectEqualStrings(UV_BIN, argv[3]);
+    try std.testing.expectEqualStrings(STAGED_VENV_DIR, argv[5]);
 }

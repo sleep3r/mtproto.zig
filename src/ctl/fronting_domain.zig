@@ -51,12 +51,17 @@ pub fn classifyOpenSslOutput(output: []const u8) FrontingVerdict {
         else
             .not_reached;
     }
-    if (std.mem.indexOf(u8, output, "Server Temp Key") != null) {
-        if (std.mem.indexOf(u8, output, "MLKEM") != null) return .pq_capable;
-        return .single_round_x25519;
+    if (lineValue(output, "Server Temp Key:")) |group| {
+        if (std.mem.indexOf(u8, group, "MLKEM") != null) return .pq_capable;
+        if (std.ascii.indexOfIgnoreCase(group, "x25519") != null) return .single_round_x25519;
+        return .reachable_without_x25519;
     }
     if (std.mem.indexOf(u8, output, "CONNECTED") != null) return .reachable_without_x25519;
     return .not_reached;
+}
+
+test "legacy OpenSSL non-x25519 key is a mismatch" {
+    try std.testing.expectEqual(FrontingVerdict.reachable_without_x25519, classifyOpenSslOutput("CONNECTED\nServer Temp Key: ECDH, secp521r1, 521 bits\n"));
 }
 
 /// Text following `needle` up to the end of that line, trimmed. Null if absent.
@@ -94,8 +99,9 @@ pub fn warnIfPoorFrontingDomain(ui: *Tui, allocator: std.mem.Allocator, domain: 
     // x25519-only probe — the same check we shipped before PQ existed.
     const legacy = runOpensslProbe(allocator, domain, "X25519") orelse .not_reached;
     if (legacy == .not_reached) return warnFromVerdict(ui, domain, .not_reached);
+    if (legacy == .reachable_without_x25519) return warnFromVerdict(ui, domain, legacy);
 
-    var b: [360]u8 = undefined;
+    var b: [768]u8 = undefined;
     if (std.fmt.bufPrint(&b, "Couldn't test X25519MLKEM768 for '{s}' (the domain rejected the hybrid offer, or this host's OpenSSL predates 3.5). It does single-round x25519 — since June 2026 that alone can mark iOS. Verify PQ support with @Sni_checker_bot.", .{domain}) catch null) |m| ui.info(m);
     return .not_reached;
 }
@@ -103,7 +109,7 @@ pub fn warnIfPoorFrontingDomain(ui: *Tui, allocator: std.mem.Allocator, domain: 
 /// Run one `openssl s_client` probe with the given `-groups` list. Returns null only
 /// if the command couldn't be launched.
 fn runOpensslProbe(allocator: std.mem.Allocator, domain: []const u8, groups: []const u8) ?FrontingVerdict {
-    var cmd_buf: [512]u8 = undefined;
+    var cmd_buf: [768]u8 = undefined;
     const cmd = std.fmt.bufPrint(
         &cmd_buf,
         "echo | timeout 10 openssl s_client -connect {s}:443 -servername {s} -groups {s} -tls1_3 2>&1",
@@ -117,24 +123,24 @@ fn runOpensslProbe(allocator: std.mem.Allocator, domain: []const u8, groups: []c
 fn warnFromVerdict(ui: *Tui, domain: []const u8, verdict: FrontingVerdict) FrontingCheckResult {
     switch (verdict) {
         .pq_capable => {
-            var b: [256]u8 = undefined;
+            var b: [768]u8 = undefined;
             if (std.fmt.bufPrint(&b, "'{s}' negotiates X25519MLKEM768 (post-quantum) — a good fronting target, no iOS marker.", .{domain}) catch null) |m| ui.ok(m);
             return .ok;
         },
         .not_reached => {
-            var b: [320]u8 = undefined;
+            var b: [768]u8 = undefined;
             if (std.fmt.bufPrint(&b, "Couldn't reach '{s}:443' from here to verify its TLS — skipping (connectivity, not a bad domain).", .{domain}) catch null) |m| ui.info(m);
             return .not_reached;
         },
         .single_round_x25519 => {
             ui.warn("This fronting domain negotiates only classical x25519, not X25519MLKEM768.");
-            var msg_buf: [360]u8 = undefined;
+            var msg_buf: [768]u8 = undefined;
             if (std.fmt.bufPrint(&msg_buf, "  Since the June-2026 TSPU rollout a non-PQ domain is a passive marker: iOS clients (and everyone sharing their NAT IP) fronting '{s}' get blocked.", .{domain}) catch null) |m| ui.warn(m);
             ui.hint("  Prefer a domain that negotiates X25519MLKEM768 in one round. Verify: openssl s_client -groups X25519MLKEM768 -connect <domain>:443 (OpenSSL 3.5+), or @Sni_checker_bot. tls_domain is IMMUTABLE once links ship — choose now.");
             return .mismatch;
         },
         .reachable_without_x25519 => {
-            var msg_buf: [360]u8 = undefined;
+            var msg_buf: [768]u8 = undefined;
             if (std.fmt.bufPrint(&msg_buf, "  '{s}' does a HelloRetryRequest or prefers a non-x25519 group (like wb.ru/mail.ru → secp521r1) — our single-round FakeTLS ServerHello can't match it, so a passive observer sees a mismatch.", .{domain}) catch null) |m| ui.warn(m);
             ui.hint("  Prefer a domain that negotiates X25519MLKEM768 (or plain x25519) in one round. tls_domain is IMMUTABLE once links are shared — choose now.");
             return .mismatch;
@@ -142,12 +148,16 @@ fn warnFromVerdict(ui: *Tui, domain: []const u8, verdict: FrontingVerdict) Front
     }
 }
 
-fn isSafeFrontingDomain(domain: []const u8) bool {
+pub fn isSafeFrontingDomain(domain: []const u8) bool {
     if (domain.len == 0 or domain.len > 253) return false;
     for (domain) |c| {
         const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
             (c >= '0' and c <= '9') or c == '.' or c == '-';
         if (!ok) return false;
+    }
+    var labels = std.mem.splitScalar(u8, domain, '.');
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return false;
     }
     return true;
 }

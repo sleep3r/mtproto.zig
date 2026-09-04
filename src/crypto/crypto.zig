@@ -35,14 +35,6 @@ pub const AesCtr = struct {
         };
     }
 
-    pub fn initFromSlices(key: []const u8, iv: []const u8) !AesCtr {
-        if (key.len != 32) return error.InvalidKeyLength;
-        if (iv.len != 16) return error.InvalidIvLength;
-        const k: *const [32]u8 = key[0..32];
-        const iv_val = std.mem.readInt(u128, iv[0..16], .big);
-        return init(k, iv_val);
-    }
-
     /// Number of AES blocks processed in parallel on the relay hot path.
     /// 8 is optimal for x86_64 AES-NI (the +aes release target) and correct on
     /// any backend (encryptWide handles arbitrary counts). Every relayed byte
@@ -78,7 +70,21 @@ pub const AesCtr = struct {
             i += wide_bytes;
         }
 
-        // 3. Tail: remaining < wide_bytes via the single-block buffer path, which
+        inline for (.{ 4, 2, 1 }) |blocks| {
+            const bytes = blocks * 16;
+            if (i + bytes <= data.len) {
+                var counters: [bytes]u8 = undefined;
+                inline for (0..blocks) |b| {
+                    std.mem.writeInt(u128, counters[b * 16 ..][0..16], self.ctr +% b, .big);
+                }
+                const chunk: *[bytes]u8 = data[i..][0..bytes];
+                self.enc_ctx.xorWide(blocks, chunk, chunk, counters);
+                self.ctr +%= blocks;
+                i += bytes;
+            }
+        }
+
+        // 3. Tail: remaining < 16 bytes via the single-block buffer path, which
         //    also refills self.buffer for keystream continuity into the next call.
         while (i < data.len) {
             if (self.buffer_pos >= 16) {
@@ -96,15 +102,6 @@ pub const AesCtr = struct {
         }
     }
 
-    /// Encrypt/decrypt into a new buffer.
-    pub fn process(self: *AesCtr, allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-        const result = try allocator.alloc(u8, data.len);
-        @memcpy(result, data);
-        self.apply(result);
-        return result;
-    }
-
-    /// Securely wipe key material.
     pub fn wipe(self: *AesCtr) void {
         std.crypto.secureZero(u8, &self.key);
         std.crypto.secureZero(u8, &self.buffer);
@@ -179,6 +176,16 @@ pub const AesCbc = struct {
         var prev: [16]u8 = self.iv;
 
         var offset: usize = 0;
+        while (offset + 128 <= data.len) : (offset += 128) {
+            const block: *[128]u8 = data[offset..][0..128];
+            const saved = block.*;
+            self.dec_ctx.decryptWide(8, block, &saved);
+            inline for (0..8) |b| {
+                const previous = if (b == 0) &prev else saved[(b - 1) * 16 ..][0..16];
+                xorBlockInPlace(block[b * 16 ..][0..16], previous);
+            }
+            prev = saved[112..128].*;
+        }
         while (offset < data.len) : (offset += block_size) {
             const block: *[16]u8 = data[offset..][0..16];
             const saved = block.*;
@@ -238,32 +245,49 @@ pub fn md5(data: []const u8) [16]u8 {
 
 // ============= Secure Random =============
 
+threadlocal var thread_csprng: ?std.Random.DefaultCsprng = null;
+
+fn secureRandom() std.Random {
+    if (thread_csprng == null) {
+        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        std.Io.Threaded.global_single_threaded.io().random(&seed);
+        thread_csprng = std.Random.DefaultCsprng.init(seed);
+    }
+    return thread_csprng.?.random();
+}
+
 /// Fill buffer with cryptographically secure random bytes.
 pub fn randomBytes(buf: []u8) void {
-    var source: std.Random.IoSource = .{
-        .io = std.Io.Threaded.global_single_threaded.io(),
-    };
-    source.interface().bytes(buf);
+    secureRandom().bytes(buf);
 }
 
 /// Generate a random integer in [0, max).
 pub fn randomRange(comptime T: type, max: T) T {
     if (max == 0) return 0;
-    var source: std.Random.IoSource = .{
-        .io = std.Io.Threaded.global_single_threaded.io(),
-    };
-    return source.interface().uintLessThan(T, max);
+    return secureRandom().uintLessThan(T, max);
 }
 
 /// Generate a random integer in the full range of T.
 pub fn randomInt(comptime T: type) T {
-    var source: std.Random.IoSource = .{
-        .io = std.Io.Threaded.global_single_threaded.io(),
-    };
-    return source.interface().int(T);
+    return secureRandom().int(T);
 }
 
 // ============= Tests =============
+
+test "CBC wide decryption agrees across split calls" {
+    const key = [_]u8{0x12} ** 32;
+    const iv = [_]u8{0x34} ** 16;
+    var data: [400]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    const original = data;
+    var enc = AesCbc.init(&key, &iv);
+    try enc.encryptInPlace(&data);
+    var dec = AesCbc.init(&key, &iv);
+    try dec.decryptInPlace(data[0..144]);
+    try dec.decryptInPlace(data[144..]);
+    try std.testing.expectEqualSlices(u8, &original, &data);
+}
 
 test "AesCtr roundtrip" {
     const key = [_]u8{0} ** 32;

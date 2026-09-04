@@ -15,8 +15,23 @@ fn realtimeSeconds() i64 {
     return @intCast(ts.sec);
 }
 
+fn timestampWithinWindow(timestamp: u32, now: i64) bool {
+    const diff = now -| @as(i64, timestamp);
+    return diff >= constants.time_skew_min and diff <= constants.time_skew_max;
+}
+
+test "timestamp window includes both 120-second boundaries" {
+    try std.testing.expect(timestampWithinWindow(1000, 880));
+    try std.testing.expect(timestampWithinWindow(1000, 1120));
+    try std.testing.expect(!timestampWithinWindow(1000, 879));
+    try std.testing.expect(!timestampWithinWindow(1000, 1121));
+    try std.testing.expect(!timestampWithinWindow(1000, 0));
+}
+
 /// Re-export for convenience
 pub const UserSecret = obfuscation.UserSecret;
+/// Bound authentication work; larger browser hellos are forwarded to the cover origin.
+pub const max_authenticated_hello_len = 4096;
 
 // ============= TLS Validation Result =============
 
@@ -40,13 +55,12 @@ pub const TlsValidation = struct {
 /// Validate a TLS ClientHello against user secrets.
 /// Returns validation result if a matching user is found.
 pub fn validateTlsHandshake(
-    allocator: std.mem.Allocator,
     handshake: []const u8,
     secrets: []const UserSecret,
     ignore_time_skew: bool,
     clock_offset_seconds: i64,
 ) !?TlsValidation {
-    _ = allocator;
+    if (handshake.len > max_authenticated_hello_len) return null;
 
     const min_len = constants.tls_digest_pos + constants.tls_digest_len + 1;
     if (handshake.len < min_len) return null;
@@ -58,15 +72,16 @@ pub fn validateTlsHandshake(
     const session_id_len_pos = constants.tls_digest_pos + constants.tls_digest_len;
     if (session_id_len_pos >= handshake.len) return null;
     const session_id_len: usize = handshake[session_id_len_pos];
-    if (session_id_len != 32) return null;
 
     const session_id_start = session_id_len_pos + 1;
-    if (handshake.len < session_id_start + session_id_len) return null;
+    const valid_session_id = session_id_len == 32 and handshake.len >= session_id_start + session_id_len;
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
-    const now: i64 = if (!ignore_time_skew) realtimeSeconds() + clock_offset_seconds else 0;
+    const now: i64 = if (!ignore_time_skew) realtimeSeconds() +| clock_offset_seconds else 0;
+    var matched: ?TlsValidation = null;
+    var clock_skew = false;
 
     for (secrets) |entry| {
         var hmac = HmacSha256.init(&entry.secret);
@@ -78,6 +93,7 @@ pub fn validateTlsHandshake(
 
         // Constant-time comparison of first 28 bytes using stdlib
         if (!std.crypto.timing_safe.eql([28]u8, digest[0..28].*, computed[0..28].*)) continue;
+        if (!valid_session_id) continue;
 
         // Extract timestamp from last 4 bytes (XOR)
         const timestamp = std.mem.readInt(u32, &[4]u8{
@@ -88,13 +104,13 @@ pub fn validateTlsHandshake(
         }, .little);
 
         if (!ignore_time_skew) {
-            const time_diff = now - @as(i64, @intCast(timestamp));
-            if (time_diff < constants.time_skew_min or time_diff > constants.time_skew_max) {
+            if (!timestampWithinWindow(timestamp, now)) {
+                clock_skew = true;
                 continue;
             }
         }
 
-        return .{
+        matched = .{
             .user = entry.name,
             .session_id = handshake[session_id_start .. session_id_start + session_id_len],
             .digest = digest,
@@ -104,6 +120,8 @@ pub fn validateTlsHandshake(
         };
     }
 
+    if (matched != null) return matched;
+    if (clock_skew) return error.ClockSkew;
     return null;
 }
 
@@ -118,12 +136,13 @@ pub fn validateTlsHandshake(
 /// we use a comptime-built template that matches real Nginx/OpenSSL TLS 1.3 fingerprint:
 /// - Extensions in OpenSSL order: supported_versions THEN key_share
 /// - Fixed AppData size (consistent like a real certificate, not random)
-/// - Deterministic pseudo-random AppData body (high entropy, same every time)
+/// - Fresh random AppData body with the configured certificate-record size
 ///
-/// Only three fields are patched at runtime:
+/// Fields patched at runtime:
 /// - Server Random (offset 11..43): HMAC-SHA256 digest
 /// - Session ID (offset 44..76): echoed from ClientHello
 /// - X25519 key (offset 95..127): fresh random key
+/// - Cipher suite and fresh Application Data bytes
 ///
 /// The client (ConnectionSocket.cpp) validates the response by:
 /// - Checking for `\x16\x03\x03` prefix (ServerHello record)
@@ -152,6 +171,19 @@ pub fn buildServerHelloWithTemplate(
     session_id: []const u8,
     cipher: ?u16,
 ) ![]u8 {
+    const response = try allocator.alloc(u8, template.len);
+    errdefer allocator.free(response);
+    return buildServerHelloWithTemplateInto(response, template, secret, client_digest, session_id, cipher);
+}
+
+pub fn buildServerHelloWithTemplateInto(
+    out: []u8,
+    template: []const u8,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+) ![]u8 {
     // The ServerHello+CCS+AppData-header prefix is a fixed 138 bytes; only the trailing
     // fake-cert (AppData body) size varies. Accept any template whose length leaves room
     // for that prefix, so a profile-matched cert size (see buildServerHelloTemplateAlloc)
@@ -159,8 +191,8 @@ pub fn buildServerHelloWithTemplate(
     if (template.len < tmpl_appdata_offset) return error.BadServerHelloTemplate;
 
     // 1. Copy the pre-built Nginx template (random and session_id are zeroed in template)
-    const response = try allocator.alloc(u8, template.len);
-    errdefer allocator.free(response);
+    if (out.len < template.len) return error.OutOfSpace;
+    const response = out[0..template.len];
     @memcpy(response, template);
 
     // 1b. Echo a client-offered cipher suite. A real TLS server negotiates the
@@ -238,7 +270,7 @@ const pq_key_share_len: usize = 1120;
 ///   +2(group)+2(keylen)+1120(key) = 1215.
 const pq_server_hello_record_len: usize = 95 + pq_key_share_len;
 /// Full PQ response: ServerHello + CCS(6) + AppData(5 + cert payload).
-pub const pq_server_hello_len: usize = pq_server_hello_record_len + 6 + 5 + fake_cert_payload_len;
+const pq_server_hello_len: usize = pq_server_hello_record_len + 6 + 5 + fake_cert_payload_len;
 /// Offset of the 1120-byte PQ key_share inside the response.
 const pq_key_offset: usize = 95;
 /// Offset of the fake AppData body inside the PQ response.
@@ -248,6 +280,14 @@ const pq_appdata_offset: usize = pq_server_hello_record_len + 6 + 5;
 /// Return true when the ClientHello carries a key_share entry for X25519MLKEM768
 /// (named group 0x11ec). Mirrors the key_share walk in formatClientHelloFingerprint.
 pub fn clientOffersPqKeyShare(handshake: []const u8) bool {
+    return clientOffersKeyShare(handshake, pq_named_group, 1216);
+}
+
+pub fn clientOffersX25519KeyShare(handshake: []const u8) bool {
+    return clientOffersKeyShare(handshake, 0x001d, 32);
+}
+
+fn clientOffersKeyShare(handshake: []const u8, group: u16, expected_len: usize) bool {
     if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return false;
     var pos: usize = 5;
     if (pos >= handshake.len or handshake[pos] != 0x01) return false; // ClientHello
@@ -267,20 +307,26 @@ pub fn clientOffersPqKeyShare(handshake: []const u8) bool {
     if (pos + 2 > handshake.len) return false;
     const ext_total = std.mem.readInt(u16, handshake[pos..][0..2], .big);
     pos += 2;
-    const ext_end = @min(pos + ext_total, handshake.len);
+    const ext_end = pos + ext_total;
+    if (ext_end > handshake.len) return false;
     while (pos + 4 <= ext_end) {
         const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
         const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
         pos += 4;
         if (pos + elen > ext_end) break;
         if (etype == 0x0033) { // key_share: 2-byte client_shares list_len, then entries
+            if (elen < 2) return false;
             var kp: usize = pos + 2;
             const ks_end = pos + elen;
+            if (std.mem.readInt(u16, handshake[pos..][0..2], .big) != elen - 2) return false;
+            var found = false;
             while (kp + 4 <= ks_end) {
-                if (std.mem.readInt(u16, handshake[kp..][0..2], .big) == pq_named_group) return true;
-                kp += 4 + @as(usize, std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big));
+                const key_len = std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big);
+                if (kp + 4 + key_len > ks_end) return false;
+                if (std.mem.readInt(u16, handshake[kp..][0..2], .big) == group and key_len == expected_len) found = true;
+                kp += 4 + @as(usize, key_len);
             }
-            return false;
+            return found and kp == ks_end;
         }
         pos += elen;
     }
@@ -299,12 +345,26 @@ pub fn buildServerHelloPq(
     cipher: ?u16,
     cert_len: usize,
 ) ![]u8 {
+    if (cert_len > 0xFFFF) return error.CertTooLarge;
+    const response = try allocator.alloc(u8, pq_appdata_offset + cert_len);
+    errdefer allocator.free(response);
+    return buildServerHelloPqInto(response, secret, client_digest, session_id, cipher, cert_len);
+}
+
+pub fn buildServerHelloPqInto(
+    out: []u8,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+    cert_len: usize,
+) ![]u8 {
     if (session_id.len != 32) return error.BadSessionIdLength;
     if (cert_len > 0xFFFF) return error.CertTooLarge;
     // Match the fake-cert (AppData) record size used on the non-PQ path so a prober can't
     // tell PQ vs classical clients apart by cert-record length.
-    const r = try allocator.alloc(u8, pq_appdata_offset + cert_len);
-    errdefer allocator.free(r);
+    if (out.len < pq_appdata_offset + cert_len) return error.OutOfSpace;
+    const r = out[0 .. pq_appdata_offset + cert_len];
     @memset(r, 0);
 
     // ── Record 1: ServerHello with a 0x11ec key_share ──
@@ -384,7 +444,7 @@ pub fn buildServerHelloTemplateAlloc(allocator: std.mem.Allocator, cert_len: usi
 /// Walk a TLS record stream and return the payload length of the first Application Data
 /// (0x17) record, or null. Used to learn the mask origin's first encrypted-flight
 /// (certificate) record size so our fake cert record can match it instead of a fixed 2878.
-pub fn firstAppDataRecordLen(data: []const u8) ?usize {
+fn firstAppDataRecordLen(data: []const u8) ?usize {
     var pos: usize = 0;
     while (pos + 5 <= data.len) {
         const rtype = data[pos];
@@ -459,7 +519,7 @@ const nginx_template: [nginx_template_len]u8 = blk: {
     break :blk buildNginxTemplate(default_template_seed);
 };
 
-pub fn buildServerHelloTemplate(seed: ?u64) [nginx_template_len]u8 {
+fn buildServerHelloTemplate(seed: ?u64) [nginx_template_len]u8 {
     const actual_seed = seed orelse crypto.randomInt(u64);
     return buildNginxTemplate(actual_seed);
 }
@@ -985,7 +1045,7 @@ test "fuzz: TLS ClientHello parsers never panic on arbitrary input" {
             var fp_buf: [256]u8 = undefined;
             _ = formatClientHelloFingerprint(data, &fp_buf);
             const secrets = [_]UserSecret{.{ .name = "u", .secret = [_]u8{0x11} ** 16 }};
-            _ = validateTlsHandshake(std.testing.allocator, data, &secrets, true, 0) catch {};
+            _ = validateTlsHandshake(data, &secrets, true, 0) catch {};
         }
     }.one, .{});
 }
@@ -1045,7 +1105,7 @@ test "formatClientHelloFingerprint summarizes ciphers/groups/keyshare" {
 }
 
 test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
-    var ch: [160]u8 = undefined;
+    var ch: [1400]u8 = undefined;
     var n: usize = 0;
     const W = struct {
         fn b(buf: []u8, i: *usize, v: u8) void {
@@ -1082,19 +1142,30 @@ test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
     const ks_len_at = n;
     W.h(&ch, &n, 0);
     const ks_payload_start = n;
-    W.h(&ch, &n, 8); // client_shares list length
+    W.h(&ch, &n, 1260); // GREASE, x25519, then PQ
+    W.h(&ch, &n, 0x0a0a);
+    W.h(&ch, &n, 0);
+    W.h(&ch, &n, 0x001d);
+    W.h(&ch, &n, 32);
+    for (0..32) |_| W.b(&ch, &n, 0xDD);
+    const pq_group_at = n;
     W.h(&ch, &n, 0x11ec); // group
-    W.h(&ch, &n, 4); // key length
+    W.h(&ch, &n, 1216); // client X25519MLKEM768 key length
     var kk: usize = 0;
-    while (kk < 4) : (kk += 1) W.b(&ch, &n, 0xCC);
+    while (kk < 1216) : (kk += 1) W.b(&ch, &n, 0xCC);
     std.mem.writeInt(u16, ch[ks_len_at..][0..2], @intCast(n - ks_payload_start), .big);
     std.mem.writeInt(u16, ch[ext_total_at..][0..2], @intCast(n - ext_start), .big);
     std.mem.writeInt(u16, ch[hs_len_at..][0..2], @intCast(n - hs_body_start), .big);
     std.mem.writeInt(u16, ch[rec_len_at..][0..2], @intCast(n - 5), .big);
 
     try std.testing.expect(clientOffersPqKeyShare(ch[0..n]));
+    try std.testing.expect(clientOffersX25519KeyShare(ch[0..n]));
+    std.mem.writeInt(u16, ch[pq_group_at + 2 ..][0..2], 1217, .big);
+    try std.testing.expect(!clientOffersPqKeyShare(ch[0..n]));
+    try std.testing.expect(!clientOffersX25519KeyShare(ch[0..n]));
+    std.mem.writeInt(u16, ch[pq_group_at + 2 ..][0..2], 1216, .big);
     // Flip the offered group to x25519 -> no longer a PQ offer.
-    std.mem.writeInt(u16, ch[ks_payload_start + 2 ..][0..2], 0x001d, .big);
+    std.mem.writeInt(u16, ch[pq_group_at..][0..2], 0x001d, .big);
     try std.testing.expect(!clientOffersPqKeyShare(ch[0..n]));
     // Truncated input never panics.
     try std.testing.expect(!clientOffersPqKeyShare(ch[0..20]));
@@ -1218,7 +1289,6 @@ test "buildServerHelloTemplate depends on seed" {
 }
 
 test "validateTlsHandshake - valid handshake" {
-    const allocator = std.testing.allocator;
 
     // Create mock secrets
     var secrets = [_]UserSecret{
@@ -1254,23 +1324,54 @@ test "validateTlsHandshake - valid handshake" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
+    const result = try validateTlsHandshake(&handshake, &secrets, true, 0);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("bob", result.?.user);
     try std.testing.expectEqual(@as(u32, 0x12345678), result.?.timestamp);
 }
 
 test "validateTlsHandshake - invalid user" {
-    const allocator = std.testing.allocator;
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
     var handshake = [_]u8{0xAA} ** 64; // random junk
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
+    const result = try validateTlsHandshake(&handshake, &secrets, true, 0);
     try std.testing.expect(result == null);
 }
 
+test "TLS clock skew validation and correction use authenticated timestamps" {
+    const secrets = [_]UserSecret{.{ .name = "clock", .secret = [_]u8{1} ** 16 }};
+    var hello = [_]u8{0} ** 96;
+    hello[43] = 32;
+    const mac = crypto.sha256Hmac(&secrets[0].secret, &hello);
+    const now = realtimeSeconds();
+    var timestamp: [4]u8 = undefined;
+    std.mem.writeInt(u32, &timestamp, @intCast(now), .little);
+    @memcpy(hello[11..43], &mac);
+    for (0..4) |i| hello[39 + i] ^= timestamp[i];
+    try std.testing.expect((try validateTlsHandshake(&hello, &secrets, false, 0)) != null);
+    try std.testing.expectError(error.ClockSkew, validateTlsHandshake(&hello, &secrets, false, 300));
+    try std.testing.expectError(error.ClockSkew, validateTlsHandshake(&hello, &secrets, false, -300));
+    try std.testing.expect((try validateTlsHandshake(&hello, &secrets, true, 300)) != null);
+}
+
+test "PQ and classical server certificates use configured sizes" {
+    const alloc = std.testing.allocator;
+    const secret = [_]u8{1} ** 16;
+    const digest = [_]u8{2} ** 32;
+    const session = [_]u8{3} ** 32;
+    for ([_]usize{ 512, 1234, 4096, 8192 }) |size| {
+        const template = try buildServerHelloTemplateAlloc(alloc, size);
+        defer alloc.free(template);
+        const classic = try buildServerHelloWithTemplate(alloc, template, &secret, &digest, &session, null);
+        defer alloc.free(classic);
+        const pq = try buildServerHelloPq(alloc, &secret, &digest, &session, null, size);
+        defer alloc.free(pq);
+        try std.testing.expectEqual(@as(?usize, size), firstAppDataRecordLen(classic));
+        try std.testing.expectEqual(@as(?usize, size), firstAppDataRecordLen(pq));
+    }
+}
+
 test "validateTlsHandshake - rejects non-32 session id" {
-    const allocator = std.testing.allocator;
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
     var handshake = [_]u8{0x00} ** 80;
 
@@ -1289,7 +1390,7 @@ test "validateTlsHandshake - rejects non-32 session id" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
+    const result = try validateTlsHandshake(&handshake, &secrets, true, 0);
     try std.testing.expect(result == null);
 }
 
@@ -1301,8 +1402,6 @@ test "extractSni - malformed returns null" {
 }
 
 test "validateTlsHandshake returns canonical_hmac" {
-    const allocator = std.testing.allocator;
-
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
     var handshake = [_]u8{0x00} ** 96;
 
@@ -1321,7 +1420,7 @@ test "validateTlsHandshake returns canonical_hmac" {
     handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
     handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
 
-    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true, 0);
+    const result = try validateTlsHandshake(&handshake, &secrets, true, 0);
     try std.testing.expect(result != null);
     try std.testing.expectEqualSlices(u8, &computed_mac, &result.?.canonical_hmac);
 }
@@ -1476,7 +1575,6 @@ test "extractSni - fuzz malformed input" {
 }
 
 test "validateTlsHandshake - fuzz random and replayed input" {
-    const allocator = std.testing.allocator;
     const secrets = [_]UserSecret{
         .{ .name = "alice", .secret = [_]u8{0x1A} ** 16 },
         .{ .name = "bob", .secret = [_]u8{0x2B} ** 16 },
@@ -1489,7 +1587,7 @@ test "validateTlsHandshake - fuzz random and replayed input" {
     for (0..3000) |_| {
         const len: usize = @as(usize, random.int(u16)) % random_buf.len;
         random.bytes(random_buf[0..len]);
-        const parsed = try validateTlsHandshake(allocator, random_buf[0..len], &secrets, true, 0);
+        const parsed = try validateTlsHandshake(random_buf[0..len], &secrets, true, 0);
         if (parsed) |v| {
             try std.testing.expect(v.session_id.len == 32);
             try std.testing.expect(v.user.len > 0);
@@ -1499,8 +1597,8 @@ test "validateTlsHandshake - fuzz random and replayed input" {
     // Replayed bytes produce identical canonical HMAC.
     var hello_buf: [512]u8 = undefined;
     const hello = try buildTlsAuthClientHello(&hello_buf, secrets[0].secret, "google.com");
-    const first = try validateTlsHandshake(allocator, hello, &secrets, true, 0);
-    const second = try validateTlsHandshake(allocator, hello, &secrets, true, 0);
+    const first = try validateTlsHandshake(hello, &secrets, true, 0);
+    const second = try validateTlsHandshake(hello, &secrets, true, 0);
     try std.testing.expect(first != null and second != null);
     try std.testing.expectEqualSlices(u8, &first.?.canonical_hmac, &second.?.canonical_hmac);
 }

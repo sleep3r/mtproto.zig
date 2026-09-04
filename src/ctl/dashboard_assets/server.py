@@ -2,6 +2,10 @@
 """MTProto Proxy Dashboard — API server."""
 
 import asyncio
+import functools
+import copy
+import ipaddress
+from contextlib import asynccontextmanager
 import base64
 import hashlib
 import hmac
@@ -27,7 +31,7 @@ except ModuleNotFoundError:
         tomllib = None
 
 import psutil
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -38,6 +42,32 @@ def _proxy_config_candidates():
         Path(__file__).parent.parent / "config.toml",  # /opt/mtproto-proxy/config.toml
         Path("/opt/mtproto-proxy/config.toml"),
     ]
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Drop a trailing '#'/';' comment, ignoring one inside a quoted string.
+
+    Mirrors stripInlineComment() in src/config.zig, which is what the proxy itself uses —
+    the dashboard must read a value exactly the way the running proxy does. Splitting on a
+    bare '#' truncated any quoted value containing one (`password = "s3cr#t"` became the
+    unbalanced `"s3cr`), and since that mangled value is pre-filled into the Routing card
+    and POSTed straight back on the next save, it silently rewrote the live credential.
+    """
+    in_quotes = None
+    escaped = False
+    for i, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if in_quotes == '"' and ch == "\\":
+            escaped = True
+            continue
+        if ch in ('"', "'") and (in_quotes is None or in_quotes == ch):
+            in_quotes = ch if in_quotes is None else None
+            continue
+        if not in_quotes and ch in "#;":
+            return value[:i].strip()
+    return value.strip()
 
 
 def _load_dashboard_config() -> dict:
@@ -67,9 +97,7 @@ def _load_dashboard_config() -> dict:
                         continue
                     key, value = line.split("=", 1)
                     key = key.strip()
-                    value = value.strip()
-                    if "#" in value:
-                        value = value.split("#", 1)[0].strip()
+                    value = _strip_inline_comment(value.strip())
                     if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
                         value = value[1:-1]
                     if key == "host":
@@ -141,7 +169,13 @@ def _proxy_version() -> str | None:
     return version
 
 
-app = FastAPI()
+@asynccontextmanager
+async def _lifespan(app):
+    yield
+    await asyncio.to_thread(stop_log_thread)
+
+
+app = FastAPI(lifespan=_lifespan)
 
 # ── Dashboard authentication & hardening ─────────────────────────────────────
 # The dashboard is a ROOT-privileged control plane: it can rewrite config.toml,
@@ -155,7 +189,7 @@ app = FastAPI()
 #   3. An Origin check on state-changing requests — defeats CSRF (a cross-origin
 #      "simple" POST the browser would auto-attach Basic credentials to).
 # Default bind stays 127.0.0.1; reach it over an SSH tunnel.
-_DASHBOARD_TOKEN_FILE = Path(__file__).parent / "dashboard.token"
+_DASHBOARD_TOKEN_FILE = Path(os.environ.get("MTPROTO_DASHBOARD_TOKEN_FILE", str(Path(__file__).parent / "dashboard.token")))
 
 
 def _load_or_create_dashboard_token() -> str:
@@ -192,7 +226,7 @@ def _dashboard_auth_ok(authorization) -> bool:
     except Exception:
         return False
     _, _, pw = raw.partition(":")
-    return hmac.compare_digest(pw, DASHBOARD_TOKEN)
+    return hmac.compare_digest(pw.encode("utf-8"), DASHBOARD_TOKEN.encode("utf-8"))
 
 
 # Safari/WebKit does not replay cached HTTP Basic credentials on a WebSocket handshake (Chrome
@@ -219,7 +253,7 @@ def _ws_ticket_ok(ticket) -> bool:
     except ValueError:
         return False
     expected = hmac.new(DASHBOARD_TOKEN.encode(), exp_s.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+    return hmac.compare_digest(sig.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _host_hostname(host_header: str) -> str:
@@ -239,7 +273,7 @@ async def _dashboard_security(request: Request, call_next):
 
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("origin")
-        if origin and urlparse(origin).netloc != host_header:
+        if (origin and urlparse(origin).netloc != host_header) or (not origin and request.headers.get("x-requested-with") != "mtbuddy"):
             return PlainTextResponse("cross-origin request blocked", status_code=403)
 
     if not _dashboard_auth_ok(request.headers.get("authorization")):
@@ -258,14 +292,13 @@ async def _dashboard_security(request: Request, call_next):
     # Real CSP, not just frame-ancestors: block injected/external SCRIPT (the dashboard's
     # only script is the external /app.js — there are no inline <script> blocks), which
     # bounds the blast radius of any future escaping mistake on this root control plane.
-    # style-src keeps 'unsafe-inline' for the page's inline style= attributes + Google
-    # Fonts CSS; style injection is far less dangerous than script execution.
+    # Inline styles are used by the local UI; no third-party fonts are fetched.
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; "
         "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com data:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self' data:; "
         "img-src 'self' data:; "
         "connect-src 'self'; "
         "base-uri 'none'; "
@@ -289,10 +322,15 @@ MAX_HISTORY = 90
 # --- Thread-safe log buffer ---
 _log_buffer = queue.Queue(maxsize=500)
 _log_thread_started = False
+_log_stop = threading.Event()
+_log_start_lock = threading.Lock()
+_log_thread = None
+_log_process = None
 
 
 def _log_reader_thread():
-    while True:
+    global _log_process
+    while not _log_stop.is_set():
         try:
             proc = subprocess.Popen(
                 ["journalctl", "-u", "mtproto-proxy", "-f", "--no-pager", "-n", "80"],
@@ -300,7 +338,12 @@ def _log_reader_thread():
                 stderr=subprocess.DEVNULL,
                 text=True,
             )
+            _log_process = proc
+            if _log_stop.is_set():
+                proc.terminate()
             for line in proc.stdout:
+                if _log_stop.is_set():
+                    break
                 text = line.strip()
                 if not text:
                     continue
@@ -325,19 +368,50 @@ def _log_reader_thread():
                         pass
                     _log_buffer.put_nowait(entry)
             proc.wait()
-        except Exception:
-            pass
-        time.sleep(2)
+        except FileNotFoundError:
+            print("[dashboard] journalctl unavailable; live logs disabled", file=sys.stderr)
+            return
+        except Exception as exc:
+            print(f"[dashboard] journal follower failed: {type(exc).__name__}", file=sys.stderr)
+        finally:
+            _log_process = None
+        _log_stop.wait(2)
 
 
 def ensure_log_thread():
-    global _log_thread_started
-    if not _log_thread_started:
+    global _log_thread_started, _log_thread
+    with _log_start_lock:
+        if _log_thread_started:
+            return
         _log_thread_started = True
-        threading.Thread(target=_log_reader_thread, daemon=True).start()
+        if shutil.which("journalctl") is None or not Path("/run/systemd/system").is_dir():
+            print("[dashboard] systemd journal unavailable; live logs disabled", file=sys.stderr)
+            try:
+                _log_buffer.put_nowait({"text": "Systemd journal unavailable; live logs disabled", "cls": "error", "ts": time.strftime("%H:%M:%S")})
+            except queue.Full:
+                pass
+            return
+        _log_stop.clear()
+        _log_thread = threading.Thread(target=_log_reader_thread, daemon=True)
+        _log_thread.start()
 
 
-ensure_log_thread()
+def stop_log_thread():
+    global _log_thread_started
+    _log_stop.set()
+    proc = _log_process
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+        except ProcessLookupError:
+            pass
+    if _log_thread is not None:
+        _log_thread.join(timeout=3)
+    _log_thread_started = False
 
 _recent_logs = []
 # Absolute sequence number of _recent_logs[0]. Each appended line has a monotonically
@@ -378,6 +452,30 @@ def _logs_since(cursor):
         return list(_recent_logs[start_idx:]), end
 
 
+def _cached_for(seconds, config_sensitive=False):
+    def decorate(fn):
+        lock = threading.Lock()
+        cached = {"until": 0, "key": None, "value": None}
+        @functools.wraps(fn)
+        def wrapped():
+            key = None
+            if config_sensitive:
+                key = []
+                for path in _proxy_config_candidates():
+                    try:
+                        stat = path.stat()
+                        key.append((str(path), stat.st_mtime_ns, stat.st_size))
+                    except OSError:
+                        key.append((str(path), None))
+            with lock:
+                if cached["value"] is None or time.monotonic() >= cached["until"] or key != cached["key"]:
+                    cached.update(value=fn(), until=time.monotonic() + seconds, key=key)
+                return copy.deepcopy(cached["value"])
+        return wrapped
+    return decorate
+
+
+@_cached_for(10)
 def _proxy_stats() -> dict:
     try:
         out = subprocess.check_output(
@@ -450,8 +548,8 @@ def _proxy_stats() -> dict:
         s["unassigned_active"] = max(active_total - users_active_total, 0)
 
         return s
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {"error": f"Proxy statistics unavailable ({type(exc).__name__})"}
 
 
 def _proxy_listening(port: int) -> bool:
@@ -482,8 +580,8 @@ def _proxy_listening(port: int) -> bool:
 
 
 def _proxy_info() -> dict:
-    for proc in psutil.process_iter(["name", "create_time", "pid", "memory_info"]):
-        if proc.info["name"] == "mtproto-proxy":
+    for proc in psutil.process_iter(["name", "create_time", "pid", "memory_info", "cmdline"]):
+        if proc.info["name"] == "mtproto-proxy" and "web-relay" not in (proc.info.get("cmdline") or []):
             el = time.time() - proc.info["create_time"]
             h, rem = divmod(int(el), 3600)
             m, sec = divmod(rem, 60)
@@ -596,6 +694,7 @@ def _dedupe(values: list[str]) -> list[str]:
     return out
 
 
+@_cached_for(2, config_sensitive=True)
 def _load_proxy_runtime_config() -> dict:
     defaults = {
         "public_ip": "",
@@ -634,6 +733,7 @@ def _load_proxy_runtime_config() -> dict:
             break
 
     if cfg_path is None:
+        defaults["error"] = "Proxy config is missing"
         return defaults
 
     result = {
@@ -665,6 +765,9 @@ def _load_proxy_runtime_config() -> dict:
 
     section = ""
     try:
+        if tomllib is not None:
+            raw = cfg_path.read_text(encoding="utf-8")
+            tomllib.loads("\n".join(_strip_inline_comment(line) for line in raw.splitlines()))
         with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
             for raw_line in f:
                 line = raw_line.strip()
@@ -680,12 +783,7 @@ def _load_proxy_runtime_config() -> dict:
 
                 key, value = line.split("=", 1)
                 key = key.strip()
-                value = value.strip()
-
-                if "#" in value:
-                    value = value.split("#", 1)[0].strip()
-                if ";" in value:
-                    value = value.split(";", 1)[0].strip()
+                value = _strip_inline_comment(value.strip())
 
                 if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
                     value = value[1:-1]
@@ -778,7 +876,8 @@ def _load_proxy_runtime_config() -> dict:
                     if key and value:
                         result["disabled_users"][key] = value
 
-    except Exception:
+    except Exception as exc:
+        defaults["error"] = f"Proxy config could not be read ({type(exc).__name__})"
         return defaults
 
     if not result["upstream_tunnel_interfaces"] and not result["upstream_tunnel_interfaces_configured"]:
@@ -1439,13 +1538,13 @@ def _routing_status() -> dict:
             "host": str(cfg.get("upstream_socks5_host", "") or ""),
             "port": int(cfg.get("upstream_socks5_port", 0) or 0),
             "username": str(cfg.get("upstream_socks5_username", "") or ""),
-            "password": str(cfg.get("upstream_socks5_password", "") or ""),
+            "password_set": bool(cfg.get("upstream_socks5_password")),
         },
         "upstream_http": {
             "host": str(cfg.get("upstream_http_host", "") or ""),
             "port": int(cfg.get("upstream_http_port", 0) or 0),
             "username": str(cfg.get("upstream_http_username", "") or ""),
-            "password": str(cfg.get("upstream_http_password", "") or ""),
+            "password_set": bool(cfg.get("upstream_http_password")),
         },
         "healthy": healthy,
     }
@@ -1574,13 +1673,11 @@ PUBLIC_IP_TTL = 300  # 5 minutes
 def _detect_public_ip() -> str:
     """Auto-detect public IP, cached for 5 minutes."""
     now = time.time()
-    if now - _public_ip_cache["ts"] < PUBLIC_IP_TTL and _public_ip_cache["ip"]:
+    if now - _public_ip_cache["ts"] < PUBLIC_IP_TTL:
         return _public_ip_cache["ip"]
 
     for url in (
-        "https://ifconfig.me/ip",
         "https://api.ipify.org",
-        "https://icanhazip.com",
     ):
         try:
             out = subprocess.check_output(
@@ -1589,7 +1686,7 @@ def _detect_public_ip() -> str:
                 timeout=5,
                 stderr=subprocess.DEVNULL,
             ).strip()
-            if out and re.match(r"^[\d.]+$", out):
+            if out and ipaddress.ip_address(out).version == 4:
                 _public_ip_cache.update(ts=now, ip=out)
                 return out
         except Exception:
@@ -1715,6 +1812,71 @@ def _find_config_path() -> Path | None:
     return None
 
 
+def _write_config_atomic(cfg_path: Path, text: str) -> None:
+    """Replace config.toml in one step, keeping the previous content as .bak.
+
+    Path.write_text() is open('w') — truncate, then write. An ENOSPC, an OOM kill or a lost
+    VPS in that window leaves a zero-length config.toml, and every mutator restarts the proxy
+    immediately afterwards, so the user secrets (which live nowhere but this file, and are
+    what every distributed tg:// link is derived from) would be gone with no way back. Writing
+    a sibling temp file and renaming it over the target makes the swap atomic: a reader sees
+    the old file or the new one, never a half-written one.
+    """
+    tmp = cfg_path.with_name(cfg_path.name + ".tmp")
+    backup = cfg_path.with_name(cfg_path.name + ".bak")
+
+    # config.toml is installed 0640 and holds every user secret. os.replace() keeps the *temp*
+    # file's mode and owner, not the target's, so create it 0600 and copy the original's
+    # metadata across — otherwise the umask would quietly republish the secrets as 0644.
+    try:
+        st = cfg_path.stat()
+    except OSError:
+        st = None
+
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    if st is not None:
+        try:
+            os.chmod(tmp, st.st_mode & 0o7777)
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+        # One previous copy, so a bad edit is recoverable by hand. A hard link rather than a
+        # copy: it is the same inode, so the backup carries the original's 0640 with no window
+        # where the secrets sit at the umask's mode. `mtbuddy uninstall` removes
+        # /opt/mtproto-proxy wholesale, so this does not outlive the install.
+        try:
+            if backup.exists():
+                backup.unlink()
+            os.link(cfg_path, backup)
+        except OSError:
+            pass
+
+    os.replace(tmp, cfg_path)
+
+    # fsync the directory too: without it the rename itself can be lost on a power cut even
+    # though the new file's bytes were fsynced.
+    try:
+        dir_fd = os.open(cfg_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
 def _restart_proxy():
     """Restart mtproto-proxy systemd service."""
     try:
@@ -1723,9 +1885,10 @@ def _restart_proxy():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10,
+            check=True,
         )
-    except Exception:
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=503, detail="Configuration saved, but proxy restart failed") from exc
     # Invalidate caches
     _users_cache["ts"] = 0
     _mask_cache["ts"] = 0
@@ -1748,8 +1911,6 @@ def _set_toml_key(
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
-            if in_section and insert_idx is None:
-                insert_idx = i
             in_section = stripped.lower() == section_l
             if in_section:
                 section_found = True
@@ -1771,7 +1932,10 @@ def _set_toml_key(
 
         indent_len = len(line) - len(line.lstrip(" \t"))
         indent = line[:indent_len]
-        lines[i] = f"{indent}{key} = {value_literal}\n"
+        original_value = line.split("=", 1)[1].rstrip("\r\n")
+        clean_value = _strip_inline_comment(original_value)
+        comment = original_value[original_value.find(clean_value) + len(clean_value):] if clean_value else ""
+        lines[i] = f"{indent}{key} = {value_literal}{comment}\n"
         return lines
 
     if section_found:
@@ -1804,7 +1968,7 @@ def _set_middle_proxy_enabled(enabled: bool) -> bool:
     )
     value = "true" if enabled else "false"
     lines = _set_toml_key(lines, "[general]", "use_middle_proxy", value)
-    cfg_path.write_text("".join(lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(lines))
     return True
 
 
@@ -1824,7 +1988,7 @@ def _set_upstream_type(upstream_type: str) -> bool:
         lines, "[upstream]", "type", _toml_string_literal(upstream_type)
     )
 
-    cfg_path.write_text("".join(lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(lines))
     return True
 
 
@@ -1843,7 +2007,7 @@ def _set_upstream_tunnel_interface(interface: str) -> bool:
     lines = _set_toml_key(
         lines, "[upstream.tunnel]", "pinned_interface", _toml_string_literal(iface)
     )
-    cfg_path.write_text("".join(lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(lines))
     return True
 
 
@@ -1963,7 +2127,7 @@ def _remove_tunnel_from_config(interface: str) -> dict | None:
                 _toml_string_literal(""),
             )
 
-        cfg_path.write_text("".join(lines), encoding="utf-8")
+        _write_config_atomic(cfg_path, "".join(lines))
 
     return {
         "removed_from_pool": in_pool,
@@ -1988,7 +2152,7 @@ def _clear_tunnel_config() -> bool:
     lines = _set_toml_key(
         lines, "[upstream.tunnel]", "pinned_interface", _toml_string_literal("")
     )
-    cfg_path.write_text("".join(lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(lines))
     return True
 
 
@@ -2050,66 +2214,8 @@ def _delete_tunnel_config_files(interface: str) -> bool:
 
 
 def _write_default_proxy_service() -> bool:
-    content = """[Unit]
-Description=MTProto Proxy (Zig)
-Documentation=https://github.com/sleep3r/mtproto.zig
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-# Type=simple (NOT notify): must match the installer (release.zig / tunnel.zig).
-# Containerized systemd (Docker/LXC) often fails to deliver the sd_notify datagram,
-# which with Restart=always restart-loops a perfectly healthy proxy. Re-enable
-# Type=notify + WatchdogSec only behind container detection + ping validation.
-Type=simple
-User=mtproto
-Group=mtproto
-WorkingDirectory=/opt/mtproto-proxy
-ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
-ExecReload=/bin/kill -HUP $MAINPID
-KillSignal=SIGTERM
-TimeoutStopSec=25
-Restart=always
-RestartSec=3
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-ReadOnlyPaths=/opt/mtproto-proxy
-
-# Syscall + kernel surface reduction (mirrors deploy/mtproto-proxy.service).
-SystemCallFilter=@system-service
-SystemCallArchitectures=native
-SystemCallErrorNumber=EPERM
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-MemoryDenyWriteExecute=yes
-RestrictNamespaces=yes
-LockPersonality=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-ProtectProc=invisible
-ProcSubset=pid
-PrivateDevices=yes
-RemoveIPC=yes
-UMask=0077
-
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-LimitNOFILE=131582
-TasksMax=65535
-
-[Install]
-WantedBy=multi-user.target
-"""
     try:
+        content = Path(__file__).with_name("proxy.service").read_text(encoding="utf-8")
         PROXY_SERVICE_FILE.write_text(content, encoding="utf-8")
         return True
     except Exception:
@@ -2172,11 +2278,13 @@ def _delete_tunnel_interface(interface: str) -> dict | None:
     else:
         result["controller_ok"] = None
 
-    _restart_proxy()
+    restarted = bool(result["removed_from_pool"] or result["removed_last"])
+    if restarted:
+        _restart_proxy()
     _awg_cache["ts"] = 0
     _routing_cache["ts"] = 0
     result["interface"] = iface
-    result["restarted"] = True
+    result["restarted"] = restarted
     return result
 
 
@@ -2202,7 +2310,7 @@ def _set_upstream_proxy_target(
     host: str,
     port: int,
     username: str,
-    password: str,
+    password: str | None,
 ) -> bool:
     cfg_path = _find_config_path()
     if cfg_path is None:
@@ -2235,8 +2343,9 @@ def _set_upstream_proxy_target(
     lines = _set_toml_key(lines, section, "host", _toml_string_literal(host_value))
     lines = _set_toml_key(lines, section, "port", str(port))
     lines = _set_toml_key(lines, section, "username", _toml_string_literal(user_value))
-    lines = _set_toml_key(lines, section, "password", _toml_string_literal(pass_value))
-    cfg_path.write_text("".join(lines), encoding="utf-8")
+    if password is not None:
+        lines = _set_toml_key(lines, section, "password", _toml_string_literal(pass_value))
+    _write_config_atomic(cfg_path, "".join(lines))
     return True
 
 
@@ -2280,7 +2389,7 @@ def _add_user_to_config(name: str, secret: str) -> bool:
 
     new_line = f'{name} = "{secret}"\n'
     lines.insert(insert_idx, new_line)
-    cfg_path.write_text("".join(lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(lines))
     return True
 
 
@@ -2302,7 +2411,7 @@ def _remove_user_from_config(name: str) -> bool:
 
     for line in lines:
         stripped = line.strip()
-        if stripped.lower() == "[access.users]":
+        if stripped.lower() in ("[access.users]", "[access.disabled_users]"):
             in_users = True
             in_direct = False
             new_lines.append(line)
@@ -2327,7 +2436,7 @@ def _remove_user_from_config(name: str) -> bool:
         new_lines.append(line)
 
     if removed:
-        cfg_path.write_text("".join(new_lines), encoding="utf-8")
+        _write_config_atomic(cfg_path, "".join(new_lines))
     return removed
 
 
@@ -2390,7 +2499,7 @@ def _set_user_direct(name: str, direct: bool) -> bool:
             new_lines.append("\n[access.direct_users]\n")
             new_lines.append(f"{name} = true\n")
 
-    cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(new_lines))
     return True
 
 
@@ -2465,7 +2574,7 @@ def _disable_user_in_config(name: str) -> bool:
         new_lines.append(f"\n[access.disabled_users]\n")
         new_lines.append(f'{name} = "{secret}"\n')
 
-    cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(new_lines))
     return True
 
 
@@ -2510,10 +2619,10 @@ def _enable_user_in_config(name: str) -> bool:
     # Add back to [access.users]
     if not _add_user_to_config_lines(new_lines, name, secret):
         # Fallback: just write the lines and use existing helper
-        cfg_path.write_text("".join(new_lines), encoding="utf-8")
+        _write_config_atomic(cfg_path, "".join(new_lines))
         return _add_user_to_config(name, secret)
 
-    cfg_path.write_text("".join(new_lines), encoding="utf-8")
+    _write_config_atomic(cfg_path, "".join(new_lines))
     return True
 
 
@@ -2547,10 +2656,25 @@ def _add_user_to_config_lines(lines: list[str], name: str, secret: str) -> bool:
 
 
 
+_mutation_lock = threading.RLock()
+_egress_lock = threading.Lock()
+
+
+def _serialized(lock):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            with lock:
+                return fn(*args, **kwargs)
+        return wrapped
+    return decorate
+
+
 @app.get("/api/stats")
+@_serialized(threading.Lock())
 def api_stats():
     global _prev_net, _net_history, _cpu_history, _mem_history
-    cpu = psutil.cpu_percent(interval=0.3)
+    cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory()
     net = psutil.net_io_counters()
     d, rem = divmod(int(time.time() - psutil.boot_time()), 86400)
@@ -2574,6 +2698,7 @@ def api_stats():
 
     return JSONResponse(
         {
+            "errors": [message for message in (_load_proxy_runtime_config().get("error"), _proxy_stats().get("error")) if message],
             "cpu": round(cpu, 1),
             "cpu_history": list(_cpu_history),
             "mem_used": round(mem.used / 1048576),
@@ -2598,6 +2723,7 @@ def api_stats():
 
 
 @app.get("/api/egress")
+@_serialized(_egress_lock)
 def api_egress():
     """Return tunnel/egress health metrics for all active interfaces.
 
@@ -2682,12 +2808,9 @@ def api_egress():
 
 
 @app.post("/api/routing/middle")
-async def api_routing_middle(request: Request):
+@_serialized(_mutation_lock)
+def api_routing_middle(body: dict):
     """Set [general].use_middle_proxy. Body: { enabled: bool }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     raw_enabled = body.get("enabled", None)
     if not isinstance(raw_enabled, bool):
@@ -2705,12 +2828,9 @@ async def api_routing_middle(request: Request):
 
 
 @app.post("/api/routing/upstream")
-async def api_routing_upstream(request: Request):
+@_serialized(_mutation_lock)
+def api_routing_upstream(body: dict):
     """Set [upstream].type. Body: { type: auto|direct|tunnel|socks5|http }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     upstream_type = str(body.get("type", "")).strip().lower()
     if upstream_type not in {"auto", "direct", "tunnel", "socks5", "http"}:
@@ -2755,12 +2875,9 @@ async def api_routing_upstream(request: Request):
 
 
 @app.post("/api/routing/tunnel-interface")
-async def api_routing_tunnel_interface(request: Request):
+@_serialized(_mutation_lock)
+def api_routing_tunnel_interface(body: dict):
     """Set [upstream.tunnel].pinned_interface. Body: { interface: str }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     clear = bool(body.get("clear", False))
     iface = "" if clear else str(body.get("interface", "")).strip()
@@ -2791,12 +2908,9 @@ async def api_routing_tunnel_interface(request: Request):
 
 
 @app.post("/api/routing/tunnel-delete")
-async def api_routing_tunnel_delete(request: Request):
+@_serialized(_mutation_lock)
+def api_routing_tunnel_delete(body: dict):
     """Hard-delete a tunnel interface. Body: { interface: str }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     iface = str(body.get("interface", "")).strip()
     if not _valid_tunnel_interface_name(iface):
@@ -2815,14 +2929,11 @@ async def api_routing_tunnel_delete(request: Request):
 
 
 @app.post("/api/routing/proxy-target")
-async def api_routing_proxy_target(request: Request):
+@_serialized(_mutation_lock)
+def api_routing_proxy_target(body: dict):
     """Set [upstream.socks5]/[upstream.http] target + auth.
     Body: { type: socks5|http, host: str, port: int, username?: str, password?: str }
     """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     proxy_type = str(body.get("type", "")).strip().lower()
     if proxy_type not in {"socks5", "http"}:
@@ -2846,9 +2957,9 @@ async def api_routing_proxy_target(request: Request):
         )
 
     username = str(body.get("username", "") or "")
-    password = str(body.get("password", "") or "")
+    password = str(body.get("password", "") or "") if "password" in body else None
 
-    if "\n" in username or "\r" in username or "\n" in password or "\r" in password:
+    if "\n" in username or "\r" in username or "\n" in (password or "") or "\r" in (password or ""):
         return JSONResponse(
             {"ok": False, "error": "username/password must not contain newlines"},
             status_code=400,
@@ -2867,7 +2978,7 @@ async def api_routing_proxy_target(request: Request):
             "host": host,
             "port": port,
             "username": username,
-            "password": password,
+            "password_set": bool(_load_proxy_runtime_config().get(f"upstream_{proxy_type}_password")),
             "restarted": True,
         }
     )
@@ -2944,12 +3055,9 @@ async def api_qr(text: str = ""):
 
 
 @app.post("/api/users/add")
-async def api_user_add(request: Request):
+@_serialized(_mutation_lock)
+def api_user_add(body: dict):
     """Add a new user. Body: { name: str, secret?: str }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     raw_name = str(body.get("name", "")).strip()
     if not raw_name or len(raw_name) > 64:
@@ -2998,12 +3106,9 @@ async def api_user_add(request: Request):
 
 
 @app.post("/api/users/remove")
-async def api_user_remove(request: Request):
+@_serialized(_mutation_lock)
+def api_user_remove(body: dict):
     """Remove a user. Body: { name: str }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     name = str(body.get("name", "")).strip()
     if not name:
@@ -3018,12 +3123,9 @@ async def api_user_remove(request: Request):
 
 
 @app.post("/api/users/direct")
-async def api_user_direct(request: Request):
+@_serialized(_mutation_lock)
+def api_user_direct(body: dict):
     """Toggle direct status. Body: { name: str, direct: bool }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     name = str(body.get("name", "")).strip()
     direct = bool(body.get("direct", False))
@@ -3047,12 +3149,9 @@ async def api_user_direct(request: Request):
 
 
 @app.post("/api/users/toggle")
-async def api_user_toggle(request: Request):
+@_serialized(_mutation_lock)
+def api_user_toggle(body: dict):
     """Enable or disable a user. Body: { name: str, enabled: bool }"""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
     name = str(body.get("name", "")).strip()
     if not name:
@@ -3086,6 +3185,7 @@ async def api_user_toggle(request: Request):
 
 @app.get("/api/logs")
 def api_logs():
+    ensure_log_thread()
     _drain_to_recent()
     with _recent_lock:
         return JSONResponse(list(_recent_logs))
@@ -3120,6 +3220,7 @@ async def ws_logs(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
+    ensure_log_thread()
     _drain_to_recent()
     # Per-client cursor: send the current backlog, then only entries newer than what THIS
     # client has already seen. No destructive sharing between concurrent viewers.

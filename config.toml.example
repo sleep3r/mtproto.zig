@@ -17,6 +17,12 @@ use_middle_proxy = true
 # ad_tag = "1234567890abcdef1234567890abcdef"
 
 [server]
+# Optional HTTPS Date source for small clock corrections (within +/-120 seconds).
+# Larger drift is rejected: configure host NTP instead.
+# clock_sync_url = "https://example.com/"
+# Accept PROXY protocol only behind a trusted, firewalled load balancer.
+# Never expose this mode directly to untrusted clients: source addresses can be forged.
+# accept_proxy_protocol = false
 port = 443
 
 # Bind address for the listen socket. When uncommented, the proxy listens
@@ -226,7 +232,9 @@ port = 443
 # Concurrency caps. Each session is one desktop client; each stream is one
 # MTProto socket it opens, and each costs a connection against
 # [server].max_connections on the proxy side.
-# max_sessions = 64
+# max_sessions = 32
+# Aggregate relay input/output/fragment/frame buffer ceiling across all clients (MiB).
+# max_buffer_mb = 128
 # max_streams = 32
 
 # TLS terminator that accepts a PROXY-protocol header, used ONLY for masked
@@ -274,9 +282,10 @@ port = 443
 # "http"       — route via HTTP CONNECT proxy
 # type = "auto"
 
-# When type is socks5/http, allow MiddleProxy metadata refresh to fall back to a
-# DIRECT fetch if the configured upstream is unreachable. Default false (the
-# upstream is treated as mandatory). Note: socks5/http/tunnel metadata refresh
+# When true, an unresolved or unconfigured socks5/http upstream allows ALL
+# traffic to use DIRECT egress from this host's IP, not just metadata refresh.
+# Default false: fail closed and treat the upstream as mandatory.
+# Note: socks5/http/tunnel metadata refresh
 # shells out to `curl`, so curl must be installed for those modes.
 # allow_direct_fallback = false
 
@@ -319,6 +328,18 @@ port = 443
 # links = ["vless://...@host:443?security=reality&pbk=...&sni=...&sid=...&flow=xtls-rprx-vision"]
 
 [censorship]
+# Bound ordinary masking connections; 0 opts into unlimited lifetime.
+# WEB carrier connections using mask_backend use their own idle limits instead.
+# mask_relay_max_secs = 300
+# Optional SNI fronting allowlist. Arrays must fit on one line.
+# mask_sni_safelist = []
+# Use RST instead of a TLS alert when unknown_sni_action = "reject".
+# reject_rst = false
+# Fake encrypted certificate record size (256..16384 bytes; 0=randomized).
+# fake_cert_size = 0
+# Delay settings apply only when desync=true (opt-in).
+# desync_split_delay_ms = 3
+# desync_split_jitter_ms = 3
 # Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
 # Since June 2026 pick a popular domain that negotiates single-round X25519MLKEM768
 # (post-quantum) — a classical-x25519-only domain now marks iOS clients (and everyone

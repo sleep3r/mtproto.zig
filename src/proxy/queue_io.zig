@@ -58,6 +58,7 @@ pub fn queueOrWriteMsg(
             return err;
         };
 
+        if (n == 0) return error.ConnectionReset;
         noteTraffic(counter, n);
         noteTrafficOptional(user_counter, n);
         if (n == data.len) return true;
@@ -124,47 +125,32 @@ pub fn queueOrWriteMsgPair(
     return false;
 }
 
-pub fn queueOrWriteOwnedMsg(
-    fd: posix.fd_t,
-    queue: *MessageQueue,
-    owned: []u8,
-    counter: *std.atomic.Value(u64),
-    user_counter: ?*std.atomic.Value(u64),
-) !bool {
-    if (owned.len == 0) {
-        queue.allocator.free(owned);
-        return true;
-    }
-
+pub fn queueOrWriteParts(fd: posix.fd_t, queue: *MessageQueue, parts: []const []const u8, counter: *std.atomic.Value(u64), user_counter: ?*std.atomic.Value(u64)) !bool {
+    if (parts.len > max_scatter_parts) return error.TooManyParts;
+    var written: usize = 0;
     if (queue.isEmpty()) {
-        const n = writeFd(fd, owned) catch |err| {
-            if (err == error.WouldBlock) {
-                try queue.appendOwned(owned);
-                return false;
-            }
-            queue.allocator.free(owned);
-            return err;
-        };
-
-        noteTraffic(counter, n);
-        noteTrafficOptional(user_counter, n);
-        if (n == owned.len) {
-            queue.allocator.free(owned);
-            return true;
+        var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
+        var total: usize = 0;
+        for (parts, 0..) |part, i| {
+            iovecs[i] = .{ .base = part.ptr, .len = part.len };
+            total += part.len;
         }
-
-        const remaining = owned[n..];
-        // Free `owned` on the appendCopy error path too — `try` here would leak it (every
-        // other exit frees it). Matches the OOM-safety of the sibling write helpers.
-        queue.appendCopy(remaining) catch |err| {
-            queue.allocator.free(owned);
-            return err;
+        if (total == 0) return true;
+        written = writevFd(fd, iovecs[0..parts.len]) catch |err| {
+            if (err != error.WouldBlock) return err;
+            for (parts) |part| try queue.appendCopy(part);
+            return false;
         };
-        queue.allocator.free(owned);
-        return false;
+        if (written == 0) return error.ConnectionReset;
+        noteTraffic(counter, written);
+        noteTrafficOptional(user_counter, written);
+        if (written == total) return true;
     }
-
-    try queue.appendOwned(owned);
+    for (parts) |part| {
+        const skip = @min(written, part.len);
+        written -= skip;
+        try queue.appendCopy(part[skip..]);
+    }
     return false;
 }
 

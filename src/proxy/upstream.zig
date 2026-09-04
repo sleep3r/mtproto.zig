@@ -22,6 +22,7 @@ const net = std.Io.net;
 const posix = std.posix;
 const tunnel_mod = @import("../tunnel.zig");
 const Address = net.IpAddress;
+const AddressCandidates = @import("net_helpers.zig").AddressCandidates;
 
 pub const Tunnel = tunnel_mod.Tunnel;
 
@@ -35,6 +36,32 @@ fn socketFamily(addr: Address) posix.sa_family_t {
         .ip4 => posix.AF.INET,
         .ip6 => posix.AF.INET6,
     };
+}
+
+test "proxy endpoints and credentials remain separate from logical destination" {
+    const proxy_addr = Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 1080 } };
+    const socks = Upstream.initSocks5(proxy_addr, "user", "pass");
+    const http = Upstream.initHttpConnect(proxy_addr, "user", "pass");
+    for ([_]Upstream{ socks, http }) |up| {
+        try std.testing.expect(Address.eql(&proxy_addr, &up.proxyAddr().?));
+        try std.testing.expectEqualStrings("user", up.proxyUsername().?);
+        try std.testing.expectEqualStrings("pass", up.proxyPassword().?);
+    }
+    try std.testing.expect(Upstream.initDirect().proxyAddr() == null);
+}
+
+test "proxy DNS candidates preserve credentials and do not mutate shared selection" {
+    const first = Address{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = 1080 } };
+    const second = Address{ .ip6 = .{ .bytes = @splat(1), .port = 1080 } };
+    const addresses = [_]Address{ first, second };
+    for ([_]Upstream{ Upstream.initSocks5Candidates(&addresses, "user", "pass"), Upstream.initHttpConnectCandidates(&addresses, "user", "pass") }) |up| {
+        try std.testing.expectEqual(@as(usize, 2), up.proxyCandidateCount());
+        const selected = up.withProxyCandidate(1);
+        try std.testing.expect(Address.eql(&second, &selected.proxyAddr().?));
+        try std.testing.expect(Address.eql(&first, &up.proxyAddr().?));
+        try std.testing.expectEqualStrings("user", selected.proxyUsername().?);
+        try std.testing.expectEqualStrings("pass", selected.proxyPassword().?);
+    }
 }
 
 fn toSocketAddr(addr: Address) SocketAddr {
@@ -80,30 +107,8 @@ fn createTcpSocket(family: posix.sa_family_t) !posix.fd_t {
     }
 }
 
-fn closeFd(fd: posix.fd_t) void {
-    while (true) switch (posix.errno(posix.system.close(fd))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
-}
-
-fn connectSockaddr(fd: posix.fd_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
-    while (true) switch (posix.errno(posix.system.connect(fd, addr, addr_len))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        .ADDRNOTAVAIL => return error.AddressUnavailable,
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .AGAIN, .INPROGRESS => return error.WouldBlock,
-        .ALREADY => return error.ConnectionPending,
-        .CONNREFUSED => return error.ConnectionRefused,
-        .CONNRESET => return error.ConnectionResetByPeer,
-        .HOSTUNREACH => return error.HostUnreachable,
-        .NETUNREACH => return error.NetworkUnreachable,
-        .TIMEDOUT => return error.Timeout,
-        else => |err| return posix.unexpectedErrno(err),
-    };
-}
+const closeFd = @import("socket_utils.zig").closeFd;
+const connectSockaddr = @import("socket_utils.zig").connectSockaddr;
 
 /// What proxy-level handshake (if any) must be completed after TCP connect.
 pub const ProxyHandshake = enum {
@@ -163,6 +168,51 @@ pub const Upstream = union(Tag) {
             .username = username,
             .password = password,
         } };
+    }
+
+    pub fn initSocks5Candidates(addresses: []const Address, username: ?[]const u8, password: ?[]const u8) Upstream {
+        var self = initSocks5(addresses[0], username, password);
+        self.socks5.candidates = AddressCandidates.init(addresses);
+        return self;
+    }
+
+    pub fn initHttpConnectCandidates(addresses: []const Address, username: ?[]const u8, password: ?[]const u8) Upstream {
+        var self = initHttpConnect(addresses[0], username, password);
+        self.http_connect.candidates = AddressCandidates.init(addresses);
+        return self;
+    }
+
+    pub fn proxyCandidateCount(self: *const Upstream) usize {
+        return switch (self.*) {
+            .direct => 1,
+            .socks5 => |s| @max(1, s.candidates.len),
+            .http_connect => |h| @max(1, h.candidates.len),
+        };
+    }
+
+    pub fn withProxyAddress(self: *const Upstream, addr: Address) Upstream {
+        var selected = self.*;
+        switch (selected) {
+            .direct => {},
+            .socks5 => |*s| s.proxy_addr = addr,
+            .http_connect => |*h| h.proxy_addr = addr,
+        }
+        return selected;
+    }
+
+    pub fn withProxyCandidate(self: *const Upstream, index: usize) Upstream {
+        std.debug.assert(index < self.proxyCandidateCount());
+        var selected = self.*;
+        switch (selected) {
+            .direct => {},
+            .socks5 => |*s| if (s.candidates.len > 0) {
+                s.proxy_addr = s.candidates.addresses[index];
+            },
+            .http_connect => |*h| if (h.candidates.len > 0) {
+                h.proxy_addr = h.candidates.addresses[index];
+            },
+        }
+        return selected;
     }
 
     /// Create a non-blocking upstream socket.
@@ -230,19 +280,15 @@ pub const Direct = struct {
 
 pub const Socks5 = struct {
     proxy_addr: Address,
+    candidates: AddressCandidates = .{},
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
-    socket_mark: ?u32 = null,
 
     /// Connect to the SOCKS5 proxy server (not the target DC).
     /// Returns a result with `.proxy_handshake = .socks5`.
     pub fn connect(self: Socks5) !ConnectResult {
         const fd = try createTcpSocket(socketFamily(self.proxy_addr));
         errdefer closeFd(fd);
-
-        if (self.socket_mark) |mark| {
-            try applySocketMark(fd, mark);
-        }
 
         connectSocket(fd, self.proxy_addr) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
@@ -263,19 +309,15 @@ pub const Socks5 = struct {
 
 pub const HttpConnect = struct {
     proxy_addr: Address,
+    candidates: AddressCandidates = .{},
     username: ?[]const u8 = null,
     password: ?[]const u8 = null,
-    socket_mark: ?u32 = null,
 
     /// Connect to the HTTP proxy server (not the target DC).
     /// Returns a result with `.proxy_handshake = .http_connect`.
     pub fn connect(self: HttpConnect) !ConnectResult {
         const fd = try createTcpSocket(socketFamily(self.proxy_addr));
         errdefer closeFd(fd);
-
-        if (self.socket_mark) |mark| {
-            try applySocketMark(fd, mark);
-        }
 
         connectSocket(fd, self.proxy_addr) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => {
@@ -291,7 +333,14 @@ pub const HttpConnect = struct {
 fn applySocketMark(fd: posix.fd_t, mark: u32) !void {
     if (builtin.os.tag != .linux) return;
 
-    const so_mark: u32 = 36;
+    const so_mark: u32 = std.os.linux.SO.MARK;
     var mark_value: u32 = mark;
-    try posix.setsockopt(fd, posix.SOL.SOCKET, so_mark, std.mem.asBytes(&mark_value));
+    posix.setsockopt(fd, posix.SOL.SOCKET, so_mark, std.mem.asBytes(&mark_value)) catch |err| {
+        // Once per process: an outage must not flood journald per connection.
+        if (!mark_failure_reported.swap(true, .monotonic))
+            std.log.err("SO_MARK failed ({s}); tunnel egress requires CAP_NET_ADMIN (or CAP_NET_RAW on supported kernels). Check the service capability settings.", .{@errorName(err)});
+        return err;
+    };
 }
+
+var mark_failure_reported = std.atomic.Value(bool).init(false);

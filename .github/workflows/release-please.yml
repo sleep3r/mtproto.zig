@@ -44,6 +44,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Two rungs per architecture: a baseline artifact that runs anywhere, and a tuned
+        # one with hardware AES. Every relayed byte passes through AES-CTR twice, so the
+        # baseline rung relays with std's bitsliced software AES and is CPU-bound under load.
+        # aarch64 had only the baseline rung: `generic` carries `fuse_aes` (a scheduling
+        # hint) but not the `aes` feature, so every published ARM binary used software AES
+        # with no artifact an operator could switch to. `generic+aes` needs the ARMv8 crypto
+        # extensions — present on every ARM server part (Graviton, Ampere, Neoverse, Apple),
+        # absent on Cortex-A72 — hence a separate `_crypto` artifact rather than making the
+        # only aarch64 download require them.
         include:
           - target: x86_64-linux
             artifact_name: mtproto-proxy-linux-x86_64
@@ -57,6 +66,10 @@ jobs:
             artifact_name: mtproto-proxy-linux-aarch64
             binary: mtproto-proxy
             cpu: ""
+          - target: aarch64-linux
+            artifact_name: mtproto-proxy-linux-aarch64_crypto
+            binary: mtproto-proxy
+            cpu: generic+aes
           - target: x86_64-linux
             artifact_name: mtbuddy-linux-x86_64
             binary: mtbuddy
@@ -69,6 +82,13 @@ jobs:
             artifact_name: mtbuddy-linux-aarch64
             binary: mtbuddy
             cpu: ""
+          # mtbuddy gains nothing from AES itself, but release.zig derives the buddy asset
+          # name from the proxy asset it picked, so the tuned rung needs a matching buddy or
+          # mtbuddy's own self-update finds no download.
+          - target: aarch64-linux
+            artifact_name: mtbuddy-linux-aarch64_crypto
+            binary: mtbuddy
+            cpu: generic+aes
 
     steps:
       - name: Checkout release tag
@@ -81,15 +101,20 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Verify AES-enabled x86_64_v3 profile
-        if: contains(matrix.cpu, 'x86_64_v3')
+      # Runs for every leg that pins a CPU, not just x86_64_v3: a tuned artifact whose name
+      # promises hardware AES but whose -Dcpu does not actually select it is invisible at
+      # runtime (std silently falls back to the bitsliced software AES) and is exactly the
+      # trap `x86_64+aes` fell into — std needs aes AND avx on x86, so `+aes` alone builds
+      # soft AES. The baseline legs (cpu: "") are software-AES on purpose and are skipped.
+      - name: Verify the pinned CPU profile really enables hardware AES
+        if: matrix.cpu != ''
         run: |
           cat > /tmp/check_aes_target.zig <<'EOF'
           const std = @import("std");
 
           comptime {
               if (!std.crypto.core.aes.has_hardware_support) {
-                  @compileError("x86_64_v3 release artifacts must be built with +aes");
+                  @compileError("tuned release artifacts must be built with a hardware-AES cpu");
               }
           }
 
@@ -130,12 +155,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y minisign
 
-          printf '%s\n' "${MINISIGN_SECRET_KEY}" > /tmp/minisign.key
-          chmod 600 /tmp/minisign.key
+          umask 077
+          signing_key="$(mktemp "$RUNNER_TEMP/minisign.XXXXXX")"
+          trap 'rm -f "$signing_key"' EXIT
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "$signing_key"
           printf '%s\n' "untrusted comment: mtproto.zig minisign public key" > dist/minisign.pub
           printf '%s\n' "${PINNED_MINISIGN_PUBKEY}" >> dist/minisign.pub
           minisign -S \
-            -s /tmp/minisign.key \
+            -s "$signing_key" \
             -m dist/${{ matrix.artifact_name }}.tar.gz.sha256 \
             -x dist/${{ matrix.artifact_name }}.tar.gz.sha256.minisig \
             -t "tag:${{ needs.release-please.outputs.tag_name }} artifact:${{ matrix.artifact_name }}"

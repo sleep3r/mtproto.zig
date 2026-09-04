@@ -24,8 +24,6 @@ pub const MiddleProxySnapshot = struct {
     addrs_media_dc4_len: usize,
     addrs_203: [8]Address,
     addrs_203_len: usize,
-    secret: [256]u8,
-    secret_len: usize,
 
     /// Pick the single primary endpoint for (dc_abs, media?). Media-path
     /// traffic (client sent dc_idx<0) must go to the media MP fleet.
@@ -70,6 +68,7 @@ pub fn buildDcConnectPlan(
     user_name: []const u8,
 ) DcConnectPlan {
     var plan = DcConnectPlan{};
+    if (dc_abs != 203 and (dc_abs < 1 or dc_abs > constants.tg_datacenters_v4.len)) return plan;
     plan.is_media_path = (dc_idx < 0) or (dc_abs == 203);
 
     if (cfg.datacenter_override) |override| {
@@ -90,7 +89,7 @@ pub fn buildDcConnectPlan(
     const has_cdn_middle_proxy = cdn_dc and snapshot != null and snapshot.?.getForDc(dc_abs, true) != null;
 
     if (cfg.userBypassesMiddleProxy(user_name) and !has_cdn_middle_proxy) {
-        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
+        plan.candidates[0] = constants.getDcAddressV4(dc_abs).?;
         plan.count = 1;
         plan.use_middle_proxy = false;
         plan.direct_fallback = null;
@@ -116,7 +115,7 @@ pub fn buildDcConnectPlan(
         cfg.use_middle_proxy and middle_addr != null;
 
     if (!plan.use_middle_proxy) {
-        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
+        plan.candidates[0] = constants.getDcAddressV4(dc_abs).?;
         plan.count = 1;
         plan.direct_fallback = null;
         return plan;
@@ -151,7 +150,7 @@ pub fn buildDcConnectPlan(
         // Safety fallback: if cache has no middle-proxy endpoint for this DC,
         // avoid dropping valid users and go direct.
         plan.use_middle_proxy = false;
-        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
+        plan.candidates[0] = constants.getDcAddressV4(dc_abs).?;
         plan.count = 1;
         plan.direct_fallback = null;
         return plan;
@@ -220,7 +219,7 @@ pub fn parseMiddleProxyAddressesForDc(
     return count;
 }
 
-pub fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?Address {
+fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?Address {
     var one: [1]Address = undefined;
     const sign: DcSignFilter = if (target_dc < 0) .negative_only else .positive_only;
     const n = parseMiddleProxyAddressesForDc(config_text, target_dc, sign, &one);
@@ -243,32 +242,8 @@ pub fn addressesEqual(a: []const Address, b: []const Address) bool {
     return true;
 }
 
-fn closeFd(fd: posix.fd_t) void {
-    while (true) {
-        switch (posix.errno(posix.system.close(fd))) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => return,
-        }
-    }
-}
-
-fn connectSockaddr(fd: posix.fd_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
-    while (true) switch (posix.errno(posix.system.connect(fd, addr, addr_len))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        .ADDRNOTAVAIL => return error.AddressUnavailable,
-        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-        .AGAIN, .INPROGRESS => return error.WouldBlock,
-        .ALREADY => return error.ConnectionPending,
-        .CONNREFUSED => return error.ConnectionRefused,
-        .CONNRESET => return error.ConnectionResetByPeer,
-        .HOSTUNREACH => return error.HostUnreachable,
-        .NETUNREACH => return error.NetworkUnreachable,
-        .TIMEDOUT => return error.Timeout,
-        else => |err| return posix.unexpectedErrno(err),
-    };
-}
+const closeFd = @import("socket_utils.zig").closeFd;
+const connectSockaddr = @import("socket_utils.zig").connectSockaddr;
 
 fn isAddressReachable(address: Address, timeout_ms: i32) bool {
     const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
@@ -367,8 +342,6 @@ test "direct users bypass middle-proxy routing" {
         .addrs_media_dc4_len = 1,
         .addrs_203 = [_]Address{mp_dc203} ++ ([_]Address{mp_dc203} ** 7),
         .addrs_203_len = 1,
-        .secret = [_]u8{0} ** 256,
-        .secret_len = 16,
     };
 
     const regular_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, "regular");
@@ -379,7 +352,7 @@ test "direct users bypass middle-proxy routing" {
     const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, "admin");
     try std.testing.expect(!admin_plan.use_middle_proxy);
     try std.testing.expect(admin_plan.direct_fallback == null);
-    try std.testing.expect(addressEql(admin_plan.candidates[0], constants.getDcAddressV4(4)));
+    try std.testing.expect(addressEql(admin_plan.candidates[0], constants.getDcAddressV4(4).?));
 
     const regular_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "regular");
     try std.testing.expect(regular_media.use_middle_proxy);

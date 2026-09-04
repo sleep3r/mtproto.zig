@@ -18,6 +18,77 @@ fn hasUpstreamPending(slot: anytype) bool {
     return !slot.upstream_queue.isEmpty();
 }
 
+test "nonce startup pins secret and advances only after pending write drains" {
+    const Step = enum { none, sending_rpc_nonce, waiting_rpc_nonce_response, sending_rpc_handshake, waiting_rpc_handshake_response };
+    const Queue = struct {
+        pending: bool = true,
+        pub fn isEmpty(self: @This()) bool {
+            return !self.pending;
+        }
+    };
+    const Slot = struct {
+        phase: enum { middle_proxy_handshake } = .middle_proxy_handshake,
+        mp_step: Step = .none,
+        mp_write_seq_no: i32 = 0,
+        mp_read_seq_no: i32 = 0,
+        mp_frame_have: usize = 0,
+        mp_frame_need: usize = 0,
+        mp_frame_total_len: usize = 0,
+        mp_frame_padded_len: usize = 0,
+        mp_frame_first_decrypted: bool = false,
+        mp_enc: ?u8 = null,
+        mp_dec: ?u8 = null,
+        mp_nonce: [16]u8 = undefined,
+        mp_timestamp: u32 = 0,
+        mp_secret: [256]u8 = undefined,
+        mp_secret_len: usize = 0,
+        upstream_queue: Queue = .{},
+    };
+    const Loop = struct {
+        state: struct {
+            clock_offset_seconds: i64 = 300,
+            middle_proxy_secret: [256]u8 = [_]u8{0x42} ** 256,
+            middle_proxy_secret_len: usize = 32,
+        } = .{},
+        message: [32]u8 = undefined,
+        failed_write: bool = false,
+        fallback_calls: usize = 0,
+        closed: bool = false,
+    };
+    const Cb = struct {
+        fn write(loop: *Loop, _: *Slot, payload: []const u8, _: bool) !void {
+            if (loop.failed_write) return error.ConnectionReset;
+            @memcpy(&loop.message, payload);
+        }
+        fn lock(_: *Loop) void {}
+        fn close(loop: *Loop, _: *Slot, _: []const u8) void {
+            loop.closed = true;
+        }
+        fn fallback(loop: *Loop, _: *Slot) bool {
+            loop.fallback_calls += 1;
+            return true;
+        }
+    };
+    var loop = Loop{};
+    var slot = Slot{};
+    begin(&loop, &slot, Cb.write, Cb.lock, Cb.lock, Cb.close, Cb.fallback);
+    try std.testing.expectEqual(Step.sending_rpc_nonce, slot.mp_step);
+    try std.testing.expectEqual(@as(usize, 32), slot.mp_secret_len);
+    @memset(&loop.state.middle_proxy_secret, 0x99);
+    try std.testing.expectEqual(@as(u8, 0x42), slot.mp_secret[0]);
+    try std.testing.expectEqualSlices(u8, &middleproxy.rpc_nonce_req, loop.message[0..4]);
+    const corrected = realtimeSeconds() + 300;
+    try std.testing.expect(@abs(@as(i64, slot.mp_timestamp) - corrected) <= 1);
+    slot.upstream_queue.pending = false;
+    onWritable(&slot);
+    try std.testing.expectEqual(Step.waiting_rpc_nonce_response, slot.mp_step);
+    try std.testing.expectEqual(@as(usize, 4), slot.mp_frame_need);
+    loop.failed_write = true;
+    begin(&loop, &slot, Cb.write, Cb.lock, Cb.lock, Cb.close, Cb.fallback);
+    try std.testing.expectEqual(@as(usize, 1), loop.fallback_calls);
+    try std.testing.expect(!loop.closed);
+}
+
 pub fn begin(
     loop: anytype,
     slot: anytype,
@@ -25,6 +96,7 @@ pub fn begin(
     comptime lock_shared: fn (@TypeOf(loop)) void,
     comptime unlock_shared: fn (@TypeOf(loop)) void,
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
+    comptime fallback_to_direct: fn (@TypeOf(loop), @TypeOf(slot)) bool,
 ) void {
     slot.phase = .middle_proxy_handshake;
     slot.mp_step = .sending_rpc_nonce;
@@ -36,7 +108,7 @@ pub fn begin(
     slot.mp_dec = null;
 
     crypto.randomBytes(&slot.mp_nonce);
-    const ts: u32 = @intCast(@mod(realtimeSeconds(), 4294967296));
+    const ts: u32 = @intCast(@mod(realtimeSeconds() +| loop.state.clock_offset_seconds, 4294967296));
     slot.mp_timestamp = ts;
 
     var crypto_ts: [4]u8 = undefined;
@@ -45,6 +117,8 @@ pub fn begin(
     var msg: [32]u8 = undefined;
     @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
     lock_shared(loop);
+    slot.mp_secret_len = loop.state.middle_proxy_secret_len;
+    @memcpy(slot.mp_secret[0..slot.mp_secret_len], loop.state.middle_proxy_secret[0..slot.mp_secret_len]);
     // Defensive copy: refresh rejects secrets shorter than 16 bytes, but
     // if that invariant is ever broken we must avoid a length-mismatched
     // memcpy panic when filling the 4-byte key selector field.
@@ -59,7 +133,7 @@ pub fn begin(
     @memcpy(msg[16..32], &slot.mp_nonce);
 
     write_frame(loop, slot, msg[0..], false) catch {
-        close_slot(loop, slot, "mp send nonce failed");
+        if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp send nonce failed");
         return;
     };
 
@@ -96,6 +170,8 @@ pub fn onReadable(
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
     comptime fallback_to_direct: fn (@TypeOf(loop), @TypeOf(slot)) bool,
 ) void {
+    _ = lock_shared;
+    _ = unlock_shared;
     switch (slot.mp_step) {
         .waiting_rpc_nonce_response => {
             // Nonce-stage failures get the same MP->direct fallback as the handshake stage:
@@ -116,16 +192,13 @@ pub fn onReadable(
                 return;
             }
 
-            lock_shared(loop);
-            const key_sel = loop.state.middle_proxy_secret[0..@min(@as(usize, 4), loop.state.middle_proxy_secret_len)];
-            const secret_slice = loop.state.middle_proxy_secret[0..loop.state.middle_proxy_secret_len];
+            const key_sel = slot.mp_secret[0..@min(@as(usize, 4), slot.mp_secret_len)];
+            const secret_slice = slot.mp_secret[0..slot.mp_secret_len];
             if (!std.mem.eql(u8, payload[4..8], key_sel)) {
-                unlock_shared(loop);
                 if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp key selector mismatch");
                 return;
             }
             if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
-                unlock_shared(loop);
                 if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp crypto schema mismatch");
                 return;
             }
@@ -136,17 +209,14 @@ pub fn onReadable(
             std.mem.writeInt(u32, &ts_arr, slot.mp_timestamp, .little);
 
             const tg_addr = slot.current_upstream_addr orelse {
-                unlock_shared(loop);
                 if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp missing logical upstream addr");
                 return;
             };
 
             const local_addr = localSocketAddress(slot.upstream_fd) catch {
-                unlock_shared(loop);
                 if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp getsockname failed");
                 return;
             };
-            var middle_local_addr = local_addr;
 
             var tg_port: [2]u8 = undefined;
             var my_port: [2]u8 = undefined;
@@ -167,7 +237,6 @@ pub fn onReadable(
                     if (loop.state.middle_proxy_nat_ip4) |nat_ip| {
                         const my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
                         my_ip_v4_opt = my_ip_v4;
-                        middle_local_addr = ip4(nat_ip, local_port);
                     } else switch (local_addr) {
                         // No explicit NAT IP configured/detected: fall back to the source
                         // address getsockname() reports — the IP Telegram actually observes
@@ -213,7 +282,10 @@ pub fn onReadable(
                 secret_slice,
                 my_ip_v6_ptr,
                 tg_ip_v6_ptr,
-            );
+            ) catch {
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp invalid key derivation input");
+                return;
+            };
 
             const dec_keys = middleproxy.getAesKeyAndIv(
                 &slot.mp_rpc_nonce_ans,
@@ -227,8 +299,10 @@ pub fn onReadable(
                 secret_slice,
                 my_ip_v6_ptr,
                 tg_ip_v6_ptr,
-            );
-            unlock_shared(loop);
+            ) catch {
+                if (!fallback_to_direct(loop, slot)) close_slot(loop, slot, "mp invalid key derivation input");
+                return;
+            };
 
             slot.mp_enc = crypto.AesCbc.init(&enc_keys[0], &enc_keys[1]);
             slot.mp_dec = crypto.AesCbc.init(&dec_keys[0], &dec_keys[1]);
@@ -289,8 +363,8 @@ pub fn onReadable(
 
             var middle_local_addr = local_addr;
             if (loop.state.middle_proxy_nat_ip4) |nat_ip| {
-                switch (local_addr) {
-                    .ip4 => |la4| middle_local_addr = ip4(nat_ip, la4.port),
+                switch (slot.current_upstream_addr orelse local_addr) {
+                    .ip4 => middle_local_addr = ip4(nat_ip, local_addr.getPort()),
                     .ip6 => {},
                 }
             }
@@ -317,6 +391,10 @@ pub fn onReadable(
             };
 
             slot.mp_step = .done;
+            if (slot.mp_frame_buf) |buf| {
+                loop.state.allocator.free(buf);
+                slot.mp_frame_buf = null;
+            }
             start_relay(loop, slot);
         },
         else => {},

@@ -26,6 +26,12 @@ jobs:
       - name: Run tests
         run: zig build test
 
+      - name: Check formatting
+        run: zig fmt --check build.zig src
+
+      - name: Test shipping optimization
+        run: zig build test -Doptimize=ReleaseSafe
+
       - name: Debug build
         run: zig build
 
@@ -38,10 +44,64 @@ jobs:
       - name: Cross-compile for Linux x86_64_v3+aes
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 
+      # The published image's CPU profiles are read out of the Dockerfile itself rather than
+      # repeated here, so editing either file can't quietly ship an image that relays with
+      # std's bitsliced software AES. That is not hypothetical: `x86_64+aes` (what the amd64
+      # image used to build with) leaves has_hardware_support false, because std needs aes
+      # AND avx on x86, and `aarch64` with no -Dcpu misses the `aes` feature entirely.
+      - name: Probe helper regression tests
+        run: python3 -m unittest discover -s test -p test_probe_helpers.py
+
+      - name: Verify the Docker image CPU profiles enable hardware AES
+        run: |
+          cat > /tmp/check_aes_target.zig <<'EOF'
+          const std = @import("std");
+
+          comptime {
+              if (!std.crypto.core.aes.has_hardware_support) {
+                  @compileError("this target/cpu pair relays with software AES");
+              }
+          }
+
+          pub fn main() void {}
+          EOF
+          amd64_cpu="$(sed -n 's/^ARG ZIG_CPU_AMD64=//p' Dockerfile)"
+          arm64_cpu="$(sed -n 's/^ARG ZIG_CPU_ARM64=//p' Dockerfile)"
+          test -n "$amd64_cpu" && test -n "$arm64_cpu" \
+            || { echo "could not read ZIG_CPU_* defaults from Dockerfile" >&2; exit 1; }
+          for pair in "x86_64-linux:$amd64_cpu" "aarch64-linux:$arm64_cpu"; do
+            echo "checking ${pair}"
+            zig build-obj -femit-bin=/tmp/check_aes.o \
+              -target "${pair%%:*}" -mcpu "${pair#*:}" /tmp/check_aes_target.zig
+          done
+
       - name: Verify binary exists
         run: |
           ls -lh zig-out/bin/mtproto-proxy
           file zig-out/bin/mtproto-proxy
+
+  dashboard:
+    name: Dashboard API Tests
+    runs-on: ubuntu-latest
+    # No Zig needed and no dependency on the build: the dashboard is a Python control plane
+    # that ships with mtbuddy, and its auth / Host-pin / CSRF gates had no CI coverage at all
+    # until this job — the suite existed but nothing ever ran it.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install dashboard runtime + test dependencies
+        # A venv, not `pip install --user`: the runner's system Python is externally managed.
+        run: |
+          python3 -m venv /tmp/dashboard-venv
+          /tmp/dashboard-venv/bin/pip install --quiet fastapi httpx psutil uvicorn pytest
+
+      - name: Run dashboard security tests
+        run: |
+          # test_server.py importorskip's its deps, so a missing wheel would turn the whole
+          # suite into a green skip that proves nothing. Import them here first so that
+          # failure is loud and the pytest run below can only be a real result.
+          /tmp/dashboard-venv/bin/python -c "import fastapi, httpx, psutil, uvicorn"
+          /tmp/dashboard-venv/bin/python -m pytest -q src/ctl/dashboard_assets/test_server.py
 
   e2e:
     name: E2E Integration
@@ -58,8 +118,18 @@ jobs:
       - name: Run E2E harness
         run: zig build e2e
 
+      - name: Run E2E with shipping optimization
+        run: zig build e2e -Doptimize=ReleaseFast
+
       - name: Run WEB proxy bridge-page contract tests
         run: zig build web-bridge
+
+  docker-build:
+    name: Docker build (no publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: docker build --platform linux/amd64 -t mtproto-ci .
 
   bench:
     name: Bench (No Soak)

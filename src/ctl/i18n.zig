@@ -11,13 +11,14 @@ pub const Lang = enum {
     ru,
 
     /// Resolve language from environment map.
-    /// Priority: LC_ALL -> LANG.
+    /// Priority: LANGUAGE preference list, then LC_ALL -> LC_MESSAGES -> LANG.
     pub fn fromEnvMap(env_map: *const std.process.Environ.Map) Lang {
-        if (env_map.get("LC_ALL")) |value| {
-            if (fromLocale(value)) |lang| return lang;
+        if (env_map.get("LANGUAGE")) |preferences| {
+            var languages = std.mem.splitScalar(u8, preferences, ':');
+            while (languages.next()) |value| if (fromLocale(value)) |lang| return lang;
         }
-        if (env_map.get("LANG")) |value| {
-            if (fromLocale(value)) |lang| return lang;
+        for ([_][]const u8{ "LC_ALL", "LC_MESSAGES", "LANG" }) |key| {
+            if (env_map.get(key)) |value| if (fromLocale(value)) |lang| return lang;
         }
         return .en;
     }
@@ -53,30 +54,21 @@ pub const S = enum(u16) {
     menu_setup_recovery,
     menu_setup_dashboard,
     menu_ipv6_hop,
-    menu_edit_config,
     menu_status,
     menu_restart,
     menu_uninstall,
     menu_exit,
 
     // ── Common ──
-    checking_root,
     error_not_root,
-    press_enter,
     yes,
-    no,
     done,
-    failed,
     skipped,
-    version_label,
     confirm_proceed,
     aborting,
     restart_success,
 
     // ── Monitor ──
-    monitor_header,
-    monitor_port_prompt,
-    monitor_port_help,
 
     // ── Tunnel ──
     tunnel_conf_prompt,
@@ -118,9 +110,7 @@ pub const S = enum(u16) {
     install_middle_proxy_warn,
     install_checking_deps,
     install_resolving_tag,
-    install_download_ok,
     install_downloading,
-    install_validating,
     install_binary_ok,
     install_config_generated,
     install_config_exists,
@@ -143,9 +133,7 @@ pub const S = enum(u16) {
     update_tag_resolved,
     update_downloading,
     update_download_ok,
-    update_validating,
     update_validation_ok,
-    update_validation_fail,
     update_backing_up,
     update_stopping,
     update_installing,
@@ -164,10 +152,8 @@ pub const S = enum(u16) {
     uninstall_success,
 
     // ── Errors ──
-    error_arch_unsupported,
     error_no_release,
     error_download_failed,
-    error_binary_not_found,
     error_service_failed,
     error_install_dir_missing,
 
@@ -223,8 +209,6 @@ const en_strings = [_][]const u8{
     "📊  Install Monitoring Dashboard",
     // menu_ipv6_hop
     "\xF0\x9F\x94\x84  IPv6 hopping",
-    // menu_edit_config
-    "\xE2\x9A\x99\xEF\xB8\x8F  Edit configuration",
     // menu_status
     "\xF0\x9F\x93\x8B  Show status",
     // menu_restart
@@ -235,24 +219,14 @@ const en_strings = [_][]const u8{
     "\xF0\x9F\x9A\xAA  Exit",
 
     // ── Common ──
-    // checking_root
-    "Checking root privileges...",
     // error_not_root
     "This command requires root. Run: sudo mtbuddy",
-    // press_enter
-    "Press Enter to continue...",
     // yes
     "yes",
-    // no
-    "no",
     // done
     "done",
-    // failed
-    "failed",
     // skipped
     "skipped",
-    // version_label
-    "version",
     // confirm_proceed
     "Proceed?",
     // aborting
@@ -261,12 +235,6 @@ const en_strings = [_][]const u8{
     "Proxy restarted successfully.",
 
     // ── Monitor ──
-    // monitor_header
-    "Configure Monitor API",
-    // monitor_port_prompt
-    "API port",
-    // monitor_port_help
-    "Port for Prometheus metrics / API.",
 
     // ── Tunnel ──
     // tunnel_conf_prompt
@@ -345,12 +313,8 @@ const en_strings = [_][]const u8{
     "Installing system dependencies...",
     // install_resolving_tag
     "Resolving latest release...",
-    // install_download_ok
-    "Binary downloaded",
     // install_downloading
     "Downloading proxy binary...",
-    // install_validating
-    "Validating binary compatibility...",
     // install_binary_ok
     "Binary installed",
     // install_config_generated
@@ -384,7 +348,7 @@ const en_strings = [_][]const u8{
     // update_version_prompt
     "Version",
     // update_version_help
-    "Leave empty for latest, or specify e.g. v0.11.0",
+    "Leave empty for latest, or specify a release tag (vX.Y.Z)",
     // update_resolving_tag
     "Resolving latest release...",
     // update_tag_resolved
@@ -393,12 +357,8 @@ const en_strings = [_][]const u8{
     "Downloading artifact...",
     // update_download_ok
     "Artifact downloaded",
-    // update_validating
-    "Validating binary compatibility...",
     // update_validation_ok
     "Binary compatible with this CPU",
-    // update_validation_fail
-    "Binary incompatible with this CPU (illegal instruction)",
     // update_backing_up
     "Backing up current binary...",
     // update_stopping
@@ -431,14 +391,10 @@ const en_strings = [_][]const u8{
     "mtproto-proxy and all its components have been removed.",
 
     // ── Errors ──
-    // error_arch_unsupported
-    "Unsupported architecture",
     // error_no_release
     "Couldn't reach GitHub to find the latest version. Check the server's internet and try again.",
     // error_download_failed
     "Failed to download artifact",
-    // error_binary_not_found
-    "Extracted binary not found in artifact",
     // error_service_failed
     "The proxy didn't start after the update — rolled back to the previous version. Check: journalctl -u mtproto-proxy -n 30",
     // error_install_dir_missing
@@ -488,8 +444,6 @@ const ru_strings = [_][]const u8{
     "📊  Установить дашборд мониторинга",
     // menu_ipv6_hop
     "\xF0\x9F\x94\x84  Ротация IPv6",
-    // menu_edit_config
-    "\xE2\x9A\x99\xEF\xB8\x8F  Настроить конфигурацию",
     // menu_status
     "\xF0\x9F\x93\x8B  Показать статус",
     // menu_restart
@@ -500,24 +454,14 @@ const ru_strings = [_][]const u8{
     "\xF0\x9F\x9A\xAA  Выход",
 
     // ── Common ──
-    // checking_root
-    "Проверка прав root...",
     // error_not_root
     "Требуются права root. Запустите: sudo mtbuddy",
-    // press_enter
-    "Нажмите Enter для продолжения...",
     // yes
     "да",
-    // no
-    "нет",
     // done
     "готово",
-    // failed
-    "ошибка",
     // skipped
     "пропущено",
-    // version_label
-    "версия",
     // confirm_proceed
     "Продолжить?",
     // aborting
@@ -526,12 +470,6 @@ const ru_strings = [_][]const u8{
     "Прокси успешно перезапущен.",
 
     // ── Monitor ──
-    // monitor_header
-    "Настройка API мониторинга",
-    // monitor_port_prompt
-    "Порт API",
-    // monitor_port_help
-    "Порт для отдачи метрик Prometheus / API.",
 
     // ── Tunnel ──
     // tunnel_conf_prompt
@@ -610,12 +548,8 @@ const ru_strings = [_][]const u8{
     "Установка системных зависимостей...",
     // install_resolving_tag
     "Определение последней версии...",
-    // install_download_ok
-    "Бинарник скачан",
     // install_downloading
     "Скачивание бинарника прокси...",
-    // install_validating
-    "Проверка совместимости бинарника...",
     // install_binary_ok
     "Бинарник установлен",
     // install_config_generated
@@ -649,7 +583,7 @@ const ru_strings = [_][]const u8{
     // update_version_prompt
     "Версия",
     // update_version_help
-    "Оставьте пустым для latest, или укажите (напр. v0.11.0)",
+    "Оставьте пустым для latest, или укажите тег релиза (vX.Y.Z)",
     // update_resolving_tag
     "Определение последней версии...",
     // update_tag_resolved
@@ -658,12 +592,8 @@ const ru_strings = [_][]const u8{
     "Скачивание артефакта...",
     // update_download_ok
     "Артефакт скачан",
-    // update_validating
-    "Проверка совместимости...",
     // update_validation_ok
     "Бинарник совместим с этим CPU",
-    // update_validation_fail
-    "Бинарник несовместим с этим CPU (недопустимая инструкция)",
     // update_backing_up
     "Резервная копия текущего бинарника...",
     // update_stopping
@@ -696,14 +626,10 @@ const ru_strings = [_][]const u8{
     "mtproto-proxy и все связанные компоненты успешно удалены.",
 
     // ── Errors ──
-    // error_arch_unsupported
-    "Неподдерживаемая архитектура",
     // error_no_release
     "Не удалось связаться с GitHub, чтобы найти последнюю версию. Проверьте интернет на сервере и повторите.",
     // error_download_failed
     "Не удалось скачать артефакт",
-    // error_binary_not_found
-    "Бинарник не найден в артефакте",
     // error_service_failed
     "Прокси не запустился после обновления — откатились к прежней версии. Подробности: journalctl -u mtproto-proxy -n 30",
     // error_install_dir_missing
@@ -770,6 +696,16 @@ test "Lang.fromEnvMap detects LANG ru locale" {
     try env.put("LANG", "ru_RU.UTF-8");
 
     try std.testing.expectEqual(Lang.ru, Lang.fromEnvMap(&env));
+}
+
+test "Lang.fromEnvMap respects message locale and language preferences" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("LANG", "en_US.UTF-8");
+    try env.put("LC_MESSAGES", "ru_RU.UTF-8");
+    try std.testing.expectEqual(Lang.ru, Lang.fromEnvMap(&env));
+    try env.put("LANGUAGE", "de:en:ru");
+    try std.testing.expectEqual(Lang.en, Lang.fromEnvMap(&env));
 }
 
 test "Lang.fromEnvMap falls back to en for C/POSIX and empty" {

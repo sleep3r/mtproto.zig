@@ -73,6 +73,17 @@ fn rawFieldChecked(s: []const u8) ![]const u8 {
     return s;
 }
 
+/// True when a WHOLE share-link is safe to record verbatim. `setup egress` writes the
+/// pasted text into `[upstream.xray] links` in the root-owned config.toml as a bare quoted
+/// array, so a newline in the link emits extra physical lines into a file the proxy parses
+/// back: an injected `[access.users]` entry hands the proxy to whoever wrote the link, and
+/// an injected `[general] tls_domain` invalidates every distributed tg:// link. A
+/// share-link is a single URI, so a control byte or a `"` in it is never legitimate.
+pub fn linkTextIsSafe(s: []const u8) bool {
+    if (hasControlBytes(s)) return false;
+    return std.mem.indexOfScalar(u8, s, '"') == null;
+}
+
 /// Return the (raw, undecoded) value of `key` in a `k=v&k2=v2` query string, or null.
 pub fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
@@ -127,6 +138,7 @@ pub const XrayLink = struct {
     id: ?[]const u8 = null, // uuid (vless/vmess)
     password: ?[]const u8 = null, // trojan / ss
     method: ?[]const u8 = null, // ss cipher
+    plugin: ?[]const u8 = null, // ss SIP002 `plugin=` (v2ray-plugin/obfs/shadow-tls)
     alter_id: u16 = 0, // vmess aid
     cipher: []const u8 = "auto", // vmess scy (auto|none|zero|aes-128-gcm|chacha20-poly1305)
     // transport / security
@@ -142,9 +154,12 @@ pub const XrayLink = struct {
     // hysteria2
     obfs: ?[]const u8 = null, // only "salamander" exists
     obfs_password: ?[]const u8 = null,
-    /// hysteria2 `insecure=1`: skip certificate verification. Hysteria servers are
-    /// commonly self-signed, and unlike the Xray family the scheme has no Reality-style
-    /// pinning we can emit faithfully, so the link has to say so explicitly.
+    /// `insecure=1` (hysteria2) / `allowInsecure=1` (vless/trojan): skip certificate
+    /// verification. Hysteria servers are commonly self-signed, and unlike the Xray family
+    /// the scheme has no Reality-style pinning we can emit faithfully, so the link has to
+    /// say so explicitly. 3x-ui hands out `allowInsecure=1` on tls links for the same
+    /// reason: dropping the flag built an outbound that verifies strictly, so `sing-box
+    /// check` passed and every dial then failed on x509 behind a green "egress up".
     insecure: bool = false,
 };
 
@@ -183,6 +198,11 @@ fn parseUriCred(a: std.mem.Allocator, link: []const u8, scheme: Scheme, prefix: 
 
     var l = XrayLink{ .scheme = scheme, .name = name, .address = try a.dupe(u8, hp.host), .port = hp.port };
     if (scheme == .vless) l.id = cred else l.password = cred;
+    // trojan is TLS by definition — the original trojan-gfw URI carries no `security=` at
+    // all. Left at the "none" default it generated a PLAINTEXT trojan outbound that ships
+    // the password in the clear on the first packet and can never connect, while
+    // `sing-box check` passed and setup reported the egress up.
+    if (scheme == .trojan) l.security = "tls";
 
     if (queryParam(query, "type")) |v| l.network = try percentDecodeAlloc(a, v);
     if (queryParam(query, "security")) |v| l.security = try percentDecodeAlloc(a, v);
@@ -194,6 +214,11 @@ fn parseUriCred(a: std.mem.Allocator, link: []const u8, scheme: Scheme, prefix: 
     if (queryParam(query, "fp")) |v| l.fingerprint = try percentDecodeAlloc(a, v);
     if (queryParam(query, "pbk")) |v| l.public_key = try percentDecodeAlloc(a, v);
     if (queryParam(query, "sid")) |v| l.short_id = try percentDecodeAlloc(a, v);
+    // Panels (3x-ui) emit `allowInsecure=1` for endpoints with a self-signed certificate;
+    // `insecure=1` is the same flag under the hysteria2 spelling. See XrayLink.insecure.
+    if (queryParam(query, "allowInsecure") orelse queryParam(query, "insecure")) |v| {
+        l.insecure = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+    }
     return l;
 }
 
@@ -212,7 +237,9 @@ fn jsonStr(a: std.mem.Allocator, obj: std.json.Value, key: []const u8) ?[]const 
 /// Parse vmess:// (base64-encoded JSON object).
 fn parseVmess(a: std.mem.Allocator, link: []const u8) !XrayLink {
     const decoded = try base64Decode(a, link["vmess://".len..]);
+    defer a.free(decoded);
     const parsed = std.json.parseFromSlice(std.json.Value, a, decoded, .{}) catch return error.BadLink;
+    defer parsed.deinit();
     const o = parsed.value;
     if (o != .object) return error.BadLink;
     const add = jsonStr(a, o, "add") orelse return error.BadLink;
@@ -247,7 +274,16 @@ fn parseSs(a: std.mem.Allocator, link: []const u8) !XrayLink {
         name = try percentDecodeAlloc(a, rest[h + 1 ..]);
         rest = rest[0..h];
     }
-    if (std.mem.indexOfScalar(u8, rest, '?')) |q| rest = rest[0..q]; // drop plugin params
+    // The query is not part of the credential/authority, but `plugin=` is KEPT: it names
+    // the transport (v2ray-plugin, obfs-local, shadow-tls) the server actually speaks, and
+    // our generator emits a bare shadowsocks outbound. Dropped, the link looked ordinary,
+    // `sing-box check` passed, and every connection to such a server died — so it is
+    // carried into validateLink as a rejection instead.
+    var plugin: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+        if (queryParam(rest[q + 1 ..], "plugin")) |v| plugin = try percentDecodeAlloc(a, v);
+        rest = rest[0..q];
+    }
     var method: []const u8 = undefined;
     var password: []const u8 = undefined;
     var hostport: []const u8 = undefined;
@@ -275,6 +311,7 @@ fn parseSs(a: std.mem.Allocator, link: []const u8) !XrayLink {
         .port = hp.port,
         .method = try a.dupe(u8, method),
         .password = try a.dupe(u8, password),
+        .plugin = plugin,
     };
 }
 
@@ -401,6 +438,22 @@ pub fn validateLink(l: XrayLink, buf: []u8) ?[]const u8 {
     if (!(net.len == 0 or std.mem.eql(u8, net, "tcp") or std.mem.eql(u8, net, "ws") or std.mem.eql(u8, net, "grpc"))) {
         return std.fmt.bufPrint(buf, "unsupported transport '{s}' for {s} — only tcp/ws/grpc are supported", .{ net, l.address }) catch "unsupported transport";
     }
+    // The generator emits a TLS block for exactly "tls" and "reality"; every other value
+    // (legacy `security=xtls`, a typo) falls through to a PLAINTEXT outbound that
+    // `sing-box check` accepts and whose every dial then fails. `none` is deliberately
+    // legal — vless+ws behind a CDN is a real plaintext-to-the-edge shape.
+    const sec = l.security;
+    if (!(sec.len == 0 or std.mem.eql(u8, sec, "none") or std.mem.eql(u8, sec, "tls") or std.mem.eql(u8, sec, "reality"))) {
+        return std.fmt.bufPrint(buf, "unsupported security '{s}' for {s} — only tls/reality/none are supported", .{ sec, l.address }) catch "unsupported security";
+    }
+    // A flow (xtls-rprx-vision) without TLS is the same trap one level down: sing-box's
+    // vless outbound only rejects an UNKNOWN flow name, so `check` exits 0 and the failure
+    // appears per-dial inside NewVisionConn ("not a valid supported TLS connection").
+    if (l.flow) |flow| {
+        if (flow.len > 0 and !(std.mem.eql(u8, sec, "tls") or std.mem.eql(u8, sec, "reality"))) {
+            return std.fmt.bufPrint(buf, "flow '{s}' needs security=tls or reality ({s})", .{ flow, l.address }) catch "flow without tls";
+        }
+    }
     if (l.scheme == .hysteria2) {
         // pinSHA256 pins sha256 of the whole DER certificate, colon-hex. sing-box's
         // nearest field pins the SPKI, base64 — a different preimage AND a different
@@ -425,6 +478,15 @@ pub fn validateLink(l: XrayLink, buf: []u8) ?[]const u8 {
         return null;
     }
     if (l.scheme == .shadowsocks) {
+        // sing-box does support `plugin`/`plugin_opts`, but our generator emits neither, so
+        // a v2ray-plugin/obfs/shadow-tls endpoint would get a plain shadowsocks outbound
+        // and drop every connection behind a config that checks clean.
+        if (l.plugin) |p| {
+            if (p.len > 0) {
+                const name = p[0 .. std.mem.indexOfScalar(u8, p, ';') orelse p.len];
+                return std.fmt.bufPrint(buf, "shadowsocks plugin '{s}' is not supported ({s})", .{ name, l.address }) catch "shadowsocks plugin unsupported";
+            }
+        }
         const m = l.method orelse "";
         for (supported_ss_methods) |sm| {
             if (std.mem.eql(u8, m, sm)) return null;
@@ -436,9 +498,13 @@ pub fn validateLink(l: XrayLink, buf: []u8) ?[]const u8 {
 
 // ── wireguard:// -> .conf transform ──────────────────────────────────────────────
 
-/// Convert a `wireguard://<privkey>@<host>:<port>?publickey=&address=&mtu=...#name`
-/// share-link into a WireGuard/AmneziaWG `.conf`. AmneziaWG obfuscation params
-/// (jc/jmin/jmax/s1/s2/h1..h4) and presharedkey are carried through when present.
+test "wireguard requires an explicit tunnel address" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadLink, convertWireguardLink(arena.allocator(), "wireguard://PRIVATE@example.com:51820?publickey=PUBLIC"));
+}
+
+/// Convert a wireguard share-link into a WireGuard/AmneziaWG config.
 pub fn convertWireguardLink(a: std.mem.Allocator, link_in: []const u8) ![]const u8 {
     const link = std.mem.trim(u8, link_in, " \t\r\n");
     const after = if (std.mem.startsWith(u8, link, "wireguard://"))
@@ -461,10 +527,12 @@ pub fn convertWireguardLink(a: std.mem.Allocator, link_in: []const u8) ![]const 
     const host = try rawFieldChecked(hp.host);
 
     const pub_key = try percentDecodeChecked(a, queryParam(query, "publickey") orelse queryParam(query, "public_key") orelse return error.BadLink);
-    const address = try percentDecodeChecked(a, queryParam(query, "address") orelse "10.0.0.2/32");
+    const address = try percentDecodeChecked(a, queryParam(query, "address") orelse return error.BadLink);
+    if (address.len == 0) return error.BadLink;
     const mtu = try rawFieldChecked(queryParam(query, "mtu") orelse "1420");
 
     var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("[Interface]\nPrivateKey = {s}\nAddress = {s}\nMTU = {s}\n", .{ private_key, address, mtu });
     if (queryParam(query, "dns")) |dns| try w.print("DNS = {s}\n", .{try percentDecodeChecked(a, dns)});
@@ -478,7 +546,7 @@ pub fn convertWireguardLink(a: std.mem.Allocator, link_in: []const u8) ![]const 
     }
     try w.print("\n[Peer]\nPublicKey = {s}\nEndpoint = {s}:{d}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n", .{ pub_key, host, hp.port });
     if (queryParam(query, "presharedkey")) |psk| try w.print("PresharedKey = {s}\n", .{try percentDecodeChecked(a, psk)});
-    return aw.written();
+    return try aw.toOwnedSlice();
 }
 
 test "parse vless reality link" {
@@ -538,6 +606,75 @@ test "validateLink rejects unsupported transport and ss cipher" {
     try std.testing.expect(validateLink(.{ .scheme = .shadowsocks, .address = "h", .port = 1, .method = "aes-256-gcm" }, &buf) == null);
     try std.testing.expect(validateLink(.{ .scheme = .vless, .address = "h", .port = 1, .network = "quic" }, &buf) != null);
     try std.testing.expect(validateLink(.{ .scheme = .shadowsocks, .address = "h", .port = 1, .method = "rc4-md5-is-unsupported" }, &buf) != null);
+}
+
+test "a share link that would inject TOML is refused before it is recorded" {
+    // `setup egress` writes the pasted argv verbatim into `[upstream.xray] links`, so a
+    // newline in the link adds physical lines to the root-owned config.toml — an
+    // `[access.users]` entry the proxy honours, or a `tls_domain` that kills every link.
+    try std.testing.expect(linkTextIsSafe("vless://u@1.2.3.4:443?security=tls#name"));
+    try std.testing.expect(!linkTextIsSafe("vless://u@1.2.3.4:443?security=tls#x\n[access.users]\nattacker = \"00\""));
+    try std.testing.expect(!linkTextIsSafe("vless://u@1.2.3.4:443#x\r\nfoo"));
+    // A bare quote alone already closes the TOML array element.
+    try std.testing.expect(!linkTextIsSafe("vless://u@1.2.3.4:443#x\",\"y"));
+}
+
+test "trojan is TLS by default and an unusable security/flow combination is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+
+    // The original trojan-gfw URI has no `security=`: at the "none" default the generator
+    // emitted a PLAINTEXT trojan outbound (password in the clear, never connects).
+    const trojan = try parseXrayLink(a, "trojan://pw@vpn.example:443?sni=vpn.example#t");
+    try std.testing.expectEqualStrings("tls", trojan.security);
+    try std.testing.expect(validateLink(trojan, &buf) == null);
+
+    // Legacy/typo'd security values must be refused, not silently degraded to plaintext.
+    const xtls = try parseXrayLink(a, "vless://u@h:443?type=tcp&security=xtls&sni=s#x");
+    try std.testing.expect(validateLink(xtls, &buf) != null);
+
+    // A flow with no TLS builds fine (`sing-box check` exits 0) and fails every dial.
+    const flow_no_tls = try parseXrayLink(a, "vless://u@h:443?type=tcp&flow=xtls-rprx-vision&sni=s&fp=chrome#x");
+    try std.testing.expect(validateLink(flow_no_tls, &buf) != null);
+    // ...while the same flow over reality stays supported.
+    const flow_reality = try parseXrayLink(a, "vless://u@h:443?type=tcp&security=reality&pbk=P&sid=S&flow=xtls-rprx-vision#x");
+    try std.testing.expect(validateLink(flow_reality, &buf) == null);
+    // security=none remains legal: vless+ws behind a CDN is a real deployment shape.
+    const ws_plain = try parseXrayLink(a, "vless://u@h:443?type=ws&path=%2Fx#x");
+    try std.testing.expect(validateLink(ws_plain, &buf) == null);
+}
+
+test "allowInsecure survives parsing instead of being dropped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const l = try parseXrayLink(a, "trojan://pw@vpn.example:443?security=tls&sni=vpn.example&allowInsecure=1#t");
+    try std.testing.expect(l.insecure);
+    const strict = try parseXrayLink(a, "trojan://pw@vpn.example:443?security=tls&sni=vpn.example#t");
+    try std.testing.expect(!strict.insecure);
+}
+
+test "ss plugin params are rejected, not silently dropped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+
+    // A v2ray-plugin (websocket+TLS) server against a bare shadowsocks outbound drops
+    // every connection while `sing-box check` passes.
+    const plugged = try parseXrayLink(a, "ss://YWVzLTI1Ni1nY206cHc=@vpn.example:443?plugin=v2ray-plugin%3Btls%3Bhost%3Dvpn.example#EU");
+    try std.testing.expectEqualStrings("v2ray-plugin;tls;host=vpn.example", plugged.plugin.?);
+    const msg = validateLink(plugged, &buf) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "v2ray-plugin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, ";tls") == null); // name only, not the opts
+
+    // A plain SIP002 link is untouched.
+    const plain = try parseXrayLink(a, "ss://YWVzLTI1Ni1nY206cHc=@vpn.example:443#EU");
+    try std.testing.expect(plain.plugin == null);
+    try std.testing.expect(validateLink(plain, &buf) == null);
 }
 
 test "detectScheme" {

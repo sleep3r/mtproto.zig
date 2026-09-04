@@ -41,6 +41,7 @@
 //! Protocol reference: tdesktop `docs/web-proxy-plan.md` §6–§8.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -48,6 +49,7 @@ const config = @import("../config.zig");
 const crypto = @import("../crypto/crypto.zig");
 const socket_utils = @import("../proxy/socket_utils.zig");
 const net_helpers = @import("../proxy/net_helpers.zig");
+const dns_cache = @import("../proxy/dns_cache.zig");
 const message_queue = @import("../proxy/message_queue.zig");
 const queue_io = @import("../proxy/queue_io.zig");
 
@@ -104,7 +106,7 @@ const carrier_queue_limit: usize = 8 * 1024 * 1024;
 /// Hard ceiling on one stream's queue towards the backend. The client's own credit
 /// already bounds this at the 4 MiB window; the backend is loopback, so anything near
 /// this means the proxy is wedged and the stream is better off dead.
-const backend_queue_limit: usize = 1024 * 1024;
+const backend_queue_limit: usize = frame.initial_stream_window + 256;
 
 /// Cap on an HTTP connection's response queue. Every response we emit is a few KiB.
 const http_queue_limit: usize = 256 * 1024;
@@ -215,6 +217,10 @@ fn buildCapabilities(
 const ConnKind = enum { http, websocket, backend };
 
 const Conn = struct {
+    accounted_bytes: usize = 0,
+    batch: std.ArrayList(u8) = .empty,
+    batch_pending: bool = false,
+    batch_frames: usize = 0,
     fd: posix.fd_t,
     kind: ConnKind,
     peer: Address,
@@ -233,6 +239,8 @@ const Conn = struct {
     session: ?*Session = null,
     stream: ?*Stream = null,
     connecting: bool = false,
+    backend_candidates: net_helpers.AddressCandidates = .{},
+    backend_next: usize = 0,
     /// Diagnostics for the one failure mode that matters here — bytes arriving from the
     /// proxy but never reaching the client. Comparing `rx_bytes` against the proxy's own
     /// `s2c=` for the same connection localises a stall to one side of the socket in a
@@ -271,12 +279,11 @@ const Session = struct {
     welcomed: bool = false,
     tearing_down: bool = false,
     streams: std.AutoHashMapUnmanaged(u32, *Stream) = .empty,
-    closed_ids: [closed_history]u32 = [_]u32{0} ** closed_history,
+    closed_ids: []u32 = &.{},
     closed_pos: usize = 0,
     last_rx_ms: i64 = 0,
     last_ping_ms: i64 = 0,
     ping_payload: [8]u8 = [_]u8{0} ** 8,
-    ping_outstanding: bool = false,
     needs_window_flush: bool = false,
     /// DATA frames and payload bytes pushed at the client. Their ratio is the average
     /// frame size, which is what decides how much work the client's JS thread does per
@@ -291,8 +298,9 @@ const Session = struct {
     streams_refused: u32 = 0,
 
     fn rememberClosed(self: *Session, id: u32) void {
+        if (self.closed_ids.len == 0) return;
         self.closed_ids[self.closed_pos] = id;
-        self.closed_pos = (self.closed_pos + 1) % closed_history;
+        self.closed_pos = (self.closed_pos + 1) % self.closed_ids.len;
     }
 
     fn recentlyClosed(self: *const Session, id: u32) bool {
@@ -303,13 +311,32 @@ const Session = struct {
     }
 };
 
+test "closed stream retention scales beyond the former 64-id cap" {
+    var ids: [256]u32 = [_]u32{0} ** 256;
+    var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .closed_ids = &ids };
+    for (1..257) |id| session.rememberClosed(@intCast(id));
+    try std.testing.expect(session.recentlyClosed(1));
+    try std.testing.expect(session.recentlyClosed(256));
+    try std.testing.expect(!session.recentlyClosed(0));
+}
+
+test "backend queue accommodates a complete granted receive window" {
+    try std.testing.expect(backend_queue_limit >= frame.initial_stream_window + 52);
+    try std.testing.expect(ws.max_message >= frame.max_payload + frame.header_size);
+}
+
 // ── the relay ─────────────────────────────────────────────────────────────────
 
 pub const Relay = struct {
     allocator: std.mem.Allocator,
     opts: Options,
+    backend_dns: ?*dns_cache.Cache = null,
+    backend_dns_id: usize = 0,
     caps: []UserCapability,
     /// Pre-rendered responses; the bridge page carries no per-user bytes.
+    /// The cover page is generated per deployment (see `page.renderCover`), so it is
+    /// owned here rather than being a constant.
+    cover_page: []u8,
     bridge_page: []u8,
     bridge_headers: []u8,
     cover_headers: []u8,
@@ -325,6 +352,7 @@ pub const Relay = struct {
     /// Closed connections whose memory is released at the top of the next loop
     /// iteration, together with their fd. See `closeConn`.
     pending_free: std.ArrayList(*Conn) = .empty,
+    batch_fds: std.ArrayList(posix.fd_t) = .empty,
     /// Reused snapshot of connection fds, so timers can close connections without
     /// mutating the map they are walking.
     tick_scratch: std.ArrayList(posix.fd_t) = .empty,
@@ -334,10 +362,10 @@ pub const Relay = struct {
     http_count: u32 = 0,
 
     bytes_out: std.atomic.Value(u64) = .init(0),
-    /// Set by `tick` when the aggregate queued bytes exceed the budget. While set, no new
-    /// client credit is handed out and backends stop being drained, so the total can only
-    /// fall. Cheaper than accounting on every queue mutation, and a 50 ms lag is
-    /// irrelevant against a multi-megabyte budget.
+    buffered_bytes: usize = 0,
+    streams_refused: u64 = 0,
+    accepts_refused: u64 = 0,
+    /// Soft backpressure before the hard budget enforced at every buffer mutation.
     throttled: bool = false,
     stop: bool = false,
     read_buf: [read_buf_size]u8 = undefined,
@@ -346,7 +374,12 @@ pub const Relay = struct {
         const caps = try buildCapabilities(allocator, cfg, opts.domain);
         errdefer allocator.free(caps);
 
-        const bridge_page = try page.renderBridge(allocator, opts.ws_path);
+        const cover_page = try page.renderCover(allocator, opts.domain);
+        errdefer allocator.free(cover_page);
+
+        // The bridge page IS the cover page plus the script: a capability holder must be
+        // served the same visible site a prober gets, or the cover proves nothing.
+        const bridge_page = try page.renderBridge(allocator, cover_page, opts.ws_path);
         errdefer allocator.free(bridge_page);
 
         // The bridge response must be framable by tdesktop's loopback fallback page,
@@ -356,7 +389,7 @@ pub const Relay = struct {
         const bridge_headers = try std.fmt.allocPrint(allocator, "Content-Type: text/html; charset=utf-8\r\n" ++
             "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; " ++
             "style-src 'unsafe-inline'; connect-src 'self' wss://{s}; base-uri 'none'; " ++
-            "form-action 'none'; frame-ancestors http://127.0.0.1:* http://[::1]:*\r\n" ++
+            "form-action 'none'; frame-ancestors http://127.0.0.1:*\r\n" ++
             "Referrer-Policy: no-referrer\r\n" ++
             "X-Content-Type-Options: nosniff\r\n" ++
             "Cache-Control: no-store\r\n", .{opts.domain});
@@ -381,15 +414,30 @@ pub const Relay = struct {
         var mask = posix.sigemptyset();
         posix.sigaddset(&mask, .TERM);
         posix.sigaddset(&mask, .INT);
+        posix.sigaddset(&mask, .HUP);
         var old_sigmask: posix.sigset_t = undefined;
         posix.sigprocmask(posix.SIG.BLOCK, &mask, &old_sigmask);
         errdefer posix.sigprocmask(posix.SIG.SETMASK, &old_sigmask, null);
         const signal_fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+        errdefer closeFd(signal_fd);
+        const cache = try dns_cache.Cache.create(allocator);
+        errdefer cache.destroy();
+        const spec = cfg.web.backend;
+        const colon = if (spec) |s| std.mem.lastIndexOfScalar(u8, s, ':') orelse return error.InvalidBackend else 0;
+        const host = if (spec) |s| std.mem.trim(u8, s[0..colon], "[] ") else "127.0.0.1";
+        const port = if (spec) |s| try std.fmt.parseInt(u16, s[colon + 1 ..], 10) else cfg.port;
+        const addresses = try net_helpers.getAddressList(allocator, host, port);
+        defer addresses.deinit();
+        const dns_id = try cache.add(host, port, net_helpers.AddressCandidates.init(addresses.addrs));
+        try cache.start();
 
         return .{
             .allocator = allocator,
             .opts = opts,
+            .backend_dns = cache,
+            .backend_dns_id = dns_id,
             .caps = caps,
+            .cover_page = cover_page,
             .bridge_page = bridge_page,
             .bridge_headers = bridge_headers,
             .cover_headers = cover_headers,
@@ -402,6 +450,7 @@ pub const Relay = struct {
     }
 
     pub fn deinit(self: *Relay) void {
+        if (self.backend_dns) |cache| cache.destroy();
         var it = self.conns.valueIterator();
         while (it.next()) |conn_ptr| {
             const conn = conn_ptr.*;
@@ -412,6 +461,7 @@ pub const Relay = struct {
                     var streams = session.streams.valueIterator();
                     while (streams.next()) |stream_ptr| self.allocator.destroy(stream_ptr.*);
                     session.streams.deinit(self.allocator);
+                    self.allocator.free(session.closed_ids);
                     self.allocator.destroy(session);
                 }
             }
@@ -423,12 +473,14 @@ pub const Relay = struct {
         self.pending_close.deinit(self.allocator);
         for (self.pending_free.items) |conn| self.destroyConn(conn);
         self.pending_free.deinit(self.allocator);
+        self.batch_fds.deinit(self.allocator);
         self.tick_scratch.deinit(self.allocator);
         closeFd(self.signal_fd);
         posix.sigprocmask(posix.SIG.SETMASK, &self.old_sigmask, null);
         closeFd(self.listen_fd);
         closeFd(self.epoll_fd);
         self.allocator.free(self.caps);
+        self.allocator.free(self.cover_page);
         self.allocator.free(self.bridge_page);
         self.allocator.free(self.bridge_headers);
         self.allocator.free(self.cover_headers);
@@ -462,7 +514,13 @@ pub const Relay = struct {
             for (events[0..n]) |ev| {
                 const fd = ev.data.fd;
                 if (fd == self.signal_fd) {
-                    self.stop = true;
+                    var info: linux.signalfd_siginfo = undefined;
+                    const size = posix.read(fd, std.mem.asBytes(&info)) catch continue;
+                    if (size == @sizeOf(linux.signalfd_siginfo)) {
+                        if (info.signo == @intFromEnum(posix.SIG.HUP)) {
+                            log.info("SIGHUP received; relay configuration changes require a restart", .{});
+                        } else self.stop = true;
+                    }
                     continue;
                 }
                 if (fd == self.listen_fd) {
@@ -472,6 +530,7 @@ pub const Relay = struct {
                 const conn = self.conns.get(fd) orelse continue;
                 self.dispatch(conn, ev.events);
             }
+            self.flushBatches();
 
             const now = nowMs();
             if (now - last_tick_ms >= event_loop_wait_ms) {
@@ -516,9 +575,7 @@ pub const Relay = struct {
     /// numbers eagerly, and a number reused inside one event batch would misattribute a
     /// stale hangup to a fresh connection.
     fn deferClose(self: *Relay, fd: posix.fd_t) void {
-        self.pending_close.append(self.allocator, fd) catch {
-            closeFd(fd);
-        };
+        self.pending_close.appendAssumeCapacity(fd);
     }
 
     fn drainPendingCloses(self: *Relay) void {
@@ -559,6 +616,17 @@ pub const Relay = struct {
             // One HTTP connection per session plus slack for cover-site traffic.
             const http_cap = @min(@as(u64, self.opts.max_sessions) * 4 + 32, 4096);
             if (self.http_count >= http_cap) {
+                var oldest: ?*Conn = null;
+                var peers = self.conns.valueIterator();
+                while (peers.next()) |candidate| {
+                    const idle = candidate.*;
+                    if (idle.kind != .http or idle.in.items.len != 0 or !idle.out.isEmpty()) continue;
+                    if (oldest == null or idle.deadline_ms < oldest.?.deadline_ms) oldest = idle;
+                }
+                if (oldest) |idle| self.closeConn(idle, "idle HTTP connection evicted for capacity");
+            }
+            if (self.http_count >= http_cap) {
+                self.accepts_refused +|= 1;
                 closeFd(result.fd);
                 continue;
             }
@@ -574,6 +642,10 @@ pub const Relay = struct {
     }
 
     fn createConn(self: *Relay, fd: posix.fd_t, kind: ConnKind, peer: Address) !*Conn {
+        // Reserve teardown storage before publishing an fd into an event batch.
+        const capacity = self.conns.count() + self.pending_close.items.len + 1;
+        try self.pending_close.ensureTotalCapacity(self.allocator, capacity);
+        try self.pending_free.ensureTotalCapacity(self.allocator, capacity);
         const conn = try self.allocator.create(Conn);
         errdefer self.allocator.destroy(conn);
         conn.* = .{
@@ -589,10 +661,67 @@ pub const Relay = struct {
     }
 
     fn destroyConn(self: *Relay, conn: *Conn) void {
+        self.buffered_bytes -= conn.accounted_bytes;
         conn.out.deinit();
         conn.in.deinit(self.allocator);
         conn.msg.deinit(self.allocator);
+        conn.batch.deinit(self.allocator);
         self.allocator.destroy(conn);
+    }
+
+    fn accountConn(self: *Relay, conn: *Conn) void {
+        const current = conn.out.total_len + conn.in.items.len + conn.msg.items.len + conn.batch.items.len;
+        self.buffered_bytes = self.buffered_bytes - conn.accounted_bytes + current;
+        conn.accounted_bytes = current;
+    }
+
+    fn canBuffer(self: *const Relay, extra: usize) bool {
+        return extra <= self.opts.max_buffer_bytes -| self.buffered_bytes;
+    }
+
+    fn writePair(self: *Relay, conn: *Conn, first: []const u8, second: []const u8) !bool {
+        if (!self.canBuffer(first.len + second.len)) return error.BufferBudgetExceeded;
+        defer self.accountConn(conn);
+        // Until SO_ERROR confirms the connection, keep every byte available for retry.
+        if (conn.connecting) {
+            try conn.out.appendCopy(first);
+            try conn.out.appendCopy(second);
+            return false;
+        }
+        return queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, first, second, &self.bytes_out, null);
+    }
+
+    fn appendInput(self: *Relay, conn: *Conn, data: []const u8, fragmented: bool) !void {
+        if (!self.canBuffer(data.len)) return error.BufferBudgetExceeded;
+        defer self.accountConn(conn);
+        const buffer = if (fragmented) &conn.msg else &conn.in;
+        try buffer.appendSlice(self.allocator, data);
+    }
+
+    fn flushBatch(self: *Relay, conn: *Conn) !void {
+        if (conn.batch.items.len == 0) return;
+        var header: [ws.max_server_header]u8 = undefined;
+        const framing = try ws.writeHeader(&header, true, .binary, conn.batch.items.len);
+        if (!self.canBuffer(framing.len)) return error.BufferBudgetExceeded;
+        // Transfer already-accounted batch bytes to the socket queue.
+        defer self.accountConn(conn);
+        errdefer {
+            conn.batch.clearRetainingCapacity();
+            conn.batch_frames = 0;
+        }
+        _ = try queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, framing, conn.batch.items, &self.bytes_out, null);
+        conn.batch.clearRetainingCapacity();
+        conn.batch_frames = 0;
+        self.syncConn(conn);
+    }
+
+    fn flushBatches(self: *Relay) void {
+        for (self.batch_fds.items) |fd| {
+            const conn = self.conns.get(fd) orelse continue;
+            conn.batch_pending = false;
+            self.flushBatch(conn) catch self.closeConn(conn, "carrier batch write failed");
+        }
+        self.batch_fds.clearRetainingCapacity();
     }
 
     fn closeConn(self: *Relay, conn: *Conn, reason: []const u8) void {
@@ -636,7 +765,7 @@ pub const Relay = struct {
         // can try to notify the websocket), so every caller that still holds `conn` on
         // return would otherwise be reading freed memory. Freeing on the same schedule
         // as the fd keeps `alive(fd)` an honest liveness check for all of them.
-        self.pending_free.append(self.allocator, conn) catch self.destroyConn(conn);
+        self.pending_free.appendAssumeCapacity(conn);
     }
 
     /// Recompute epoll interest, writing it out only when it changed.
@@ -657,6 +786,7 @@ pub const Relay = struct {
                     if (conn.connecting) break :blk false;
                     if (self.throttled) break :blk false;
                     const s = stream orelse break :blk false;
+                    if (s.session.conn.close_after_flush) break :blk false;
                     if (s.send_window == 0) break :blk false;
                     break :blk s.session.conn.out.total_len < carrier_high_water;
                 };
@@ -682,6 +812,12 @@ pub const Relay = struct {
     fn dispatch(self: *Relay, conn: *Conn, events: u32) void {
         const fd = conn.fd;
         const fatal = (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0;
+        // A failed/prematurely closed connect must not enter the read/flush path:
+        // doing so can discard the queued preamble before trying another address.
+        if (conn.connecting and (fatal or (events & linux.EPOLL.RDHUP) != 0)) {
+            if (!self.retryBackend(conn)) self.closeConn(conn, "backend connect failed");
+            return;
+        }
         if ((events & linux.EPOLL.OUT) != 0) {
             self.onWritable(conn);
             if (!self.alive(fd)) return;
@@ -698,10 +834,11 @@ pub const Relay = struct {
     }
 
     fn onWritable(self: *Relay, conn: *Conn) void {
+        defer self.accountConn(conn);
         if (conn.kind == .backend and conn.connecting) {
             socket_utils.checkSocketConnectError(conn.fd) catch |err| {
                 log.debug("backend connect failed: {any}", .{err});
-                self.closeConn(conn, "backend connect failed");
+                if (!self.retryBackend(conn)) self.closeConn(conn, "backend connect failed");
                 return;
             };
             conn.connecting = false;
@@ -758,18 +895,14 @@ pub const Relay = struct {
             self.closeConn(conn, "client closed");
             return;
         }
-        if (conn.in.items.len + n > http.max_head_bytes) {
-            self.respondStatus(conn, "431 Request Header Fields Too Large");
-            return;
-        }
-        conn.in.appendSlice(self.allocator, self.read_buf[0..n]) catch {
+        self.appendInput(conn, self.read_buf[0..n], false) catch {
             self.closeConn(conn, "out of memory");
             return;
         };
         const fd = conn.fd;
         while (http.headEnd(conn.in.items) != null) {
-            const request = http.parse(conn.in.items) catch {
-                self.respondStatus(conn, "400 Bad Request");
+            const request = http.parse(conn.in.items) catch |err| {
+                self.respondStatus(conn, if (err == error.HeadTooLarge) "431 Request Header Fields Too Large" else "400 Bad Request");
                 return;
             };
             // `request` borrows slices out of conn.in, so the head can only be dropped
@@ -779,6 +912,7 @@ pub const Relay = struct {
             self.serve(conn, &request);
             if (!self.alive(fd)) return;
             dropFront(&conn.in, consumed);
+            self.accountConn(conn);
             if (conn.kind != .http) {
                 // Upgraded. Anything pipelined behind the request head is already the
                 // WebSocket stream, and no further readiness event will announce it.
@@ -788,10 +922,20 @@ pub const Relay = struct {
             if (conn.close_after_flush) return;
             conn.deadline_ms = nowMs() + http_idle_timeout_ms;
         }
+        if (conn.in.items.len >= http.max_head_bytes) self.respondStatus(conn, "431 Request Header Fields Too Large");
     }
 
     fn serve(self: *Relay, conn: *Conn, request: *const http.Request) void {
         const keep = request.keepAlive();
+        if (std.mem.eql(u8, request.path(), "/metrics") and metricsRequestAllowed(conn.peer, request)) {
+            var metrics_buf: [2048]u8 = undefined;
+            const body = self.renderMetrics(&metrics_buf) catch {
+                self.respondStatus(conn, "500 Internal Server Error");
+                return;
+            };
+            self.respondPage(conn, "200 OK", "Content-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\n", body, keep, request.method == .head);
+            return;
+        }
         if (request.method == .other) {
             self.respondStatus(conn, "405 Method Not Allowed");
             return;
@@ -807,7 +951,7 @@ pub const Relay = struct {
                 self.upgrade(conn, request, name);
             } else {
                 // No valid capability: behave exactly like any other unknown path.
-                self.respondPage(conn, "404 Not Found", self.notfound_headers, page.cover_body, keep, request.method == .head);
+                self.respondPage(conn, "404 Not Found", self.notfound_headers, self.cover_page, keep, request.method == .head);
             }
             return;
         }
@@ -816,11 +960,26 @@ pub const Relay = struct {
             if (user != null) {
                 self.respondPage(conn, "200 OK", self.bridge_headers, self.bridge_page, keep, request.method == .head);
             } else {
-                self.respondPage(conn, "200 OK", self.cover_headers, page.cover_body, keep, request.method == .head);
+                self.respondPage(conn, "200 OK", self.cover_headers, self.cover_page, keep, request.method == .head);
             }
             return;
         }
-        self.respondPage(conn, "404 Not Found", self.notfound_headers, page.cover_body, keep, request.method == .head);
+        self.respondPage(conn, "404 Not Found", self.notfound_headers, self.cover_page, keep, request.method == .head);
+    }
+
+    fn renderMetrics(self: *const Relay, buffer: []u8) ![]const u8 {
+        var streams: usize = 0;
+        var it = self.conns.valueIterator();
+        while (it.next()) |conn| {
+            if (conn.*.session) |session| streams += session.streams.count();
+        }
+        return std.fmt.bufPrint(buffer, "# TYPE mtproto_web_sessions gauge\nmtproto_web_sessions {d}\n" ++
+            "# TYPE mtproto_web_streams gauge\nmtproto_web_streams {d}\n" ++
+            "# TYPE mtproto_web_streams_refused_total counter\nmtproto_web_streams_refused_total {d}\n" ++
+            "# TYPE mtproto_web_accept_refused_total counter\nmtproto_web_accept_refused_total {d}\n" ++
+            "# TYPE mtproto_web_throttled gauge\nmtproto_web_throttled {d}\n" ++
+            "# TYPE mtproto_web_buffered_bytes gauge\nmtproto_web_buffered_bytes {d}\n" ++
+            "# TYPE mtproto_web_bytes_out_total counter\nmtproto_web_bytes_out_total {d}\n", .{ self.session_count, streams, self.streams_refused, self.accepts_refused, @intFromBool(self.throttled), self.buffered_bytes, self.bytes_out.load(.monotonic) });
     }
 
     /// Constant-time match of a presented capability against every configured user.
@@ -844,8 +1003,12 @@ pub const Relay = struct {
     ) void {
         var head_buf: [1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&head_buf);
-        writer.print("HTTP/1.1 {s}\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{
+        var date_buf: [40]u8 = undefined;
+        const seconds = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds();
+        const date = httpDate(&date_buf, @intCast(@max(0, seconds))) catch "Thu, 01 Jan 1970 00:00:00 GMT";
+        writer.print("HTTP/1.1 {s}\r\nDate: {s}\r\nServer: nginx\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{
             status,
+            date,
             headers,
             body.len,
             if (keep_alive) "keep-alive" else "close",
@@ -859,7 +1022,7 @@ pub const Relay = struct {
         }
         conn.close_after_flush = !keep_alive;
         const payload = if (head_only) "" else body;
-        const drained = queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, writer.buffered(), payload, &self.bytes_out, null) catch {
+        const drained = self.writePair(conn, writer.buffered(), payload) catch {
             self.closeConn(conn, "response write failed");
             return;
         };
@@ -873,7 +1036,9 @@ pub const Relay = struct {
     }
 
     fn respondStatus(self: *Relay, conn: *Conn, status: []const u8) void {
-        self.respondPage(conn, status, self.notfound_headers, page.cover_body, false, false);
+        var body_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "<!doctype html><html><head><title>{s}</title></head><body><h1>{s}</h1></body></html>\n", .{ status, status }) catch self.cover_page;
+        self.respondPage(conn, status, self.notfound_headers, body, false, false);
     }
 
     // ── WebSocket upgrade ─────────────────────────────────────────────────────
@@ -897,7 +1062,7 @@ pub const Relay = struct {
             const want = std.fmt.bufPrint(&expected, "https://{s}", .{self.opts.domain}) catch "";
             if (!std.mem.eql(u8, origin, want)) {
                 log.debug("rejecting websocket upgrade with unexpected origin", .{});
-                self.respondPage(conn, "404 Not Found", self.notfound_headers, page.cover_body, false, false);
+                self.respondPage(conn, "404 Not Found", self.notfound_headers, self.cover_page, false, false);
                 return;
             }
         }
@@ -923,6 +1088,12 @@ pub const Relay = struct {
             .last_rx_ms = nowMs(),
             .last_ping_ms = nowMs(),
         };
+        session.closed_ids = self.allocator.alloc(u32, @max(closed_history, self.opts.max_streams)) catch {
+            self.allocator.destroy(session);
+            self.closeConn(conn, "out of memory");
+            return;
+        };
+        @memset(session.closed_ids, 0);
 
         conn.kind = .websocket;
         conn.session = session;
@@ -930,7 +1101,7 @@ pub const Relay = struct {
         conn.deadline_ms = 0;
         self.session_count += 1;
 
-        _ = queue_io.queueOrWriteMsg(conn.fd, &conn.out, head, &self.bytes_out, null) catch {
+        _ = self.writePair(conn, head, "") catch {
             self.closeConn(conn, "upgrade write failed");
             return;
         };
@@ -949,17 +1120,21 @@ pub const Relay = struct {
     ///
     /// Behind a TLS terminator the socket peer is the terminator, so a forwarded-for
     /// header is the only source of the real client. Only its right-most entry is read,
-    /// because that is the one our own hop wrote and the one a client cannot forge.
+    /// because that is the one our own hop wrote and the one a client cannot forge —
+    /// and only the LAST such header line, because a terminator that appends a line
+    /// rather than replacing ours would otherwise leave the client's own line first.
     ///
     /// In `--mode mask` this legitimately resolves to loopback: the masking hop inside
     /// the proxy is a raw byte pipe that carries no client address, so nginx genuinely
     /// observes 127.0.0.1. That costs per-IP granularity for relayed users, which is why
     /// they are exempt from the per-IP guards rather than sharing one key with them.
     fn clientAddress(self: *Relay, conn: *Conn, request: *const http.Request) ?Address {
-        if (self.opts.trust_forwarded_for and self.opts.client_ip_header.len > 0) {
-            if (request.header(self.opts.client_ip_header)) |value| {
+        if (self.opts.trust_forwarded_for and self.opts.client_ip_header.len > 0 and trusted_peers.isLoopback(conn.peer)) {
+            if (request.lastHeader(self.opts.client_ip_header)) |value| {
                 if (http.forwardedForClient(value)) |text| {
-                    if (Address.parse(text, 0)) |addr| return addr else |_| {}
+                    if (Address.parse(text, 0)) |addr| {
+                        if (!trusted_peers.isLoopback(addr)) return addr;
+                    } else |_| {}
                 }
             }
         }
@@ -979,6 +1154,7 @@ pub const Relay = struct {
             self.allocator.destroy(stream);
         }
         session.streams.deinit(self.allocator);
+        self.allocator.free(session.closed_ids);
         self.session_count -|= 1;
         const avg_frame = if (session.data_frames > 0) session.data_bytes / session.data_frames else 0;
         log.info("web session closed for user {s} (peak {d}/{d} streams, {d} refused, {d} KiB in {d} frames, avg {d} B)", .{
@@ -1005,7 +1181,7 @@ pub const Relay = struct {
             self.closeConn(conn, "websocket closed by peer");
             return;
         }
-        conn.in.appendSlice(self.allocator, self.read_buf[0..n]) catch {
+        self.appendInput(conn, self.read_buf[0..n], false) catch {
             self.closeConn(conn, "out of memory");
             return;
         };
@@ -1014,33 +1190,42 @@ pub const Relay = struct {
     }
 
     /// Parse and dispatch every complete WebSocket frame buffered in `conn.in`.
+    ///
+    /// Frames are consumed with a cursor and the buffer is compacted **once**, when the
+    /// pass ends. `dropFront` memmoves the whole remainder, so compacting per frame made
+    /// this O(n²) in the size of one read: a peer packing a 64 KiB read with minimal
+    /// 6-byte frames (a masked zero-length PONG costs it nothing and is answered by
+    /// nothing) moved ~340 MiB per pass and pinned the relay's single thread, stalling
+    /// every other WEB session on the box.
     fn processWsBuffer(self: *Relay, conn: *Conn) void {
+        if (conn.close_after_flush) return;
         const fd = conn.fd;
+        var used: usize = 0;
+        // Only a still-mapped connection may be touched: a frame handler can close this
+        // one, and then `conn` is queued for release and its buffer is no longer ours.
+        defer if (self.alive(fd)) {
+            dropFront(&conn.in, used);
+            self.accountConn(conn);
+        };
         while (true) {
-            const parsed = ws.parseHeader(conn.in.items) catch {
-                self.failCarrier(conn, ws.close_protocol_error, "bad websocket frame");
+            const rest = conn.in.items[used..];
+            const parsed = ws.parseHeader(rest) catch |err| {
+                self.failCarrier(conn, if (err == error.TooBig) ws.close_message_too_big else ws.close_protocol_error, "bad websocket frame");
                 return;
             };
             const header = switch (parsed) {
-                .incomplete => {
-                    if (conn.in.items.len > ws.max_message + 32) {
-                        self.failCarrier(conn, ws.close_message_too_big, "websocket header never completed");
-                    }
-                    return;
-                },
+                .incomplete => return,
                 .header => |h| h,
             };
-            if (conn.in.items.len < header.totalLen()) {
-                if (conn.in.items.len > ws.max_message + 32) {
-                    self.failCarrier(conn, ws.close_message_too_big, "websocket frame too large");
-                }
+            if (rest.len < header.totalLen()) {
                 return;
             }
-            const payload = conn.in.items[header.header_len..header.totalLen()];
+            const payload = rest[header.header_len..header.totalLen()];
             ws.unmask(payload, header.mask, 0);
+            // Counted before dispatch: the handler may return through the `defer` above.
+            used += header.totalLen();
             self.handleWsFrame(conn, header, payload);
-            if (!self.alive(fd)) return;
-            dropFront(&conn.in, header.totalLen());
+            if (!self.alive(fd) or conn.close_after_flush) return;
         }
     }
 
@@ -1059,7 +1244,7 @@ pub const Relay = struct {
                 }
                 var head: [ws.max_server_header]u8 = undefined;
                 const framing = ws.writeHeader(&head, true, .pong, payload.len) catch return;
-                _ = queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, framing, payload, &self.bytes_out, null) catch {
+                _ = self.writePair(conn, framing, payload) catch {
                     self.closeConn(conn, "pong write failed");
                     return;
                 };
@@ -1096,7 +1281,7 @@ pub const Relay = struct {
             self.failCarrier(conn, ws.close_message_too_big, "fragmented message too large");
             return;
         }
-        conn.msg.appendSlice(self.allocator, payload) catch {
+        self.appendInput(conn, payload, true) catch {
             self.closeConn(conn, "out of memory");
             return;
         };
@@ -1106,6 +1291,7 @@ pub const Relay = struct {
         self.handleCarrierMessage(conn, conn.msg.items);
         if (!self.alive(fd)) return;
         conn.msg.clearRetainingCapacity();
+        self.accountConn(conn);
     }
 
     /// One carrier message holds one or more complete relay frames — an empty message or
@@ -1163,12 +1349,11 @@ pub const Relay = struct {
                 },
                 .pong => {
                     if (f.payload.len > frame.max_ping_payload) return error.Protocol;
-                    // Only an exact echo clears the outstanding probe, but a stale PONG
-                    // is not a protocol violation — it is just late, and the frame having
-                    // arrived at all is the liveness signal that actually matters.
-                    if (std.mem.eql(u8, f.payload, &session.ping_payload)) {
-                        session.ping_outstanding = false;
-                    }
+                    // Any inbound frame updates last_rx_ms; a late PONG remains valid.
+                },
+                .ping => {
+                    if (f.payload.len > frame.max_ping_payload) return error.Protocol;
+                    try self.sendFrame(session, .pong, 0, f.payload);
                 },
                 .bye => self.byeAndClose(session),
                 else => return error.Protocol,
@@ -1216,6 +1401,41 @@ pub const Relay = struct {
 
     fn sendFrame(self: *Relay, session: *Session, kind: frame.FrameType, stream_id: u32, payload: []const u8) !void {
         const conn = session.conn;
+        if (conn.close_after_flush) return error.CarrierClosed;
+        if (kind != .welcome and kind != .bye) {
+            if (conn.batch.items.len + frame.header_size + payload.len > data_frame_size or conn.batch_frames >= frame.max_batch_frames) {
+                self.flushBatch(conn) catch {
+                    self.closeConn(conn, "carrier batch write failed");
+                    return error.CarrierClosed;
+                };
+            }
+            if (!self.canBuffer(frame.header_size + payload.len) or conn.out.total_len + conn.batch.items.len + frame.header_size + payload.len > carrier_queue_limit) {
+                self.closeConn(conn, "carrier buffer budget exceeded");
+                return error.CarrierClosed;
+            }
+            if (!conn.batch_pending) {
+                self.batch_fds.append(self.allocator, conn.fd) catch {
+                    self.closeConn(conn, "out of memory");
+                    return error.CarrierClosed;
+                };
+                conn.batch_pending = true;
+            }
+            var relay_header: [frame.header_size]u8 = undefined;
+            frame.writeHeader(&relay_header, kind, stream_id, @intCast(payload.len));
+            conn.batch.ensureUnusedCapacity(self.allocator, relay_header.len + payload.len) catch {
+                self.closeConn(conn, "out of memory");
+                return error.CarrierClosed;
+            };
+            conn.batch.appendSliceAssumeCapacity(&relay_header);
+            conn.batch.appendSliceAssumeCapacity(payload);
+            conn.batch_frames += 1;
+            self.accountConn(conn);
+            return;
+        }
+        self.flushBatch(conn) catch {
+            self.closeConn(conn, "carrier batch write failed");
+            return error.CarrierClosed;
+        };
         var head: [ws.max_server_header + frame.header_size]u8 = undefined;
         const total = frame.header_size + payload.len;
         const framing = ws.writeHeader(head[0..ws.max_server_header], true, .binary, total) catch return error.Protocol;
@@ -1227,7 +1447,7 @@ pub const Relay = struct {
             self.closeConn(conn, "carrier queue limit exceeded");
             return error.CarrierClosed;
         }
-        _ = queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, prefix, payload, &self.bytes_out, null) catch {
+        _ = self.writePair(conn, prefix, payload) catch {
             self.closeConn(conn, "carrier write failed");
             return error.CarrierClosed;
         };
@@ -1245,9 +1465,13 @@ pub const Relay = struct {
     }
 
     fn failCarrier(self: *Relay, conn: *Conn, code: u16, reason: []const u8) void {
+        // Discard unsent logical frames before the terminal WebSocket CLOSE.
+        conn.batch.clearRetainingCapacity();
+        conn.batch_frames = 0;
+        self.accountConn(conn);
         var buf: [8]u8 = undefined;
         if (ws.closeFrame(&buf, code)) |close_frame| {
-            _ = queue_io.queueOrWriteMsg(conn.fd, &conn.out, close_frame, &self.bytes_out, null) catch {};
+            _ = self.writePair(conn, close_frame, "") catch {};
         } else |_| {}
         conn.close_after_flush = true;
         log.debug("carrier failing: {s}", .{reason});
@@ -1268,6 +1492,7 @@ pub const Relay = struct {
             // error would drop every other stream with it. It does mean the client sees
             // an unexplained failure, so make the cause visible here.
             session.streams_refused +|= 1;
+            self.streams_refused +|= 1;
             if (session.streams_refused == 1) {
                 log.warn("user {s}: refused a stream over the [web].max_streams cap of {d}; " ++
                     "the client will retry it as a failed connection. Raise max_streams if this repeats.", .{
@@ -1289,18 +1514,22 @@ pub const Relay = struct {
         const live: u32 = @intCast(session.streams.count());
         if (live > session.streams_high_water) session.streams_high_water = live;
 
-        const dialed_fd = self.dialBackend() catch |err| {
+        const candidates = if (self.backend_dns) |cache| cache.snapshot(self.backend_dns_id) else net_helpers.AddressCandidates.init(&.{self.opts.backend});
+        var next: usize = 0;
+        const dialed_fd = dialCandidate(candidates, &next) catch |err| {
             log.debug("backend dial failed: {any}", .{err});
             self.closeStream(stream, true);
             return;
         };
-        const conn = self.createConn(dialed_fd, .backend, self.opts.backend) catch {
+        const conn = self.createConn(dialed_fd, .backend, candidates.addresses[next - 1]) catch {
             closeFd(dialed_fd);
             self.closeStream(stream, true);
             return;
         };
         conn.stream = stream;
         conn.connecting = true;
+        conn.backend_candidates = candidates;
+        conn.backend_next = next;
         conn.deadline_ms = nowMs() + backend_connect_timeout_ms;
         stream.conn = conn;
 
@@ -1310,8 +1539,45 @@ pub const Relay = struct {
         self.syncConn(conn);
     }
 
-    fn dialBackend(self: *Relay) !posix.fd_t {
-        const family: u32 = if (net_helpers.isIpv6(self.opts.backend)) posix.AF.INET6 else posix.AF.INET;
+    fn dialCandidate(candidates: net_helpers.AddressCandidates, next: *usize) !posix.fd_t {
+        while (next.* < candidates.len) {
+            const address = candidates.addresses[next.*];
+            next.* += 1;
+            return dialBackend(address) catch continue;
+        }
+        return error.BackendAddressesExhausted;
+    }
+
+    fn retryBackend(self: *Relay, conn: *Conn) bool {
+        const fd = dialCandidate(conn.backend_candidates, &conn.backend_next) catch return false;
+        // Preserve the old fd until the event batch ends; preserve the connection's queue.
+        self.pending_close.ensureTotalCapacity(self.allocator, self.conns.count() + self.pending_close.items.len + 1) catch {
+            closeFd(fd);
+            return false;
+        };
+        self.conns.put(self.allocator, fd, conn) catch {
+            closeFd(fd);
+            return false;
+        };
+        self.addFd(fd, false, true) catch {
+            _ = self.conns.remove(fd);
+            closeFd(fd);
+            return false;
+        };
+        const old_fd = conn.fd;
+        self.delFd(old_fd);
+        _ = self.conns.remove(old_fd);
+        self.deferClose(old_fd);
+        conn.fd = fd;
+        conn.peer = conn.backend_candidates.addresses[conn.backend_next - 1];
+        conn.want_in = false;
+        conn.want_out = true;
+        conn.deadline_ms = nowMs() + backend_connect_timeout_ms;
+        return true;
+    }
+
+    fn dialBackend(address: Address) !posix.fd_t {
+        const family: u32 = if (net_helpers.isIpv6(address)) posix.AF.INET6 else posix.AF.INET;
         const flags = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
         const rc = posix.system.socket(family, flags, posix.IPPROTO.TCP);
         const fd: posix.fd_t = switch (posix.errno(rc)) {
@@ -1320,7 +1586,7 @@ pub const Relay = struct {
         };
         errdefer closeFd(fd);
         var storage: posix.sockaddr.storage = undefined;
-        const len = addressToSockaddr(self.opts.backend, &storage);
+        const len = addressToSockaddr(address, &storage);
         socket_utils.connectSockaddr(fd, @ptrCast(&storage), len) catch |err| {
             if (err != error.WouldBlock) return err;
         };
@@ -1335,7 +1601,7 @@ pub const Relay = struct {
         var buf: [64]u8 = undefined;
         const header = proxy_protocol.buildV2(&buf, session.client_addr, self.opts.backend);
         const before = conn.out.total_len;
-        _ = queue_io.queueOrWriteMsg(conn.fd, &conn.out, header, &self.bytes_out, null) catch {
+        _ = self.writePair(conn, header, "") catch {
             self.closeConn(conn, "proxy header write failed");
             return;
         };
@@ -1360,7 +1626,7 @@ pub const Relay = struct {
         }
         const fd = conn.fd;
         const before = conn.out.total_len;
-        _ = queue_io.queueOrWriteMsg(conn.fd, &conn.out, data, &self.bytes_out, null) catch {
+        _ = self.writePair(conn, data, "") catch {
             self.closeConn(conn, "backend write failed");
             return;
         };
@@ -1440,6 +1706,7 @@ pub const Relay = struct {
         if (conn.connecting) return;
         const session = stream.session;
         conn.rx_passes += 1;
+        if (session.conn.close_after_flush or self.throttled) return;
         conn.last_window = stream.send_window;
         while (true) {
             const budget = @min(@as(usize, stream.send_window), data_frame_size);
@@ -1512,11 +1779,11 @@ pub const Relay = struct {
         var queued: usize = 0;
         var it = self.conns.iterator();
         while (it.next()) |entry| {
-            queued += entry.value_ptr.*.out.total_len;
+            queued += entry.value_ptr.*.accounted_bytes;
             self.tick_scratch.append(self.allocator, entry.key_ptr.*) catch break;
         }
         const was_throttled = self.throttled;
-        self.throttled = queued > self.opts.max_buffer_bytes;
+        self.throttled = queued >= self.opts.max_buffer_bytes -| (2 * read_buf_size);
         if (self.throttled != was_throttled) {
             log.warn("relay {s} at {d} KiB queued (budget {d} KiB)", .{
                 if (self.throttled) "throttling" else "resuming",
@@ -1528,6 +1795,7 @@ pub const Relay = struct {
         for (self.tick_scratch.items) |fd| {
             const conn = self.conns.get(fd) orelse continue;
             if (conn.deadline_ms != 0 and now >= conn.deadline_ms) {
+                if (conn.connecting and self.retryBackend(conn)) continue;
                 self.closeConn(conn, "timed out");
                 continue;
             }
@@ -1566,7 +1834,6 @@ pub const Relay = struct {
             if (quiet_for >= ping_interval_ms and now - session.last_ping_ms >= ping_interval_ms) {
                 session.last_ping_ms = now;
                 crypto.randomBytes(&session.ping_payload);
-                session.ping_outstanding = true;
                 self.sendFrame(session, .ping, 0, &session.ping_payload) catch {};
             }
         }
@@ -1575,8 +1842,147 @@ pub const Relay = struct {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+fn httpDate(buffer: []u8, seconds: u64) ![]const u8 {
+    const epoch = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const day = epoch.getEpochDay();
+    const year = day.calculateYearDay();
+    const month = year.calculateMonthDay();
+    const time = epoch.getDaySeconds();
+    const weekdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    return std.fmt.bufPrint(buffer, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{ weekdays[(day.day + 4) % 7], @as(u8, month.day_index) + 1, months[month.month.numeric() - 1], year.year, time.getHoursIntoDay(), time.getMinutesIntoHour(), time.getSecondsIntoMinute() });
+}
+
+test "HTTP Date uses IMF-fixdate in UTC" {
+    var buffer: [40]u8 = undefined;
+    try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", try httpDate(&buffer, 0));
+    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", try httpDate(&buffer, 784111777));
+}
+
+/// Only a direct loopback scrape, never a request forwarded by the public terminator.
+fn metricsRequestAllowed(peer: Address, request: *const http.Request) bool {
+    if (!trusted_peers.isLoopback(peer) or (request.method != .get and request.method != .head)) return false;
+    if (request.header("x-forwarded-for") != null or request.header("forwarded") != null or request.header("origin") != null) return false;
+    const host = request.header("host") orelse return false;
+    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.startsWith(u8, host, "127.0.0.1:") or std.mem.eql(u8, host, "[::1]") or std.mem.startsWith(u8, host, "[::1]:");
+}
+
+/// Test-only witness: `processWsBuffer` must compact once per read pass, never once per
+/// frame. Counting it is the only way a test can see the O(n²) memmove come back.
+var compactions_for_test: usize = 0;
+
+fn testRelay(allocator: std.mem.Allocator, limit: usize) Relay {
+    var options: Options = undefined;
+    options.max_buffer_bytes = limit;
+    return .{
+        .allocator = allocator,
+        .opts = options,
+        .caps = &.{},
+        .cover_page = "",
+        .bridge_page = "",
+        .bridge_headers = "",
+        .cover_headers = "",
+        .notfound_headers = "",
+        .epoll_fd = -1,
+        .listen_fd = -1,
+        .signal_fd = -1,
+        .old_sigmask = undefined,
+    };
+}
+
+test "aggregate budget includes input and fragment buffers and releases consumed bytes" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 8);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.in.deinit(allocator);
+    defer conn.msg.deinit(allocator);
+    try relay.appendInput(&conn, "12345", false);
+    try relay.appendInput(&conn, "678", true);
+    try std.testing.expectEqual(@as(usize, 8), relay.buffered_bytes);
+    try std.testing.expectError(error.BufferBudgetExceeded, relay.appendInput(&conn, "9", false));
+    dropFront(&conn.in, 3);
+    relay.accountConn(&conn);
+    try relay.appendInput(&conn, "abc", true);
+    try std.testing.expectEqual(@as(usize, 8), relay.buffered_bytes);
+}
+
+test "production emitter batches exact DATA and WINDOW bytes and refuses condemned carriers" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024);
+    defer relay.batch_fds.deinit(allocator);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.batch.deinit(allocator);
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null };
+    try relay.sendFrame(&session, .data, 7, "abc");
+    const grant = frame.windowPayload(4096);
+    try relay.sendFrame(&session, .window, 7, &grant);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 7, 0, 0, 0, 3, 'a', 'b', 'c', 4, 0, 0, 7, 0, 0, 0, 4, 0, 0, 16, 0 }, conn.batch.items);
+    try std.testing.expectEqual(@as(usize, 2), conn.batch_frames);
+    try std.testing.expectEqual(@as(usize, 1), relay.batch_fds.items.len);
+    try std.testing.expectEqual(conn.batch.items.len, relay.buffered_bytes);
+    conn.close_after_flush = true;
+    try std.testing.expectError(error.CarrierClosed, relay.sendFrame(&session, .data, 7, "ignored"));
+    try std.testing.expectEqual(@as(usize, 2), conn.batch_frames);
+}
+
+test "backend credit excludes PROXY header debt and grants only drained client bytes" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024);
+    var carrier = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    var session = Session{ .conn = &carrier, .user = "test", .client_addr = null };
+    var stream = Stream{ .id = 1, .session = &session, .recv_window = frame.initial_stream_window - 100, .grant_debt = 4 };
+    var backend = Conn{ .fd = -1, .kind = .backend, .peer = carrier.peer, .stream = &stream, .out = .{ .allocator = allocator } };
+    defer backend.out.deinit();
+    try backend.out.appendCopy("0123456789");
+    relay.creditDrainWith(&backend, 14);
+    try std.testing.expectEqual(@as(usize, 0), stream.grant_debt);
+    try std.testing.expectEqual(@as(u32, 0), stream.pending_grant);
+    relay.creditDrainWith(&backend, 110);
+    try std.testing.expectEqual(frame.initial_stream_window, stream.recv_window);
+    try std.testing.expectEqual(@as(u32, 100), stream.pending_grant);
+    try std.testing.expect(session.needs_window_flush);
+    relay.creditDrainWith(&backend, 10); // no new bytes drained
+    try std.testing.expectEqual(@as(u32, 100), stream.pending_grant);
+}
+
+test "metrics accepts direct loopback requests and rejects public or forwarded requests" {
+    const request = try http.parse("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:8081\r\n\r\n");
+    try std.testing.expect(metricsRequestAllowed(net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), &request));
+    try std.testing.expect(!metricsRequestAllowed(net_helpers.ip4(.{ 203, 0, 113, 7 }, 0), &request));
+    const forwarded = try http.parse("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:8081\r\nX-Forwarded-For: 203.0.113.7\r\n\r\n");
+    try std.testing.expect(!metricsRequestAllowed(net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), &forwarded));
+    var relay = testRelay(std.testing.allocator, 1024);
+    relay.session_count = 3;
+    relay.streams_refused = 7;
+    var buffer: [2048]u8 = undefined;
+    const metrics = try relay.renderMetrics(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "mtproto_web_sessions 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "mtproto_web_streams_refused_total 7\n") != null);
+}
+
+test "a queued websocket CLOSE stops the rest of the same read batch" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024);
+    defer relay.conns.deinit(allocator);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    conn.want_out = true; // epoll interest is already correct; no OS call in this unit test
+    defer conn.in.deinit(allocator);
+    defer conn.out.deinit();
+    try relay.conns.put(allocator, conn.fd, &conn);
+    try conn.out.appendCopy("x"); // prevent an inline write on the fake fd
+    const close = [_]u8{ 0x88, 0x80, 1, 2, 3, 4 };
+    try conn.in.appendSlice(allocator, &close);
+    try conn.in.appendSlice(allocator, &close);
+    relay.accountConn(&conn);
+    relay.processWsBuffer(&conn);
+    try std.testing.expect(conn.close_after_flush);
+    try std.testing.expectEqual(@as(usize, 5), conn.out.total_len);
+    try std.testing.expectEqualSlices(u8, &close, conn.in.items);
+}
+
 fn dropFront(list: *std.ArrayList(u8), n: usize) void {
     if (n == 0) return;
+    if (builtin.is_test) compactions_for_test += 1;
     std.debug.assert(n <= list.items.len);
     const rest = list.items.len - n;
     if (rest > 0) std.mem.copyForwards(u8, list.items[0..rest], list.items[n..]);
@@ -1584,9 +1990,14 @@ fn dropFront(list: *std.ArrayList(u8), n: usize) void {
 }
 
 fn listen(host: []const u8, port: u16) !posix.fd_t {
-    const io_ctx = std.Io.Threaded.global_single_threaded.io();
-    const addr = try Address.parse(host, port);
-    const server = try addr.listen(io_ctx, .{ .reuse_address = true, .kernel_backlog = 128 });
+    const addr = Address.parse(host, port) catch |err| {
+        log.err("[web].host must be an IP literal, got '{s}': {any}", .{ host, err });
+        return err;
+    };
+    const server = net_helpers.listen(addr, 128, false) catch |err| {
+        log.err("Cannot bind WEB relay to {s}:{d}: {any}; check [web].host/port and other listeners", .{ host, port, err });
+        return err;
+    };
     const fd = server.socket.handle;
     socket_utils.setNonBlocking(fd);
     return fd;
@@ -1619,6 +2030,68 @@ fn addressToSockaddr(addr: Address, storage: *posix.sockaddr.storage) posix.sock
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+test "backend retry freezes candidates and preserves queued bytes while retiring stale fd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const listener = try net_helpers.listen(net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), 8, false);
+    defer closeFd(listener.socket.handle);
+    const target = try socket_utils.localSocketAddress(listener.socket.handle);
+    var relay = Relay{
+        .allocator = allocator,
+        .opts = undefined,
+        .caps = undefined,
+        .cover_page = undefined,
+        .bridge_page = undefined,
+        .bridge_headers = undefined,
+        .cover_headers = undefined,
+        .notfound_headers = undefined,
+        .epoll_fd = try socket_utils.epollCreate(),
+        .listen_fd = -1,
+        .signal_fd = -1,
+        .old_sigmask = undefined,
+    };
+    relay.opts.max_buffer_bytes = 1024;
+    defer closeFd(relay.epoll_fd);
+    defer relay.conns.deinit(allocator);
+    defer relay.pending_close.deinit(allocator);
+    defer relay.pending_free.deinit(allocator);
+    defer relay.tick_scratch.deinit(allocator);
+    defer relay.drainPendingCloses();
+    const first = try Relay.dialBackend(target);
+    const conn = try relay.createConn(first, .backend, target);
+    defer {
+        closeFd(conn.fd);
+        relay.destroyConn(conn);
+    }
+    conn.connecting = true;
+    conn.backend_candidates = net_helpers.AddressCandidates.init(&.{ target, target, target, target });
+    conn.backend_next = 1;
+    try std.testing.expect(!try relay.writePair(conn, "PROXY", "payload"));
+    try std.testing.expectEqual(@as(usize, 12), conn.out.total_len);
+    relay.dispatch(conn, linux.EPOLL.ERR);
+    try std.testing.expect(!relay.alive(first));
+    try std.testing.expect(relay.alive(conn.fd));
+    try std.testing.expectEqual(@as(usize, 1), relay.pending_close.items.len);
+    try std.testing.expectEqual(@as(usize, 12), conn.out.total_len);
+    try std.testing.expectEqual(@as(u64, 0), relay.bytes_out.load(.monotonic));
+    const second = conn.fd;
+    relay.tick(conn.deadline_ms);
+    try std.testing.expect(!relay.alive(second));
+    try std.testing.expect(relay.alive(conn.fd));
+    try std.testing.expectEqual(@as(usize, 2), relay.pending_close.items.len);
+    try std.testing.expectEqual(@as(usize, 12), conn.out.total_len);
+    const third = conn.fd;
+    relay.dispatch(conn, linux.EPOLL.RDHUP);
+    try std.testing.expect(!relay.alive(third));
+    try std.testing.expect(relay.alive(conn.fd));
+    try std.testing.expectEqual(@as(usize, 3), relay.pending_close.items.len);
+    try std.testing.expectEqual(@as(usize, 12), conn.out.total_len);
+    // A stale event has no mapped connection, and exhausted candidates cannot loop.
+    try std.testing.expect(!relay.retryBackend(conn));
+    var empty_next: usize = 0;
+    try std.testing.expectError(error.BackendAddressesExhausted, Relay.dialCandidate(.{}, &empty_next));
+}
 
 test "proxy v2 header round-trips through the proxy's own parser" {
     var buf: [64]u8 = undefined;
@@ -1679,6 +2152,55 @@ test "an unknown client becomes a LOCAL header the proxy tolerates" {
         .ok => |res| try std.testing.expectEqual(@as(?Address, null), res.src),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "a burst of tiny websocket frames compacts the carrier buffer once, not once per frame" {
+    const allocator = std.testing.allocator;
+    // Only the fields this path touches are real: a pong is answered by nothing, so no
+    // socket, session or epoll fd is reached. `alive()` is the connection map alone.
+    var relay = Relay{
+        .allocator = allocator,
+        .opts = undefined,
+        .caps = undefined,
+        .cover_page = undefined,
+        .bridge_page = undefined,
+        .bridge_headers = undefined,
+        .cover_headers = undefined,
+        .notfound_headers = undefined,
+        .epoll_fd = -1,
+        .listen_fd = -1,
+        .signal_fd = -1,
+        .old_sigmask = undefined,
+    };
+    defer relay.conns.deinit(allocator);
+    var conn = Conn{
+        .fd = 7,
+        .kind = .websocket,
+        .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0),
+        .out = .{ .allocator = allocator },
+    };
+    defer conn.out.deinit();
+    defer conn.in.deinit(allocator);
+    try relay.conns.put(allocator, conn.fd, &conn);
+
+    // The cheapest frame a client can send: masked, zero-length, opcode PONG.
+    const tiny_pong = [_]u8{ 0x8a, 0x80, 1, 2, 3, 4 };
+    for (0..512) |_| try conn.in.appendSlice(allocator, &tiny_pong);
+
+    compactions_for_test = 0;
+    relay.processWsBuffer(&conn);
+    try std.testing.expectEqual(@as(usize, 0), conn.in.items.len);
+    // One memmove for the pass. Per-frame compaction moved the whole remainder every
+    // time, which is what let one peer burn a core with a few MB/s of pongs.
+    try std.testing.expectEqual(@as(usize, 1), compactions_for_test);
+
+    // The cursor must still leave a trailing partial frame in place for the next read.
+    try conn.in.appendSlice(allocator, &tiny_pong);
+    try conn.in.appendSlice(allocator, tiny_pong[0..2]);
+    compactions_for_test = 0;
+    relay.processWsBuffer(&conn);
+    try std.testing.expectEqualSlices(u8, tiny_pong[0..2], conn.in.items);
+    try std.testing.expectEqual(@as(usize, 1), compactions_for_test);
 }
 
 test "dropFront compacts a buffer" {

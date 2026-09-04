@@ -11,6 +11,45 @@ pub const RelayProgress = enum {
     forwarded,
 };
 
+test "TLS relay chunk parser handles every TCP split across multiple records" {
+    const Cipher = struct {
+        fn apply(_: *@This(), _: []u8) void {}
+    };
+    const Mp = struct {
+        fn encapsulateC2S(_: *@This(), data: []u8, _: []u8) ![]u8 {
+            return data;
+        }
+    };
+    const Slot = struct {
+        relay_tls_hdr: [5]u8 = undefined,
+        relay_tls_hdr_pos: u8 = 0,
+        relay_tls_body_pos: u16 = 0,
+        relay_tls_body_len: u16 = 0,
+        relay_record_type: u8 = 0,
+        client_decryptor: ?Cipher = null,
+        tg_encryptor: ?Cipher = .{},
+        middle_ctx: ?Mp = null,
+        c2s_bytes: usize = 0,
+        output: [5]u8 = undefined,
+        count: usize = 0,
+        fn queue(self: *@This(), _: std.mem.Allocator, data: []const u8) !bool {
+            @memcpy(self.output[self.count..][0..data.len], data);
+            self.count += data.len;
+            return true;
+        }
+    };
+    const input = [_]u8{ 0x17, 3, 3, 0, 3, 'a', 'b', 'c', 0x14, 3, 3, 0, 1, 1, 0x17, 3, 3, 0, 2, 'd', 'e' };
+    for (1..input.len) |split| {
+        var data = input;
+        var slot = Slot{};
+        _ = try consumeClientTlsBytes(&slot, std.testing.allocator, null, data[0..split], Slot.queue);
+        _ = try consumeClientTlsBytes(&slot, std.testing.allocator, null, data[split..], Slot.queue);
+        try std.testing.expectEqualStrings("abcde", &slot.output);
+        try std.testing.expectEqual(@as(usize, 5), slot.c2s_bytes);
+        try std.testing.expectEqual(@as(u8, 0), slot.relay_tls_hdr_pos);
+    }
+}
+
 pub fn relayClientToUpstreamStep(
     slot: anytype,
     allocator: std.mem.Allocator,
@@ -18,88 +57,63 @@ pub fn relayClientToUpstreamStep(
     read_buf: []u8,
     comptime queue_upstream: fn (@TypeOf(slot), std.mem.Allocator, []const u8) anyerror!bool,
 ) !RelayProgress {
-    var consumed_any = false;
+    const n = posix.read(slot.client_fd, read_buf) catch |err| {
+        if (err == error.WouldBlock) return .none;
+        return err;
+    };
+    if (n == 0) return error.EndOfStream;
+    return consumeClientTlsBytes(slot, allocator, mp_c2s_scratch, read_buf[0..n], queue_upstream);
+}
 
-    while (true) {
+/// Consume an arbitrary TCP chunk, retaining only incomplete TLS header/body positions.
+fn consumeClientTlsBytes(
+    slot: anytype,
+    allocator: std.mem.Allocator,
+    mp_c2s_scratch: ?[]u8,
+    data: []u8,
+    comptime queue_upstream: fn (@TypeOf(slot), std.mem.Allocator, []const u8) anyerror!bool,
+) !RelayProgress {
+    var pos: usize = 0;
+    var forwarded = false;
+    while (pos < data.len) {
         if (slot.relay_tls_hdr_pos < 5) {
-            const n = posix.read(slot.client_fd, slot.relay_tls_hdr[slot.relay_tls_hdr_pos..]) catch |err| {
-                if (err == error.WouldBlock) return if (consumed_any) .partial else .none;
-                return err;
-            };
-            if (n == 0) return error.EndOfStream;
-            consumed_any = true;
-            slot.relay_tls_hdr_pos += @intCast(n);
-
-            if (slot.relay_tls_hdr_pos < 5) return .partial;
-
+            const take = @min(5 - @as(usize, slot.relay_tls_hdr_pos), data.len - pos);
+            @memcpy(slot.relay_tls_hdr[slot.relay_tls_hdr_pos..][0..take], data[pos..][0..take]);
+            slot.relay_tls_hdr_pos += @intCast(take);
+            pos += take;
+            if (slot.relay_tls_hdr_pos < 5) break;
             slot.relay_record_type = slot.relay_tls_hdr[0];
             slot.relay_tls_body_len = std.mem.readInt(u16, slot.relay_tls_hdr[3..5], .big);
             slot.relay_tls_body_pos = 0;
-
-            if (slot.relay_record_type == constants.tls_record_alert) return error.ConnectionReset;
             if (slot.relay_record_type != constants.tls_record_change_cipher and
-                slot.relay_record_type != constants.tls_record_application)
-            {
+                slot.relay_record_type != constants.tls_record_application) return error.ConnectionReset;
+            if (slot.relay_tls_body_len == 0 or slot.relay_tls_body_len > constants.max_tls_ciphertext_size)
                 return error.ConnectionReset;
-            }
-            if (slot.relay_tls_body_len == 0 or slot.relay_tls_body_len > constants.max_tls_ciphertext_size) {
-                return error.ConnectionReset;
-            }
         }
-
-        const remaining = slot.relay_tls_body_len - slot.relay_tls_body_pos;
-        if (remaining == 0) {
-            slot.relay_tls_hdr_pos = 0;
-            slot.relay_tls_body_pos = 0;
-            slot.relay_tls_body_len = 0;
-            if (consumed_any) return .partial;
-            continue;
+        const take = @min(@as(usize, slot.relay_tls_body_len - slot.relay_tls_body_pos), data.len - pos);
+        const payload = data[pos..][0..take];
+        if (take > 0 and slot.relay_record_type == constants.tls_record_application) {
+            if (slot.client_decryptor) |*dec| dec.apply(payload);
+            if (slot.middle_ctx) |*mp| {
+                const scratch = mp_c2s_scratch orelse return error.MissingMiddleProxyScratch;
+                const output = try mp.encapsulateC2S(payload, scratch);
+                if (output.len > 0) _ = try queue_upstream(slot, allocator, output);
+            } else if (slot.tg_encryptor) |*enc| {
+                enc.apply(payload);
+                _ = try queue_upstream(slot, allocator, payload);
+            } else return error.MissingUpstreamCipher;
+            slot.c2s_bytes += payload.len;
+            forwarded = true;
         }
-
-        const want = @min(@as(usize, remaining), read_buf.len);
-        const n = posix.read(slot.client_fd, read_buf[0..want]) catch |err| {
-            if (err == error.WouldBlock) return if (consumed_any) .partial else .none;
-            return err;
-        };
-        if (n == 0) return error.EndOfStream;
-
-        consumed_any = true;
-        slot.relay_tls_body_pos += @intCast(n);
-
-        if (slot.relay_record_type == constants.tls_record_change_cipher) {
-            if (slot.relay_tls_body_pos == slot.relay_tls_body_len) {
-                slot.relay_tls_hdr_pos = 0;
-                slot.relay_tls_body_pos = 0;
-                slot.relay_tls_body_len = 0;
-            }
-            return .partial;
-        }
-
-        const payload = read_buf[0..n];
-        if (slot.client_decryptor) |*dec| dec.apply(payload);
-
-        if (slot.middle_ctx) |*mp| {
-            const scratch = mp_c2s_scratch orelse return error.MissingMiddleProxyScratch;
-            const out_data = try mp.encapsulateC2S(payload, scratch);
-            if (out_data.len > 0) {
-                _ = try queue_upstream(slot, allocator, out_data);
-            }
-        } else if (slot.tg_encryptor) |*enc| {
-            enc.apply(payload);
-            _ = try queue_upstream(slot, allocator, payload);
-        }
-
-        slot.c2s_bytes += payload.len;
-
+        pos += take;
+        slot.relay_tls_body_pos += @intCast(take);
         if (slot.relay_tls_body_pos == slot.relay_tls_body_len) {
             slot.relay_tls_hdr_pos = 0;
             slot.relay_tls_body_pos = 0;
             slot.relay_tls_body_len = 0;
-            return .forwarded;
         }
-
-        return .partial;
     }
+    return if (forwarded) .forwarded else .partial;
 }
 
 pub fn relayUpstreamToClientStep(
@@ -141,23 +155,44 @@ pub fn queueTlsAppRecords(
     slot: anytype,
     allocator: std.mem.Allocator,
     payload: []u8,
-    comptime queue_client_pair: fn (@TypeOf(slot), std.mem.Allocator, []const u8, []const u8) anyerror!bool,
+    comptime queue_client_parts: fn (@TypeOf(slot), std.mem.Allocator, []const []const u8) anyerror!bool,
 ) !void {
     var off: usize = 0;
-    var header: [5]u8 = undefined;
+    var headers: [32][5]u8 = undefined;
+    var parts: [64][]const u8 = undefined;
+    var count: usize = 0;
 
     while (off < payload.len) {
-        const chunk_len = @min(payload.len - off, slot.drs.nextRecordSize());
+        // A genuine TLS 1.3 sender's on-wire application_data length is the
+        // plaintext chunk plus the 1-byte inner content type and 16-byte
+        // AEAD tag, so it can reach 16384+17=16401 but never lands on
+        // exactly 16384 (0x4000). We forward the MTProto payload with no
+        // such expansion, so letting chunk_len ride drs.nextRecordSize()'s
+        // ceiling unclamped put every bulk S2C record at precisely 0x4000 —
+        // a length no real TLS 1.3 stack ever emits, and a one-rule passive
+        // DPI record-length discriminator for this proxy. Stay one
+        // AEAD-tag-plus-content-type below the ceiling so the wire length
+        // can never hit that impossible constant.
+        const wire_cap = @min(payload.len - off, slot.drs.nextRecordSize());
+        const chunk_len = @min(wire_cap, constants.max_tls_plaintext_size - 17);
 
+        const header = &headers[count / 2];
         header[0] = constants.tls_record_application;
         header[1] = constants.tls_version[0];
         header[2] = constants.tls_version[1];
         std.mem.writeInt(u16, header[3..5], @intCast(chunk_len), .big);
 
-        _ = try queue_client_pair(slot, allocator, header[0..], payload[off .. off + chunk_len]);
+        parts[count] = header;
+        parts[count + 1] = payload[off .. off + chunk_len];
+        count += 2;
         slot.drs.recordSent(chunk_len);
         off += chunk_len;
+        if (count == parts.len) {
+            _ = try queue_client_parts(slot, allocator, &parts);
+            count = 0;
+        }
     }
+    if (count > 0) _ = try queue_client_parts(slot, allocator, parts[0..count]);
 }
 
 pub fn startRelay(
@@ -199,6 +234,9 @@ pub fn startRelay(
                 close_slot(loop, slot, "queue pipelined direct payload failed");
                 return;
             };
+        } else {
+            close_slot(loop, slot, "missing encryptor/middle_ctx");
+            return;
         }
 
         slot.c2s_bytes += buf.len;
@@ -213,6 +251,7 @@ pub fn relayRawClientToUpstream(
     read_buf: []u8,
     comptime queue_upstream: fn (@TypeOf(loop), @TypeOf(slot), []const u8) anyerror!bool,
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
+    comptime read_eof: fn (@TypeOf(loop), @TypeOf(slot), posix.fd_t) void,
 ) void {
     if (!slot.upstream_queue.isEmpty()) return;
 
@@ -222,7 +261,7 @@ pub fn relayRawClientToUpstream(
         return;
     };
     if (n == 0) {
-        close_slot(loop, slot, "mask relay c2s eof");
+        read_eof(loop, slot, slot.client_fd);
         return;
     }
 
@@ -239,6 +278,7 @@ pub fn relayRawUpstreamToClient(
     read_buf: []u8,
     comptime queue_client: fn (@TypeOf(loop), @TypeOf(slot), []const u8) anyerror!bool,
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
+    comptime read_eof: fn (@TypeOf(loop), @TypeOf(slot), posix.fd_t) void,
 ) void {
     if (!slot.client_queue.isEmpty()) return;
 
@@ -248,7 +288,7 @@ pub fn relayRawUpstreamToClient(
         return;
     };
     if (n == 0) {
-        close_slot(loop, slot, "mask relay s2c eof");
+        read_eof(loop, slot, slot.upstream_fd);
         return;
     }
 
@@ -257,4 +297,44 @@ pub fn relayRawUpstreamToClient(
         return;
     };
     slot.last_activity_ms = nowMs();
+}
+
+test "queueTlsAppRecords never emits the impossible 0x4000 TLS record length" {
+    // Regression (X03-4): a real TLS 1.3 bulk sender's application_data
+    // records top out at 16401 bytes and never at exactly 16384 (0x4000),
+    // since 16384 is the plaintext limit before the 1-byte content type and
+    // 16-byte AEAD tag are added. Before this fix chunk_len rode
+    // drs.nextRecordSize()'s ceiling of 16384 unclamped, so every full-size
+    // bulk S2C record hit 0x4000 exactly — a one-rule passive DPI tell.
+    const drs_mod = @import("drs.zig");
+
+    const FakeSlot = struct {
+        drs: drs_mod.DynamicRecordSizer,
+        lengths: [8]usize = undefined,
+        count: usize = 0,
+
+        fn queuePair(self: *@This(), allocator: std.mem.Allocator, parts: []const []const u8) !bool {
+            _ = allocator;
+            var i: usize = 0;
+            while (i < parts.len) : (i += 2) {
+                self.lengths[self.count] = std.mem.readInt(u16, parts[i][3..5], .big);
+                self.count += 1;
+            }
+            return true;
+        }
+    };
+
+    var slot = FakeSlot{ .drs = drs_mod.DynamicRecordSizer.init(false) };
+
+    const payload = try std.testing.allocator.alloc(u8, 40000);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0xAB);
+
+    try queueTlsAppRecords(&slot, std.testing.allocator, payload, FakeSlot.queuePair);
+
+    try std.testing.expect(slot.count > 0);
+    for (slot.lengths[0..slot.count]) |len| {
+        try std.testing.expect(len != constants.max_tls_plaintext_size);
+        try std.testing.expect(len <= constants.max_tls_plaintext_size - 17);
+    }
 }

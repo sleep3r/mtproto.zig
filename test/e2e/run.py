@@ -34,6 +34,7 @@ import threading
 import time
 import traceback
 import zlib
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -42,6 +43,7 @@ from typing import Callable, Optional
 ROOT = Path(__file__).resolve().parents[2]
 PROXY_BIN = ROOT / "zig-out/bin/mtproto-proxy"
 ACTIVE_PROXY_BIN = PROXY_BIN
+ACTIVE_OBF_GEN = None
 OBF_GEN = ROOT / "src/e2e_obf_handshake_gen.zig"
 DEFAULT_SECRET_HEX = "00112233445566778899aabbccddeeff"
 DEFAULT_TLS_DOMAIN = "google.com"
@@ -53,6 +55,12 @@ DEFAULT_MP_KEY_SEL = bytes([0xC4, 0xF9, 0xFA, 0xCA])  # first 4 bytes of default
 TLS_RECORD_HANDSHAKE = 0x16
 TLS_RECORD_CHANGE_CIPHER = 0x14
 TLS_RECORD_APPLICATION = 0x17
+
+# The proxy writes its own 64-byte obfuscation nonce (constants.handshake_len) upstream the
+# instant the DC connect completes — before a single client byte is relayed. A fake DC
+# therefore counts 64 bytes on its own, which is why "tunnel_bytes > 0" proves nothing about
+# the C2S transform; only a count that clears the nonce does.
+DC_NONCE_BYTES = 64
 
 _HANDSHAKE_CACHE: dict[tuple[str, int, str], bytes] = {}
 
@@ -81,6 +89,23 @@ def wait_for_condition(predicate: Callable[[], bool], timeout_sec: float, interv
             return True
         time.sleep(interval_sec)
     return predicate()
+
+
+def assert_client_payload_relayed(server, payload_bytes: int, what: str, timeout_sec: float = 2.0) -> None:
+    """Assert the fake DC saw the client's payload, not just the proxy's own nonce.
+
+    Both relay directions are length-preserving on the direct path (relay_steps.zig
+    re-encrypts in place and queues the same slice), so the DC must end up with exactly
+    the 64-byte nonce plus every payload byte the client sent. Comparing against that
+    total is what makes the assertion fail when the C2S transform drops or mangles bytes;
+    the old `tunnel_bytes > 0` was already satisfied by the nonce.
+    """
+    expected = DC_NONCE_BYTES + payload_bytes
+    ok = wait_for_condition(lambda: server.tunnel_bytes >= expected, timeout_sec=timeout_sec)
+    assert ok, (
+        f"{what}: fake DC saw {server.tunnel_bytes} bytes, expected >= {expected} "
+        f"({DC_NONCE_BYTES}-byte DC nonce + {payload_bytes} relayed client bytes)"
+    )
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -130,6 +155,7 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
         + sni_ext_len
         + 4
         + supported_versions_ext_len
+        + 42
     )
 
     record_payload_len = 4 + body_len
@@ -167,7 +193,7 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     packet[pos] = 0
     pos += 1
 
-    packet[pos : pos + 2] = struct.pack(">H", 4 + sni_ext_len + 4 + supported_versions_ext_len)
+    packet[pos : pos + 2] = struct.pack(">H", 4 + sni_ext_len + 4 + supported_versions_ext_len + 42)
     pos += 2
 
     packet[pos : pos + 2] = b"\x00\x00"
@@ -192,6 +218,10 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     packet[pos : pos + 2] = b"\x03\x04"
     pos += 2
 
+    packet[pos:pos + 10] = bytes.fromhex("003300260024001d0020")
+    packet[pos + 10:pos + 42] = os.urandom(32)
+    pos += 42
+
     if pos != len(packet):
         raise RuntimeError("tls-auth packet build mismatch")
 
@@ -215,8 +245,8 @@ def generate_obf_handshake(secret_hex: str, dc_idx: int, proto: str = "intermedi
     if key in _HANDSHAKE_CACHE:
         return _HANDSHAKE_CACHE[key]
 
-    cmd = ["zig", "run", str(OBF_GEN), "--", secret_hex, str(dc_idx), proto]
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+    cmd = ([str(ACTIVE_OBF_GEN)] if ACTIVE_OBF_GEN else ["zig", "run", str(OBF_GEN), "--"]) + [secret_hex, str(dc_idx), proto]
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(f"obf handshake generator failed:\n{proc.stderr}\n{proc.stdout}")
     raw = proc.stdout.strip()
@@ -228,24 +258,27 @@ def generate_obf_handshake(secret_hex: str, dc_idx: int, proto: str = "intermedi
 
 
 def read_proxy_records(sock: socket.socket, budget_sec: float = 0.7) -> bytes:
+    previous_timeout = sock.gettimeout()
     sock.setblocking(False)
     deadline = time.time() + budget_sec
     out = bytearray()
-    while time.time() < deadline:
-        timeout = max(0.0, deadline - time.time())
-        r, _, _ = select.select([sock], [], [], timeout)
-        if not r:
-            continue
-        try:
-            chunk = sock.recv(8192)
-        except BlockingIOError:
-            continue
-        if not chunk:
-            break
-        out.extend(chunk)
-        if len(out) >= 4096:
-            break
-    sock.setblocking(True)
+    try:
+        while time.time() < deadline:
+            timeout = max(0.0, deadline - time.time())
+            r, _, _ = select.select([sock], [], [], timeout)
+            if not r:
+                continue
+            try:
+                chunk = sock.recv(8192)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            out.extend(chunk)
+            if len(out) >= 4096:
+                break
+    finally:
+        sock.settimeout(previous_timeout)
     return bytes(out)
 
 
@@ -285,6 +318,7 @@ def connect_from(source_ip: str, host: str, port: int, timeout_sec: float = 2.0)
 
 
 def wait_socket_closed(sock: socket.socket, timeout_sec: float = 2.0) -> bool:
+    previous_timeout = sock.gettimeout()
     deadline = time.time() + timeout_sec
     sock.setblocking(False)
     try:
@@ -302,7 +336,7 @@ def wait_socket_closed(sock: socket.socket, timeout_sec: float = 2.0) -> bool:
                 return True
         return False
     finally:
-        sock.setblocking(True)
+        sock.settimeout(previous_timeout)
 
 
 def assert_socket_closed_soon(sock: socket.socket, timeout_sec: float = 2.0) -> None:
@@ -317,6 +351,12 @@ class ProxyInstance:
     log_path: Path
     port: int
     workdir: Path
+    metrics_port: int
+
+    def scrape(self) -> dict[str, float]:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.metrics_port}/metrics", timeout=3) as response:
+            return {line.split()[0]: float(line.split()[1]) for line in response.read().decode().splitlines()
+                    if line and not line.startswith("#")}
 
     def stop(self) -> None:
         try:
@@ -345,6 +385,8 @@ def start_proxy(config_text: str, port: int) -> ProxyInstance:
 
     temp_dir = Path(tempfile.mkdtemp(prefix="mtproto-e2e-"))
     cfg_path = temp_dir / "config.toml"
+    metrics_port = free_port()
+    config_text += f'\n[metrics]\nenabled = true\nhost = "127.0.0.1"\nport = {metrics_port}\n'
     log_path = temp_dir / "proxy.log"
     cfg_path.write_text(config_text, encoding="utf-8")
 
@@ -357,7 +399,7 @@ def start_proxy(config_text: str, port: int) -> ProxyInstance:
     )
     log_file.close()
 
-    if not wait_for_listen("127.0.0.1", port, timeout_sec=8.0):
+    if not wait_for_listen("127.0.0.1", port, timeout_sec=8.0) or proc.poll() is not None:
         if proc.poll() is None:
             proc.terminate()
             try:
@@ -368,7 +410,7 @@ def start_proxy(config_text: str, port: int) -> ProxyInstance:
         shutil.rmtree(temp_dir, ignore_errors=True)  # don't leak the workdir on early failure
         raise RuntimeError(f"proxy failed to listen on port {port}\n{tail}")
 
-    return ProxyInstance(proc=proc, cfg_path=cfg_path, log_path=log_path, port=port, workdir=temp_dir)
+    return ProxyInstance(proc=proc, cfg_path=cfg_path, log_path=log_path, port=port, workdir=temp_dir, metrics_port=metrics_port)
 
 
 class FakeSocks5Server:
@@ -707,6 +749,7 @@ def base_config(
     lines.append("")
 
     lines.append("[server]")
+    lines.append('bind_address = "127.0.0.1"')
     lines.append(f"port = {port}")
     lines.append(f"max_connections = {max_connections}")
     lines.append(f"idle_timeout_sec = {idle_timeout_sec}")
@@ -781,9 +824,7 @@ def scenario_fake_telegram_dc_via_socks5() -> None:
             assert connected, "SOCKS5 CONNECT was not attempted in time"
             # Send one more record after connect to reduce scheduling flakiness in CI.
             c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x12" * 128))
-            forwarded = wait_for_condition(lambda: socks.tunnel_bytes > 0, timeout_sec=2.0)
-            assert forwarded, "no C2S bytes reached fake DC tunnel"
-        assert socks.tunnel_bytes > 0, "no C2S bytes reached fake DC tunnel"
+            assert_client_payload_relayed(socks, 64 + 128, "no C2S bytes reached fake DC tunnel")
         assert any(p == 443 for _, p in socks.connect_targets), f"no DC connect in {socks.connect_targets}"
     finally:
         proxy.stop()
@@ -814,9 +855,9 @@ def scenario_desync_relay_via_socks5() -> None:
                 lambda: len(socks.connect_targets) > 0, timeout_sec=2.0
             ), "SOCKS5 CONNECT not attempted with desync enabled"
             c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x12" * 128))
-            assert wait_for_condition(
-                lambda: socks.tunnel_bytes > 0, timeout_sec=2.0
-            ), "desync corrupted the relay — no C2S bytes reached the fake DC"
+            assert_client_payload_relayed(
+                socks, 64 + 128, "desync corrupted the relay — C2S bytes lost on the way to the fake DC"
+            )
     finally:
         proxy.stop()
         socks.stop()
@@ -841,8 +882,7 @@ def scenario_direct_secure_via_socks5() -> None:
             c.sendall(b"\x44" * 128)
             connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=2.0)
             assert connected, "SOCKS5 CONNECT was not attempted for direct secure transport"
-            forwarded = wait_for_condition(lambda: socks.tunnel_bytes > 0, timeout_sec=2.0)
-            assert forwarded, "direct secure transport did not reach fake DC tunnel"
+            assert_client_payload_relayed(socks, 128, "direct secure transport did not reach fake DC tunnel")
         assert any(p == 443 for _, p in socks.connect_targets), f"no DC connect in {socks.connect_targets}"
     finally:
         proxy.stop()
@@ -884,6 +924,7 @@ def scenario_socks5_upstream_failure() -> None:
     proxy_port = free_port()
     cfg = base_config(
         port=proxy_port,
+        use_middle_proxy=True,
         upstream_type="socks5",
         upstream_host="127.0.0.1",
         upstream_port=socks.port,
@@ -898,7 +939,7 @@ def scenario_socks5_upstream_failure() -> None:
             assert_socket_closed_soon(c, timeout_sec=2.0)
         finally:
             c.close()
-        assert len(socks.connect_targets) >= 1, "SOCKS5 CONNECT was not attempted"
+        assert len(set(socks.connect_targets)) >= 2, "SOCKS5 rejection did not advance endpoint/fallback"
     finally:
         proxy.stop()
         socks.stop()
@@ -923,9 +964,7 @@ def scenario_http_connect_success() -> None:
             connected = wait_for_condition(lambda: len(http.connect_targets) > 0, timeout_sec=2.0)
             assert connected, "HTTP CONNECT was not attempted in time"
             c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x34" * 128))
-            forwarded = wait_for_condition(lambda: http.tunnel_bytes > 0, timeout_sec=2.0)
-            assert forwarded, "no tunneled bytes through HTTP CONNECT"
-        assert http.tunnel_bytes > 0, "no tunneled bytes through HTTP CONNECT"
+            assert_client_payload_relayed(http, 64 + 128, "no tunneled client bytes through HTTP CONNECT")
         assert any(p == 443 for _, p in http.connect_targets), f"no DC connect in {http.connect_targets}"
     finally:
         proxy.stop()
@@ -938,6 +977,7 @@ def scenario_http_connect_failure() -> None:
     proxy_port = free_port()
     cfg = base_config(
         port=proxy_port,
+        use_middle_proxy=True,
         upstream_type="http",
         upstream_host="127.0.0.1",
         upstream_port=http.port,
@@ -951,7 +991,7 @@ def scenario_http_connect_failure() -> None:
             assert_socket_closed_soon(c, timeout_sec=2.0)
         finally:
             c.close()
-        assert len(http.connect_targets) >= 1, "HTTP CONNECT was not attempted"
+        assert len(set(http.connect_targets)) >= 2, "HTTP rejection did not advance endpoint/fallback"
     finally:
         proxy.stop()
         http.stop()
@@ -1072,11 +1112,13 @@ def scenario_web_only_still_serves_the_relay() -> None:
         with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
             c.settimeout(2.0)
             perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
-            c.sendall(b"\x44" * 128)
+            # A FakeTLS session, so the payload has to be a real application record: bare
+            # bytes are an illegal record type and relay_steps.zig closes the connection
+            # instead of relaying them.
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x44" * 128))
             connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=3.0)
             assert connected, "web-only masked the relay's own loopback handshake"
-            forwarded = wait_for_condition(lambda: socks.tunnel_bytes > 0, timeout_sec=2.0)
-            assert forwarded, "web-only relay handshake did not reach the fake DC tunnel"
+            assert_client_payload_relayed(socks, 128, "web-only relay handshake did not reach the fake DC tunnel")
         assert not mask.received_bytes(), (
             f"a trusted loopback peer was sent to the masking backend: {mask.received_bytes()!r}"
         )
@@ -1130,6 +1172,8 @@ def scenario_web_only_masks_a_direct_client() -> None:
         upstream_host="127.0.0.1",
         upstream_port=socks.port,
     )
+    # This trust-boundary scenario deliberately needs a non-loopback listener.
+    cfg = cfg.replace('bind_address = "127.0.0.1"', 'bind_address = "0.0.0.0"')
     proxy = start_proxy(cfg, proxy_port)
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as c:
@@ -1148,6 +1192,7 @@ def scenario_web_only_masks_a_direct_client() -> None:
         )
         relayed = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=1.5)
         assert not relayed, f"web-only still relayed a direct client upstream: {socks.connect_targets}"
+        assert proxy.scrape()["mtproto_web_only_masked_total"] >= 1
     finally:
         proxy.stop()
         mask.stop()
@@ -1182,9 +1227,12 @@ def scenario_web_only_ignored_without_web_enabled() -> None:
         with socket.create_connection(("127.0.0.1", proxy_port), timeout=2.0) as c:
             c.settimeout(2.0)
             perform_valid_client_handshake(c, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
-            c.sendall(b"\x44" * 128)
+            # Application record, not bare bytes: an illegal record type would be torn down
+            # by relay_steps.zig, and the scenario would pass on the connect alone.
+            c.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x44" * 128))
             connected = wait_for_condition(lambda: len(socks.connect_targets) > 0, timeout_sec=3.0)
             assert connected, "a stale [web].only masked traffic with the relay disabled"
+            assert_client_payload_relayed(socks, 128, "a stale [web].only broke the relay it should have ignored")
     finally:
         proxy.stop()
         mask.stop()
@@ -1275,6 +1323,7 @@ def scenario_replay_attack_rejected() -> None:
         # Settle, then assert the replay added NO second connect (the actual property).
         time.sleep(0.4)
         assert len(socks.connect_targets) == 1, f"replay should not create 2nd upstream connect: {socks.connect_targets}"
+        assert proxy.scrape()["mtproto_replay_hits_total"] >= 1
         c1.close()
     finally:
         proxy.stop()
@@ -1335,6 +1384,7 @@ def scenario_user_max_ips_distinct_client_networks() -> None:
         assert len(socks.connect_targets) == 3, (
             f"over-quota network was relayed upstream: {socks.connect_targets}"
         )
+        assert sum(v for k, v in proxy.scrape().items() if k.startswith("mtproto_user_ip_limit_refused_total{")) >= 1
     finally:
         for c in clients:
             try:
@@ -1367,6 +1417,53 @@ def scenario_slowloris_partial_clienthello() -> None:
             )
         finally:
             c.close()
+    finally:
+        proxy.stop()
+
+
+def scenario_silent_connections_do_not_starve_clients() -> None:
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    port = free_port()
+    proxy = start_proxy(base_config(port=port, max_connections=64,
+        upstream_type="socks5", upstream_host="127.0.0.1", upstream_port=socks.port,
+        idle_timeout_sec=120, handshake_timeout_sec=5), port)
+    silent = []
+    try:
+        for _ in range(70):
+            silent.append(socket.create_connection(("127.0.0.1", port), timeout=2))
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            client.settimeout(2)
+            perform_valid_client_handshake(client, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            client.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x12" * 128))
+            assert_client_payload_relayed(socks, 128, "silent sockets starved authenticated client")
+        # Below saturation, a silent socket still uses the handshake deadline.
+        for client in silent:
+            client.close()
+        silent.clear()
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            assert wait_socket_closed(client, 8), "silent socket survived handshake deadline"
+    finally:
+        for client in silent:
+            client.close()
+        proxy.stop()
+        socks.stop()
+
+
+def scenario_long_username_expiry_and_reload_warning() -> None:
+    port = free_port()
+    username = "long_username_" + "x" * 80
+    cfg = base_config(port=port).replace("user1 =", username + " =")
+    cfg += f'\n[access.user_expirations]\n{username} = "2020-01-01"\n'
+    proxy = start_proxy(cfg, port)
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            client.settimeout(2)
+            perform_valid_client_handshake(client, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            assert wait_socket_closed(client, 2), "expiry bypassed for long username"
+        proxy.cfg_path.write_text(cfg.replace("fake_tls_only = true", "fake_tls_only = false"))
+        proxy.proc.send_signal(signal.SIGHUP)
+        assert wait_for_condition(lambda: "fake_tls_only changed; restart required" in proxy.read_log_tail(), 2), proxy.read_log_tail()
     finally:
         proxy.stop()
 
@@ -1415,6 +1512,12 @@ def scenario_connection_churn_10k() -> None:
         elapsed = time.time() - start
         print(f"      churn: ok={ok} fail={fail} elapsed={elapsed:.2f}s")
         assert ok >= 9_500, f"too many churn failures: ok={ok} fail={fail}"
+        assert wait_for_condition(lambda: proxy.scrape()["mtproto_connections_active"] == 0, timeout_sec=8), "churn slots did not recover"
+        with urllib.request.urlopen(f"http://127.0.0.1:{proxy.metrics_port}/healthz", timeout=3) as response:
+            assert response.status == 200
+        with socket.create_connection(("127.0.0.1", proxy_port), timeout=2) as client:
+            client.sendall(build_tls_auth_client_hello(bytes.fromhex(DEFAULT_SECRET_HEX), DEFAULT_TLS_DOMAIN))
+            assert client.recv(3) == b"\x16\x03\x03", "authenticated handshake failed after churn"
     finally:
         proxy.stop()
 
@@ -1471,7 +1574,130 @@ def scenario_sigterm_during_active_relay() -> None:
         socks.stop()
 
 
+def scenario_proxy_header_split_tlv_quota() -> None:
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    port = free_port()
+    cfg = base_config(port=port, web_enabled=True, upstream_type="socks5",
+                      upstream_host="127.0.0.1", upstream_port=socks.port)
+    cfg = cfg.replace("[server]", "[server]\naccept_proxy_protocol = true")
+    cfg += "\n[access.user_max_ips]\nuser1 = 1\n"
+    proxy = start_proxy(cfg, port)
+    clients = []
+    try:
+        for index, source in enumerate(("198.51.100.1", "203.0.113.1")):
+            client = socket.create_connection(("127.0.0.1", port), timeout=3)
+            clients.append(client)
+            address = socket.inet_aton(source) + socket.inet_aton("127.0.0.1") + struct.pack(">HH", 12345, port)
+            tlv = b"\xe0" + struct.pack(">H", 300) + b"x" * 300
+            header = b"\r\n\r\n\x00\r\nQUIT\n" + b"\x21\x11" + struct.pack(">H", len(address + tlv)) + address + tlv
+            client.sendall(header[:10])
+            time.sleep(0.04)
+            client.sendall(header[10:])
+            perform_valid_client_handshake(client, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            if index == 0:
+                assert wait_for_condition(lambda: len(socks.connect_targets) == 1, 3), "split/TLV header did not reach upstream"
+            else:
+                assert_socket_closed_soon(client)
+        assert sum(v for k, v in proxy.scrape().items() if k.startswith("mtproto_user_ip_limit_refused_total{")) >= 1, "announced client address did not enforce quota"
+    finally:
+        for client in clients:
+            client.close()
+        proxy.stop()
+        socks.stop()
+
+
+def scenario_guard_admission_metrics() -> None:
+    for setting, metric in (
+        ("rate_limit_per_subnet = 1", "mtproto_drops_rate_limit_total"),
+        ("handshake_flood_guard_enabled = true\nhandshake_flood_guard_threshold = 1", "mtproto_drops_flood_guard_total"),
+    ):
+        port = free_port()
+        cfg = base_config(port=port, mask=False, handshake_timeout_sec=5).replace("[server]", "[server]\n" + setting)
+        proxy = start_proxy(cfg, port)
+        try:
+            if "flood" in metric:
+                # Invalid HTTP is masked, not a flood event. A deliberately incomplete
+                # TLS handshake exercises the documented timeout -> block path.
+                with socket.create_connection(("127.0.0.1", port), timeout=2) as stalled:
+                    stalled.sendall(b"\x16\x03")
+                    assert_socket_closed_soon(stalled, 8)
+            for _ in range(12):
+                with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+                    try:
+                        client.sendall(b"GET /invalid HTTP/1.0\r\n\r\n")
+                        client.recv(128)
+                    except (OSError, TimeoutError):
+                        pass
+            assert wait_for_condition(lambda: proxy.scrape()[metric] >= 1, 3), f"guard not wired to admission: {metric}"
+        finally:
+            proxy.stop()
+
+
+def scenario_explicit_relay_source() -> None:
+    source = _local_non_loopback_ipv4()
+    if source is None:
+        raise RuntimeError("explicit relay-source test needs a non-loopback IPv4")
+    for trusted in (False, True):
+        socks = FakeSocks5Server(mode="success")
+        socks.start()
+        port = free_port()
+        cfg = base_config(port=port, web_enabled=True, mask=False, upstream_type="socks5",
+                          upstream_host="127.0.0.1", upstream_port=socks.port)
+        if trusted:
+            cfg = cfg.replace("[web]", f'[web]\nrelay_sources = ["{source}"]')
+        proxy = start_proxy(cfg, port)
+        try:
+            with connect_from(source, "127.0.0.1", port) as client:
+                client.settimeout(3)
+                client.sendall(generate_obf_handshake(DEFAULT_SECRET_HEX, 1, "secure"))
+                if trusted:
+                    assert wait_for_condition(lambda: len(socks.connect_targets) == 1, 3), "listed relay rejected dd"
+                else:
+                    assert_socket_closed_soon(client)
+                    assert not socks.connect_targets, "unlisted non-loopback source bypassed FakeTLS gate"
+        finally:
+            proxy.stop()
+            socks.stop()
+
+
+def scenario_two_workers_traffic_health() -> None:
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    port = free_port()
+    cfg = base_config(port=port, upstream_type="socks5", upstream_host="127.0.0.1", upstream_port=socks.port)
+    cfg = cfg.replace("[server]", "[server]\nworkers = 2")
+    proxy = start_proxy(cfg, port)
+    clients = []
+    try:
+        for _ in range(24):
+            client = socket.create_connection(("127.0.0.1", port), timeout=2)
+            clients.append(client)
+            perform_valid_client_handshake(client, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
+            client.sendall(build_tls_record(TLS_RECORD_APPLICATION, b"\x55" * 128))
+        assert wait_for_condition(lambda: len(socks.connect_targets) == 24, 5)
+        assert wait_for_condition(lambda: socks.tunnel_bytes >= 24 * (DC_NONCE_BYTES + 128), 5), "two-worker traffic was lost"
+        assert proxy.scrape()["mtproto_connections_active"] >= 24
+        with urllib.request.urlopen(f"http://127.0.0.1:{proxy.metrics_port}/healthz", timeout=3) as response:
+            assert response.status == 200
+        # Linux exposes one SO_REUSEPORT socket per worker, not merely two threads.
+        with open("/proc/net/tcp") as table:
+            listeners = [line for line in table.readlines()[1:] if line.split()[1].endswith(f":{port:04X}") and line.split()[3] == "0A"]
+        assert len(listeners) == 2, f"expected two worker listeners, got {len(listeners)}"
+    finally:
+        for client in clients:
+            client.close()
+        proxy.stop()
+        socks.stop()
+
+
 SCENARIOS: dict[str, Callable[[], None]] = {
+    "guard_admission_metrics": scenario_guard_admission_metrics,
+    "explicit_relay_source": scenario_explicit_relay_source,
+    "two_workers_traffic_health": scenario_two_workers_traffic_health,
+    "proxy_header_split_tlv_quota": scenario_proxy_header_split_tlv_quota,
+    "silent_connections_do_not_starve_clients": scenario_silent_connections_do_not_starve_clients,
+    "long_username_expiry_and_reload_warning": scenario_long_username_expiry_and_reload_warning,
     "fake_telegram_dc_via_socks5": scenario_fake_telegram_dc_via_socks5,
     "desync_relay_via_socks5": scenario_desync_relay_via_socks5,
     "direct_secure_via_socks5": scenario_direct_secure_via_socks5,
@@ -1508,6 +1734,9 @@ def main() -> int:
         help="Run only selected scenario(s); repeatable",
     )
     parser.add_argument("--list", action="store_true", help="List available scenarios and exit")
+    parser.add_argument("--obf-gen", help="Precompiled handshake generator")
+    parser.add_argument("--scenario-timeout", type=int, default=90)
+    parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
 
     if args.list:
@@ -1525,8 +1754,11 @@ def main() -> int:
         print(f"skip: e2e harness requires Linux runtime (current: {sys.platform})")
         return 0
 
-    global ACTIVE_PROXY_BIN
+    global ACTIVE_PROXY_BIN, ACTIVE_OBF_GEN
     ACTIVE_PROXY_BIN = Path(args.proxy_bin).resolve()
+    ACTIVE_OBF_GEN = Path(args.obf_gen).resolve() if args.obf_gen else None
+    if args.scenario_timeout < 1:
+        parser.error("--scenario-timeout must be positive")
 
     if not ACTIVE_PROXY_BIN.exists():
         print(f"error: missing binary {ACTIVE_PROXY_BIN}. Run `zig build` first.")
@@ -1538,12 +1770,25 @@ def main() -> int:
     print("")
 
     passed = 0
+    failures = []
+    def deadline(_signum, _frame):
+        raise TimeoutError("scenario deadline exceeded")
+    signal.signal(signal.SIGALRM, deadline)
     started = time.time()
     for name in selected:
         print(f"[RUN ] {name}")
         t0 = time.time()
         try:
-            SCENARIOS[name]()
+            signal.alarm(args.scenario_timeout)
+            for attempt in range(3):
+                try:
+                    SCENARIOS[name]()
+                    break
+                except (OSError, RuntimeError) as error:
+                    collision = "AddressInUse" in str(error) or "Address already in use" in str(error)
+                    if not collision or attempt == 2:
+                        raise
+                    print(f"[RETRY] {name}: port collision; selecting fresh ports")
             dt = time.time() - t0
             print(f"[PASS] {name} ({dt:.2f}s)")
             passed += 1
@@ -1551,12 +1796,18 @@ def main() -> int:
             dt = time.time() - t0
             print(f"[FAIL] {name} ({dt:.2f}s): {exc}")
             traceback.print_exc()
-            return 1
+            failures.append(name)
+            if args.fail_fast:
+                break
+        finally:
+            signal.alarm(0)
 
     total = time.time() - started
     print("")
     print(f"passed {passed}/{len(selected)} scenarios in {total:.2f}s")
-    return 0
+    if failures:
+        print("failed: " + ", ".join(failures))
+    return int(bool(failures))
 
 
 if __name__ == "__main__":

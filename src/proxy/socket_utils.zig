@@ -98,7 +98,7 @@ pub fn connectSockaddr(fd: posix.fd_t, addr: *const posix.sockaddr, addr_len: po
 pub fn checkSocketConnectError(fd: posix.fd_t) !void {
     var so_error: i32 = 0;
     var opt_len: linux.socklen_t = @sizeOf(i32);
-    const so_error_opt: u32 = 4; // SO_ERROR
+    const so_error_opt: u32 = linux.SO.ERROR;
     const rc = linux.getsockopt(fd, posix.SOL.SOCKET, so_error_opt, std.mem.asBytes(&so_error).ptr, &opt_len);
     if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
     if (so_error == 0) return;
@@ -157,6 +157,7 @@ pub fn acceptClient(listen_fd: posix.fd_t) AcceptError!?AcceptResult {
             },
             .INTR => continue,
             .AGAIN => return null,
+            .NETDOWN, .PROTO, .NOPROTOOPT, .HOSTUNREACH, .OPNOTSUPP, .NETUNREACH, .NONET, .PERM => return null,
             .CONNABORTED => return error.ConnectionAborted,
             .CONNRESET => return error.ConnectionResetByPeer,
             .MFILE => return error.ProcessFdQuotaExceeded,

@@ -7,7 +7,6 @@ zig-out
 !README.md
 .env
 .env.*
-deploy
 GEMINI.md
 Makefile
 test_*.zig

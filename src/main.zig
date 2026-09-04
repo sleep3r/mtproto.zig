@@ -26,7 +26,7 @@ const web_relay = @import("web/relay.zig");
 pub const std_options = std.Options{
     // Set comptime level to .debug so all log calls are compiled in.
     // Runtime filtering is done in lockFreeLog via runtime_log.level.
-    .log_level = .debug,
+    .log_level = if (builtin.is_test) .err else .debug,
     .logFn = lockFreeLog,
 };
 
@@ -37,7 +37,7 @@ fn lockFreeLog(
     args: anytype,
 ) void {
     // Runtime filter: skip messages below configured level
-    if (@intFromEnum(message_level) > @intFromEnum(runtime_log.level)) return;
+    if (@intFromEnum(message_level) > @intFromEnum(runtime_log.level.load(.monotonic))) return;
 
     const level_txt = comptime message_level.asText();
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
@@ -83,32 +83,7 @@ fn writeRaw(s: []const u8) void {
 
 // ============= Public IP Detection =============
 
-fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    const uri = try std.Uri.parse(url);
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-
-    var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(3),
-        .keep_alive = false,
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-        },
-    });
-    defer req.deinit();
-
-    try req.sendBodiless();
-
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status.class() != .success) return error.HttpRequestFailed;
-
-    var transfer_buf: [4 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
-    return reader.allocRemaining(allocator, .limited(64 * 1024));
-}
+const fetchUrlBytes = @import("proxy/http_fetch.zig").fetchUrlBytes;
 
 /// Try to detect the server's public IP address via external services.
 /// Returns the IP string (caller owns memory) or null on failure.
@@ -240,17 +215,17 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     // - optional middle-proxy stream buffers (2 per-connection buffers)
     // - allocator/socket bookkeeping cushion
     const tls_working_bytes: u64 = @intCast(6 * 1024);
-    const middleproxy_per_conn_bytes: u64 = if (cfg.use_middle_proxy)
+    const middleproxy_per_conn_bytes: u64 = if (cfg.use_middle_proxy or cfg.force_media_middle_proxy or cfg.tag != null)
         @intCast(cfg.middleProxyBufferBytes() * 2)
     else
         0;
     // Event loop also keeps 2 shared scratch buffers for middle-proxy
     // encapsulate/decapsulate temporary output.
-    const middleproxy_shared_bytes: u64 = if (cfg.use_middle_proxy)
-        @intCast(cfg.middleProxyBufferBytes() * 2)
+    const middleproxy_shared_bytes: u64 = if (cfg.use_middle_proxy or cfg.force_media_middle_proxy or cfg.tag != null)
+        @intCast(cfg.middleProxySharedBytes())
     else
         0;
-    const overhead_bytes: u64 = 2 * 1024;
+    const overhead_bytes: u64 = 2 * 1024 + 2 * 32 * 1024; // two bounded queue block caches
     const per_conn_bytes = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes;
 
     // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
@@ -297,13 +272,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
     const configured_limit = cfg.max_connections;
     cfg.max_connections = est.safe_connections;
 
-    if (cfg.max_connections > est.safe_connections) {
-        log_main.err(
-            "failed to enforce RAM safety limit: max_connections={d}, safe={d}; refusing startup",
-            .{ cfg.max_connections, est.safe_connections },
-        );
-        return error.CapacitySafetyEnforcementFailed;
-    }
+    std.debug.assert(cfg.max_connections <= est.safe_connections);
 
     log_main.warn(
         "auto-clamping max_connections from {d} to {d} " ++
@@ -421,7 +390,7 @@ fn runWebRelay(allocator: std.mem.Allocator, config_path: []const u8) !void {
         std.process.exit(1);
     };
     defer cfg.deinit(allocator);
-    runtime_log.level = cfg.log_level;
+    runtime_log.level.store(cfg.log_level, .monotonic);
 
     // `opts.domain` borrows this frame, which outlives the relay.
     var domain_buf: [web_capability.max_host_len]u8 = undefined;
@@ -456,9 +425,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (first_arg) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            writeStderr(
+            writeStdout(
                 \\
                 \\  Usage: mtproto-proxy [config.toml]
+                \\         mtproto-proxy web-relay <config.toml>
                 \\
                 \\  Starts the MTProto proxy using the given config file.
                 \\  Defaults to 'config.toml' in the current directory.
@@ -473,7 +443,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            writeStderr("mtproto-proxy v" ++ version ++ "\n", .{});
+            writeStdout("mtproto-proxy v" ++ version ++ "\n", .{});
             return;
         }
         // Config dry-run (like `nginx -t`): parse + validate, then exit with a
@@ -485,7 +455,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             defer check_cfg.deinit(allocator);
-            runtime_log.level = check_cfg.log_level;
+            runtime_log.level.store(check_cfg.log_level, .monotonic);
             check_cfg.emitWarnings();
             writeStdout("  \x1b[32m✓\x1b[0m config '{s}' is valid ({d} user(s))\n", .{ path, check_cfg.users.count() });
             std.process.exit(0);
@@ -506,13 +476,13 @@ pub fn main(init: std.process.Init) !void {
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
         writeStderr("\n  Usage: mtproto-proxy [config.toml]\n\n", .{});
-        return;
+        return err;
     };
     var cfg_owned_by_main = true;
     defer if (cfg_owned_by_main) cfg.deinit(allocator);
 
     // Apply runtime log level from config
-    runtime_log.level = cfg.log_level;
+    runtime_log.level.store(cfg.log_level, .monotonic);
 
     if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
         const log_main = std.log.scoped(.config);
@@ -537,22 +507,29 @@ pub fn main(init: std.process.Init) !void {
     cfg.emitWarnings();
 
     // Create shared state (DI — no globals)
-    var state = try proxy.ProxyState.init(allocator, cfg, config_path);
+    const state = try allocator.create(proxy.ProxyState);
+    defer allocator.destroy(state);
+    state.* = try proxy.ProxyState.init(allocator, cfg, config_path);
     cfg_owned_by_main = false;
     defer state.deinit();
 
     // systemd notify/watchdog wiring (no-op when not run under systemd). The env
     // strings are owned by the process environ and live for the whole run.
     state.notify_socket = init.environ_map.get("NOTIFY_SOCKET");
-    if (init.environ_map.get("WATCHDOG_USEC")) |w| {
-        state.watchdog_usec = std.fmt.parseInt(u64, w, 10) catch 0;
-    }
+    state.watchdog_usec = @import("proxy/sd_notify.zig").watchdogInterval(
+        init.environ_map.get("WATCHDOG_USEC"),
+        init.environ_map.get("WATCHDOG_PID"),
+        @intCast(std.os.linux.getpid()),
+    );
 
     // Run the proxy
     try state.run();
 }
 
 test {
+    // Zig's server-mode test runner reports any warning output as "failed command"
+    // even on exit 0. Expected warning-path regressions should remain quiet.
+    std.testing.log_level = .err;
     _ = constants;
     _ = crypto;
     _ = obfuscation;
@@ -585,6 +562,21 @@ test "capacity safety clamp enforces safe cap when override disabled" {
 
     try enforceCapacitySafety(&cfg, est);
     try std.testing.expectEqual(@as(u32, 585), cfg.max_connections);
+}
+
+test "capacity estimate includes forced media MiddleProxy buffers" {
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    const direct = estimateCapacity(&cfg, 2 * 1024 * 1024 * 1024);
+    cfg.force_media_middle_proxy = true;
+    const media = estimateCapacity(&cfg, 2 * 1024 * 1024 * 1024);
+    try std.testing.expectEqual(direct.per_conn_bytes + cfg.middleProxyBufferBytes() * 2, media.per_conn_bytes);
+    try std.testing.expect(media.safe_connections < direct.safe_connections);
 }
 
 test "capacity safety clamp keeps configured limit when override enabled" {

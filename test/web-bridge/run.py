@@ -10,11 +10,10 @@ fallback. Neither is exercised by `zig build test`.
 This script lifts the inline script out of page.zig exactly as the relay renders it and
 hands it to harness.js, which impersonates the client.
 
-Skips (exit 0) when node is unavailable, so a dev box without it still gets a green
-`zig build`; CI runs on ubuntu-latest, which ships node.
+Missing node or zig is an error; contract tests cannot silently pass without running.
 """
 
-import re
+import os
 import shutil
 import subprocess
 import sys
@@ -27,39 +26,33 @@ HARNESS = Path(__file__).resolve().parent / "harness.js"
 WS_PATH = "/api/v1/socket"
 
 
-def multiline_literal(source: str, name: str) -> str:
-    """Return the text of a `const <name> = \\\\...` Zig multiline string literal."""
-    match = re.search(r"const %s =\n((?:[ \t]*\\\\.*\n)+)" % re.escape(name), source)
-    if not match:
-        raise SystemExit(f"could not find the {name} literal in {PAGE}")
-    lines = []
-    for raw in match.group(1).splitlines():
-        stripped = raw.strip()
-        if stripped.startswith("\\\\"):
-            lines.append(stripped[2:])
-    return "\n".join(lines)
-
-
-def extract_script() -> str:
-    source = PAGE.read_text(encoding="utf-8")
-    # renderBridge() writes: script_head + <ws path as a JS string> + script_body
-    page = multiline_literal(source, "script_head") + f'"{WS_PATH}"' + multiline_literal(source, "script_body")
+def extract_script() -> tuple[str, str, str]:
+    zig = os.environ.get("ZIG") or shutil.which("zig")
+    if not zig:
+        raise SystemExit("web-bridge: zig is required")
+    rendered = subprocess.run([
+        zig, "run", "--dep", "page", "--dep", "frame",
+        "-Mroot=" + str(HARNESS.with_name("render.zig")),
+        "-Mpage=" + str(PAGE),
+        "-Mframe=" + str(PAGE.with_name("frame.zig")),
+    ], check=True, text=True, capture_output=True, cwd=REPO).stdout
+    hello, welcome, page = rendered.split("\n", 2)
     body = page.split("<script>", 1)
     if len(body) != 2:
         raise SystemExit("the bridge page no longer opens a <script> element")
     js = body[1].split("</script>", 1)[0]
     if "TelegramWebProxy" not in js or "tproxy-init" not in js:
         raise SystemExit("the extracted script is missing a client boundary")
-    return js
+    return js, hello, welcome
 
 
 def main() -> int:
     node = shutil.which("node")
     if node is None:
-        print("web-bridge: node not found, skipping the bridge-page contract tests")
-        return 0
+        print("web-bridge: node is required", file=sys.stderr)
+        return 1
 
-    js = extract_script()
+    js, hello, welcome = extract_script()
     print(f"web-bridge: checking {len(js)} bytes of bridge script")
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "bridge.js"
@@ -70,7 +63,7 @@ def main() -> int:
             print(syntax.stderr.strip())
             return 1
 
-        result = subprocess.run([node, str(HARNESS), str(path)], text=True)
+        result = subprocess.run([node, str(HARNESS), str(path), hello, welcome], text=True)
         return result.returncode
 
 

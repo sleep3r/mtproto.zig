@@ -28,9 +28,9 @@ const ConfigCmdOpts = struct {
 pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     const sub = args.next() orelse {
         ui.fail("Usage: mtbuddy config <validate|doctor|print-effective> [--config <path>] [--network]");
-        return;
+        return error.BadUsage;
     };
-    const opts = parseConfigOpts(args);
+    const opts = try parseConfigOpts(args);
 
     if (std.mem.eql(u8, sub, "validate")) {
         try validate(ui, allocator, opts.path);
@@ -47,18 +47,21 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 
     ui.fail("Unknown config subcommand");
     ui.hint("Available: validate, doctor, print-effective");
+    return error.BadUsage;
 }
 
 fn isNetworkFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--network");
 }
 
-fn parseConfigOpts(args: *std.process.Args.Iterator) ConfigCmdOpts {
+fn parseConfigOpts(args: *std.process.Args.Iterator) !ConfigCmdOpts {
     var path: ?[]const u8 = null;
     var network = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            path = args.next() orelse path;
+            const value = args.next() orelse return error.MissingConfigPath;
+            if (std.mem.startsWith(u8, value, "-")) return error.MissingConfigPath;
+            path = value;
             continue;
         }
         if (isNetworkFlag(arg)) {
@@ -67,6 +70,8 @@ fn parseConfigOpts(args: *std.process.Args.Iterator) ConfigCmdOpts {
         }
         if (arg.len > 0 and arg[0] != '-') {
             path = arg;
+        } else {
+            return error.UnknownOption;
         }
     }
     return .{ .path = path orelse defaultConfigPath(), .network = network };
@@ -168,7 +173,7 @@ fn validate(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !void {
                 ui.warn("[web].only sends every refused MTProto connection to the remote masking target — run `mtbuddy setup masking` for a local one");
             }
             if (cfg.accept_proxy_protocol) {
-                ui.warn("[web].only with accept_proxy_protocol: traffic via the load balancer is masked unless its IP is in [web].relay_sources");
+                ui.warn("[web].only: relays must connect directly, bypassing the LB. Never add a public LB to relay_sources: that trusts every forwarded client");
             }
         }
         // Warnings, not errors: `validate` is routinely run against a config copied off
@@ -235,8 +240,8 @@ fn doctor(ui: *Tui, allocator: std.mem.Allocator, path: []const u8, network: boo
         else => {},
     }
 
-    if (cfg.use_middle_proxy and cfg.middleproxy_buffer_kb < 1024) {
-        ui.warn("middleproxy_buffer_kb < 1024 may break media downloads");
+    if (cfg.use_middle_proxy and cfg.middleproxy_buffer_kb < 2048) {
+        ui.warn("middleproxy_buffer_kb < 2048 may break media downloads");
         warnings += 1;
     }
     if (cfg.use_middle_proxy and cfg.max_connections > 2000) {
@@ -781,6 +786,46 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
 
     ui.print("[access.users] count = {d}\n", .{cfg.users.count()});
     ui.print("[access.direct_users] count = {d}\n", .{cfg.direct_users.count()});
+    ui.writeRaw("\n# Complete scalar settings (internal field names; credentials redacted)\n");
+    printResolvedFields(ui, "", cfg);
+}
+
+fn printResolvedFields(ui: *Tui, comptime prefix: []const u8, value: anytype) void {
+    @setEvalBranchQuota(20_000);
+    inline for (std.meta.fields(@TypeOf(value))) |field| {
+        const name = prefix ++ field.name;
+        const v = @field(value, field.name);
+        if (comptime std.mem.indexOf(u8, name, "password") != null or std.mem.indexOf(u8, name, "secret") != null) {
+            ui.print("# {s} = <redacted>\n", .{name});
+        } else switch (@typeInfo(field.type)) {
+            .bool, .int, .float => ui.print("# {s} = {any}\n", .{ name, v }),
+            .@"enum" => ui.print("# {s} = {s}\n", .{ name, @tagName(v) }),
+            .pointer => |ptr| if (comptime ptr.size == .slice and ptr.child == u8) {
+                ui.print("# {s} = {s}\n", .{ name, v });
+            } else if (comptime ptr.size == .slice and ptr.child == []const u8) {
+                ui.print("# {s} = [", .{name});
+                for (v, 0..) |item, index| {
+                    if (index != 0) ui.writeRaw(", ");
+                    ui.print("{s}", .{item});
+                }
+                ui.writeRaw("]\n");
+            },
+            .optional => |opt| {
+                if (v) |present| {
+                    if (comptime opt.child == []const u8 or opt.child == []u8) {
+                        ui.print("# {s} = {s}\n", .{ name, present });
+                    } else switch (@typeInfo(opt.child)) {
+                        .int, .bool, .array => ui.print("# {s} = {any}\n", .{ name, present }),
+                        else => {},
+                    }
+                } else ui.print("# {s} = <unset>\n", .{name});
+            },
+            .@"struct" => if (comptime std.mem.eql(u8, field.name, "web") or std.mem.eql(u8, field.name, "metrics") or std.mem.eql(u8, field.name, "drs")) {
+                printResolvedFields(ui, name ++ ".", v);
+            },
+            else => {},
+        }
+    }
 }
 
 fn isLoopbackHost(host: []const u8) bool {

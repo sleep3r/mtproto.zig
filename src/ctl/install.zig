@@ -18,6 +18,7 @@ const masking = @import("masking.zig");
 const nfqws = @import("nfqws.zig");
 const fronting_domain = @import("fronting_domain.zig");
 const web = @import("web.zig");
+const update = @import("update.zig");
 const web_capability = @import("web_capability");
 
 const Tui = tui_mod.Tui;
@@ -48,7 +49,7 @@ pub const InstallOpts = struct {
     enable_masking: bool = true,
     enable_nfqws: bool = true,
     enable_ipv6_hop: bool = false,
-    enable_desync: bool = true,
+    enable_desync: bool = false,
     enable_drs: bool = false,
     /// Enable MiddleProxy (Telegram relay). Required for promo tags and
     /// non-Premium media loading.
@@ -168,7 +169,8 @@ pub fn printInstallHelp(ui: *Tui) void {
     ui.writeRaw("    --port, -p <port>          Listen port (default: 443)\n");
     ui.writeRaw("    --public-port <port>       Port shown in client links\n");
     ui.writeRaw("    --domain, -d <domain>      FakeTLS masking domain (default: rutube.ru)\n");
-    ui.writeRaw("    --secret, -s <32-hex>      Initial user secret for a new config\n");
+    ui.writeRaw("    --secret-file <path>      Read initial secret from a protected file (recommended)\n");
+    ui.writeRaw("    --secret, -s <32-hex>      Initial secret; visible in process arguments/history\n");
     ui.writeRaw("    --user, -u <name>          Initial user name for a new config\n");
     ui.writeRaw("    --config, -c <path>        Install using an existing config.toml\n");
     ui.writeRaw("    --max-connections <N>      Max concurrent client connections (default: 512)\n");
@@ -321,6 +323,15 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             if (args.next()) |val| opts.config_path = val;
         } else if (std.mem.eql(u8, arg, "--max-connections")) {
             if (args.next()) |val| opts.max_connections = std.fmt.parseInt(u32, val, 10) catch 512;
+        } else if (std.mem.eql(u8, arg, "--secret-file")) {
+            const path = args.next() orelse return error.MissingSecretFile;
+            const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(256));
+            defer allocator.free(data);
+            const secret = std.mem.trim(u8, data, " \r\n\t");
+            if (!isValidSecretHex(secret)) return error.InvalidSecret;
+            var sec: [32]u8 = undefined;
+            @memcpy(&sec, secret);
+            opts.secret = sec;
         } else if (std.mem.eql(u8, arg, "--secret") or std.mem.eql(u8, arg, "-s")) {
             if (args.next()) |val| {
                 if (isValidSecretHex(val)) {
@@ -369,6 +380,9 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.version = args.next();
         } else if (std.mem.eql(u8, arg, "--insecure")) {
             opts.insecure = true;
+        } else {
+            ui.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
 
@@ -501,7 +515,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         opts.enable_tcpmss = true;
         opts.enable_masking = true;
         opts.enable_nfqws = true;
-        opts.enable_desync = true;
+        opts.enable_desync = false;
         opts.enable_drs = false;
         opts.enable_ipv6_hop = false;
     } else {
@@ -524,7 +538,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
                 ui.str(.install_dpi_drs_help),
                 ui.str(.install_dpi_ipv6_help),
             },
-            &.{ true, true, true, true, false, false },
+            &.{ true, true, true, false, false, false },
         );
 
         opts.enable_tcpmss = (dpi_result & 1) != 0;
@@ -597,11 +611,43 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 }
 
 /// Execute the installation steps.
-fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
+fn execute(ui: *Tui, allocator: std.mem.Allocator, requested_opts: InstallOpts) !void {
+    var opts = requested_opts;
     // ── Check root ──
     if (!sys.isRoot()) {
         ui.fail(ui.str(.error_not_root));
         return;
+    }
+
+    // A repeated install preserves the deployed identity, including its early QR.
+    const existing_path = opts.config_path orelse INSTALL_DIR ++ "/config.toml";
+    var existing_domain: ?[]u8 = null;
+    defer if (existing_domain) |domain| allocator.free(domain);
+    if (sys.fileExists(existing_path)) {
+        var existing = try toml.TomlDoc.load(allocator, existing_path);
+        defer existing.deinit();
+        if (existing.get("censorship", "tls_domain")) |domain| {
+            if (opts.domain_provided and !std.mem.eql(u8, domain, opts.tls_domain)) {
+                ui.fail("Existing tls_domain differs from --domain; install preserves existing client links");
+                return error.ConfigIdentityConflict;
+            }
+            existing_domain = try allocator.dupe(u8, domain);
+            opts.tls_domain = existing_domain.?;
+        }
+        if (existing.get("server", "port")) |value| {
+            const port = try std.fmt.parseInt(u16, value, 10);
+            if (opts.port_provided and opts.port != port) return error.ConfigIdentityConflict;
+            opts.port = port;
+        }
+        if (existing.get("server", "public_port")) |value| {
+            if (!opts.public_port_provided) opts.public_port = try std.fmt.parseInt(u16, value, 10);
+        }
+        if (existing.get("censorship", "mask_port")) |value| {
+            if (std.mem.eql(u8, value, "443")) {
+                ui.info("Preserving existing port-443 masking; local masking setup skipped");
+                opts.enable_masking = false;
+            }
+        }
     }
 
     // Warn NOW (before the link — which embeds tls_domain — is generated and frozen)
@@ -629,6 +675,15 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     if (insecure_mode) {
         ui.warn("INSECURE mode enabled: release signature verification is disabled.");
     }
+
+    var completed = false;
+    defer if (!completed) {
+        ui.warn("Installation did not complete; partial state may remain. Existing files were not rolled back.");
+        for ([_][]const u8{ INSTALL_DIR, INSTALL_DIR ++ "/config.toml", release.SERVICE_FILE }) |path| {
+            if (sys.fileExists(path)) ui.print("  Present: {s}\n", .{path});
+        }
+        ui.warn("Inspect the paths above before retrying; for a fresh installation use mtbuddy uninstall --yes to remove managed state.");
+    };
 
     ui.writeRaw("\n");
     ui.rule();
@@ -740,7 +795,21 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
             ui.fail("Installing the mtproto-proxy binary failed (disk full / read-only " ++ INSTALL_DIR ++ "?)");
             return;
         }
-        release.writeServiceFile();
+        // Same guard `mtbuddy update` applies (update.zig): `setup tunnel` replaces this
+        // unit with one carrying AmbientCapabilities=…CAP_NET_ADMIN and
+        // ExecStartPre=+/usr/local/bin/setup_tunnel.sh. Stamping the stock unit over it
+        // leaves `[upstream] type = tunnel` in config.toml while the proxy can no longer
+        // SO_MARK its DC sockets — every upstream connect then fails EPERM on a service
+        // that still binds :443 and looks perfectly active.
+        if (update.isTunnelServiceUnit()) {
+            ui.info(localized(
+                ui,
+                "Keeping the existing tunnel-aware systemd unit (it carries CAP_NET_ADMIN). Use `mtbuddy update --force-service` to reset it.",
+                "Оставляю существующий systemd-юнит для туннеля (в нём CAP_NET_ADMIN). Чтобы перезаписать его, выполните `mtbuddy update --force-service`.",
+            ));
+        } else {
+            try release.writeServiceFile();
+        }
     }
     ui.ok(ui.str(.install_binary_ok));
 
@@ -833,7 +902,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     // ── Create system user/group ──
     if (!ensureServiceUser(ui, allocator)) return;
-    if (!runRequired(ui, allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }, "Failed to chown install directory")) return;
+    if (!runRequired(ui, allocator, &.{ "chown", "root:root", INSTALL_DIR }, "Failed to secure install directory")) return;
+    if (!runRequired(ui, allocator, &.{ "chown", "mtproto:mtproto", INSTALL_DIR ++ "/config.toml" }, "Failed to chown config")) return;
 
     // ── Systemd service ──
     {
@@ -872,8 +942,26 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     if (sys.commandExists("ufw")) {
         var port_str_buf: [8]u8 = undefined;
         const port_rule = std.fmt.bufPrint(&port_str_buf, "{d}/tcp", .{opts.port}) catch "443/tcp";
-        _ = sys.exec(allocator, &.{ "ufw", "allow", port_rule }) catch {};
-        ui.ok(ui.str(.install_firewall_ok));
+        // ufw lives in /usr/sbin. `commandExists` shells out and so sees dash's own default
+        // PATH, but the spawn does not — resolve the absolute path the way web.zig does.
+        // And report what actually happened: on a ufw-enabled default-deny host a swallowed
+        // failure here means every client SYN is dropped while the installer prints success
+        // and a working-looking link.
+        const ufw = sys.commandOrPath("ufw", &.{ "/usr/sbin/ufw", "/sbin/ufw" });
+        const ufw_result = sys.exec(allocator, &.{ ufw, "allow", port_rule }) catch null;
+        const ufw_ok = if (ufw_result) |r| blk: {
+            defer r.deinit();
+            break :blk r.exit_code == 0;
+        } else false;
+        if (ufw_ok) {
+            ui.ok(ui.str(.install_firewall_ok));
+        } else {
+            ui.warn(localized(
+                ui,
+                "Could not add the ufw rule for the proxy port — open it by hand (`ufw allow <port>/tcp`) or clients will be blocked.",
+                "Не удалось добавить правило ufw для порта прокси — откройте его вручную (`ufw allow <порт>/tcp`), иначе клиенты не подключатся.",
+            ));
+        }
     }
 
     // ── TCPMSS clamping ──
@@ -912,7 +1000,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
 
     // ── Masking (via Zig module) ──
     if (opts.enable_masking) {
-        masking.execute(ui, allocator, .{ .tls_domain = opts.tls_domain }) catch {
+        masking.execute(ui, allocator, .{ .tls_domain = opts.tls_domain, .domain_explicit = opts.domain_provided, .local_backend = true }) catch {
             ui.warn("Masking setup failed");
         };
         // Source of truth is the config (mask=true), not a local nginx site: the
@@ -951,7 +1039,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     }
 
     // ── Final restart ──
-    if (!runRequired(ui, allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }, "Failed to chown install directory")) return;
+    if (!runRequired(ui, allocator, &.{ "chown", "root:root", INSTALL_DIR }, "Failed to secure install directory")) return;
     if (!runRequired(ui, allocator, &.{ "systemctl", "restart", SERVICE_NAME }, "Failed to restart mtproto-proxy after setup")) return;
     if (!sys.isServiceActive(SERVICE_NAME)) {
         ui.fail("mtproto-proxy service is not active after setup");
@@ -962,6 +1050,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     ui.rule();
 
     // ── Print summary ──
+    completed = true;
     // The public server was already resolved once (resolved_server: configured
     // [server].public_ip preferred, else auto-detected) and reused here, so the
     // early link/QR and the summary agree and detection runs only once. The
@@ -1034,7 +1123,9 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: InstallOpts) !void {
     );
 }
 
-fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) []const u8 {
+fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: []u8) ![]const u8 {
+    if (ee_buf.len < 34) return error.NoSpaceLeft;
+    if (tls_domain.len == 0 or tls_domain.len > 253) return error.InvalidDomain;
     var ee_pos: usize = 0;
 
     @memcpy(ee_buf[0..2], "ee");
@@ -1045,15 +1136,13 @@ fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) [
         clean_secret = clean_secret[1 .. clean_secret.len - 1];
     }
 
-    const sec_len = @min(clean_secret.len, ee_buf.len - ee_pos);
+    if (clean_secret.len != 32) return error.InvalidSecret;
+    const sec_len = clean_secret.len;
     @memcpy(ee_buf[ee_pos..][0..sec_len], clean_secret[0..sec_len]);
     ee_pos += sec_len;
 
-    var domain_hex_buf: [512]u8 = undefined;
-    const domain_hex = sys.domainToHex(tls_domain, &domain_hex_buf);
-    const dh_len = @min(domain_hex.len, ee_buf.len - ee_pos);
-    @memcpy(ee_buf[ee_pos..][0..dh_len], domain_hex[0..dh_len]);
-    ee_pos += dh_len;
+    const domain_hex = try sys.domainToHex(tls_domain, ee_buf[ee_pos..]);
+    ee_pos += domain_hex.len;
 
     return ee_buf[0..ee_pos];
 }
@@ -1135,7 +1224,7 @@ fn encodeServerForProxyLink(server: []const u8, out: []u8) []const u8 {
 /// the link straight from an SSH session onto a phone — or show it to a relative.
 fn printQrCode(ui: *Tui, allocator: std.mem.Allocator, text: []const u8) void {
     if (!sys.commandExists("qrencode")) return;
-    const r = sys.exec(allocator, &.{ "qrencode", "-t", "UTF8", "-m", "1", text }) catch return;
+    const r = sys.execInput(allocator, &.{ "qrencode", "-t", "UTF8", "-m", "1", "-o", "-" }, text) catch return;
     defer r.deinit();
     if (r.stdout.len == 0) return;
     ui.writeRaw("\n");
@@ -1245,13 +1334,16 @@ fn printLinksFromConfig(
         }
         if (!isValidSecretHex(secret_hex)) continue;
 
-        var ee_buf: [512]u8 = undefined;
-        const ee_secret = buildEeSecret(secret_hex, tls_domain, &ee_buf);
+        var ee_buf: [576]u8 = undefined;
+        const ee_secret = buildEeSecret(secret_hex, tls_domain, &ee_buf) catch {
+            ui.warn("Cannot encode FakeTLS link: invalid or oversized secret/domain.");
+            continue;
+        };
 
         var encoded_ip_buf: [768]u8 = undefined;
         const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
 
-        var ee_link_buf: [512]u8 = undefined;
+        var ee_link_buf: [2048]u8 = undefined;
         const ee_link = std.fmt.bufPrint(&ee_link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
             port,
@@ -1260,7 +1352,7 @@ fn printLinksFromConfig(
         // The t.me link is the one to SHARE — it renders a tappable "Connect proxy"
         // card in Telegram and opens from any browser/messenger; tg:// is the direct
         // app link.
-        var tme_link_buf: [512]u8 = undefined;
+        var tme_link_buf: [2048]u8 = undefined;
         const tme_link = std.fmt.bufPrint(&tme_link_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
             port,
@@ -1407,20 +1499,23 @@ fn printSummary(
         // secure TLS-only posture (fake_tls_only = true), so only the FakeTLS
         // (ee) link is printed here. dd links are surfaced by printLinksFromConfig
         // only when the operator has explicitly enabled the dd transport.
-        var ee_buf: [512]u8 = undefined;
-        const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf);
+        var ee_buf: [576]u8 = undefined;
+        const ee_secret = buildEeSecret(secret, tls_domain, &ee_buf) catch {
+            ui.warn("Cannot encode FakeTLS link: invalid or oversized secret/domain.");
+            return;
+        };
 
         var encoded_ip_buf: [768]u8 = undefined;
         const safe_public_ip = encodeServerForProxyLink(public_ip, &encoded_ip_buf);
 
-        var ee_link_buf: [512]u8 = undefined;
+        var ee_link_buf: [2048]u8 = undefined;
         const ee_link = std.fmt.bufPrint(&ee_link_buf, "tg://proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
             public_port,
             ee_secret,
         }) catch "error building link";
 
-        var tme_link_buf: [512]u8 = undefined;
+        var tme_link_buf: [2048]u8 = undefined;
         const tme_link = std.fmt.bufPrint(&tme_link_buf, "https://t.me/proxy?server={s}&port={d}&secret={s}", .{
             safe_public_ip,
             public_port,
@@ -1478,9 +1573,13 @@ fn resolvePublicServer(ui: *Tui, allocator: std.mem.Allocator, config_path: []co
     } else |_| {}
     var ip_sp = ui.spinner("Detecting public IP");
     ip_sp.start();
-    const ip = sys.detectPublicIp(allocator) orelse "SERVER_IP";
+    const detected = sys.detectPublicIp(allocator);
+    defer if (detected) |owned| allocator.free(owned);
+    const ip = detected orelse "SERVER_IP";
     ip_sp.stop(true, ip);
-    return ip;
+    const n = @min(ip.len, out_buf.len);
+    @memcpy(out_buf[0..n], ip[0..n]);
+    return out_buf[0..n];
 }
 
 pub fn ensureServiceUser(ui: *Tui, allocator: std.mem.Allocator) bool {
@@ -1742,10 +1841,10 @@ fn removeTcpmssClamp(allocator: std.mem.Allocator) void {
 
 fn tcpmssRuleExists(allocator: std.mem.Allocator, cmd: []const u8, port_str: []const u8, mss_str: []const u8) bool {
     const result = sys.exec(allocator, &.{
-        cmd,       "-t",      "mangle",  "-C",     "OUTPUT",
-        "-p",      "tcp",     "--sport", port_str, "--tcp-flags",
-        "SYN,ACK", "SYN,ACK", "-j",      "TCPMSS", "--set-mss",
-        mss_str,
+        cmd,       "-t",     "mangle",      "-C",      "OUTPUT",
+        "!",       "-o",     "lo",          "-p",      "tcp",
+        "--sport", port_str, "--tcp-flags", "SYN,ACK", "SYN,ACK",
+        "-j",      "TCPMSS", "--set-mss",   mss_str,
     }) catch return false;
     defer result.deinit();
     return result.exit_code == 0;

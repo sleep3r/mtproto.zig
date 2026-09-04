@@ -60,7 +60,7 @@ pub fn sameHost(a: Address, b: Address) bool {
             .ip6 => false,
         },
         .ip6 => |x| switch (nb) {
-            .ip6 => |y| std.mem.eql(u8, &x.bytes, &y.bytes),
+            .ip6 => |y| std.mem.eql(u8, &x.bytes, &y.bytes) and x.interface.index == y.interface.index,
             .ip4 => false,
         },
     };

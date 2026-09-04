@@ -257,6 +257,8 @@ fn installTerminalSignalHandlers() void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
     std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.QUIT, &act, null);
 }
 
 pub const Tui = struct {
@@ -392,8 +394,13 @@ pub const Tui = struct {
     /// Write formatted output to stdout.
     pub fn print(self: *Self, comptime fmt: []const u8, args: anytype) void {
         var buf: [8192]u8 = undefined;
-        const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        self.writeRaw(slice);
+        var writer: std.Io.Writer = .fixed(&buf);
+        writer.print(fmt, args) catch {
+            self.writeRaw(writer.buffered());
+            self.writeRaw("… [output truncated]\n");
+            return;
+        };
+        self.writeRaw(writer.buffered());
     }
 
     // ── Localized helpers ──────────────────────────────────────────────────
@@ -499,6 +506,7 @@ pub const Tui = struct {
 
     /// Show a numbered menu, return the 0-based index of the selected item.
     pub fn menu(self: *Self, title: []const u8, items: []const []const u8) !usize {
+        if (items.len == 0) return error.EmptyMenu;
         self.print("\n  {s}╭─ {s}{s}{s}\n", .{ Color.gray, Color.bold, title, Color.reset });
         self.print("  {s}│{s}\n", .{ Color.gray, Color.reset });
 
@@ -644,13 +652,15 @@ pub const Tui = struct {
 
         if (trimmed.len == 0) {
             if (default) |d| {
+                if (d.len > buf.len) return error.InputTooLong;
                 @memcpy(buf[0..d.len], d);
                 return buf[0..d.len];
             }
             return error.InputError;
         }
 
-        const len = @min(trimmed.len, buf.len);
+        if (trimmed.len > buf.len) return error.InputTooLong;
+        const len = trimmed.len;
         @memcpy(buf[0..len], trimmed[0..len]);
         return buf[0..len];
     }
@@ -665,6 +675,8 @@ pub const Tui = struct {
         helps: []const []const u8,
         defaults: []const bool,
     ) !u32 {
+        if (items.len == 0 or items.len > 32 or defaults.len > items.len or helps.len != items.len)
+            return error.InvalidCheckboxItems;
         var state: u32 = 0;
         for (defaults, 0..) |d, idx| {
             if (d) state |= @as(u32, 1) << @intCast(idx);
@@ -787,7 +799,7 @@ pub const Tui = struct {
         const title_len = std.unicode.utf8CountCodepoints(title) catch title.len;
         const box_interior = 66;
         const title_pad = if (title_len + 1 < box_interior) box_interior - title_len - 1 else 0;
-        var title_pad_buf: [64]u8 = undefined;
+        var title_pad_buf: [66]u8 = undefined;
         @memset(title_pad_buf[0..title_pad], ' ');
 
         self.print("  {s}│{s} {s}{s}{s}{s}{s}│{s}\n", .{
@@ -979,6 +991,8 @@ pub const Tui = struct {
                 },
                 .enter => {
                     self.writeRaw("\n");
+                    // A pasted second line must not silently answer the next prompt.
+                    while (self.readByteTimeout(0) != null) {}
                     return self.line_buf[0..pos];
                 },
                 .char => {
@@ -1031,7 +1045,6 @@ pub const SummaryLine = struct {
 };
 
 test "visibleLen counts display columns: ASCII=1, emoji/CJK=2, combining/VS=0" {
-
     try std.testing.expectEqual(@as(usize, 5), visibleLen("hello"));
 
     // Emoji is double-width.
@@ -1049,6 +1062,10 @@ test "visibleLen counts display columns: ASCII=1, emoji/CJK=2, combining/VS=0" {
 }
 
 fn expectRawPromptInput(input: []const u8, expected: []const u8) !void {
+    return expectPromptInteraction(input, expected, .line);
+}
+
+fn expectPromptInteraction(input: []const u8, expected: []const u8, kind: enum { line, menu, checkboxes, default_too_long }) !void {
     const input_pipe = try std.Io.Threaded.pipe2(.{});
     defer std.Io.Threaded.closeFd(input_pipe[0]);
     defer std.Io.Threaded.closeFd(input_pipe[1]);
@@ -1073,8 +1090,33 @@ fn expectRawPromptInput(input: []const u8, expected: []const u8) !void {
         .lang = .en,
         .is_tty = true,
     };
-    const line = try ui.readLineOrBack();
-    try std.testing.expectEqualStrings(expected, line);
+    switch (kind) {
+        .line => try std.testing.expectEqualStrings(expected, try ui.readLineOrBack()),
+        .menu => try std.testing.expectEqual(@as(usize, 1), try ui.menu("Choose", &.{ "First", "Second" })),
+        .checkboxes => try std.testing.expectEqual(@as(u32, 1), try ui.checkboxes("Choose", &.{ "First", "Second" }, &.{ "", "" }, &.{ false, false })),
+        .default_too_long => {
+            var small: [2]u8 = undefined;
+            try std.testing.expectError(error.InputTooLong, ui.input("Value", null, "long", &small));
+        },
+    }
+}
+
+test "menu keyboard navigation selects second item" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // terminal width uses Linux ioctl.
+    try expectPromptInteraction("\x1b[B\n", "", .menu);
+}
+
+test "checkbox keyboard toggles selected item" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try expectPromptInteraction(" \n", "", .checkboxes);
+}
+
+test "prompt default does not truncate into the destination" {
+    try expectPromptInteraction("\n", "", .default_too_long);
+}
+
+test "raw prompt returns only the first line of a CRLF paste" {
+    try expectRawPromptInput("first\r\nsecond\n", "first");
 }
 
 test "raw prompt backspace can erase the first pasted byte" {

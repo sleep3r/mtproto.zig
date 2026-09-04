@@ -16,8 +16,8 @@
 //!
 //!  1. Because we know every configured user secret, we can recompute the capability
 //!     and learn *which user* is behind a bridge request without ever seeing the
-//!     MTProto stream. That gives per-user accounting and lets a disabled user be
-//!     refused at the HTTP layer.
+//!     MTProto stream. Disabled/expired-user enforcement remains in the authenticated
+//!     MTProto backend; capabilities are a startup snapshot, not live access policy.
 //!  2. A visitor who cannot present a capability derived from a real secret never sees
 //!     the bridge page at all — they get the ordinary cover site. An active prober
 //!     without a valid user secret cannot distinguish this host from a plain website.

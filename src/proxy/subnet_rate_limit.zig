@@ -21,7 +21,7 @@ pub const SubnetRateLimit = struct {
 
     pub const Entry = struct {
         used: bool = false,
-        subnet_key: u32 = 0,
+        subnet_key: u64 = 0,
         tokens: u8 = 0,
         last_refill_s: i64 = 0,
     };
@@ -35,7 +35,7 @@ pub const SubnetRateLimit = struct {
         };
     }
 
-    fn indexFor(self: *const SubnetRateLimit, key: u32) usize {
+    fn indexFor(self: *const SubnetRateLimit, key: u64) usize {
         var x = self.hash_seed ^ @as(u64, key);
         x +%= 0x9E3779B97F4A7C15;
         x ^= x >> 30;
@@ -46,7 +46,7 @@ pub const SubnetRateLimit = struct {
         return @as(usize, @intCast(x & (BUCKETS - 1)));
     }
 
-    pub fn findEntry(self: *SubnetRateLimit, key: u32) ?*Entry {
+    pub fn findEntry(self: *SubnetRateLimit, key: u64) ?*Entry {
         const start = self.indexFor(key);
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
@@ -109,7 +109,7 @@ pub const SubnetRateLimit = struct {
         return true;
     }
 
-    pub fn subnetKey(addr: Address) u32 {
+    pub fn subnetKey(addr: Address) u64 {
         return switch (addr) {
             .ip4 => |ip4_addr| @as(u32, ip4_addr.bytes[0]) << 16 |
                 @as(u32, ip4_addr.bytes[1]) << 8 |
@@ -125,11 +125,13 @@ pub const SubnetRateLimit = struct {
                         @as(u32, ip6_bytes[14]);
                 }
 
-                break :blk @as(u32, ip6_bytes[0]) << 24 |
-                    @as(u32, ip6_bytes[1]) << 16 |
-                    @as(u32, ip6_bytes[2]) << 8 |
-                    @as(u32, ip6_bytes[3]) ^
-                    (@as(u32, ip6_bytes[4]) << 8 | @as(u32, ip6_bytes[5]));
+                // Preserve the full /48 identity and separate address families.
+                break :blk (@as(u64, 1) << 48) |
+                    (@as(u64, ip6_bytes[0]) << 40) |
+                    (@as(u64, ip6_bytes[1]) << 32) |
+                    (@as(u64, ip6_bytes[2]) << 24) |
+                    (@as(u64, ip6_bytes[3]) << 16) |
+                    (@as(u64, ip6_bytes[4]) << 8) | ip6_bytes[5];
             },
         };
     }
@@ -137,6 +139,13 @@ pub const SubnetRateLimit = struct {
 
 fn ip4(bytes: [4]u8, port: u16) Address {
     return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+test "IPv6 subnet identities preserve all 48 bits and family" {
+    const a = try Address.parse("2001:db8:1::1", 0);
+    const b = try Address.parse("2001:db9::1", 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(a) != SubnetRateLimit.subnetKey(b));
+    try std.testing.expect(SubnetRateLimit.subnetKey(try Address.parse("::1", 0)) != SubnetRateLimit.subnetKey(ip4(.{ 0, 0, 0, 1 }, 0)));
 }
 
 fn ip6(bytes: [16]u8, port: u16, flow: u32, scope_id: u32) Address {

@@ -38,6 +38,9 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             if (args.next()) |val| opts.ttl = val;
         } else if (std.mem.eql(u8, arg, "--remove") or std.mem.eql(u8, arg, "--uninstall")) {
             opts.remove = true;
+        } else {
+            ui.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
     try execute(ui, allocator, opts);
@@ -79,9 +82,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
         if (doc) |*d| {
             defer d.deinit();
             const raw = d.get("server", "port") orelse "443";
-            const n = @min(raw.len, port_buf.len);
-            @memcpy(port_buf[0..n], raw[0..n]);
-            port = port_buf[0..n];
+            const number = try parsePort(raw);
+            port = try std.fmt.bufPrint(&port_buf, "{d}", .{number});
         }
     }
 
@@ -140,59 +142,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 
     const ipt = iptablesCommands();
 
-    // ── Clone and build zapret ──
-    if (sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws")) {
-        ui.ok("nfqws already built");
-    } else {
-        const cc = chooseWorkingCCompiler(ui, allocator) orelse return;
-
-        // Clone the newest release tag (falls back to a known-good one offline) so
-        // the bypass engine stays current with DPI changes, while avoiding raw HEAD.
-        var tag_buf: [64]u8 = undefined;
-        var sha_buf: [64]u8 = undefined;
-        const ref = resolveLatestZapretTag(allocator, &tag_buf, &sha_buf);
-        const tag = if (ref) |rf| rf.tag else ZAPRET_FALLBACK_TAG;
-
-        var step_buf: [96]u8 = undefined;
-        ui.step(std.fmt.bufPrint(&step_buf, "Cloning and building zapret ({s})...", .{tag}) catch "Cloning and building zapret...");
-        _ = sys.exec(allocator, &.{ "rm", "-rf", ZAPRET_DIR }) catch {};
-        if (!runLogged(ui, allocator, &.{
-            "git", "clone", "--branch", tag, "--depth", "1", "https://github.com/bol-van/zapret.git", ZAPRET_DIR,
-        }, "Failed to clone zapret")) return;
-
-        // When we resolved the tag from the remote, verify the clone landed on the
-        // exact commit that remote advertised for it (guards against the clone
-        // returning a different commit than ls-remote saw). Built+run root-side, so
-        // refuse to build on mismatch. The offline fallback path has no SHA to check.
-        if (ref) |rf| {
-            const rev = sys.exec(allocator, &.{ "git", "-C", ZAPRET_DIR, "rev-parse", "HEAD" }) catch null;
-            if (rev) |rv| {
-                defer rv.deinit();
-                const got = std.mem.trim(u8, rv.stdout, " \t\r\n");
-                if (!std.mem.eql(u8, got, rf.sha)) {
-                    ui.fail("zapret clone commit does not match the resolved release tag — refusing to build");
-                    return;
-                }
-            }
-        }
-
-        _ = sys.exec(allocator, &.{ "bash", "-c", "cd " ++ ZAPRET_DIR ++ "/nfq && make clean" }) catch {};
-        var make_cmd_buf: [128]u8 = undefined;
-        const make_cmd = std.fmt.bufPrint(
-            &make_cmd_buf,
-            "cd " ++ ZAPRET_DIR ++ "/nfq && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin make CC={s}",
-            .{cc},
-        ) catch "cd " ++ ZAPRET_DIR ++ "/nfq && make";
-        if (!runLogged(ui, allocator, &.{
-            "bash", "-c", make_cmd,
-        }, "nfqws build failed")) return;
-
-        if (!sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws")) {
-            ui.fail("nfqws build finished but /opt/zapret/nfq/nfqws was not created");
-            return;
-        }
-        ui.ok("nfqws built successfully");
-    }
+    if (!try ensureZapret(ui, allocator)) return;
 
     // ── Configure iptables NFQUEUE ──
     ui.step("Setting up NFQUEUE rules...");
@@ -208,28 +158,30 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     // there, so without this exclusion every relayed byte takes a userspace round trip
     // through nfqws and the relay's streams crawl.
     if (!runLogged(ui, allocator, &.{
-        ipt.iptables, "-t",          "mangle",    "-A",             "OUTPUT",
-        "!",          "-o",          "lo",
-        "-p",         "tcp",         "--sport",   port,             "-j",
-        "NFQUEUE",    "--queue-num", NFQUEUE_NUM, "--queue-bypass",
+        ipt.iptables, "-t",             "mangle", "-A",      "OUTPUT",
+        "!",          "-o",             "lo",     "-p",      "tcp",
+        "--sport",    port,             "-j",     "NFQUEUE", "--queue-num",
+        NFQUEUE_NUM,  "--queue-bypass",
     }, "Failed to apply IPv4 NFQUEUE rule")) return;
-    _ = sys.exec(allocator, &.{
-        ipt.ip6tables, "-t",          "mangle",    "-A",             "OUTPUT",
-        "!",           "-o",          "lo",
-        "-p",          "tcp",         "--sport",   port,             "-j",
-        "NFQUEUE",     "--queue-num", NFQUEUE_NUM, "--queue-bypass",
-    }) catch {};
+    if (!runLogged(ui, allocator, &.{
+        ipt.ip6tables, "-t",             "mangle", "-A",      "OUTPUT",
+        "!",           "-o",             "lo",     "-p",      "tcp",
+        "--sport",     port,             "-j",     "NFQUEUE", "--queue-num",
+        NFQUEUE_NUM,   "--queue-bypass",
+    }, "IPv6 NFQUEUE rule unavailable; IPv6 desync is not enabled")) ui.warn("IPv4 may work, but IPv6 protection needs repair.");
 
-    if (!outputRuleContains(allocator, ipt.iptables, "NFQUEUE")) {
+    if (!nfqueueRuleExists(allocator, ipt.iptables, port)) {
         ui.fail("IPv4 NFQUEUE rule was not installed");
         return;
     }
+    const ipv6_active = nfqueueRuleExists(allocator, ipt.ip6tables, port);
+    if (!ipv6_active) ui.warn("IPv6 NFQUEUE verification failed; do not assume IPv6 traffic is protected.");
 
     // NOTE: we intentionally do NOT `iptables-save > /etc/iptables/rules.v4` here. The
     // systemd unit's ExecStartPre re-adds the NFQUEUE rule on every boot, so persisting it
     // is redundant — and a full-firewall snapshot would clobber any operator-curated
     // rules.v4 and freeze transient chains (Docker, fail2ban) into the boot ruleset.
-    ui.ok("NFQUEUE rules applied (queue " ++ NFQUEUE_NUM ++ ")");
+    ui.ok(if (ipv6_active) "IPv4 and IPv6 NFQUEUE rules verified (queue " ++ NFQUEUE_NUM ++ ")" else "IPv4 NFQUEUE rule verified (IPv6 unavailable)");
 
     // ── Create systemd service ──
     ui.step("Creating systemd service...");
@@ -292,6 +244,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
     }
 
     // ── Summary ──
+    ui.hint("After changing [server].port, rerun: sudo mtbuddy setup nfqws (the unit records the current port).");
     ui.summaryBox("nfqws TCP Desync Configured", &.{
         .{ .label = "Binary:", .value = ZAPRET_DIR ++ "/nfq/nfqws" },
         .{ .label = "Service:", .value = SERVICE_NAME },
@@ -308,20 +261,75 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: NfqwsOpts) !void {
 const IptablesCommands = struct {
     iptables: []const u8,
     ip6tables: []const u8,
-    iptables_save: []const u8,
-    ip6tables_save: []const u8,
 };
 
 fn iptablesCommands() IptablesCommands {
     return .{
         .iptables = sys.commandOrPath("iptables", &.{ "/usr/sbin/iptables", "/sbin/iptables" }),
         .ip6tables = sys.commandOrPath("ip6tables", &.{ "/usr/sbin/ip6tables", "/sbin/ip6tables" }),
-        .iptables_save = sys.commandOrPath("iptables-save", &.{ "/usr/sbin/iptables-save", "/sbin/iptables-save" }),
-        .ip6tables_save = sys.commandOrPath("ip6tables-save", &.{ "/usr/sbin/ip6tables-save", "/sbin/ip6tables-save" }),
     };
 }
 
 const ZapretRef = struct { tag: []const u8, sha: []const u8 };
+
+fn parsePort(raw: []const u8) !u16 {
+    if (raw.len == 0) return error.InvalidPort;
+    for (raw) |c| if (!std.ascii.isDigit(c)) return error.InvalidPort;
+    const port = std.fmt.parseInt(u16, raw, 10) catch return error.InvalidPort;
+    if (port == 0) return error.InvalidPort;
+    return port;
+}
+
+test "nfqws port validation rejects truncation and command tokens" {
+    try std.testing.expectEqual(@as(u16, 443), try parsePort("00443"));
+    for ([_][]const u8{ "", "0", "65536", "443 --jump ACCEPT", "12345678901234567890", "+443" }) |text| try std.testing.expectError(error.InvalidPort, parsePort(text));
+}
+
+fn ensureZapret(ui: *Tui, allocator: std.mem.Allocator) !bool {
+    var tag_buf: [64]u8 = undefined;
+    var sha_buf: [64]u8 = undefined;
+    const ref = resolveLatestZapretTag(allocator, &tag_buf, &sha_buf);
+    const installed = sys.fileExists(ZAPRET_DIR ++ "/nfq/nfqws");
+    if (installed and ref == null) {
+        ui.warn("Could not resolve the current zapret release; keeping the installed binary.");
+        return true;
+    }
+    const tag = if (ref) |r| r.tag else ZAPRET_FALLBACK_TAG;
+    const version = if (ref) |r| r.sha else tag;
+    const previous = sys.readFileAllocAbsolute(allocator, ZAPRET_DIR ++ "/nfq/nfqws.version", 128);
+    defer if (previous) |v| allocator.free(v);
+    if (installed and previous != null and std.mem.eql(u8, std.mem.trim(u8, previous.?, " \r\n"), version)) return true;
+
+    const cc = chooseWorkingCCompiler(ui, allocator) orelse return false;
+    const temporary = try sys.exec(allocator, &.{ "mktemp", "-d", "/opt/zapret-build.XXXXXXXX" });
+    defer temporary.deinit();
+    if (temporary.exit_code != 0) return error.StagingDirectoryFailed;
+    const stage = std.mem.trim(u8, temporary.stdout, " \r\n");
+    if (!std.mem.startsWith(u8, stage, "/opt/zapret-build.") or std.mem.indexOfScalar(u8, stage[18..], '/') != null) return error.InvalidStagingDirectory;
+    defer sys.execSilent(allocator, &.{ "rm", "-rf", "--", stage });
+    if (!runLogged(ui, allocator, &.{ "git", "clone", "--branch", tag, "--depth", "1", "https://github.com/bol-van/zapret.git", stage }, "Failed to clone zapret release")) return false;
+    if (ref) |r| {
+        // Compare tag objects, not HEAD: annotated tag objects have their own SHA.
+        const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}", .{tag});
+        defer allocator.free(tag_ref);
+        const rev = try sys.exec(allocator, &.{ "git", "-C", stage, "rev-parse", tag_ref });
+        defer rev.deinit();
+        if (rev.exit_code != 0 or !std.mem.eql(u8, std.mem.trim(u8, rev.stdout, " \r\n"), r.sha)) return error.ReleaseTagMismatch;
+    }
+    const source = try std.fmt.allocPrint(allocator, "{s}/nfq", .{stage});
+    defer allocator.free(source);
+    const compiler = try std.fmt.allocPrint(allocator, "CC={s}", .{cc});
+    defer allocator.free(compiler);
+    if (!runLogged(ui, allocator, &.{ "make", "-C", source, compiler }, "nfqws build failed; installed binary retained")) return false;
+    const binary = try std.fmt.allocPrint(allocator, "{s}/nfqws", .{source});
+    defer allocator.free(binary);
+    if (!runLogged(ui, allocator, &.{ "mkdir", "-p", ZAPRET_DIR ++ "/nfq" }, "Could not create nfqws install directory")) return false;
+    if (!runLogged(ui, allocator, &.{ "install", "-m", "755", binary, ZAPRET_DIR ++ "/nfq/nfqws.new" }, "Could not stage nfqws binary")) return false;
+    try std.Io.Dir.renameAbsolute(ZAPRET_DIR ++ "/nfq/nfqws.new", ZAPRET_DIR ++ "/nfq/nfqws", std.Io.Threaded.global_single_threaded.io());
+    try sys.writeFile(ZAPRET_DIR ++ "/nfq/nfqws.version", version);
+    ui.ok("nfqws release built and installed atomically");
+    return true;
+}
 
 /// Resolve the newest zapret release tag (highest vX.Y) AND the commit it points
 /// to, from the remote without the GitHub API (works wherever `git clone` does).
@@ -450,11 +458,10 @@ fn removeNfqwsRules(allocator: std.mem.Allocator, ipt: []const u8) void {
     _ = sys.exec(allocator, &.{ "bash", "-c", cmd }) catch {};
 }
 
-fn outputRuleContains(allocator: std.mem.Allocator, ipt: []const u8, needle: []const u8) bool {
-    const result = sys.exec(allocator, &.{ ipt, "-t", "mangle", "-S", "OUTPUT" }) catch return false;
+fn nfqueueRuleExists(allocator: std.mem.Allocator, ipt: []const u8, port: []const u8) bool {
+    const result = sys.exec(allocator, &.{ ipt, "-t", "mangle", "-C", "OUTPUT", "!", "-o", "lo", "-p", "tcp", "--sport", port, "-j", "NFQUEUE", "--queue-num", NFQUEUE_NUM, "--queue-bypass" }) catch return false;
     defer result.deinit();
-    if (result.exit_code != 0) return false;
-    return std.mem.indexOf(u8, result.stdout, needle) != null;
+    return result.exit_code == 0;
 }
 
 fn runLogged(ui: *Tui, allocator: std.mem.Allocator, argv: []const []const u8, failure_msg: []const u8) bool {

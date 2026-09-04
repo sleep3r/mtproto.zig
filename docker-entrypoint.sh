@@ -12,6 +12,7 @@ set -e
 CONFIG="${1:-/etc/mtproto-proxy/config.toml}"
 
 if [ ! -f "$CONFIG" ]; then
+    echo "mtproto-proxy: keep a named /etc/mtproto-proxy volume to preserve generated secrets across container recreation." >&2
     SECRET="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     mkdir -p "$(dirname "$CONFIG")"
     cat > "$CONFIG" <<EOF
