@@ -51,19 +51,18 @@ pub const ObfuscationParams = struct {
 
             const decrypt_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
 
-            // Decrypt the handshake to check proto tag
-            var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
+            // Only bytes 56..61 are inspected: they use the fourth counter block.
+            var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv +% 3);
             defer decryptor.wipe();
-            var decrypted: [constants.handshake_len]u8 = undefined;
-            @memcpy(&decrypted, handshake);
+            var decrypted: [16]u8 = handshake[48..64].*;
             decryptor.apply(&decrypted);
 
             // Check proto tag at offset 56
-            const tag_bytes: [4]u8 = decrypted[constants.proto_tag_pos..][0..4].*;
+            const tag_bytes: [4]u8 = decrypted[constants.proto_tag_pos - 48 ..][0..4].*;
             const proto_tag = constants.ProtoTag.fromBytes(tag_bytes) orelse continue;
 
             // Extract DC index at offset 60
-            const dc_idx = std.mem.readInt(i16, decrypted[constants.dc_idx_pos..][0..2], .little);
+            const dc_idx = std.mem.readInt(i16, decrypted[constants.dc_idx_pos - 48 ..][0..2], .little);
 
             // Derive encrypt key
             var enc_key_input: [constants.prekey_len + 16]u8 = undefined;

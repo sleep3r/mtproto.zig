@@ -7,6 +7,9 @@
 const std = @import("std");
 const tui_mod = @import("tui.zig");
 
+/// Set once by main before dispatch; tests may use the per-call fallback.
+pub var command_io: ?std.Io = null;
+
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -81,14 +84,29 @@ pub const Arch = enum {
     }
 };
 
+/// The environment this process was started with.
+///
+/// `std.Io.Threaded.InitOptions.environ` defaults to `.empty`, and an empty block makes
+/// `Threaded` skip its environment scan entirely: every child then got an EMPTY environment
+/// (no HOME, no LANG, no http(s)_proxy, no SSL_CERT_FILE) and argv[0] was resolved against
+/// the hardcoded `default_PATH` "/usr/local/bin:/bin/:/usr/bin". That is the real reason a
+/// bare `ufw`/`ip` from /usr/sbin came back FileNotFound while `commandExists` — which shells
+/// out and so gets dash's own compiled-in PATH — said the tool was there. `start.zig` records
+/// the real environment on this singleton before main() runs, so it is available without
+/// threading `std.process.Init` through every call site.
+fn processEnviron() std.process.Environ {
+    return std.Io.Threaded.global_single_threaded.environ.process_environ;
+}
+
 /// Run a command, capture stdout/stderr, return result.
 pub fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !ExecResult {
-    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = processEnviron() });
     defer io_instance.deinit();
 
-    const result = try std.process.run(allocator, io_instance.io(), .{
+    const result = try std.process.run(allocator, command_io orelse io_instance.io(), .{
         .argv = argv,
         .expand_arg0 = .expand,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(900), .clock = .awake } },
         .stdout_limit = std.Io.Limit.limited(1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(1024 * 1024),
     });
@@ -109,8 +127,54 @@ pub fn exec(allocator: std.mem.Allocator, argv: []const []const u8) !ExecResult 
 }
 
 /// Run a command with output forwarded directly to the terminal (no capture).
+/// Small stdin payloads stay off argv. Limit input to PIPE_BUF so writing it
+/// before collecting output cannot fill the pipe on our Linux runtime.
+pub fn execInput(allocator: std.mem.Allocator, argv: []const []const u8, input: []const u8) !ExecResult {
+    if (input.len > 4096) return error.InputTooLong;
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = processEnviron() });
+    defer io_instance.deinit();
+    const child_io = command_io orelse io_instance.io();
+    var child = try std.process.spawn(child_io, .{
+        .argv = argv,
+        .expand_arg0 = .expand,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(child_io);
+    try child.stdin.?.writeStreamingAll(child_io, input);
+    child.stdin.?.close(child_io);
+    child.stdin = null;
+    var buffers: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var reader: std.Io.File.MultiReader = undefined;
+    reader.init(allocator, child_io, buffers.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer reader.deinit();
+    while (reader.fill(256, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } })) |_| {
+        if (reader.reader(0).buffered().len > 1024 * 1024 or reader.reader(1).buffered().len > 1024 * 1024)
+            return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try reader.checkAnyError();
+    const term = try child.wait(child_io);
+    const stdout = try reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try reader.toOwnedSlice(1);
+    return .{
+        .allocator = allocator,
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = switch (term) {
+            .exited => |code| code,
+            else => 1,
+        },
+    };
+}
+
+/// Run a command with output forwarded directly to the terminal (no capture).
 pub fn execForward(argv: []const []const u8) !u8 {
-    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = processEnviron() });
     defer io_instance.deinit();
 
     const io_ctx = io_instance.io();
@@ -205,7 +269,7 @@ fn containsWord(haystack: []const u8, word: []const u8) bool {
             // Check word boundaries
             const before_ok = (i == 0) or (haystack[i - 1] == ' ' or haystack[i - 1] == '\t' or haystack[i - 1] == ':');
             const after_idx = i + word.len;
-            const after_ok = (after_idx >= haystack.len) or (haystack[after_idx] == ' ' or haystack[after_idx] == '\t' or haystack[after_idx] == '\n');
+            const after_ok = (after_idx >= haystack.len) or (haystack[after_idx] == ' ' or haystack[after_idx] == '\t' or haystack[after_idx] == '\n' or haystack[after_idx] == '\r');
             if (before_ok and after_ok) return true;
         }
         i += 1;
@@ -215,18 +279,19 @@ fn containsWord(haystack: []const u8, word: []const u8) bool {
 
 /// Check if a command exists on PATH.
 pub fn commandExists(name: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, name, '/') != null) return fileExists(name);
-
-    const shell = if (fileExists("/bin/sh")) "/bin/sh" else "sh";
-    const result = exec(std.heap.page_allocator, &.{
-        shell,
-        "-c",
-        "command -v \"$1\" >/dev/null 2>&1",
-        "sh",
-        name,
-    }) catch return false;
-    defer result.deinit();
-    return result.exit_code == 0;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        std.Io.Dir.cwd().access(io(), name, .{ .execute = true }) catch return false;
+        return true;
+    }
+    const path = processEnviron().getPosix("PATH") orelse "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    var directories = std.mem.splitScalar(u8, path, ':');
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    while (directories.next()) |directory| {
+        const candidate = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ if (directory.len == 0) "." else directory, name }) catch continue;
+        std.Io.Dir.cwd().access(io(), candidate, .{ .execute = true }) catch continue;
+        return true;
+    }
+    return false;
 }
 
 /// Resolve a command by known absolute-path fallbacks first, then PATH.
@@ -277,6 +342,9 @@ pub fn writeFileMode(path: []const u8, content: []const u8, mode: u9) !void {
             .permissions = std.Io.File.Permissions.fromMode(mode),
         },
     });
+    var file = try std.Io.Dir.cwd().openFile(io(), path, .{ .mode = .read_write });
+    defer file.close(io());
+    try file.setPermissions(io(), std.Io.File.Permissions.fromMode(mode));
 }
 
 /// Parse a simple KEY=VALUE .env file, return value for given key.
@@ -305,11 +373,8 @@ pub fn readEnvFile(allocator: std.mem.Allocator, path: []const u8, key: []const 
 /// Read a boolean-like env flag from the current process environment.
 /// Returns true for: 1, true, yes, on (case-insensitive).
 pub fn envFlagSet(name: []const u8) bool {
-    const result = exec(std.heap.page_allocator, &.{ "printenv", name }) catch return false;
-    defer result.deinit();
-    if (result.exit_code != 0) return false;
-
-    const trimmed = std.mem.trim(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    const value = processEnviron().getPosix(name) orelse return false;
+    const trimmed = std.mem.trim(u8, value, &[_]u8{ ' ', '\t', '\r', '\n' });
     return std.ascii.eqlIgnoreCase(trimmed, "1") or
         std.ascii.eqlIgnoreCase(trimmed, "true") or
         std.ascii.eqlIgnoreCase(trimmed, "yes") or
@@ -344,11 +409,11 @@ pub fn generateSecret(buf: *[32]u8) error{NoEntropy}!void {
 }
 
 /// Convert a domain string to hex encoding (for ee-secret).
-pub fn domainToHex(domain: []const u8, buf: []u8) []const u8 {
+pub fn domainToHex(domain: []const u8, buf: []u8) error{NoSpaceLeft}![]const u8 {
+    if (domain.len > buf.len / 2) return error.NoSpaceLeft;
     const hex = "0123456789abcdef";
     var pos: usize = 0;
     for (domain) |byte| {
-        if (pos + 2 > buf.len) break;
         buf[pos] = hex[byte >> 4];
         buf[pos + 1] = hex[byte & 0x0f];
         pos += 2;
@@ -415,4 +480,64 @@ fn detectPublicIpFromServices(
     }
 
     return null;
+}
+
+test "exec hands the child the process environment" {
+    // Regression: `Threaded.init(.., .{})` defaults `environ` to `.empty`, which both gave
+    // every child a zero-entry environment and pinned argv[0] resolution to the hardcoded
+    // "/usr/local/bin:/bin/:/usr/bin". `env` with an empty environment prints nothing at all.
+    const result = exec(std.testing.allocator, &.{"/usr/bin/env"}) catch return error.SkipZigTest;
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(result.stdout.len > 0);
+}
+
+test "execInput feeds stdin and captures output without argument disclosure" {
+    const result = try execInput(std.testing.allocator, &.{"/bin/cat"}, "private payload\n");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("private payload\n", result.stdout);
+}
+
+test "CPU feature word boundaries do not accept substring matches" {
+    try std.testing.expect(containsWord("flags:aes\r", "aes"));
+    try std.testing.expect(containsWord("flags:\tavx2 aes\n", "avx2"));
+    try std.testing.expect(!containsWord("vaes noavx2 avx512", "aes"));
+    try std.testing.expect(!containsWord("avx512", "avx"));
+}
+
+test "domain hex conversion stays inside odd-sized output buffers" {
+    var buf: [7]u8 = @splat(0xaa);
+    try std.testing.expectEqualStrings("612e62", try domainToHex("a.b", &buf));
+    try std.testing.expectEqual(@as(u8, 0xaa), buf[6]);
+    try std.testing.expectError(error.NoSpaceLeft, domainToHex("x", buf[0..1]));
+}
+
+test "exec maps normal failure and signal termination to failure" {
+    const normal = try exec(std.testing.allocator, &.{ "/bin/sh", "-c", "exit 7" });
+    defer normal.deinit();
+    try std.testing.expectEqual(@as(u8, 7), normal.exit_code);
+    const signaled = try exec(std.testing.allocator, &.{ "/bin/sh", "-c", "kill -TERM $$" });
+    defer signaled.deinit();
+    try std.testing.expect(signaled.exit_code != 0);
+}
+
+test "secret generator fills exactly a hexadecimal secret" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var secret: [32]u8 = undefined;
+    try generateSecret(&secret);
+    for (secret) |c| try std.testing.expect(std.ascii.isHex(c));
+}
+
+test "environment file reads exports quoted values and ignores comment lines" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io_ctx, .{ .sub_path = "vars.env", .data = "# ignored=yes\nexport TOKEN = \"value#inside\"\r\nTAG=v1\n" });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/vars.env", .{tmp.sub_path});
+    const token = readEnvFile(std.testing.allocator, path, "TOKEN") orelse return error.MissingToken;
+    defer std.testing.allocator.free(token);
+    try std.testing.expectEqualStrings("value#inside", token);
+    try std.testing.expect(readEnvFile(std.testing.allocator, path, "ignored") == null);
 }

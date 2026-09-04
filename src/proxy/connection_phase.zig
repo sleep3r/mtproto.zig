@@ -27,7 +27,6 @@ pub const ConnectionPhase = enum {
     middle_proxy_handshake,
     relaying,
     mask_relaying,
-    closing,
 };
 
 pub fn hasFatalEpollHangup(events: u32) bool {

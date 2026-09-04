@@ -35,9 +35,16 @@ const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
 
 pub const version = version_mod.version;
+pub const std_options: std.Options = .{ .log_level = if (@import("builtin").is_test) .err else .info };
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
+    var command_runtime: std.Io.Threaded = .init(std.heap.page_allocator, .{
+        .environ = std.Io.Threaded.global_single_threaded.environ.process_environ,
+    });
+    defer command_runtime.deinit();
+    @import("sys.zig").command_io = command_runtime.io();
+    defer @import("sys.zig").command_io = null;
 
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
@@ -55,13 +62,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--lang")) {
             const lang_val = args.next() orelse {
                 printLangFlagError("Missing value for --lang (expected: en|ru)\n");
-                return;
+                return error.BadUsage;
             };
             lang = parseLangFlag(lang_val) orelse {
                 var buf: [96]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "Unsupported language '{s}' (expected: en|ru)\n", .{lang_val}) catch "Unsupported language (expected: en|ru)\n";
                 printLangFlagError(msg);
-                return;
+                return error.BadUsage;
             };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             const help_lang = lang orelse i18n.Lang.fromEnvMap(init.environ_map);
@@ -113,6 +120,10 @@ pub fn main(init: std.process.Init) !void {
         // printing help (issue #310). Scan a copy so the real iterator stays intact.
         var help_scan = remaining_args;
         while (help_scan.next()) |a| {
+            if (std.mem.eql(u8, a, "--lang") or std.mem.eql(u8, a, "--interactive") or std.mem.eql(u8, a, "-i")) {
+                ui.fail("Global options --lang and --interactive must precede the command");
+                return error.BadUsage;
+            }
             if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
                 if (std.mem.eql(u8, cmd, "install")) {
                     install.printInstallHelp(&ui);
@@ -155,11 +166,11 @@ pub fn main(init: std.process.Init) !void {
                         sub,
                     });
                     ui.hint(tr(ui.lang, "Available: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard, web", "Доступно: masking, nfqws, syn-limit, tunnel, egress, recovery, dashboard, web"));
-                    return;
+                    return error.BadUsage;
                 }
             } else {
                 ui.fail(tr(ui.lang, "Usage: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard|web>", "Использование: mtbuddy setup <masking|nfqws|syn-limit|tunnel|egress|recovery|dashboard|web>"));
-                return;
+                return error.BadUsage;
             }
         } else if (std.mem.eql(u8, cmd, "ipv6-hop")) {
             return ipv6hop.run(&ui, allocator, &remaining_args);
@@ -186,7 +197,7 @@ pub fn main(init: std.process.Init) !void {
                 cmd,
             });
             printHelp(ui.lang);
-            return;
+            return error.BadUsage;
         }
     }
 
@@ -230,8 +241,11 @@ fn menuWebRemove(lang: i18n.Lang) []const u8 {
     return tr(lang, "🌐  Remove the WEB proxy relay", "🌐  Удалить релей WEB-прокси");
 }
 
-fn interactiveMain(ui: *Tui, allocator: std.mem.Allocator) !void {
+fn interactiveMain(ui: *Tui, backing_allocator: std.mem.Allocator) !void {
     while (true) {
+        var action_arena = std.heap.ArenaAllocator.init(backing_allocator);
+        defer action_arena.deinit();
+        const allocator = action_arena.allocator();
         const sys = @import("sys.zig");
         const is_installed = sys.fileExists("/opt/mtproto-proxy");
 
@@ -562,9 +576,9 @@ fn printHelp(lang: i18n.Lang) void {
     printCmd(&ui, "setup egress [--deps-only] <share-link...>", tr(lang, "Setup VPN share-link egress", "Настроить egress через VPN-ссылку"));
     printCmd(&ui, "setup dashboard", tr(lang, "Install web monitoring dashboard", "Установить веб-дашборд мониторинга"));
     printCmd(&ui, "setup recovery", tr(lang, "Install DPI auto-recovery", "Установить авто-восстановление DPI"));
-    printCmd(&ui, "setup web --domain <host> [--mode mask|behind] [--only] [--cert <pem> --key <pem>] [--remove]", tr(lang, "WEB proxy relay for Telegram Desktop 7.1+ (--only serves nothing else)", "Релей WEB-прокси для Telegram Desktop 7.1+ (--only отдаёт только его)"));
+    printCmd(&ui, "setup web --domain <host> [--mode mask|behind] [--only|--no-only] [--cert <pem> --key <pem>] [--remove]", tr(lang, "WEB proxy relay for Telegram Desktop 7.1+ (--only serves nothing else)", "Релей WEB-прокси для Telegram Desktop 7.1+ (--only отдаёт только его)"));
     printCmd(&ui, "ipv6-hop", tr(lang, "IPv6 address rotation", "Ротация IPv6 адреса"));
-    printCmd(&ui, "update-dns <ip>", tr(lang, "Update Cloudflare DNS A record", "Обновить A-запись Cloudflare DNS"));
+    printCmd(&ui, "update-dns <ip> <hostname>", tr(lang, "Update Cloudflare DNS A record", "Обновить A-запись Cloudflare DNS"));
     printCmd(&ui, "config <validate|doctor|print-effective>", tr(lang, "Config diagnostics and effective values", "Диагностика и эффективные значения конфига"));
     printCmd(&ui, "links", tr(lang, "Print tg:// links from config (sensitive)", "Показать tg:// ссылки из конфига (секретно)"));
     printCmd(&ui, "secret", tr(lang, "Generate a fresh 32-hex secret", "Сгенерировать новый 32-hex секрет"));
@@ -578,6 +592,7 @@ fn printHelp(lang: i18n.Lang) void {
     printOpt(&ui, "--public-port <port>", tr(lang, "Port advertised in Telegram links", "Порт для Telegram-ссылок"));
     printOpt(&ui, "--domain, -d <domain>", tr(lang, "TLS masking domain (default: rutube.ru)", "TLS-домен маскировки (по умолчанию: rutube.ru)"));
     printOpt(&ui, "--secret, -s <hex32>", tr(lang, "User secret (32 hex chars, auto-generated if omitted)", "Секрет пользователя (32 hex, если не задан — генерируется)"));
+    printOpt(&ui, "--secret-file <path>", tr(lang, "Read secret from a private file (avoids argv disclosure)", "Прочитать секрет из закрытого файла (не раскрывать в argv)"));
     printOpt(&ui, "--user,   -u <name>", tr(lang, "Username in config.toml (default: user)", "Имя пользователя в config.toml (по умолчанию: user)"));
     printOpt(&ui, "--config, -c <path>", tr(lang, "Use existing config.toml file", "Использовать существующий config.toml"));
     printOpt(&ui, "--yes,    -y", tr(lang, "Skip confirmation prompt (non-interactive)", "Пропустить подтверждение (non-interactive)"));
@@ -590,7 +605,7 @@ fn printHelp(lang: i18n.Lang) void {
     printOpt(&ui, "--bind,   -b <ip>", tr(lang, "Bind to specific IP (default: all interfaces)", "Слушать конкретный IP (по умолчанию: все интерфейсы)"));
     printOpt(&ui, "--middle-proxy", tr(lang, "Enable Telegram MiddleProxy relay", "Включить Telegram MiddleProxy relay"));
     printOpt(&ui, "--web <domain>", tr(lang, "Also set up the WEB proxy relay (Desktop 7.1+)", "Дополнительно поднять релей WEB-прокси (Desktop 7.1+)"));
-    printOpt(&ui, "--ipv6-hop", tr(lang, "Enable IPv6 auto-hopping", "Включить автоматическую ротацию IPv6"));
+    printOpt(&ui, "--ipv6-hop", tr(lang, "Print reminder to configure IPv6 hopping separately", "Напомнить об отдельной настройке ротации IPv6"));
     printOpt(&ui, "--version, -v <tag>", tr(lang, "Release version to install (default: latest)", "Версия релиза для установки (по умолчанию: latest)"));
     printOpt(&ui, "--insecure", tr(lang, "Allow unsigned assets (disables minisign verification)", "Разрешить неподписанные артефакты (отключает minisign verification)"));
     ui.writeRaw("\n");
@@ -599,12 +614,15 @@ fn printHelp(lang: i18n.Lang) void {
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Update options", "Опции обновления"), Color.reset });
     printOpt(&ui, "--version, -v <tag>", tr(lang, "Pin to specific release tag", "Зафиксировать конкретный тег релиза"));
     printOpt(&ui, "--force-service", tr(lang, "Force systemd unit update", "Принудительно обновить systemd unit"));
+    printOpt(&ui, "--force", tr(lang, "Reapply the same release and host repairs", "Повторно применить релиз и настройки хоста"));
+    printOpt(&ui, "--allow-downgrade", tr(lang, "Explicitly allow an older release", "Явно разрешить более старый релиз"));
     printOpt(&ui, "--insecure", tr(lang, "Allow unsigned assets (disables minisign verification)", "Разрешить неподписанные артефакты (отключает minisign verification)"));
     ui.writeRaw("\n");
 
     // ── Setup options ──
     ui.print("  {s}{s}:{s}\n\n", .{ Color.accent, tr(lang, "Setup options", "Опции setup"), Color.reset });
     printOpt(&ui, "--domain <domain>", tr(lang, "TLS masking domain", "TLS-домен маскировки"));
+    printOpt(&ui, "--local", tr(lang, "Masking: explicitly replace remote cover with local nginx", "Маскировка: явно заменить удалённый сайт локальным nginx"));
     printOpt(&ui, "--ttl <N>", tr(lang, "nfqws fake packet TTL (default: 6)", "TTL фейковых пакетов nfqws (по умолчанию: 6)"));
     printOpt(&ui, "--remove", tr(lang, "Remove nfqws installation", "Удалить установленный nfqws"));
     ui.writeRaw("\n");
@@ -669,6 +687,7 @@ fn tr(lang: i18n.Lang, en: []const u8, ru: []const u8) []const u8 {
 }
 
 test {
+    std.testing.log_level = .err;
     // Zig only collects tests from files reachable through analyzed test code. The root
     // test previously referenced only `tunnel`, so 25+ tests in modules reached solely
     // from main() (sharelink, links, config_cmd, fronting_domain, install, ipv6hop, …)
@@ -693,6 +712,7 @@ test {
     _ = @import("uninstall.zig");
     _ = @import("update.zig");
     _ = @import("web.zig");
+    _ = @import("dashboard.zig");
 }
 
 test "every main-menu entry is decorated with an emoji" {

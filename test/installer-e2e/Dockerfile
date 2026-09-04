@@ -14,6 +14,7 @@ RUN set -eux; \
         dbus \
         iproute2 \
         procps \
+        python3 \
         systemd \
         systemd-sysv; \
     apt-get clean; \

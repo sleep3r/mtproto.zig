@@ -42,26 +42,80 @@ pub const TomlDoc = struct {
     }
 
     /// Save the document back to a file.
+    ///
+    /// Staged through `<path>.tmp` + rename(2) rather than written in place: `createFile`
+    /// truncates the destination before the first byte lands, so an ENOSPC, an EIO or a
+    /// kill mid-write left config.toml empty or half-written. That file is the ONLY copy of
+    /// the `[access.users]` secrets — losing it kills every distributed link. rename is
+    /// atomic within a filesystem, so a reader (or a crash) sees either the whole old file
+    /// or the whole new one, a failed write leaves the original untouched, and the previous
+    /// contents are kept one deep in `<path>.bak`.
     pub fn save(self: *Self, path: []const u8) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        // config.toml carries [access.users] secrets and the FakeTLS identity.
-        // Create it 0640 (owner+group only) so unprivileged local accounts
-        // (e.g. the www-data user this tool installs for masking) cannot read
-        // the proxy secrets. createFile only sets the mode on creation, so also
-        // fchmod to tighten an already-existing world-readable config in place.
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{
-            .permissions = std.Io.File.Permissions.fromMode(0o640),
-        });
-        defer file.close(io);
-        file.setPermissions(io, std.Io.File.Permissions.fromMode(0o640)) catch {};
+        const dir = std.Io.Dir.cwd();
 
-        for (self.lines.items) |line| {
-            try file.writeStreamingAll(io, line);
-            try file.writeStreamingAll(io, "\n");
+        // Render before touching the filesystem: an allocation failure must not be able to
+        // happen with the destination already replaced.
+        var rendered: std.ArrayListUnmanaged(u8) = .empty;
+        defer rendered.deinit(self.allocator);
+        var last = self.lines.items.len;
+        while (last > 0 and self.lines.items[last - 1].len == 0) last -= 1;
+        for (self.lines.items[0..last]) |line| {
+            try rendered.appendSlice(self.allocator, line);
+            try rendered.append(self.allocator, '\n');
+        }
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+        defer self.allocator.free(tmp_path);
+
+        // Read the current contents now, while they still exist, so the .bak below is the
+        // document this save replaces and not the one it wrote.
+        const previous: ?[]u8 = dir.readFileAlloc(io, path, self.allocator, .limited(1024 * 1024)) catch null;
+        defer if (previous) |old| self.allocator.free(old);
+
+        {
+            errdefer dir.deleteFile(io, tmp_path) catch {};
+
+            var file = try dir.createFile(io, tmp_path, .{
+                .permissions = std.Io.File.Permissions.fromMode(0o640),
+            });
+            defer file.close(io);
+            // config.toml carries [access.users] secrets and the FakeTLS identity.
+            // Keep it 0640 (owner+group only) so unprivileged local accounts (e.g. the
+            // www-data user this tool installs for masking) cannot read the proxy secrets.
+            // createFile only sets the mode on creation, so also fchmod in case a stale
+            // world-readable .tmp was left behind by an older build.
+            file.setPermissions(io, std.Io.File.Permissions.fromMode(0o640)) catch {};
+            // rename() installs a NEW inode, so the destination's owner has to be carried
+            // over explicitly. The proxy runs as User=mtproto and reads config.toml 0640 —
+            // a root:root replacement would make the service fail to start, and most
+            // save() call sites do not chown afterwards.
+            if (fileOwner(path)) |owner| file.setOwner(io, owner.uid, owner.gid) catch {};
+
+            try file.writeStreamingAll(io, rendered.items);
+            // Durability before the rename: without the fsync the directory entry can be
+            // committed while the data is still in the page cache, and a host reset then
+            // leaves a 0-length config.toml — exactly the loss the rename is here to avoid.
+            try file.sync(io);
+        }
+
+        try dir.rename(tmp_path, dir, path, io);
+
+        // Best-effort second copy. rename() rules out a torn write, but not mtbuddy itself
+        // writing a document that dropped a user; one undo is cheap.
+        if (previous) |old| {
+            var bak_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const bak_path = std.fmt.bufPrint(&bak_buf, "{s}.bak", .{path}) catch return;
+            dir.writeFile(io, .{
+                .sub_path = bak_path,
+                .data = old,
+                .flags = .{ .permissions = std.Io.File.Permissions.fromMode(0o640) },
+            }) catch {};
         }
     }
 
     /// Get a value by [section].key. Returns null if not found.
+    /// Borrowed value: copy it before changing this document. Surrounding quotes are removed.
     pub fn get(self: *Self, section_name: []const u8, key: []const u8) ?[]const u8 {
         var in_section = false;
         var hdr_buf: [128]u8 = undefined;
@@ -90,7 +144,15 @@ pub const TomlDoc = struct {
         return null;
     }
 
-    /// Set a value in [section].key, creating section/key if needed.
+    /// Write a raw TOML literal. Use setString for text. Invalidates borrowed get() values.
+    pub fn setString(self: *Self, section_name: []const u8, key: []const u8, value: []const u8) !void {
+        var encoded: std.Io.Writer.Allocating = .init(self.allocator);
+        defer encoded.deinit();
+        try std.json.Stringify.value(value, .{}, &encoded.writer);
+        try self.set(section_name, key, encoded.written());
+    }
+
+    /// Set a raw TOML literal in [section].key, creating section/key if needed.
     pub fn set(self: *Self, section_name: []const u8, key: []const u8, value: []const u8) !void {
         var hdr_buf: [128]u8 = undefined;
         const target_header = sectionHeader(section_name, &hdr_buf);
@@ -116,8 +178,9 @@ pub const TomlDoc = struct {
             if (parseKeyValue(trimmed)) |kv| {
                 if (std.mem.eql(u8, kv.key, key)) {
                     // Replace existing line
+                    const replacement = try formatKv(self.allocator, key, value);
                     self.allocator.free(self.lines.items[idx]);
-                    self.lines.items[idx] = try formatKv(self.allocator, key, value);
+                    self.lines.items[idx] = replacement;
                     return;
                 }
             }
@@ -161,9 +224,14 @@ pub const TomlDoc = struct {
 
     /// Add a key-value pair with a quoted string value.
     pub fn addKvStr(self: *Self, key: []const u8, value: []const u8) !void {
-        var buf: [512]u8 = undefined;
-        const formatted = std.fmt.bufPrint(&buf, "{s} = \"{s}\"", .{ key, value }) catch return;
-        try self.lines.append(self.allocator, try self.allocator.dupe(u8, formatted));
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        defer output.deinit();
+        try output.writer.print("{s} = ", .{key});
+        // JSON string escaping is also valid for TOML basic strings.
+        try std.json.Stringify.value(value, .{}, &output.writer);
+        const owned = try self.allocator.dupe(u8, output.written());
+        errdefer self.allocator.free(owned);
+        try self.lines.append(self.allocator, owned);
     }
 
     /// Render the full document as a string.
@@ -198,6 +266,25 @@ pub const TomlDoc = struct {
 fn sectionHeader(name: []const u8, buf: []u8) []const u8 {
     if (name.len > 0 and name[0] == '[') return name;
     return std.fmt.bufPrint(buf, "[{s}]", .{name}) catch name;
+}
+
+const Owner = struct {
+    uid: std.posix.uid_t,
+    gid: std.posix.gid_t,
+};
+
+/// Owner of an existing file, so `save()` can put it back on the replacement it renames
+/// into place. Linux is mtbuddy's runtime target; on a dev host the owner is left alone
+/// (everything there already belongs to the developer).
+fn fileOwner(path: []const u8) ?Owner {
+    if (@import("builtin").os.tag != .linux) return null;
+
+    const path_z = std.posix.toPosixPath(path) catch return null;
+    var stx: std.os.linux.Statx = undefined;
+    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, &path_z, 0, .{ .UID = true, .GID = true }, &stx);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    if (!stx.mask.UID or !stx.mask.GID) return null;
+    return .{ .uid = stx.uid, .gid = stx.gid };
 }
 
 const KeyValue = struct {
@@ -276,6 +363,17 @@ test "parseKeyValue: quoted '#' preserved" {
     try std.testing.expectEqualStrings("abc#def", kv.value);
 }
 
+test "setString writes escaped TOML literals and set accepts an aliased value" {
+    var doc = TomlDoc{ .allocator = std.testing.allocator };
+    defer doc.deinit();
+    try doc.setString("upstream", "type", "tunnel");
+    try std.testing.expectEqualStrings("type = \"tunnel\"", doc.lines.items[2]);
+    try doc.setString("upstream", "password", "quote\" and newline\n");
+    try std.testing.expectEqualStrings("password = \"quote\\\" and newline\\n\"", doc.lines.items[3]);
+    try doc.setString("upstream", "type", doc.get("upstream", "type").?);
+    try std.testing.expectEqualStrings("tunnel", doc.get("upstream", "type").?);
+}
+
 test "set/get round-trips a dotted (non-allowlisted) section with brackets" {
     var doc = TomlDoc.initEmpty(std.testing.allocator);
     defer doc.deinit();
@@ -329,4 +427,68 @@ test "TomlDoc.set survives a value longer than the old fixed buffer" {
     // And it is readable back in one piece.
     const read_back = doc.get("upstream.xray", "links") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(long.items, read_back);
+}
+
+test "TomlDoc.save keeps the replaced document in <path>.bak" {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/config.toml", .{tmp.sub_path});
+
+    const original = "[server]\nport = 443\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = original });
+
+    var doc = try TomlDoc.load(a, path);
+    defer doc.deinit();
+    try doc.set("server", "port", "8443");
+    try doc.save(path);
+
+    const saved = try tmp.dir.readFileAlloc(io, "config.toml", a, .limited(4096));
+    defer a.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "port = 8443") != null);
+
+    const bak = try tmp.dir.readFileAlloc(io, "config.toml.bak", a, .limited(4096));
+    defer a.free(bak);
+    try std.testing.expectEqualStrings(original, bak);
+
+    // A successful save must not leave the staging file behind.
+    if (tmp.dir.access(io, "config.toml.tmp", .{})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "TomlDoc.save leaves the destination intact when the staged write fails" {
+    // Regression: save() opened the destination itself with createFile, which truncates it
+    // to zero before a single byte of the new document is written — an ENOSPC or a kill in
+    // that window destroyed the only copy of the [access.users] secrets.
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/config.toml", .{tmp.sub_path});
+
+    const original = "[access.users]\nalice = \"deadbeef\"\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = original });
+
+    var doc = try TomlDoc.load(a, path);
+    defer doc.deinit();
+    try doc.set("access.users", "alice", "\"c0ffee\"");
+
+    // A directory sitting on the staging path makes the write fail at exactly the point
+    // where the old code had already emptied config.toml.
+    try tmp.dir.createDir(io, "config.toml.tmp", .default_dir);
+    if (doc.save(path)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    const survived = try tmp.dir.readFileAlloc(io, "config.toml", a, .limited(4096));
+    defer a.free(survived);
+    try std.testing.expectEqualStrings(original, survived);
 }

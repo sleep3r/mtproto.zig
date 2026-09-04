@@ -109,6 +109,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     if (sys.fileExists("/etc/systemd/system/mtproto-singbox-egress.service")) {
         ui.warn("Retiring the existing sing-box egress — it can't share table 200 with a WG tunnel.");
         sys.execSilent(allocator, &.{ "systemctl", "disable", "--now", "mtproto-singbox-egress.service" });
+        sys.execSilent(allocator, &.{ "rm", "-f", "/etc/mtproto-proxy/singbox-egress.json.bak" });
         sys.execSilent(allocator, &.{ "rm", "-f", "/etc/systemd/system/mtproto-singbox-egress.service", "/etc/mtproto-proxy/singbox-egress.json", "/usr/local/bin/mtproto-singbox-route.sh", "/etc/systemd/system/mtproto-proxy.service.d/egress.conf" });
         sys.execSilent(allocator, &.{ "systemctl", "daemon-reload" });
     }
@@ -151,6 +152,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     // Decided BEFORE the write, because the write is what makes the two paths
     // indistinguishable afterwards. See `sourceIsDestination`.
     const adopted_in_place = sourceIsDestination(awg_source, awg_config_path);
+    if (!adopted_in_place and sys.fileExists(awg_config_path) and !configIsOwned(allocator, awg_config_path)) {
+        ui.fail("Refusing to overwrite an existing tunnel config owned by the operator");
+        return;
+    }
 
     const config_kind = installAwgConfigSource(allocator, awg_source, awg_config_path) catch |err| {
         switch (err) {
@@ -248,8 +253,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\ExecReload=/bin/kill -HUP $MAINPID
         \\KillSignal=SIGTERM
         \\TimeoutStopSec=25
-        \\Restart=on-failure
-        \\RestartSec=5
+        \\Restart=always
+        \\RestartSec=3
         \\
         \\# Security hardening — mirrors the default unit so tunnel mode does NOT
         \\# silently run the internet-facing proxy as unsandboxed root. CAP_NET_ADMIN
@@ -269,6 +274,14 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
         \\ProtectClock=yes
         \\ProtectHostname=yes
         \\ProtectKernelLogs=yes
+        \\SystemCallArchitectures=native
+        \\MemoryDenyWriteExecute=yes
+        \\RestrictNamespaces=yes
+        \\ProtectControlGroups=yes
+        \\ProtectKernelTunables=yes
+        \\ProtectProc=invisible
+        \\ProcSubset=pid
+        \\RemoveIPC=yes
         \\UMask=0077
         \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
         \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
@@ -290,7 +303,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
     installTunnelPoolUnits(ui, allocator);
 
     // ── Configure proxy egress mode ──
-    setTunnelPoolConfig(allocator, iface);
+    setTunnelPoolConfig(allocator, iface) catch {
+        ui.fail("Failed to save tunnel pool configuration");
+        return;
+    };
     ui.stepOk("Set [upstream].type", "tunnel");
     ui.stepOk("Added tunnel pool interface", iface);
     ui.stepOk("Preserved [general].use_middle_proxy", "unchanged");
@@ -369,7 +385,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: TunnelOpts) !void {
 
     _ = sys.execForward(&.{TUNNEL_SCRIPT}) catch {};
 
-    const awg_status = sys.exec(allocator, &.{ "awg", "show", iface }) catch null;
+    const show_tool = if (std.mem.startsWith(u8, iface, "wg") and sys.commandExists("wg")) "wg" else if (sys.commandExists("awg")) "awg" else "wg";
+    const awg_status = sys.exec(allocator, &.{ show_tool, "show", iface }) catch null;
     if (awg_status) |result| {
         defer result.deinit();
         if (result.exit_code == 0) {
@@ -423,19 +440,29 @@ fn installAwgConfigSource(allocator: std.mem.Allocator, source: []const u8, dest
     const trimmed = std.mem.trim(u8, source, &[_]u8{ ' ', '\t', '\r', '\n' });
     if (trimmed.len == 0) return error.ConfigSourceNotFound;
 
-    if (isAmneziaVpnLinkSource(trimmed)) {
-        try sys.writeFileMode(dest_path, trimmed, 0o600);
-    } else {
-        const content = readFileAllocCwd(allocator, trimmed, 1024 * 1024) catch |err| switch (err) {
+    const content = if (isAmneziaVpnLinkSource(trimmed))
+        try allocator.dupe(u8, trimmed)
+    else
+        readFileAllocCwd(allocator, trimmed, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return error.ConfigSourceNotFound,
             else => return err,
         };
-        defer allocator.free(content);
-
-        try sys.writeFileMode(dest_path, content, 0o600);
+    defer allocator.free(content);
+    const source_text = std.mem.trim(u8, content, " \t\r\n");
+    if (isAmneziaVpnLinkSource(source_text)) {
+        const converted = convertAmneziaVpnLink(allocator, source_text) catch |err| switch (err) {
+            error.AwgConfigNotFound => return error.AwgConfigNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidAmneziaVpnLink,
+        };
+        defer allocator.free(converted);
+        try sys.writeFileMode(dest_path, converted, 0o600);
+        return .amnezia_vpn_link;
     }
-
-    return normalizeAwgConfig(allocator, dest_path);
+    if (!looksLikeAwgConfig(source_text)) return error.UnsupportedConfigFormat;
+    try validateImportedAwgConfig(source_text);
+    try sys.writeFileMode(dest_path, content, 0o600);
+    return .native_conf;
 }
 fn normalizeAwgConfig(allocator: std.mem.Allocator, path: []const u8) !AwgConfigKind {
     const content = try readFileAllocCwd(allocator, path, 1024 * 1024);
@@ -467,16 +494,15 @@ fn convertAmneziaVpnLink(allocator: std.mem.Allocator, link: []const u8) ![]u8 {
     };
     defer allocator.free(decoded);
     if (decoded.len <= 4) return error.InvalidAmneziaVpnLink;
+    if (std.mem.readInt(u32, decoded[0..4], .big) > 1024 * 1024) return error.InvalidAmneziaVpnLink;
 
     var compressed_reader: std.Io.Reader = .fixed(decoded[4..]);
-    var json_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer json_writer.deinit();
-
     var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .zlib, &decompress_buffer);
-    _ = decompressor.reader.streamRemaining(&json_writer.writer) catch return error.InvalidAmneziaVpnLink;
+    const json_bytes = decompressor.reader.allocRemaining(allocator, .limited(1024 * 1024)) catch return error.InvalidAmneziaVpnLink;
+    defer allocator.free(json_bytes);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_writer.written(), .{}) catch return error.InvalidAmneziaVpnLink;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return error.InvalidAmneziaVpnLink;
     defer parsed.deinit();
 
     const root = switch (parsed.value) {
@@ -561,7 +587,66 @@ fn convertAmneziaLastConfig(
         prepared = updated;
     }
 
+    try validateImportedAwgConfig(prepared);
     return prepared;
+}
+
+// Share links are untrusted data; wg-quick hook directives execute as root.
+// Validate the final text, including every substituted JSON value.
+fn validateImportedAwgConfig(content: []const u8) !void {
+    if (!looksLikeAwgConfig(content)) return error.InvalidAmneziaVpnLink;
+    var in_interface = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        if (std.mem.eql(u8, line, "[Interface]")) {
+            in_interface = true;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "[Peer]")) {
+            in_interface = false;
+            continue;
+        }
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidAmneziaVpnLink;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        // Our own installed configs carry this directive. Permit only the safe
+        // value we generate, so adopting/re-importing them remains idempotent.
+        if (in_interface and std.mem.eql(u8, key, "Table")) {
+            if (!std.mem.eql(u8, std.mem.trim(u8, line[eq + 1 ..], " \t"), "off")) return error.InvalidAmneziaVpnLink;
+            continue;
+        }
+        const allowed = if (in_interface)
+            &[_][]const u8{ "PrivateKey", "Address", "DNS", "MTU", "ListenPort", "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5", "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts", "RandomTrailers", "DisableCookies" }
+        else
+            &[_][]const u8{ "PublicKey", "PresharedKey", "AllowedIPs", "Endpoint", "PersistentKeepalive" };
+        var known = false;
+        for (allowed) |candidate| {
+            if (std.mem.eql(u8, key, candidate)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return error.InvalidAmneziaVpnLink;
+        for (line[eq + 1 ..]) |c| {
+            if (c < 32 and c != '\t') return error.InvalidAmneziaVpnLink;
+        }
+    }
+}
+
+test "vpn import rejects root hooks and substituted hooks" {
+    try validateImportedAwgConfig("[Interface]\nPrivateKey = abc\n[Peer]\nPublicKey = def");
+    try std.testing.expectError(error.InvalidAmneziaVpnLink, validateImportedAwgConfig("[Interface]\nPostUp = touch /tmp/pwn\n[Peer]"));
+    try std.testing.expectError(error.InvalidAmneziaVpnLink, convertAmneziaLastConfig(std.testing.allocator, "{\"config\":\"[Interface]\\nDNS = $PRIMARY_DNS\\n[Peer]\"}", "1.1.1.1\nPostUp = id", ""));
+}
+
+test "vpn import accepts AWG 3.1 protocol fields but never quick hooks" {
+    const conf = "[Interface]\nPrivateKey=abc\nHeaderProtectionKey=abc\nContentPaddingAddition=10-100\nRekeyAfterTime=120\nRekeyTimeout=5\nRejectAfterTime=180\nKeepaliveTimeout=10\nMaxHandshakeAttempts=18\nRandomTrailers=on\nDisableCookies=on\n[Peer]\nPublicKey=def\n";
+    try validateImportedAwgConfig(conf);
+    try validateImportedAwgConfig("[Interface]\nTable = off\nPrivateKey=abc\n[Peer]\nPublicKey=def\n");
+    try std.testing.expectError(error.InvalidAmneziaVpnLink, validateImportedAwgConfig("[Interface]\nTable=200\n"));
+    try std.testing.expectError(error.InvalidAmneziaVpnLink, validateImportedAwgConfig(conf ++ "PostUp=id\n"));
+    try std.testing.expectError(error.InvalidAmneziaVpnLink, validateImportedAwgConfig("[Interface]\nSaveConfig=true\n"));
 }
 fn jsonObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = object.get(key) orelse return null;
@@ -827,6 +912,8 @@ fn debianAmneziaRepositorySetupScript() []const u8 {
     \\tmp="$(mktemp)"
     \\trap 'rm -f "$tmp"' EXIT
     \\curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x75C9DD72C799870E310542E24166F2C257290828" -o "$tmp"
+    \\fingerprints="$(gpg --batch --with-colons --import-options show-only --import "$tmp" | awk -F: '$1=="pub" { want=1; next } want && $1=="fpr" { print $10; want=0 }')"
+    \\[ "$fingerprints" = 75C9DD72C799870E310542E24166F2C257290828 ] || exit 1
     \\gpg --batch --yes --dearmor -o /usr/share/keyrings/amnezia-ppa.gpg "$tmp"
     \\cat >/etc/apt/sources.list.d/amnezia-ppa.list <<'AMNEZIA_PPA'
     \\deb [signed-by=/usr/share/keyrings/amnezia-ppa.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main
@@ -1066,6 +1153,13 @@ pub fn selectTunnelInterface(allocator: std.mem.Allocator, requested: []const u8
         const candidate = try std.fmt.bufPrint(&name_buf, "awg{d}", .{i});
         var path_buf: [256]u8 = undefined;
         const path = awgConfigPath(&path_buf, candidate) catch continue;
+        var wg_path_buf: [256]u8 = undefined;
+        const wg_path = try std.fmt.bufPrint(&wg_path_buf, "/etc/wireguard/{s}.conf", .{candidate});
+        if (sys.fileExists(wg_path)) continue;
+        if (sys.exec(allocator, &.{ "ip", "link", "show", "dev", candidate })) |r| {
+            defer r.deinit();
+            if (r.exit_code == 0) continue;
+        } else |_| {}
         if (!containsInterface(pool, candidate) and !sys.fileExists(path)) {
             return try allocator.dupe(u8, candidate);
         }
@@ -1087,29 +1181,29 @@ pub fn formatInterfaceArrayLiteral(allocator: std.mem.Allocator, values: []const
     try out.append(allocator, ']');
     return try out.toOwnedSlice(allocator);
 }
-fn setTunnelPoolConfig(allocator: std.mem.Allocator, iface: []const u8) void {
-    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch return;
+fn setTunnelPoolConfig(allocator: std.mem.Allocator, iface: []const u8) !void {
+    var doc = toml.TomlDoc.load(allocator, INSTALL_DIR ++ "/config.toml") catch |err| return err;
     defer doc.deinit();
 
-    doc.set("upstream", "type", "\"tunnel\"") catch return;
+    doc.set("upstream", "type", "\"tunnel\"") catch |err| return err;
 
-    const existing = loadTunnelPoolFromDoc(allocator, &doc) catch &.{};
+    const existing = loadTunnelPoolFromDoc(allocator, &doc) catch |err| return err;
     defer freeOwnedStringSlice(allocator, existing);
 
-    const pool = appendInterfaceIfMissing(allocator, existing, iface) catch return;
+    const pool = appendInterfaceIfMissing(allocator, existing, iface) catch |err| return err;
     defer freeOwnedStringSlice(allocator, pool);
 
     if (pool.len > 0) {
         var first_buf: [64]u8 = undefined;
-        const first = std.fmt.bufPrint(&first_buf, "\"{s}\"", .{pool[0]}) catch return;
-        doc.set("upstream.tunnel", "interface", first) catch return;
+        const first = std.fmt.bufPrint(&first_buf, "\"{s}\"", .{pool[0]}) catch |err| return err;
+        doc.set("upstream.tunnel", "interface", first) catch |err| return err;
     }
 
-    const array_literal = formatInterfaceArrayLiteral(allocator, pool) catch return;
+    const array_literal = formatInterfaceArrayLiteral(allocator, pool) catch |err| return err;
     defer allocator.free(array_literal);
-    doc.set("upstream.tunnel", "interfaces", array_literal) catch return;
+    doc.set("upstream.tunnel", "interfaces", array_literal) catch |err| return err;
 
-    doc.save(INSTALL_DIR ++ "/config.toml") catch {};
+    try doc.save(INSTALL_DIR ++ "/config.toml");
 }
 fn installTunnelPoolUnits(ui: *Tui, allocator: std.mem.Allocator) void {
     const service =
@@ -1178,6 +1272,8 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\BOUNCE_AFTER_DEGRADED_CHECKS=2
         \\
         \\mkdir -p "$STATE_DIR"
+        \\exec 9>"$STATE_DIR/pool.lock"
+        \\flock -w 60 9 || exit 1
         \\
         \\log() {
         \\    logger -t mtproto-tunnel-pool "$*" 2>/dev/null || true
@@ -1325,6 +1421,9 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\}
         \\
         \\ensure_policy_rule() {
+        \\    while ip -6 rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
+        \\    ip -6 route replace blackhole default table "$TABLE"
+        \\    ip -6 rule add fwmark "$MARK" table "$TABLE" priority "$RULE_PRIORITY" || return 1
         \\    while ip -4 rule del priority "$RULE_PRIORITY" fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
         \\    while ip -4 rule del fwmark "$MARK" table "$TABLE" 2>/dev/null; do :; done
         \\    ip -4 rule add fwmark "$MARK" table "$TABLE" priority "$RULE_PRIORITY" 2>/dev/null || true
@@ -1333,7 +1432,6 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\
         \\route_table_to_iface() {
         \\    local iface="$1"
-        \\    ip -4 route flush table "$TABLE" 2>/dev/null || true
         \\    ip -4 route replace default dev "$iface" table "$TABLE"
         \\}
         \\
@@ -1370,14 +1468,13 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\    local streak
         \\    streak="$(( $(read_degraded_streak "$iface") + 1 ))"
         \\    write_degraded_streak "$iface" "$streak"
-        \\    if [[ "$streak" -ge "$BOUNCE_AFTER_DEGRADED_CHECKS" ]]; then
+        \\    if [[ "$streak" -ge "$BOUNCE_AFTER_DEGRADED_CHECKS" ]] && { [[ "$streak" -eq "$BOUNCE_AFTER_DEGRADED_CHECKS" ]] || (( streak % 20 == 0 )); }; then
         \\        if bounce_iface "$iface" && telegram_probe_iface "$iface"; then
         \\            write_degraded_streak "$iface" 0
         \\            reason="healthy (recovered after bounce)"
         \\            return 0
         \\        fi
         \\        log "tunnel $iface still unreachable after bounce"
-        \\        write_degraded_streak "$iface" 0
         \\    fi
         \\    # Usable (up + policy route installed) but can't reach Telegram through it.
         \\    # Return 2 ("degraded-usable") so pool selection PREFERS a tunnel that can
@@ -1408,7 +1505,8 @@ fn renderTunnelPoolScript(allocator: std.mem.Allocator) ![]const u8 {
         \\        printf 'pool=%s\n' "${pool[*]}"
         \\        printf 'last_switch=%s\n' "$last_switch"
         \\        printf 'checked_at=%s\n' "$now"
-        \\    } > "$STATE_FILE"
+        \\    } > "$STATE_FILE.tmp"
+        \\    mv -f "$STATE_FILE.tmp" "$STATE_FILE"
         \\}
         \\
         \\mapfile -t pool < <(
@@ -1676,6 +1774,60 @@ fn cleanupNetnsNginxListen(allocator: std.mem.Allocator) bool {
 }
 const test_amnezia_vpn_link =
     "vpn://AAABPXicLY9Ra8IwFIX_Srn4WGoSHZSCD6I-lDEX9Gm0IrG5jkKbliSdG6X_fTdWTiA53wn3JCNo4zhkwJOnIA5AEEiTpwhUnfGqNmgdZMUI6vEN2QiNcv5K0b0mC2MJ87mELCqhyI1He1cVXsrSbLW26Fy0iThLgsRyJYhLW_8oj-_4R1FPhtj-eCazkKf8Y3v6upKNo8X5sPs87l-eLuUi2tBGq5CINnTI4dbU1WvUcAutTdM9UOcyFM-9bMkoOBjdd7XxhPFXtX2DSdW12Xq9CjMhpve3fpg_wkXKZtR31gf2xlPBJpimy_QPWglhtw";
+test "tunnel pool executes bounce backoff and recovery" {
+    const a = std.testing.allocator;
+    const script = try renderTunnelPoolScript(a);
+    defer a.free(script);
+    const start = std.mem.indexOf(u8, script, "probe_iface() {\n") orelse unreachable;
+    const end = std.mem.indexOfPos(u8, script, start, "\nstate_value() {") orelse unreachable;
+    const harness = try std.mem.concat(a, u8, &.{
+        script[start..end],
+        \\
+        \\set -eu
+        \\stored_streak=0; bounces=0; healthy=0; BOUNCE_AFTER_DEGRADED_CHECKS=2
+        \\ensure_iface_up() { :; }
+        \\ip() { :; }
+        \\show_tool_for() { echo true; }
+        \\route_table_to_iface() { :; }
+        \\policy_route_matches_iface() { :; }
+        \\telegram_probe_iface() { [[ "$healthy" == 1 ]]; }
+        \\write_degraded_streak() { stored_streak="$2"; }
+        \\read_degraded_streak() { echo "$stored_streak"; }
+        \\bounce_iface() { bounces=$((bounces + 1)); }
+        \\log() { :; }
+        \\for ((n=1;n<=19;n++)); do
+        \\  if probe_iface awg0; then exit 10; else [[ "$?" == 2 ]]; fi
+        \\done
+        \\[[ "$bounces" == 1 && "$stored_streak" == 19 ]]
+        \\if probe_iface awg0; then exit 11; else [[ "$?" == 2 ]]; fi
+        \\[[ "$bounces" == 2 && "$stored_streak" == 20 ]]
+        \\healthy=1
+        \\probe_iface awg0
+        \\[[ "$stored_streak" == 0 && "$bounces" == 2 ]]
+    });
+    defer a.free(harness);
+    const result = try sys.exec(a, &.{ "bash", "-c", harness });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "tunnel pool executes both fail closed routes when no tunnel is usable" {
+    const a = std.testing.allocator;
+    const script = try renderTunnelPoolScript(a);
+    defer a.free(script);
+    const start = std.mem.indexOf(u8, script, "if [[ -z \"$selected\" ]]; then") orelse unreachable;
+    const end = std.mem.indexOfPos(u8, script, start, "\nroute_table_to_iface \"$selected\"") orelse unreachable;
+    const harness = try std.mem.concat(a, u8, &.{
+        "selected=''; TABLE=200; candidates=(awg0); ip() { printf '%s\\n' \"$*\"; }; write_state() { :; };\n",
+        script[start..end],
+    });
+    defer a.free(harness);
+    const result = try sys.exec(a, &.{ "bash", "-c", harness });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("-4 route replace blackhole default table 200\n-6 route replace blackhole default table 200\n", result.stdout);
+}
+
 test "tunnel pool - script renders failover (prefer reachable, fall back to usable)" {
     const script = try renderTunnelPoolScript(std.testing.allocator);
     defer std.testing.allocator.free(script);
@@ -1708,6 +1860,8 @@ test "tunnel pool script - degraded tunnel bounces after consecutive-failure thr
     try std.testing.expect(std.mem.indexOf(u8, script, "\"$quick\" up \"$conf\"") != null);
     // Streak resets on success so only CONSECUTIVE failures trigger a bounce.
     try std.testing.expect(std.mem.indexOf(u8, script, "write_degraded_streak \"$iface\" 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "streak % 20 == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "still unreachable after bounce\"\n        write_degraded_streak") == null);
     try std.testing.expect(std.mem.indexOf(u8, script, "recovered after bounce") != null);
 }
 

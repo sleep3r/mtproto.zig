@@ -30,9 +30,9 @@ pub const DynamicRecordSizer = struct {
     }
 
     pub fn recordSent(self: *DynamicRecordSizer, payload_len: usize) void {
-        if (!self.enabled) return;
-        self.records_sent += 1;
-        self.bytes_sent += @as(u64, @intCast(payload_len));
+        if (!self.enabled or self.current_size == full_size) return;
+        self.records_sent +|= 1;
+        self.bytes_sent +|= @as(u64, @intCast(payload_len));
         if (self.current_size == initial_size and
             (self.records_sent >= ramp_record_threshold or self.bytes_sent >= ramp_byte_threshold))
         {

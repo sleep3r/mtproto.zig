@@ -35,6 +35,21 @@ const SCRIPT_PATH = "/usr/local/sbin/mtproto-syn-limit.sh";
 const UNIT_PATH = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
 const CHAIN = "MTPROTO_SYNLIMIT";
 
+/// Upgrade the previously generated script while preserving its chosen rate/burst.
+pub fn repairInstalled(allocator: std.mem.Allocator) void {
+    const old = sys.readFileAllocAbsolute(allocator, SCRIPT_PATH, 64 * 1024) orelse return;
+    defer allocator.free(old);
+    const loopback = std.mem.replaceOwned(u8, allocator, old, "-I INPUT -p tcp", "-I INPUT ! -i lo -p tcp") catch return;
+    defer allocator.free(loopback);
+    const reset = std.mem.replaceOwned(u8, allocator, loopback, "\"$T\" $W -F \"$CHAIN\"", "\"$T\" $W -D INPUT ! -i lo -p tcp --dport \"$PORT\" --syn -j \"$CHAIN\" 2>/dev/null || true\n    \"$T\" $W -F \"$CHAIN\"") catch return;
+    defer allocator.free(reset);
+    const ipv6 = std.mem.replaceOwned(u8, allocator, reset, "\"$IP6T\" $W -A \"$CHAIN\" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above", "\"$IP6T\" $W -A \"$CHAIN\" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-srcmask 64 --hashlimit-above") catch return;
+    defer allocator.free(ipv6);
+    if (std.mem.eql(u8, old, loopback) and std.mem.indexOf(u8, old, "--hashlimit-srcmask 64") != null) return;
+    sys.writeFileMode(SCRIPT_PATH, ipv6, 0o755) catch return;
+    sys.execSilent(allocator, &.{ "systemctl", "try-restart", SERVICE_NAME });
+}
+
 /// Token-bucket presets, mirroring MTproxy-reanimation's hard/medium/soft. Rates use
 /// the iptables `<n>/second` syntax. `soft` is the default when enabling because the
 /// stricter presets false-positive behind carrier-grade NAT / shared VPN egress.
@@ -117,6 +132,9 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.reject = true;
         } else if (std.mem.eql(u8, arg, "--drop")) {
             opts.reject = false;
+        } else {
+            ui.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
     try execute(ui, allocator, opts);
@@ -126,20 +144,12 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     ui.section(tr(ui, "Kernel SYN rate-limit (anti-flood)", "Ограничение SYN на уровне ядра (анти-флуд)"));
 
-    ui.print("  {s}{s}{s}\n", .{ Color.dim, tr(ui,
-        "Drops abusive first-SYN bursts per source IP in the kernel, before they",
-        "Дропает абьюзные SYN-всплески по каждому IP-источнику в ядре, до того как они"), Color.reset });
-    ui.print("  {s}{s}{s}\n\n", .{ Color.dim, tr(ui,
-        "ever reach the proxy. Complements the in-proxy guards (which run after accept).",
-        "достигнут прокси. Дополняет защиту внутри прокси (которая работает после accept)."), Color.reset });
+    ui.print("  {s}{s}{s}\n", .{ Color.dim, tr(ui, "Drops abusive first-SYN bursts per source IP in the kernel, before they", "Дропает абьюзные SYN-всплески по каждому IP-источнику в ядре, до того как они"), Color.reset });
+    ui.print("  {s}{s}{s}\n\n", .{ Color.dim, tr(ui, "ever reach the proxy. Complements the in-proxy guards (which run after accept).", "достигнут прокси. Дополняет защиту внутри прокси (которая работает после accept)."), Color.reset });
 
     // The same NAT/VPN false-positive that keeps the in-proxy flood guard OFF by default.
-    ui.warn(tr(ui,
-        "Per-IP limit: behind carrier-NAT / shared VPN egress many real users share one IP",
-        "Лимит на IP: за carrier-NAT / общим VPN-выходом много реальных пользователей делят один IP"));
-    ui.print("  {s}{s}{s}\n\n", .{ Color.dim, tr(ui,
-        "and can be throttled together. Leave it off unless you see a SYN flood.",
-        "и могут быть зарезаны вместе. Оставьте выключенным, если нет SYN-флуда."), Color.reset });
+    ui.warn(tr(ui, "Per-IP limit: behind carrier-NAT / shared VPN egress many real users share one IP", "Лимит на IP: за carrier-NAT / общим VPN-выходом много реальных пользователей делят один IP"));
+    ui.print("  {s}{s}{s}\n\n", .{ Color.dim, tr(ui, "and can be throttled together. Leave it off unless you see a SYN flood.", "и могут быть зарезаны вместе. Оставьте выключенным, если нет SYN-флуда."), Color.reset });
 
     printStatus(ui, allocator);
     ui.writeRaw("\n");
@@ -235,12 +245,8 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: SynLimitOpts) !void
     // client's — the limiter would throttle the LB. Warn loudly (don't refuse: for a
     // single trusted LB the operator may still want a global cap).
     if (proxy_protocol) {
-        ui.warn(tr(ui,
-            "accept_proxy_protocol is ON: the kernel sees your load balancer's IP, not real clients.",
-            "accept_proxy_protocol включён: ядро видит IP балансировщика, а не реальных клиентов."));
-        ui.print("  {s}{s}{s}\n", .{ Color.dim, tr(ui,
-            "The per-IP SYN limiter will throttle the LB. Only enable if you understand this.",
-            "Лимитер SYN per-IP будет резать балансировщик. Включайте, только если понимаете это."), Color.reset });
+        ui.warn(tr(ui, "accept_proxy_protocol is ON: the kernel sees your load balancer's IP, not real clients.", "accept_proxy_protocol включён: ядро видит IP балансировщика, а не реальных клиентов."));
+        ui.print("  {s}{s}{s}\n", .{ Color.dim, tr(ui, "The per-IP SYN limiter will throttle the LB. Only enable if you understand this.", "Лимитер SYN per-IP будет резать балансировщик. Включайте, только если понимаете это."), Color.reset });
     }
 
     ui.step(tr(ui, "Installing kernel SYN rate-limit...", "Установка ограничения SYN на уровне ядра..."));
@@ -297,6 +303,11 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: SynLimitOpts) !void
 /// and by `mtbuddy status`.
 pub fn printStatus(ui: *Tui, allocator: std.mem.Allocator) void {
     if (sys.isServiceActive(SERVICE_NAME)) {
+        const ipt = iptablesCommands().iptables;
+        if (!chainHasLimitRule(allocator, ipt) or !inputHasJump(allocator, ipt)) {
+            ui.warn(tr(ui, "SYN limiter unit is active, but its live firewall rules are missing; rerun setup syn-limit.", "Сервис SYN-limit активен, но правила firewall отсутствуют; повторите setup syn-limit."));
+            return;
+        }
         const drops = limitedCount(allocator);
         if (drops) |d| {
             var buf: [96]u8 = undefined;
@@ -361,7 +372,11 @@ pub fn renderScript(buf: []u8, p: ScriptParams) ![]const u8 {
         \\
         \\# Idempotent reset: drop the jump, flush + delete the chain (both families).
         \\for T in "$IPT" "$IP6T"; do
-        \\    "$T" $W -D INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null || true
+        \\    "$T" $W -S INPUT 2>/dev/null | while read -r op rule; do
+        \\        case "$rule" in
+        \\            *"-j $CHAIN") "$T" $W -D $rule 2>/dev/null || true ;;
+        \\        esac
+        \\    done
         \\    "$T" $W -F "$CHAIN" 2>/dev/null || true
         \\    "$T" $W -X "$CHAIN" 2>/dev/null || true
         \\done
@@ -372,13 +387,13 @@ pub fn renderScript(buf: []u8, p: ScriptParams) ![]const u8 {
         \\"$IPT" $W -N "$CHAIN" 2>/dev/null || true
         \\"$IPT" $W -A "$CHAIN" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION
         \\"$IPT" $W -A "$CHAIN" -j RETURN
-        \\"$IPT" $W -I INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN"
+        \\"$IPT" $W -I INPUT ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN"
         \\
         \\# IPv6 (best-effort — hosts without IPv6 must not fail the unit).
         \\"$IP6T" $W -N "$CHAIN" 2>/dev/null || true
-        \\"$IP6T" $W -A "$CHAIN" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION 2>/dev/null || true
+        \\"$IP6T" $W -A "$CHAIN" -p tcp -m hashlimit --hashlimit-name mtproto_syn --hashlimit-mode srcip --hashlimit-srcmask 64 --hashlimit-above "$RATE" --hashlimit-burst "$BURST" --hashlimit-htable-expire 60000 -j $ACTION 2>/dev/null || true
         \\"$IP6T" $W -A "$CHAIN" -j RETURN 2>/dev/null || true
-        \\"$IP6T" $W -I INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null || true
+        \\"$IP6T" $W -I INPUT ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null || true
         \\exit 0
         \\
     , .{
@@ -402,6 +417,9 @@ fn unitContent() []const u8 {
         "[Service]\n" ++
         "Type=oneshot\n" ++
         "RemainAfterExit=yes\n" ++
+        "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\n" ++
+        "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK\n" ++
+        "ProtectKernelTunables=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\n" ++
         "ExecStart=/bin/sh " ++ SCRIPT_PATH ++ " apply\n" ++
         "ExecStop=/bin/sh " ++ SCRIPT_PATH ++ " flush\n" ++
         "\n" ++
@@ -442,6 +460,17 @@ fn chainHasLimitRule(allocator: std.mem.Allocator, ipt: []const u8) bool {
     defer result.deinit();
     if (result.exit_code != 0) return false;
     return lineHasLimitTarget(result.stdout);
+}
+
+fn inputHasJump(allocator: std.mem.Allocator, ipt: []const u8) bool {
+    const result = sys.exec(allocator, &.{ ipt, "-S", "INPUT" }) catch return false;
+    defer result.deinit();
+    if (result.exit_code != 0) return false;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.endsWith(u8, std.mem.trim(u8, line, " \r"), "-j " ++ CHAIN)) return true;
+    }
+    return false;
 }
 
 /// Sum the limit rule's packet counter from `iptables -nvxL CHAIN`. Returns an owned
@@ -532,7 +561,8 @@ test "renderScript bakes params and stays brace-free for std.fmt" {
     try std.testing.expect(std.mem.indexOf(u8, out, "RATE=2/second") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "BURST=5") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "CHAIN=MTPROTO_SYNLIMIT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "-I INPUT -p tcp --dport \"$PORT\" --syn -j \"$CHAIN\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-I INPUT ! -i lo -p tcp --dport \"$PORT\" --syn -j \"$CHAIN\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "--hashlimit-srcmask 64") != null);
     // Default over-limit target is DROP.
     try std.testing.expect(std.mem.indexOf(u8, out, "ACTION=\"DROP\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "-j $ACTION") != null);

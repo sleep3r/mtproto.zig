@@ -212,7 +212,8 @@ pub const HandshakeFloodGuard = struct {
                 }
 
                 var key = ClientKey{ .family = .ip6 };
-                @memcpy(&key.bytes, b);
+                // Group native IPv6 by /64, matching per-user network quotas.
+                @memcpy(key.bytes[0..8], b[0..8]);
                 break :blk key;
             },
         };

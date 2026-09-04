@@ -20,7 +20,26 @@ const ProcessMetrics = struct {
     cgroup_memory_limit_bytes: ?u64 = null,
 };
 
-pub fn start(state: *proxy.ProxyState) !void {
+pub const Handle = struct {
+    context: *Context,
+    threads: [4]std.Thread,
+
+    pub fn stop(self: Handle) void {
+        self.context.stopping.store(true, .release);
+        _ = linux.shutdown(self.context.server.socket.handle, linux.SHUT.RD);
+        for (self.threads) |thread| thread.join();
+        self.context.server.deinit(std.Io.Threaded.global_single_threaded.io());
+        self.context.state.allocator.destroy(self.context);
+    }
+};
+
+const Context = struct {
+    state: *proxy.ProxyState,
+    server: net.Server,
+    stopping: std.atomic.Value(bool) = .init(false),
+};
+
+pub fn start(state: *proxy.ProxyState) !Handle {
     if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
     const host = state.config.metrics.effectiveHost();
@@ -36,22 +55,34 @@ pub fn start(state: *proxy.ProxyState) !void {
 
     log.info("metrics endpoint listening on {s}:{d}", .{ host, port });
 
-    const thread = try std.Thread.spawn(.{}, acceptLoop, .{ state, server });
-    thread.detach();
+    const context = try state.allocator.create(Context);
+    errdefer state.allocator.destroy(context);
+    context.* = .{ .state = state, .server = server };
+    var threads: [4]std.Thread = undefined;
+    var count: usize = 0;
+    errdefer {
+        context.stopping.store(true, .release);
+        _ = linux.shutdown(server.socket.handle, linux.SHUT.RD);
+        for (threads[0..count]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, acceptLoop, .{context});
+        count += 1;
+    }
+    return .{ .context = context, .threads = threads };
 }
 
-fn acceptLoop(state: *proxy.ProxyState, server: net.Server) void {
-    var local_server = server;
+fn acceptLoop(context: *Context) void {
     const io_ctx = std.Io.Threaded.global_single_threaded.io();
-    defer local_server.deinit(io_ctx);
 
-    while (true) {
-        const conn = local_server.accept(io_ctx) catch |err| {
+    while (!context.stopping.load(.acquire)) {
+        const conn = context.server.accept(io_ctx) catch |err| {
+            if (context.stopping.load(.acquire)) return;
             log.warn("metrics accept failed: {any}", .{err});
             sleepNs(200 * std.time.ns_per_ms);
             continue;
         };
-        handleConnection(state, conn.socket.handle);
+        handleConnection(context.state, conn.socket.handle);
     }
 }
 
@@ -61,7 +92,7 @@ fn resolveFirstAddress(host: []const u8, port: u16) !net.IpAddress {
     const host_name = try net.HostName.init(host);
     const io_ctx = std.Io.Threaded.global_single_threaded.io();
 
-    var results_buf: [8]net.HostName.LookupResult = undefined;
+    var results_buf: [32]net.HostName.LookupResult = undefined;
     var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
     try host_name.lookup(io_ctx, &results, .{ .port = port });
 
@@ -104,7 +135,17 @@ fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
     }
 
     var req_buf: [2048]u8 = undefined;
-    const req_len = posix.read(fd, &req_buf) catch return;
+    var req_len: usize = 0;
+    const deadline = @import("proxy/socket_utils.zig").nowMs() + 5000;
+    while (req_len < req_buf.len and std.mem.indexOf(u8, req_buf[0..req_len], "\r\n") == null) {
+        const remaining = deadline - @import("proxy/socket_utils.zig").nowMs();
+        if (remaining <= 0) return;
+        const timeout = posix.timeval{ .sec = @intCast(@divTrunc(remaining, 1000)), .usec = @intCast(@mod(remaining, 1000) * 1000) };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch return;
+        const n = posix.read(fd, req_buf[req_len..]) catch return;
+        if (n == 0) return;
+        req_len += n;
+    }
     if (req_len == 0) return;
 
     const request = req_buf[0..req_len];
@@ -134,9 +175,8 @@ fn handleConnection(state: *proxy.ProxyState, fd: posix.fd_t) void {
         writeSimpleResponse(fd, "404 Not Found", "text/plain", "not found\n");
         return;
     }
-    writeMetricsResponse(fd, state) catch {
-        writeSimpleResponse(fd, "500 Internal Server Error", "text/plain", "internal error\n");
-    };
+    // Once the response starts, a write failure must only close the connection.
+    writeMetricsResponse(fd, state) catch {};
 }
 
 fn closeFd(fd: posix.fd_t) void {
@@ -153,10 +193,10 @@ fn writeMetricsResponse(fd: posix.fd_t, state: *proxy.ProxyState) !void {
     // Sized for the per-user families, which dominate: every configured user costs
     // ~165 bytes, and a user with an [access.user_max_ips] quota ~145 more. A fixed
     // writer that runs out fails the whole scrape, so keep the headroom generous.
-    var body_buf: [64 * 1024]u8 = undefined;
-    var body_writer: std.Io.Writer = .fixed(&body_buf);
-    try writeMetrics(&body_writer, state, collectProcessMetrics());
-    const body = body_writer.buffered();
+    var body_writer: std.Io.Writer.Allocating = .init(state.allocator);
+    defer body_writer.deinit();
+    try writeMetrics(&body_writer.writer, state, collectProcessMetrics());
+    const body = body_writer.written();
 
     var header_buf: [256]u8 = undefined;
     var header_writer: std.Io.Writer = .fixed(&header_buf);
@@ -360,10 +400,24 @@ fn writePrometheusLabelValue(writer: anytype, value: []const u8) !void {
         switch (ch) {
             '\\' => try writer.writeAll("\\\\"),
             '"' => try writer.writeAll("\\\""),
-            '\n' => try writer.writeAll("\\n"),
+            '\n', '\r' => try writer.writeAll("\\n"), // Prometheus has no \\r escape.
             else => try writer.writeByte(ch),
         }
     }
+}
+
+test "labels normalize carriage returns using valid Prometheus escapes" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writePrometheusLabelValue(&writer, "a\rb\n\"\\");
+    try std.testing.expectEqualStrings("a\\nb\\n\\\"\\\\", writer.buffered());
+}
+
+test "process status parses both gauges from one snapshot and rejects overflow" {
+    const status = "Name: proxy\nVmRSS:\t12 kB\nVmSize:\t34 kB\n";
+    try std.testing.expectEqual(@as(?u64, 12 * 1024), parseStatusValueBytes(status, "VmRSS:"));
+    try std.testing.expectEqual(@as(?u64, 34 * 1024), parseStatusValueBytes(status, "VmSize:"));
+    try std.testing.expectEqual(@as(?u64, null), parseStatusValueBytes("VmRSS: 18446744073709551615 kB", "VmRSS:"));
 }
 
 fn writeGauge(writer: anytype, name: []const u8, help: []const u8, value: anytype) !void {
@@ -381,15 +435,31 @@ fn boolToInt(value: bool) u8 {
 }
 
 fn collectProcessMetrics() ProcessMetrics {
-    return .{
-        .resident_memory_bytes = readStatusValueBytes("VmRSS:"),
-        .virtual_memory_bytes = readStatusValueBytes("VmSize:"),
+    // Four scrape workers share one one-second snapshot, including the O(fd-count)
+    // directory walk. A burst of scrapes must not multiply procfs work.
+    const Cache = struct {
+        var mutex: std.Io.Mutex = .init;
+        var at_ms: i64 = -1;
+        var value: ProcessMetrics = .{};
+    };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    Cache.mutex.lockUncancelable(io);
+    defer Cache.mutex.unlock(io);
+    const now: i64 = @intCast(std.Io.Clock.awake.now(io).toMilliseconds());
+    if (Cache.at_ms >= 0 and now - Cache.at_ms < 1000) return Cache.value;
+    var status_buf: [16 * 1024]u8 = undefined;
+    const status = readFileAbsolute("/proc/self/status", &status_buf) orelse "";
+    Cache.value = .{
+        .resident_memory_bytes = parseStatusValueBytes(status, "VmRSS:"),
+        .virtual_memory_bytes = parseStatusValueBytes(status, "VmSize:"),
         .cpu_seconds_total = readCpuSecondsTotal(),
         .open_fds = countOpenFds(),
         .max_fds = readMaxFds(),
         .cgroup_memory_usage_bytes = readCgroupMemoryCurrent(),
         .cgroup_memory_limit_bytes = readCgroupMemoryLimit(),
     };
+    Cache.at_ms = now;
+    return Cache.value;
 }
 
 fn readCgroupMemoryCurrent() ?u64 {
@@ -418,17 +488,14 @@ fn readNumericFileAbsolute(path: []const u8) ?u64 {
     return std.fmt.parseInt(u64, trimmed, 10) catch null;
 }
 
-fn readStatusValueBytes(label: []const u8) ?u64 {
-    var buf: [16 * 1024]u8 = undefined;
-    const text = readFileAbsolute("/proc/self/status", &buf) orelse return null;
-
+fn parseStatusValueBytes(text: []const u8, label: []const u8) ?u64 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, label)) continue;
         var it = std.mem.tokenizeAny(u8, line[label.len..], " \t");
         const value_txt = it.next() orelse return null;
         const kib = std.fmt.parseInt(u64, value_txt, 10) catch return null;
-        return kib * 1024;
+        return std.math.mul(u64, kib, 1024) catch null;
     }
     return null;
 }

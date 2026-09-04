@@ -10,7 +10,6 @@ const sys = @import("sys.zig");
 const toml = @import("toml.zig");
 const release = @import("release.zig");
 const tunnel_wg = @import("tunnel_wg.zig");
-const Tunnel = @import("tunnel").Tunnel;
 
 const Tui = tui_mod.Tui;
 const Color = tui_mod.Color;
@@ -45,6 +44,8 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
 
         if (arg.len > 0 and arg[0] != '-') {
             opts.awg_source = arg;
+        } else {
+            return error.UnknownOption;
         }
     }
 
@@ -71,7 +72,7 @@ pub fn freeInterfaceList(allocator: std.mem.Allocator, list: []const []const u8)
 }
 
 /// Create (iface_opt == null → next free interface) or replace (iface_opt set) an AmneziaWG /
-/// WireGuard tunnel from a pasted config or vpn:// share link. The management/type menus that
+/// WireGuard tunnel from a config file path or vpn:// share link. The management/type menus that
 /// reach this live in main.zig; this is just the AmneziaWG create wizard. Esc steps back one
 /// field (confirm → config), and Esc at the config prompt returns error.GoBack to the caller.
 pub fn runCreateAmnezia(ui: *Tui, allocator: std.mem.Allocator, iface_opt: ?[]const u8) !void {
@@ -181,6 +182,7 @@ fn tunnelRuntimeStatus(allocator: std.mem.Allocator, iface: []const u8) []const 
     const link = sys.exec(allocator, &.{ "ip", "link", "show", "dev", iface }) catch return "unknown";
     defer link.deinit();
     if (link.exit_code != 0) return "down";
+    if (std.mem.startsWith(u8, iface, "sbx")) return "up";
 
     const tool = tunnelShowTool(iface) orelse return "up, no tool";
     const show = sys.exec(allocator, &.{ tool, "show", iface }) catch return "up, show failed";
@@ -294,6 +296,12 @@ fn deleteTunnelPoolMember(allocator: std.mem.Allocator, iface: []const u8) !Tunn
         try doc.save(INSTALL_DIR ++ "/config.toml");
     }
 
+    if (removed_last) {
+        sys.execSilent(allocator, &.{ "ip", "-4", "route", "replace", "blackhole", "default", "table", "200" });
+    } else {
+        refreshTunnelPoolRuntime(allocator);
+    }
+
     // Only bring the interface down when no config behind it is somebody else's. An
     // adopted interface was up before mtbuddy touched it and is theirs to run; the pool
     // entry is gone either way, so nothing of ours routes through it any more.
@@ -302,10 +310,8 @@ fn deleteTunnelPoolMember(allocator: std.mem.Allocator, iface: []const u8) !Tunn
 
     if (removed_last) {
         disableTunnelPoolRuntime(allocator);
-        release.writeServiceFile();
+        try release.writeServiceFile();
         _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch null;
-    } else {
-        refreshTunnelPoolRuntime(allocator);
     }
 
     _ = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch null;
@@ -398,6 +404,7 @@ fn disableTunnelPoolRuntime(allocator: std.mem.Allocator) void {
     sys.execSilent(allocator, &.{ "systemctl", "disable", "--now", "mtproto-tunnel-pool.timer" });
     sys.execSilent(allocator, &.{ "systemctl", "stop", "mtproto-tunnel-pool.service" });
     sys.execSilent(allocator, &.{ "sh", "-c", "while ip -4 rule del priority 1200 fwmark 200 table 200 2>/dev/null; do :; done; while ip -4 rule del fwmark 200 table 200 2>/dev/null; do :; done; ip -4 route flush table 200 2>/dev/null || true" });
+    sys.execSilent(allocator, &.{ "sh", "-c", "while ip -6 rule del fwmark 200 table 200 2>/dev/null; do :; done; ip -6 route flush table 200 2>/dev/null || true" });
     sys.execSilent(allocator, &.{ "rm", "-f", TUNNEL_SCRIPT, TUNNEL_POOL_STATE, TUNNEL_POOL_SERVICE, TUNNEL_POOL_TIMER });
 }
 
@@ -525,50 +532,6 @@ fn clearTunnelConfigInDoc(doc: *toml.TomlDoc) !void {
     try doc.set("upstream.tunnel", "interface", "\"\"");
     try doc.set("upstream.tunnel", "interfaces", "[]");
     try doc.set("upstream.tunnel", "pinned_interface", "\"\"");
-}
-
-fn nextAwgInterfaceNameFromPool(allocator: std.mem.Allocator, used: []const []const u8) ![]const u8 {
-    var i: usize = 0;
-    while (i < 64) : (i += 1) {
-        var buf: [16]u8 = undefined;
-        const candidate = try std.fmt.bufPrint(&buf, "awg{d}", .{i});
-        if (!tunnel_wg.containsInterface(used, candidate)) return try allocator.dupe(u8, candidate);
-    }
-    return error.NoFreeInterface;
-}
-
-/// Strip legacy netns listen directives (e.g. `listen 10.200.200.1:8443 ssl;`)
-/// from the nginx masking config. Returns true if any lines were removed.
-/// Detect the currently active tunnel by inspecting runtime state.
-/// Returns the `Tunnel.Tag` corresponding to the detected tunnel,
-/// or `.none` if no known tunnel is active.
-pub fn detectActiveTunnel(allocator: std.mem.Allocator) Tunnel.Tag {
-    const route_result = sys.exec(allocator, &.{ "ip", "-4", "route", "show", "table", "200", "default" }) catch null;
-    if (route_result) |r| {
-        defer r.deinit();
-        if (r.exit_code == 0 and std.mem.indexOf(u8, r.stdout, " dev ") != null) return .tunnel;
-    }
-
-    const awg_result = sys.exec(allocator, &.{ "awg", "show", "awg0" }) catch null;
-    if (awg_result) |r| {
-        defer r.deinit();
-        if (r.exit_code == 0) return .tunnel;
-    }
-
-    const wg_result = sys.exec(allocator, &.{ "wg", "show", "wg0" }) catch null;
-    if (wg_result) |r| {
-        defer r.deinit();
-        if (r.exit_code == 0) return .tunnel;
-    }
-
-    return .none;
-}
-
-test "tunnel pool - next awg interface skips used names" {
-    const used = [_][]const u8{ "awg0", "awg1" };
-    const next = try nextAwgInterfaceNameFromPool(std.testing.allocator, &used);
-    defer std.testing.allocator.free(next);
-    try std.testing.expectEqualStrings("awg2", next);
 }
 
 test "tunnel pool - append interface avoids duplicates" {

@@ -67,6 +67,7 @@ fn parseV1(buf: []const u8) ParseResult {
     const src_port = std.fmt.parseInt(u16, src_port_s, 10) catch return .invalid;
 
     const addr = net.IpAddress.parse(src_ip, src_port) catch return .invalid;
+    if (std.mem.eql(u8, proto, "TCP4") != (addr == .ip4)) return .invalid;
     return .{ .ok = .{ .consumed = consumed, .src = addr } };
 }
 
@@ -76,6 +77,7 @@ fn parseV2(buf: []const u8) ParseResult {
     const ver_cmd = buf[12];
     if (ver_cmd >> 4 != 0x2) return .invalid; // version must be 2
     const cmd = ver_cmd & 0x0f; // 0=LOCAL, 1=PROXY
+    if (cmd > 1) return .invalid;
     const fam = buf[13];
     const addr_len = std.mem.readInt(u16, buf[14..16], .big);
     const total = 16 + @as(usize, addr_len);
@@ -97,7 +99,8 @@ fn parseV2(buf: []const u8) ParseResult {
             const port = std.mem.readInt(u16, ab[32..34], .big);
             return .{ .ok = .{ .consumed = total, .src = net_helpers.ip6(ip, port, 0, 0) } };
         },
-        else => return .{ .ok = .{ .consumed = total, .src = null } }, // unspec / unix: keep peer
+        0x00 => return .{ .ok = .{ .consumed = total, .src = null } },
+        else => return .invalid,
     }
 }
 

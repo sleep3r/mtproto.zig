@@ -35,15 +35,8 @@ test "http fetch - curl config escaping backslash and double-quote" {
 }
 
 pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    return fetchUrlBytesStd(allocator, url) catch |err| {
-        // Zig's std resolver throws ResolvConfParseFailed on a /etc/resolv.conf whose
-        // last line lacks a trailing newline (SolusVM and several VPS images). curl
-        // resolves via NSS/getent, which tolerates it — retry there instead of failing
-        // the whole fetch (keeps the dependency-free std path for healthy hosts).
-        if (std.mem.eql(u8, @errorName(err), "ResolvConfParseFailed"))
-            return runCurlFetch(allocator, url, null);
-        return err;
-    };
+    // The std HTTP path has no deadline. curl bounds DNS, connect and body reads.
+    return runCurlFetch(allocator, url, null);
 }
 
 fn fetchUrlBytesStd(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
@@ -206,8 +199,8 @@ fn writeCurlProxyConfig(
 
     // scheme/endpoint are interpolated unescaped into the proxy line; reject control bytes
     // so they can't break out of the value (same option-injection class as the creds).
-    for (scheme) |c| if (c < 0x20 or c == 0x7f) return error.CurlConfigWriteFailed;
-    for (endpoint) |c| if (c < 0x20 or c == 0x7f) return error.CurlConfigWriteFailed;
+    for (scheme) |c| if (c < 0x20 or c == 0x7f or c == '"' or c == '\\') return error.CurlConfigWriteFailed;
+    for (endpoint) |c| if (c < 0x20 or c == 0x7f or c == '"' or c == '\\') return error.CurlConfigWriteFailed;
 
     const header = std.fmt.bufPrint(content_buf, "proxy = \"{s}://{s}\"\nproxy-user = \"", .{ scheme, endpoint }) catch
         return error.CurlConfigTooLong;
@@ -311,7 +304,7 @@ pub fn fetchUrlBytesViaProxy(
     }
     try argv.append(allocator, url);
 
-    const result = std.process.run(allocator, io, .{
+    const result = @import("child_process").run(allocator, io, .{
         .argv = argv.items,
         .stdout_limit = std.Io.Limit.limited(1 * 1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(1 * 1024 * 1024),
@@ -386,7 +379,7 @@ fn runCurlFetch(allocator: std.mem.Allocator, url: []const u8, interface: ?[]con
     var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer io_instance.deinit();
 
-    const result = std.process.run(allocator, io_instance.io(), .{
+    const result = @import("child_process").run(allocator, io_instance.io(), .{
         .argv = argv,
         .stdout_limit = std.Io.Limit.limited(1 * 1024 * 1024),
         .stderr_limit = std.Io.Limit.limited(1 * 1024 * 1024),

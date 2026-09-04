@@ -13,6 +13,7 @@ pub fn parseIpv4Literal(text: []const u8) ?[4]u8 {
     var i: usize = 0;
     while (parts.next()) |p| {
         if (i >= 4 or p.len == 0) return null;
+        for (p) |c| if (!std.ascii.isDigit(c)) return null;
         const n = std.fmt.parseInt(u16, p, 10) catch return null;
         if (n > 255) return null;
         out[i] = @intCast(n);
@@ -153,28 +154,13 @@ pub fn detectAwgEndpointIpv4(allocator: std.mem.Allocator) ?[4]u8 {
 
     for (paths) |path| {
         const io_ctx = std.Io.Threaded.global_single_threaded.io();
-        const content = std.Io.Dir.cwd().readFileAlloc(io_ctx, path, allocator, .limited(64 * 1024)) catch continue;
+        const content = std.Io.Dir.cwd().readFileAlloc(io_ctx, path, allocator, .limited(64 * 1024)) catch |err| {
+            if (err == error.AccessDenied) std.log.scoped(.proxy).warn("Cannot read tunnel endpoint config '{s}'; NAT detection will try remaining configs/public egress. Set middle_proxy_nat_ip explicitly if the endpoint differs", .{path});
+            continue;
+        };
         defer allocator.free(content);
 
         if (parseAwgEndpointIpv4FromConfig(allocator, content)) |ip| return ip;
-    }
-
-    return null;
-}
-
-pub fn detectPublicIpv4(allocator: std.mem.Allocator, comptime fetchBytes: anytype) ?[4]u8 {
-    const services = [_][]const u8{
-        "https://api.ipify.org",
-        "https://ifconfig.me",
-        "https://ipv4.icanhazip.com",
-    };
-
-    for (services) |url| {
-        const stdout = fetchBytes(allocator, url) catch continue;
-        const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-        const parsed = parseIpv4Literal(trimmed);
-        allocator.free(stdout);
-        if (parsed) |ip| return ip;
     }
 
     return null;

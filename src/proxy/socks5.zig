@@ -70,7 +70,7 @@ pub fn buildGreeting(buf: []u8, use_auth: bool) []u8 {
 pub fn parseGreetingResponse(data: []const u8) ?Method {
     if (data.len < 2) return null;
     if (data[0] != version) return null;
-    return std.enums.fromInt(Method, data[1]) orelse .no_acceptable;
+    return std.enums.fromInt(Method, data[1]);
 }
 
 /// Minimum bytes needed for greeting response.

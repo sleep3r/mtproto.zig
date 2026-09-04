@@ -6,6 +6,20 @@
 const std = @import("std");
 const posix = std.posix;
 
+pub fn watchdogInterval(usec: ?[]const u8, owner_pid: ?[]const u8, current_pid: u32) u64 {
+    if (owner_pid) |text| {
+        const pid = std.fmt.parseInt(u32, text, 10) catch return 0;
+        if (pid != current_pid) return 0;
+    }
+    return std.fmt.parseInt(u64, usec orelse return 0, 10) catch 0;
+}
+
+test "watchdog interval honors the designated process" {
+    try std.testing.expectEqual(@as(u64, 1000), watchdogInterval("1000", "42", 42));
+    try std.testing.expectEqual(@as(u64, 0), watchdogInterval("1000", "43", 42));
+    try std.testing.expectEqual(@as(u64, 0), watchdogInterval("1000", "bad", 42));
+}
+
 /// Build an AF_UNIX address for `name`. `name` is either an absolute path or an
 /// abstract socket starting with '@' (encoded as a leading NUL byte). Returns
 /// the address plus its used length, or null if it doesn't fit.

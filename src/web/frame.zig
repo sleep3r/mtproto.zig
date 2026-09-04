@@ -293,4 +293,7 @@ test "frame type classification matches tdesktop" {
 test "serialize rejects oversized payload and short buffers" {
     var small: [4]u8 = undefined;
     try std.testing.expectError(error.NoSpace, serialize(&small, .welcome, 0, ""));
+    const oversized = try std.testing.allocator.alloc(u8, max_payload + 1);
+    defer std.testing.allocator.free(oversized);
+    try std.testing.expectError(error.PayloadTooLarge, serialize(&small, .data, 1, oversized));
 }

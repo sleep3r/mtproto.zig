@@ -2,6 +2,25 @@ const std = @import("std");
 const posix = std.posix;
 const crypto = @import("../crypto/crypto.zig");
 
+test "concurrent workers admit the same replay digest exactly once" {
+    const cache = try std.testing.allocator.create(ReplayCache);
+    defer std.testing.allocator.destroy(cache);
+    cache.* = ReplayCache.init();
+    var admitted = std.atomic.Value(u32).init(0);
+    const Worker = struct {
+        fn run(shared: *ReplayCache, count: *std.atomic.Value(u32)) void {
+            const digest = [_]u8{0x7b} ** 32;
+            for (0..1000) |_| {
+                if (!shared.checkAndInsert(&digest)) _ = count.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ cache, &admitted });
+    for (threads) |thread| thread.join();
+    try std.testing.expectEqual(@as(u32, 1), admitted.load(.monotonic));
+}
+
 fn nowSeconds() i64 {
     var ts: posix.timespec = undefined;
     const rc = posix.system.clock_gettime(.MONOTONIC, &ts);
@@ -12,7 +31,7 @@ fn nowSeconds() i64 {
 pub const ReplayCache = struct {
     const BUCKETS = 8192;
     const MAX_PROBES = 8;
-    const stale_after_s: i64 = 60 * 60;
+    const stale_after_s: i64 = 240;
 
     const Entry = struct {
         used: bool = false,
@@ -59,17 +78,18 @@ pub const ReplayCache = struct {
     /// Returns true if this digest was already seen (duplicate replay),
     /// false when inserted as a new digest.
     pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
+        return self.checkAndInsertAt(digest, nowSeconds());
+    }
+
+    fn checkAndInsertAt(self: *ReplayCache, digest: *const [32]u8, now_s: i64) bool {
         const io = lockIo();
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
 
         const key = digestKey(digest);
-        const now_s = nowSeconds();
         const start = self.indexFor(key);
 
         var first_stale_idx: ?usize = null;
-        var oldest_idx: usize = start;
-        var oldest_ts: i64 = std.math.maxInt(i64);
 
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
@@ -89,13 +109,10 @@ pub const ReplayCache = struct {
             if (now_s - e.last_seen_s > stale_after_s and first_stale_idx == null) {
                 first_stale_idx = idx;
             }
-            if (e.last_seen_s < oldest_ts) {
-                oldest_ts = e.last_seen_s;
-                oldest_idx = idx;
-            }
         }
 
-        const victim_idx = first_stale_idx orelse oldest_idx;
+        // Saturation must reject the new handshake, never forget a live digest.
+        const victim_idx = first_stale_idx orelse return true;
         self.entries[victim_idx] = .{ .used = true, .key = key, .last_seen_s = now_s };
         return false;
     }
@@ -107,6 +124,20 @@ test "replay cache detects duplicate digest" {
 
     try std.testing.expect(!cache.checkAndInsert(&digest));
     try std.testing.expect(cache.checkAndInsert(&digest));
+}
+
+test "saturated replay probe window never evicts a live entry" {
+    var cache = ReplayCache.init();
+    const digest = [_]u8{0xab} ** 32;
+    const start = cache.indexFor(ReplayCache.digestKey(&digest));
+    for (0..ReplayCache.MAX_PROBES) |i| {
+        cache.entries[(start + i) & (ReplayCache.BUCKETS - 1)] = .{ .used = true, .key = i, .last_seen_s = nowSeconds() };
+    }
+    try std.testing.expect(cache.checkAndInsert(&digest));
+    try std.testing.expectEqual(@as(u64, 0), cache.entries[start].key);
+    const expired_now = nowSeconds() + 241;
+    try std.testing.expect(!cache.checkAndInsertAt(&digest, expired_now));
+    try std.testing.expect(cache.checkAndInsertAt(&digest, expired_now));
 }
 
 test "replay cache accepts distinct digests" {

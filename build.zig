@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
         "Build the internet-facing proxy with runtime safety on (ReleaseSafe) even in release builds (default: true)",
     ) orelse true;
     const dataplane_optimize: std.builtin.OptimizeMode =
-        if (dataplane_safety and optimize == .ReleaseFast) .ReleaseSafe else optimize;
+        if (dataplane_safety and (optimize == .ReleaseFast or optimize == .ReleaseSmall)) .ReleaseSafe else optimize;
     const pinned_minisign_pubkey = "RWT8YwmUuq/3WpUnYJjD6rAfQugYdZKWr61U3O+2kdNvriLSyrvVU/NO";
     const minisign_pubkey = b.option(
         []const u8,
@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "minisign_pubkey", minisign_pubkey);
+    build_options.addOption([]const u8, "proxy_service", @embedFile("deploy/mtproto-proxy.service"));
     const build_options_mod = build_options.createModule();
     const version_mod = b.createModule(.{
         .root_source_file = b.path("src/version.zig"),
@@ -44,6 +45,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const child_process_mod = b.createModule(.{
+        .root_source_file = b.path("src/proxy/child_process.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -51,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
+            .{ .name = "child_process", .module = child_process_mod },
         },
     });
 
@@ -89,7 +97,8 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
 
-    b.installArtifact(bench_exe);
+    const install_bench = b.addInstallArtifact(bench_exe, .{});
+    b.step("install-bench", "Install the optional benchmark binary").dependOn(&install_bench.step);
 
     const run_bench_cmd = b.addRunArtifact(bench_exe);
     if (b.args) |args| {
@@ -119,12 +128,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/proxy/http_fetch.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "child_process", .module = child_process_mod }},
     });
 
     const proxy_net_helpers_mod = b.createModule(.{
         .root_source_file = b.path("src/proxy/net_helpers.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "child_process", .module = child_process_mod }},
     });
 
     // The WEB proxy hostname rules and bridge-capability derivation are shared: the relay
@@ -141,6 +152,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "cover_page", .module = b.createModule(.{ .root_source_file = b.path("src/web/page.zig"), .target = target, .optimize = optimize }) },
             .{ .name = "tunnel", .module = tunnel_mod },
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
@@ -156,6 +168,7 @@ pub fn build(b: *std.Build) void {
         .name = "mtbuddy",
         .root_module = ctl_mod,
     });
+    ctl_exe.pie = target.result.os.tag == .linux;
 
     b.installArtifact(ctl_exe);
 
@@ -174,6 +187,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "child_process", .module = child_process_mod },
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },
         },
@@ -192,6 +206,15 @@ pub fn build(b: *std.Build) void {
     const run_ctl_tests = b.addRunArtifact(ctl_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    const obf_gen = b.addExecutable(.{
+        .name = "e2e-obf-handshake-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/e2e_obf_handshake_gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&obf_gen.step);
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_ctl_tests.step);
 
@@ -199,11 +222,42 @@ pub fn build(b: *std.Build) void {
     if (target.query.isNative() and target.result.os.tag == .linux) {
         const run_mtbuddy_help_ru = b.addRunArtifact(ctl_exe);
         run_mtbuddy_help_ru.addArgs(&.{ "--lang", "ru", "--help" });
+        _ = run_mtbuddy_help_ru.captureStdOut(.{});
+        _ = run_mtbuddy_help_ru.captureStdErr(.{});
         test_step.dependOn(&run_mtbuddy_help_ru.step);
+        const bad_invocations = [_][]const []const u8{
+            &.{"unknown-command"},
+            &.{"--lang"},
+            &.{ "setup", "unknown" },
+            &.{ "setup", "masking", "--lang", "ru" },
+            &.{ "config", "validate", "--config" },
+            &.{ "install", "--secert", "bad" },
+            &.{ "update", "--unknown" },
+            &.{ "setup", "web", "--unknown" },
+            &.{ "setup", "egress", "--unknown" },
+            &.{ "setup", "tunnel", "--unknown" },
+            &.{ "setup", "masking", "--unknown" },
+            &.{ "setup", "dashboard", "--unknown" },
+            &.{ "setup", "nfqws", "--unknown" },
+            &.{ "setup", "recovery", "--unknown" },
+            &.{ "setup", "syn-limit", "--unknown" },
+            &.{ "ipv6-hop", "--unknown" },
+        };
+        for (bad_invocations) |argv| {
+            const bad_usage = b.addRunArtifact(ctl_exe);
+            bad_usage.addArgs(argv);
+            bad_usage.expectExitCode(1);
+            _ = bad_usage.captureStdOut(.{});
+            _ = bad_usage.captureStdErr(.{});
+            test_step.dependOn(&bad_usage.step);
+        }
     }
 
     // E2E / integration harness (process-level scenarios).
-    const e2e_cmd = b.addSystemCommand(&.{ "python3", "test/e2e/run.py" });
+    const e2e_cmd = b.addSystemCommand(&.{"python3"});
+    e2e_cmd.addFileArg(b.path("test/e2e/run.py"));
+    e2e_cmd.addArg("--obf-gen");
+    e2e_cmd.addFileArg(obf_gen.getEmittedBin());
     e2e_cmd.step.dependOn(&exe.step);
     e2e_cmd.addArg("--proxy-bin");
     e2e_cmd.addFileArg(exe.getEmittedBin());
@@ -219,7 +273,8 @@ pub fn build(b: *std.Build) void {
     // that fail silently when they are wrong — so it is driven by a scripted client in
     // node rather than left unexercised. Kept out of `test` because it needs python3 and
     // node; the runner skips cleanly when node is absent.
-    const web_bridge_cmd = b.addSystemCommand(&.{ "python3", "test/web-bridge/run.py" });
+    const web_bridge_cmd = b.addSystemCommand(&.{"python3"});
+    web_bridge_cmd.addFileArg(b.path("test/web-bridge/run.py"));
     const web_bridge_step = b.step("web-bridge", "Run WEB proxy bridge-page contract tests");
     web_bridge_step.dependOn(&web_bridge_cmd.step);
 }

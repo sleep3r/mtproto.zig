@@ -23,10 +23,8 @@ pub const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// base64 of a 20-byte SHA-1 digest.
 pub const accept_len: usize = 28;
 
-/// Largest client frame we will buffer. tdesktop sends one relay frame per carrier
-/// message and never exceeds 64 KiB of DATA, so this leaves >2x headroom while keeping
-/// per-session memory bounded and predictable.
-pub const max_message: usize = 128 * 1024;
+/// Largest client frame/message includes one maximum-size relay frame.
+pub const max_message: usize = @import("frame.zig").max_payload + @import("frame.zig").header_size;
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -169,8 +167,15 @@ pub fn parseHeader(buf: []const u8) FrameError!Incoming {
 /// Unmask a payload in place. `offset` is the payload byte index the slice starts at,
 /// so a payload can be unmasked in several chunks.
 pub fn unmask(payload: []u8, mask: [4]u8, offset: usize) void {
-    for (payload, 0..) |*byte, i| {
-        byte.* ^= mask[(offset + i) % 4];
+    const rotated = [4]u8{ mask[offset & 3], mask[(offset +% 1) & 3], mask[(offset +% 2) & 3], mask[(offset +% 3) & 3] };
+    const key: @Vector(16, u8) = (rotated ** 4);
+    var used: usize = 0;
+    while (payload.len - used >= 16) : (used += 16) {
+        const block: @Vector(16, u8) = payload[used..][0..16].*;
+        payload[used..][0..16].* = block ^ key;
+    }
+    for (payload[used..], used..) |*byte, i| {
+        byte.* ^= mask[(offset +% i) & 3];
     }
 }
 

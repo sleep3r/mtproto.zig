@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import resource
 import socket
 import subprocess
 import sys
@@ -83,8 +84,10 @@ def tcp_states(port: int) -> Dict[str, int]:
         state, local_addr, peer_addr = parts[0], parts[3], parts[4]
         # Exact port match, not substring: `:443` must not also count :4433/:44310 etc.
         # (unrelated services on a shared VPS), which would skew the CLOSE-WAIT assertions.
-        if port_of(local_addr) == want or port_of(peer_addr) == want:
+        if port_of(local_addr) == want:
             states[state] = states.get(state, 0) + 1
+        if port_of(peer_addr) == want:
+            states["client:" + state] = states.get("client:" + state, 0) + 1
 
     return states
 
@@ -105,24 +108,32 @@ def print_snapshot(label: str, pid: Optional[int], port: int) -> Dict[str, objec
 
 
 def has_stats(stats: ProcStats) -> bool:
-    return any(
+    return all(
         v is not None for v in (stats.rss_kb, stats.vms_kb, stats.threads, stats.fds)
     )
 
 
 def open_idle_connections(
-    host: str, port: int, count: int, timeout: float
+    host: str, port: int, count: int, timeout: float, budget: float = 30.0
 ) -> tuple[list[socket.socket], int]:
     conns: list[socket.socket] = []
     failed = 0
 
+    deadline = time.monotonic() + budget
+    consecutive_failures = 0
     for i in range(count):
+        if time.monotonic() >= deadline or consecutive_failures >= 32:
+            failed += count - i
+            break
         try:
-            s = socket.create_connection((host, port), timeout=timeout)
+            s = socket.create_connection((host, port), timeout=min(timeout, max(0.001, deadline - time.monotonic())))
             conns.append(s)
+            consecutive_failures = 0
         except OSError as err:
             failed += 1
-            if err.errno == errno.EMFILE:
+            consecutive_failures += 1
+            if err.errno in (errno.EMFILE, errno.ENFILE):
+                print("WARN: local file-descriptor limit reached (EMFILE/ENFILE)")
                 failed += count - i - 1
                 break
 
@@ -161,15 +172,17 @@ def run_churn(
                 idx += 1
 
             try:
-                s = socket.create_connection((host, port), timeout=timeout)
-                if payload:
-                    s.sendall(payload)
-                    s.settimeout(0.3)
-                    try:
-                        _ = s.recv(128)
-                    except OSError:
-                        pass
-                s.close()
+                with socket.create_connection((host, port), timeout=timeout) as s:
+                    if payload:
+                        s.sendall(payload() if callable(payload) else payload)
+                        response = bytearray()
+                        while len(response) < 3:
+                            chunk = s.recv(3 - len(response))
+                            if not chunk:
+                                raise OSError("closed before authenticated ServerHello")
+                            response.extend(chunk)
+                        if response != b"\x16\x03\x03":
+                            raise OSError("invalid ServerHello prefix")
                 with ok_fail_lock:
                     ok += 1
             except OSError:
@@ -196,6 +209,7 @@ def assert_threshold(
     failures: list[str],
 ) -> None:
     if value is None or baseline is None:
+        failures.append(f"{name}: requested process metric unavailable")
         return
     if value > baseline + delta_limit:
         failures.append(
@@ -218,6 +232,11 @@ def main() -> int:
     parser.add_argument("--idle-hold-seconds", type=int, default=30)
     parser.add_argument("--idle-settle-seconds", type=int, default=8)
     parser.add_argument("--connect-timeout", type=float, default=1.0)
+    parser.add_argument("--idle-open-budget", type=float, default=30.0)
+    parser.add_argument("--payload", choices=("none", "tls-auth"), default="none",
+                        help="none measures TCP load only; tls-auth verifies ServerHello without masking-site traffic")
+    parser.add_argument("--secret", help="32 hex characters for tls-auth churn")
+    parser.add_argument("--tls-domain", default="google.com")
 
     parser.add_argument("--churn-total", type=int, default=30000)
     parser.add_argument("--churn-concurrency", type=int, default=300)
@@ -228,6 +247,20 @@ def main() -> int:
     parser.add_argument("--close-wait-limit", type=int, default=128)
 
     args = parser.parse_args()
+    if args.idle_cycles < 1 or args.idle_open_budget <= 0 or args.connect_timeout <= 0 or args.churn_concurrency < 1:
+        parser.error("idle-cycles/concurrency must be >= 1 and budgets/timeouts positive")
+    payload = b""
+    if args.payload == "tls-auth":
+        from capacity_connections_probe import build_tls_auth_client_hello
+        try:
+            secret = bytes.fromhex(args.secret or "")
+            if len(secret) != 16:
+                raise ValueError("expected 16 bytes")
+        except ValueError:
+            parser.error("--payload tls-auth requires a 32-hex-character --secret")
+        payload = lambda: build_tls_auth_client_hello(secret, args.tls_domain)
+    else:
+        print("WARN: --payload none measures TCP load only, not MTProto correctness")
 
     if args.pid is not None and not os.path.exists(f"/proc/{args.pid}"):
         print(f"error: /proc/{args.pid} not found. pass a valid proxy PID")
@@ -245,6 +278,13 @@ def main() -> int:
     )
 
     baseline = print_snapshot("baseline", args.pid, args.port)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    desired = args.idle_connections + args.churn_concurrency + 128
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(desired, hard) if hard != resource.RLIM_INFINITY else desired), hard))
+    except (OSError, ValueError) as error:
+        print(f"WARN: cannot raise RLIMIT_NOFILE: {error}")
+    failures: list[str] = []
 
     idle_closes: list[Dict[str, object]] = []
     stats_skipped_cycles = 0
@@ -254,8 +294,11 @@ def main() -> int:
             args.port,
             args.idle_connections,
             args.connect_timeout,
+            args.idle_open_budget,
         )
         print(f"idle_open[{cycle}]: opened={len(conns)} failed={failed_open}")
+        if len(conns) < args.idle_connections * 0.95:
+            failures.append(f"idle cycle {cycle}: pressure target not reached ({len(conns)}/{args.idle_connections}); check local EMFILE and server availability")
         open_snap = print_snapshot(f"idle_open_{cycle}", args.pid, args.port)
         if args.pid is not None and not has_stats(open_snap["stats"]):  # type: ignore[arg-type]
             stats_skipped_cycles += 1
@@ -275,7 +318,6 @@ def main() -> int:
 
     after_idle_close = idle_closes[-1]
 
-    payload = b"GET / HTTP/1.1\r\nHost: test\r\n\r\n"
     ok, fail, elapsed = run_churn(
         args.host,
         args.port,
@@ -292,10 +334,12 @@ def main() -> int:
         stats_skipped_cycles += 1
 
     if args.pid is None:
-        print("PASS (load-only mode, no PID assertions)")
-        return 0
-
-    failures: list[str] = []
+        if ok < args.churn_total * 0.95:
+            failures.append(f"churn success ratio too low: {ok}/{args.churn_total}")
+        for failure in failures:
+            print(f"FAIL: {failure}")
+        print("WARN: no PID supplied; memory/FD recovery was not checked")
+        return 1 if failures else 0
 
     # Hard fail if the proxy died at any point: a crashed PID makes every /proc read return
     # None, so all threshold asserts early-return and the script would otherwise print PASS

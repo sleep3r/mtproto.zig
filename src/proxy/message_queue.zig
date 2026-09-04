@@ -2,7 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 
 const msg_block_size: usize = 2048;
-const msg_free_cap_per_queue: usize = 4;
+// Retain one complete 32 KiB relay read to avoid churn under backpressure.
+const msg_free_cap_per_queue: usize = 16;
 
 const MsgBlock = struct {
     len: usize,
@@ -70,11 +71,6 @@ pub const MessageQueue = struct {
             self.total_len += take;
             off += take;
         }
-    }
-
-    pub fn appendOwned(self: *MessageQueue, owned: []u8) !void {
-        defer self.allocator.free(owned);
-        try self.appendCopy(owned);
     }
 
     pub fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const) usize {

@@ -81,25 +81,33 @@ pub const ParseResult = struct {
     header_end: usize, // offset past the final \r\n\r\n
 };
 
+test "CONNECT skips interim responses and accepts LF terminators" {
+    const input = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\n\n";
+    const parsed = parseResponse(input).?;
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+    try std.testing.expectEqual(input.len, parsed.header_end);
+    try std.testing.expectEqual(@as(u16, 0), parseResponse("garbage\r\n\r\n").?.status);
+}
+
 /// Parse an HTTP CONNECT response.
 /// Looks for `HTTP/1.x NNN` status line and `\r\n\r\n` terminator.
 /// Returns null if not enough data has been received yet.
 pub fn parseResponse(data: []const u8) ?ParseResult {
-    // Find the end of headers
-    const header_end = findHeaderEnd(data) orelse return null;
-
-    // Parse status line: "HTTP/1.x NNN ..."
-    const status = parseStatusCode(data) orelse return null;
-
-    return .{
-        .status = status,
-        .header_end = header_end,
-    };
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const header_len = findHeaderEnd(data[offset..]) orelse return null;
+        const status = parseStatusCode(data[offset..]) orelse 0;
+        offset += header_len;
+        if (status >= 100 and status < 200 and status != 101) continue;
+        return .{ .status = status, .header_end = offset };
+    }
+    return null;
 }
 
 /// Check if we have received the complete header block.
 /// Returns the offset past `\r\n\r\n`, or null.
 fn findHeaderEnd(data: []const u8) ?usize {
+    const lf_end = if (std.mem.indexOf(u8, data, "\n\n")) |pos| pos + 2 else data.len + 1;
     if (data.len < 4) return null;
 
     var i: usize = 0;
@@ -107,10 +115,10 @@ fn findHeaderEnd(data: []const u8) ?usize {
         if (data[i] == '\r' and data[i + 1] == '\n' and
             data[i + 2] == '\r' and data[i + 3] == '\n')
         {
-            return i + 4;
+            return @min(i + 4, lf_end);
         }
     }
-    return null;
+    return if (lf_end <= data.len) lf_end else null;
 }
 
 /// Extract HTTP status code from the first line.
@@ -139,7 +147,7 @@ fn parseStatusCode(data: []const u8) ?u16 {
 
 /// Maximum response size we'll buffer before giving up.
 /// HTTP CONNECT responses are typically < 200 bytes.
-pub const max_response_size: usize = 4096;
+pub const max_response_size: usize = 16 * 1024;
 
 // ─── Internal Helpers ────────────────────────────────────────
 

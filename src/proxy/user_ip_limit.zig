@@ -31,6 +31,34 @@ const std = @import("std");
 const net = std.Io.net;
 const Address = net.IpAddress;
 
+test "concurrent workers preserve quota references" {
+    var limit = try UserIpLimit.init(std.testing.allocator, 1);
+    defer limit.deinit(std.testing.allocator);
+    const key = [_]u8{1} ** 16;
+    try std.testing.expect(limit.acquire(key));
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(shared: *UserIpLimit, errors: *std.atomic.Value(bool)) void {
+            for (0..1000) |_| {
+                if (shared.acquire([_]u8{1} ** 16)) {
+                    shared.release([_]u8{1} ** 16);
+                } else errors.store(true, .monotonic);
+                if (shared.acquire([_]u8{2} ** 16)) {
+                    errors.store(true, .monotonic);
+                    shared.release([_]u8{2} ** 16);
+                }
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &limit, &failed });
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), limit.activeCount());
+    limit.release(key);
+    try std.testing.expectEqual(@as(u32, 0), limit.activeCount());
+}
+
 pub const UserIpLimit = struct {
     /// Upper bound on a configured cap. The table is a linear scan and is allocated
     /// eagerly for every capped user, so this both bounds the memory a typo

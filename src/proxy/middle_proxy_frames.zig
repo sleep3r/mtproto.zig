@@ -10,7 +10,6 @@ pub fn readReset(slot: anytype, encrypted: bool) void {
     slot.mp_frame_have = 0;
     slot.mp_frame_total_len = 0;
     slot.mp_frame_padded_len = 0;
-    slot.mp_frame_encrypted = encrypted;
     slot.mp_frame_first_decrypted = false;
     slot.mp_frame_need = if (encrypted) 16 else 4;
 }
@@ -30,13 +29,14 @@ pub fn writeFrame(
     comptime frame_buf_size: usize,
     comptime queue_upstream: fn (@TypeOf(slot), std.mem.Allocator, []const u8) anyerror!bool,
 ) !void {
+    if (payload.len % 4 != 0) return error.BadMiddleProxyFrameSize;
     var plain: [frame_buf_size]u8 = undefined;
     const total_len: usize = payload.len + 12;
     if (total_len > plain.len) return error.BadMiddleProxyFrameSize;
 
     std.mem.writeInt(u32, plain[0..4], @intCast(total_len), .little);
     std.mem.writeInt(i32, plain[4..8], slot.mp_write_seq_no, .little);
-    slot.mp_write_seq_no += 1;
+    slot.mp_write_seq_no +%= 1;
 
     @memcpy(plain[8 .. 8 + payload.len], payload);
     const checksum = middleproxy.crc32(plain[0 .. 8 + payload.len]);
@@ -212,7 +212,6 @@ const TestSlot = struct {
     mp_frame_have: usize = 0,
     mp_frame_total_len: usize = 0,
     mp_frame_padded_len: usize = 0,
-    mp_frame_encrypted: bool = false,
     mp_frame_first_decrypted: bool = false,
     mp_frame_need: usize = 0,
     mp_frame_buf: ?[]u8 = null,

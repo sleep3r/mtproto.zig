@@ -34,6 +34,9 @@ function frame(type, stream, payload) {
 }
 const HELLO = frame(0x10, 0, Buffer.from([1]));
 const WELCOME = frame(0x11, 0);
+if (HELLO.toString('hex') !== process.argv[3] || WELCOME.toString('hex') !== process.argv[4]) {
+  throw new Error('harness frame encoding differs from production frame.serialize');
+}
 
 /// A fresh page instance with a scripted browser around it.
 function boot(opts) {
@@ -41,12 +44,15 @@ function boot(opts) {
   const timers = [];
   const listeners = {};
   const toClient = [];
+  let initReceiverReady = false;
 
   class FakeWebSocket {
     constructor(url) {
+      if (opts.constructorThrows) throw new Error('WebSocket construction failed');
       this.url = url;
       this.readyState = 0;
       this.sent = [];
+      this.binaryType = 'blob';
       sockets.push(this);
     }
     send(b) {
@@ -62,13 +68,20 @@ function boot(opts) {
       if (this.onopen) this.onopen();
     }
     deliver(buf) {
-      if (this.onmessage) this.onmessage({ data: new Uint8Array(buf).buffer });
+      const data = this.binaryType === 'arraybuffer' ? new Uint8Array(buf).buffer : { blob: Buffer.from(buf) };
+      if (this.onmessage) this.onmessage({ data });
     }
   }
 
   const bridge = {
     _receiver: null,
-    postMessage(v) { toClient.push(v); },
+    postMessage(v) {
+      toClient.push(v);
+      if (typeof v === 'string' && JSON.parse(v).t === 'tproxy-android-init') {
+        initReceiverReady = typeof this._receiver === 'function';
+        if (opts.synchronousHello) this._receiver({ data: new Uint8Array(HELLO).buffer });
+      }
+    },
     get onmessage() { return this._receiver; },
     set onmessage(v) { this._receiver = v; },
   };
@@ -80,7 +93,7 @@ function boot(opts) {
     clearTimeout: () => {},
     addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
     location: {
-      search: '?bridge=' + CAP,
+      search: opts.capability === null ? '' : '?bridge=' + CAP,
       hash: opts.native ? '#android=' + NONCE : '',
       host: 'relay.example.com',
       protocol: 'https:',
@@ -102,6 +115,8 @@ function boot(opts) {
     listeners,
     toClient,
     bridge,
+    initReceiverReady: () => initReceiverReady,
+    runNextTimer: () => { const timer = timers.shift(); if (!timer) throw new Error('no timer'); timer.fn(); },
     controls: () => toClient.filter(m => typeof m === 'string').map(JSON.parse),
     // `.map(Buffer.from)` would pass the index as a byteOffset — bind the arity.
     binaries: () => toClient.filter(m => m instanceof ArrayBuffer).map(m => Buffer.from(m)),
@@ -112,19 +127,18 @@ const cases = {};
 
 // The normal path: a hidden WebView with the injected bridge object.
 cases['native handshake'] = (t) => {
-  const p = boot({ native: true });
+  const p = boot({ native: true, synchronousHello: true });
 
   const init = p.controls()[0];
   t.eq(init && init.t, 'tproxy-android-init', 'first control message');
   t.eq(init.v, 1, 'init version');
   t.eq(init.nonce, NONCE, 'init nonce echoes the fragment');
-  t.ok(typeof p.bridge.onmessage === 'function', 'onmessage is live before init is sent');
+  t.ok(p.initReceiverReady(), 'onmessage was live at the instant init was sent');
 
   t.eq(p.sockets.length, 1, 'exactly one carrier socket');
   t.eq(p.sockets[0].url, 'wss://relay.example.com/api/v1/socket?b=' + CAP, 'same-origin carrier url');
 
   // HELLO arrives before the socket opens, so it has to be queued rather than dropped.
-  p.bridge.onmessage({ data: new Uint8Array(HELLO).buffer });
   t.eq(p.sockets[0].sent.length, 0, 'nothing sent before the socket opened');
   p.sockets[0].open();
   t.eq(p.sockets[0].sent.length, 1, 'HELLO flushed on open');
@@ -174,7 +188,7 @@ cases['iframe fallback'] = (t) => {
   const p = boot({ native: false });
   t.eq(p.sockets.length, 0, 'no carrier before tproxy-init');
 
-  const port = { onmessage: null, start() {}, posted: [], postMessage(v) { this.posted.push(v); } };
+  const port = { onmessage: null, start() {}, posted: [], postMessage(v, transfer = []) { this.posted.push(structuredClone(v, { transfer })); } };
   const post = (origin) => p.listeners.message.forEach(fn =>
     fn({ data: { t: 'tproxy-init', v: 1 }, origin, ports: [port] }));
 
@@ -205,15 +219,57 @@ cases['garbage never throws'] = (t) => {
   for (const junk of ['not json', '{"t":', null, undefined, 42, {}, new Uint8Array(0).buffer]) {
     p.bridge.onmessage({ data: junk });
   }
+  p.bridge.onmessage({ get data() { throw new Error('hostile getter'); } });
+  p.bridge.onmessage(null);
   t.ok(true, 'handler survived garbage');
 };
 
 // The page must not carry a capability of its own: it reads one from the URL, so the
 // served bytes are identical for every user.
 cases['no carrier without a capability'] = (t) => {
-  const p = boot({ native: true, });
-  t.ok(src.indexOf('location.search') >= 0, 'capability is read from the URL');
-  t.eq(p.sockets[0].url.indexOf(CAP) > 0, true, 'capability reached the carrier url');
+  const p = boot({ native: true, capability: null });
+  if (typeof p.bridge.onmessage === 'function') p.bridge.onmessage({ data: new Uint8Array(HELLO).buffer });
+  p.timers.forEach(timer => timer.fn());
+  t.eq(p.sockets.length, 0, 'no websocket can open without a capability');
+};
+
+cases['failure before first open replays exactly one HELLO'] = (t) => {
+  const p = boot({ native: true, synchronousHello: true });
+  p.sockets[0].close();
+  p.runNextTimer();
+  p.sockets[1].open();
+  t.eq(p.sockets[1].sent.length, 1, 'queued and replayed HELLO are deduplicated');
+  t.ok(p.sockets[1].sent[0].equals(HELLO), 'HELLO survives failed connect');
+};
+
+cases['retry limit gives up after two retries'] = (t) => {
+  const p = boot({ native: true });
+  for (let i = 0; i < 2; i++) { p.sockets[i].close(); p.runNextTimer(); }
+  p.sockets[2].close();
+  t.eq(p.sockets.length, 3, 'only two replacement sockets');
+  t.eq(p.timers.length, 0, 'no timer after retry exhaustion');
+  t.ok(p.controls().some(c => c.state === 'failed'), 'retry exhaustion reported');
+};
+
+cases['client close and constructor failure terminate cleanly'] = (t) => {
+  const p = boot({ native: true });
+  p.bridge.onmessage({ data: JSON.stringify({ t: 'close' }) });
+  t.eq(p.sockets[0].readyState, 3, 'client close shuts carrier');
+  t.eq(p.timers.length, 0, 'client close never reconnects');
+  const bad = boot({ native: true, constructorThrows: true });
+  t.eq(bad.sockets.length, 0, 'failed constructor published no socket');
+  t.ok(bad.controls().some(c => c.state === 'failed'), 'constructor failure reported');
+};
+
+cases['BYE bytes reach the adopted client before it closes'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const bye = frame(0x1f, 0);
+  p.sockets[0].deliver(bye);
+  t.ok(p.binaries().at(-1).equals(bye), 'BYE delivered intact');
+  p.bridge.onmessage({ data: JSON.stringify({ t: 'close' }) });
+  t.eq(p.timers.length, 0, 'no reconnect after BYE/client close');
 };
 
 let failures = 0;

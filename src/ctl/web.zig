@@ -25,10 +25,16 @@
 //!
 //! ## Order of operations
 //!
-//! nginx-touching steps follow `masking.zig`'s discipline exactly: symlink first, then
-//! `nginx -t`, and on failure remove **only our own** symlink and leave nginx untouched.
-//! A vhost that breaks nginx would otherwise be caught by the mask-health timer, which
-//! restarts `mtproto-proxy` every minute while the masking probe fails.
+//! nginx-touching steps follow `masking.zig`'s discipline: symlink first, then `nginx -t`,
+//! and on failure roll back rather than leave nginx broken. `writeVhost` goes one step
+//! further than a fresh install needs to, because it is also how `mtbuddy update`
+//! re-renders an already-live relay vhost: it takes an `nginx -t` baseline *before*
+//! touching the file, so a tree that was already broken for an unrelated reason is
+//! reported as such instead of blamed on us, and on failure it restores the previous
+//! vhost content (not just the symlink) so a previously working relay actually comes
+//! back up rather than staying disabled with the new, bad file still on disk. A vhost
+//! that breaks nginx would otherwise be caught by the mask-health timer, which restarts
+//! `mtproto-proxy` every minute while the masking probe fails.
 
 const std = @import("std");
 const tui_mod = @import("tui.zig");
@@ -78,6 +84,9 @@ pub const WebOpts = struct {
     /// the pre-upgrade binary.
     mode_explicit: bool = false,
     port: []const u8 = DEFAULT_PORT,
+    /// Explicit bind address for a remote TLS terminator; defaults to loopback.
+    host: ?[]const u8 = null,
+    lets_encrypt: bool = false,
     /// Contact address for the ACME account; empty registers without one.
     email: []const u8 = "",
     /// Skip ACME issuance and keep whatever certificate is already on disk.
@@ -92,10 +101,40 @@ pub const WebOpts = struct {
     only: ?bool = null,
     quiet: bool = false,
     yes: bool = false,
+    /// Allow changing an already-configured [web].domain even though it breaks every
+    /// distributed WEB link (same gate as masking.zig's tls_domain --force).
+    force: bool = false,
 };
 
 fn tr(ui: *Tui, en: []const u8, ru: []const u8) []const u8 {
     return if (ui.lang == .ru) ru else en;
+}
+
+fn safeCertificatePath(path: []const u8) bool {
+    if (path.len == 0 or path[0] != '/' or path.len > 512) return false;
+    for (path) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "/._-", c) != null)) return false;
+    }
+    return true;
+}
+
+fn dnsHasAddress(output: []const u8, address: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        if (std.mem.eql(u8, fields.next() orelse continue, address)) return true;
+    }
+    return false;
+}
+
+test "certificate paths reject directive and TOML injection" {
+    try std.testing.expect(safeCertificatePath("/etc/ssl/relay/fullchain.pem"));
+    for ([_][]const u8{ "relative.pem", "/tmp/cert;", "/tmp/cert\n", "/tmp/a\"b", "/tmp/a b" }) |path| try std.testing.expect(!safeCertificatePath(path));
+}
+
+test "DNS check compares the first complete address field" {
+    try std.testing.expect(dnsHasAddress("1.2.3.40 STREAM name\n1.2.3.4 DGRAM name\n", "1.2.3.4"));
+    try std.testing.expect(!dnsHasAddress("1.2.3.40 STREAM name\n", "1.2.3.4"));
 }
 
 // ── entry points ──────────────────────────────────────────────────────────────
@@ -128,6 +167,10 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.only = false;
         } else if (std.mem.eql(u8, arg, "--port")) {
             opts.port = args.next() orelse DEFAULT_PORT;
+        } else if (std.mem.eql(u8, arg, "--host")) {
+            opts.host = args.next() orelse return error.MissingHost;
+        } else if (std.mem.eql(u8, arg, "--lets-encrypt")) {
+            opts.lets_encrypt = true;
         } else if (std.mem.eql(u8, arg, "--email")) {
             opts.email = args.next() orelse "";
         } else if (std.mem.eql(u8, arg, "--skip-cert")) {
@@ -136,10 +179,15 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.quiet = true;
         } else if (std.mem.eql(u8, arg, "--yes") or std.mem.eql(u8, arg, "-y")) {
             opts.yes = true;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            opts.force = true;
         } else if (std.mem.eql(u8, arg, "--remove") or std.mem.eql(u8, arg, "--uninstall")) {
             do_remove = true;
         } else if (arg.len > 0 and arg[0] != '-') {
             opts.domain = arg;
+        } else {
+            ui.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
 
@@ -201,12 +249,35 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
         return;
     }
 
+    // If the operator typed a domain different from the live one, require informed
+    // consent before clobbering it — same gate as masking.zig's tls_domain.
+    var force = false;
+    if (existing) |e| {
+        if (!std.mem.eql(u8, e, domain)) {
+            var warn_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&warn_buf, "{s} '{s}' {s} '{s}' {s}", .{
+                tr(ui, "Changing the relay domain from", "Смена домена релея с"),
+                e,
+                tr(ui, "to", "на"),
+                domain,
+                tr(ui, "INVALIDATES every WEB link already distributed.", "СДЕЛАЕТ НЕРАБОЧИМИ все уже выданные WEB-ссылки."),
+            }) catch tr(ui, "Changing the relay domain invalidates every distributed WEB link.", "Смена домена релея сделает нерабочими все выданные WEB-ссылки.");
+            ui.warn(msg);
+            if (!try ui.confirm(tr(ui, "Change the relay domain anyway?", "Всё равно сменить домен релея?"), false)) {
+                ui.info(i18n.get(ui.lang, .aborting));
+                return;
+            }
+            force = true;
+        }
+    }
+
     try execute(ui, allocator, .{
         .domain = domain,
         .mode = if (mode_choice == 1) .behind else .mask,
         .mode_explicit = true,
         .only = only,
         .yes = true,
+        .force = force,
     });
 }
 
@@ -225,6 +296,24 @@ fn readConfigured(allocator: std.mem.Allocator, key: []const u8, buf: []u8) ?[]c
     return buf[0..trimmed.len];
 }
 
+/// Whether `[web].domain` may move from `existing` to `new`. Same rule as
+/// [censorship].tls_domain in masking.zig: a live deploy's domain is baked into every
+/// distributed link, so only an unchanged value or an explicit `--force` may pass.
+fn domainChangeAllowed(existing: []const u8, new: []const u8, force: bool) bool {
+    return std.mem.eql(u8, existing, new) or force;
+}
+
+fn configuredPort(allocator: std.mem.Allocator, section: []const u8, key: []const u8, fallback: u16) u16 {
+    var doc = toml.TomlDoc.load(allocator, config_path) catch return fallback;
+    defer doc.deinit();
+    const text = doc.get(section, key) orelse return fallback;
+    return std.fmt.parseInt(u16, std.mem.trim(u8, text, " \t\""), 10) catch fallback;
+}
+
+fn relayPortConflicts(port: u16, proxy_port: u16, mask_port: u16) bool {
+    return port == 0 or port == proxy_port or port == mask_port or port == 8443 or port == 8444;
+}
+
 // ── the work ──────────────────────────────────────────────────────────────────
 
 pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
@@ -240,11 +329,28 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
     // the domain is baked into every WEB link's bridge capability, so changing it
     // silently would break links exactly the way changing tls_domain does.
     var existing_buf: [256]u8 = undefined;
+    const existing_domain = readConfigured(allocator, "domain", &existing_buf);
     if (opts.domain.len == 0) {
-        opts.domain = readConfigured(allocator, "domain", &existing_buf) orelse {
+        opts.domain = existing_domain orelse {
             ui.fail(tr(ui, "No relay domain configured. Pass --domain <hostname>.", "Домен релея не задан. Укажите --domain <hostname>."));
             return;
         };
+    } else if (existing_domain) |cur| {
+        // Mirrors masking.zig's tls_domain gate: the caller named a domain that differs
+        // from the one already configured. Every distributed tg://webproxy link's bridge
+        // capability is HMAC'd over the OLD host (web_capability.deriveForPaddedSecret),
+        // so writing this through unguarded breaks every one of them the moment the
+        // relay restarts — refuse unless the operator explicitly overrides it.
+        if (!domainChangeAllowed(cur, opts.domain, opts.force)) {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "Refusing to change [web].domain from '{s}' to '{s}' — this invalidates every distributed WEB link. Re-run with --force to override.",
+                .{ cur, opts.domain },
+            ) catch "Refusing to change [web].domain (would break WEB links); re-run with --force.";
+            ui.fail(msg);
+            return;
+        }
     }
     var port_buf: [16]u8 = undefined;
     if (std.mem.eql(u8, opts.port, DEFAULT_PORT)) {
@@ -255,11 +361,11 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
     // not name it. `mtbuddy update` calls us with bare defaults, and defaults are
     // `--mode mask` with a Let's Encrypt certificate — re-running a `behind` host or a
     // bring-your-own-cert host that way rewrote it into a topology it never asked for.
-    if (!opts.mode_explicit and isInstalled()) {
+    if (!opts.mode_explicit) {
         var mode_buf: [16]u8 = undefined;
         if (readConfigured(allocator, "mode", &mode_buf)) |persisted| {
             opts.mode = if (std.ascii.eqlIgnoreCase(persisted, "behind")) .behind else .mask;
-        } else {
+        } else if (isInstalled()) {
             // A relay installed before `[web].mode` existed. Only mode "mask" has a
             // PROXY-protocol terminator to point at, so the presence of `mask_backend`
             // is the best record of what it was set up as.
@@ -276,7 +382,10 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
     }
     var cert_buf: [512]u8 = undefined;
     var key_buf: [512]u8 = undefined;
-    if (opts.cert.len == 0 and opts.key.len == 0) {
+    if (opts.lets_encrypt) {
+        opts.cert = "";
+        opts.key = "";
+    } else if (opts.cert.len == 0 and opts.key.len == 0) {
         opts.cert = readConfigured(allocator, "cert", &cert_buf) orelse "";
         opts.key = readConfigured(allocator, "key", &key_buf) orelse "";
         // A config carrying only one of the two is not a pair either; ignore both and
@@ -285,6 +394,12 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
             opts.cert = "";
             opts.key = "";
         }
+    }
+
+    if ((opts.cert.len > 0 and !safeCertificatePath(opts.cert)) or (opts.key.len > 0 and !safeCertificatePath(opts.key))) return error.InvalidCertificatePath;
+    if (opts.host) |host| {
+        _ = std.Io.net.IpAddress.parse(host, 0) catch return error.InvalidListenHost;
+        if (opts.mode == .mask and !std.mem.eql(u8, host, "127.0.0.1")) return error.MaskRequiresLoopback;
     }
 
     // Validate exactly the way the client does, so a domain that would be silently
@@ -311,7 +426,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
         ui.fail(tr(ui, "--port must be a number", "--port должен быть числом"));
         return;
     };
-    if (port == 443 or std.mem.eql(u8, opts.port, masking.NGINX_PORT)) {
+    if (relayPortConflicts(port, configuredPort(allocator, "server", "port", 443), configuredPort(allocator, "censorship", "mask_port", 8443))) {
         ui.fail(tr(
             ui,
             "The relay port must not collide with the proxy (443) or the masking backend (8443).",
@@ -332,7 +447,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
         return;
     }
 
-    checkDns(ui, allocator, domain);
+    if (!opts.quiet and opts.mode == .mask) checkDns(ui, allocator, domain);
 
     if (opts.mode == .mask) {
         if (!try prepareMaskTopology(ui, allocator, domain, opts)) {
@@ -357,23 +472,29 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
     // same breath as failing to open the WEB one, leaving a box that serves nobody.
     var staged = opts;
     staged.only = if (opts.only == true) null else opts.only;
-    try writeConfig(ui, allocator, domain, staged);
+    var config_changed = try writeConfig(ui, allocator, domain, staged);
     try installService(ui, allocator);
     if (opts.only == true) {
-        if (!sys.isServiceActive(SERVICE_NAME)) {
+        if (!sys.isServiceActive(SERVICE_NAME) or !verifyEndToEnd(ui, allocator, domain)) {
             ui.fail(tr(
                 ui,
-                "The relay is not running, so WEB-only was NOT enabled — it would have left this proxy with no working links at all.",
-                "Релей не запущен, поэтому WEB-only НЕ включён — иначе у прокси не осталось бы ни одной рабочей ссылки.",
+                "The relay HTTPS path could not be verified; the existing WEB-only setting was left unchanged.",
+                "Не удалось проверить HTTPS-путь релея; прежнее значение WEB-only оставлено без изменений.",
             ));
             ui.hint("journalctl -u " ++ SERVICE_NAME ++ " -n 50 --no-pager");
-            opts.only = false;
+            opts.only = null;
         } else {
-            try writeConfig(ui, allocator, domain, opts);
+            config_changed = try writeConfig(ui, allocator, domain, opts) or config_changed;
         }
     }
+    if (config_changed) {
+        ui.step(tr(ui, "Restarting the proxy to apply [web]...", "Перезапускаю прокси, чтобы применить [web]..."));
+        const restart = try sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" });
+        defer restart.deinit();
+        if (restart.exit_code != 0) return error.ProxyRestartFailed;
+    }
 
-    if (opts.mode == .mask and !opts.quiet) verifyEndToEnd(ui, allocator, domain);
+    if (opts.only != true and opts.mode == .mask and !opts.quiet) _ = verifyEndToEnd(ui, allocator, domain);
     if (!opts.quiet) printSummary(ui, allocator, domain, opts);
 }
 
@@ -448,7 +569,7 @@ fn checkDns(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) void {
         ui.hint(tr(ui, "Add an A record pointing at this server before handing out links.", "Добавьте A-запись на этот сервер до раздачи ссылок."));
         return;
     }
-    if (std.mem.indexOf(u8, result.stdout, public_ip) == null) {
+    if (!dnsHasAddress(result.stdout, public_ip)) {
         var buf: [384]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "{s} '{s}' {s} {s}.", .{
             tr(ui, "DNS for", "DNS для"),
@@ -495,14 +616,29 @@ fn aptInstall(allocator: std.mem.Allocator, packages: []const []const u8) bool {
 /// fronting domain (`rutube.ru`) that could never validate. The relay domain is one the
 /// operator actually owns, so issuance is both possible and required — a self-signed
 /// certificate would make every client's WebView refuse the bridge.
+fn prepareAcmeRoot(allocator: std.mem.Allocator) !void {
+    const mkdir = try sys.exec(allocator, &.{ "mkdir", "-p", ACME_ROOT ++ "/.well-known/acme-challenge" });
+    defer mkdir.deinit();
+    if (mkdir.exit_code != 0) return error.AcmeDirectoryFailed;
+    const chmod = try sys.exec(allocator, &.{ "chmod", "755", ACME_ROOT, ACME_ROOT ++ "/.well-known", ACME_ROOT ++ "/.well-known/acme-challenge" });
+    defer chmod.deinit();
+    if (chmod.exit_code != 0) return error.AcmeDirectoryFailed;
+}
+
 fn ensureCertificate(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, email: []const u8) !bool {
     var live_buf: [512]u8 = undefined;
     const fullchain = std.fmt.bufPrint(&live_buf, "/etc/letsencrypt/live/{s}/fullchain.pem", .{domain}) catch return false;
-    if (sys.fileExists(fullchain)) {
+    const valid_certificate = blk: {
+        if (!sys.fileExists(fullchain)) break :blk false;
+        const result = sys.exec(allocator, &.{ "openssl", "x509", "-checkend", "86400", "-noout", "-in", fullchain }) catch break :blk false;
+        defer result.deinit();
+        break :blk result.exit_code == 0;
+    };
+    if (valid_certificate) {
         ui.ok(tr(ui, "Certificate already present", "Сертификат уже есть"));
         // The lineage renews over HTTP-01 through our port-80 responder; (re)create it
         // so a re-setup after `--remove`, or a lineage issued by hand, keeps renewing.
-        _ = sys.exec(allocator, &.{ "mkdir", "-p", ACME_ROOT ++ "/.well-known/acme-challenge" }) catch {};
+        try prepareAcmeRoot(allocator);
         if (!sys.fileExists("/etc/nginx/sites-enabled/mtproto-web-acme")) {
             _ = try writeAcmeVhost(ui, allocator, domain);
         }
@@ -521,7 +657,7 @@ fn ensureCertificate(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8,
 
     // HTTP-01 needs port 80. It also makes the cover story better: a host that serves
     // HTTPS but refuses port 80 is unusual.
-    _ = sys.exec(allocator, &.{ "mkdir", "-p", ACME_ROOT ++ "/.well-known/acme-challenge" }) catch {};
+    try prepareAcmeRoot(allocator);
     if (!try writeAcmeVhost(ui, allocator, domain)) return false;
     if (sys.commandExists("ufw")) {
         sys.execSilent(allocator, &.{ sys.commandOrPath("ufw", &.{ "/usr/sbin/ufw", "/sbin/ufw" }), "allow", "80/tcp" });
@@ -565,13 +701,13 @@ fn writeAcmeVhost(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) !b
         \\    }}
         \\
         \\    location / {{
-        \\        return 301 https://$host$request_uri;
+        \\        return 301 https://{s}$request_uri;
         \\    }}
         \\
         \\    access_log off;
         \\}}
         \\
-    , .{ domain, ACME_ROOT });
+    , .{ domain, ACME_ROOT, domain });
     defer allocator.free(content);
 
     sys.writeFile("/etc/nginx/sites-available/mtproto-web-acme", content) catch {
@@ -714,6 +850,36 @@ fn writeVhost(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: 
     };
     defer allocator.free(content);
 
+    // `nginx -t` validates the WHOLE /etc/nginx tree, not just this vhost. Take a
+    // baseline BEFORE touching anything: if the tree is already broken (an unrelated
+    // half-written vhost, a missing cert for some other site), that is not this vhost's
+    // fault to fix, and clobbering the live file first would make a pre-existing
+    // problem look like ours to roll back.
+    if (!nginxTestPasses(allocator)) {
+        ui.fail(tr(
+            ui,
+            "nginx's config was already broken before this change (unrelated to the relay vhost) — fix that first, then re-run.",
+            "конфигурация nginx была сломана ещё до этого изменения (не из-за vhost релея) — сначала исправьте её, затем повторите.",
+        ));
+        return false;
+    }
+
+    // Back up whatever is live now, so a test failure below can restore the exact prior
+    // state — which the check just above proved passes `nginx -t` — instead of leaving
+    // the clobbered file on disk with only the symlink removed (the old rollback deleted
+    // the symlink but left the overwritten file, so the previously working vhost stayed
+    // both clobbered and disabled). Only a currently-ENABLED vhost was actually exercised
+    // by that baseline test — nginx reads sites-enabled, not sites-available — so a stale
+    // NGINX_SITE left over from an earlier failed run (not linked) is not "proven valid"
+    // and must not be restored as if it were.
+    const was_enabled = sys.fileExists(NGINX_LINK);
+    const previous = if (was_enabled) sys.readFileAllocAbsolute(allocator, NGINX_SITE, 64 * 1024) else null;
+    defer if (previous) |p| allocator.free(p);
+    if (was_enabled and previous == null) {
+        ui.fail("Cannot back up the active relay vhost; leaving it unchanged");
+        return false;
+    }
+
     sys.writeFile(NGINX_SITE, content) catch {
         ui.fail(tr(ui, "Could not write the relay vhost", "Не удалось записать vhost релея"));
         return false;
@@ -723,7 +889,15 @@ fn writeVhost(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: 
     // order masking.zig uses, and for the same reason.
     _ = sys.exec(allocator, &.{ "ln", "-sf", NGINX_SITE, NGINX_LINK }) catch {};
     if (!nginxTestPasses(allocator)) {
-        _ = sys.exec(allocator, &.{ "rm", "-f", NGINX_LINK }) catch {};
+        if (previous) |p| {
+            // A previous vhost existed and the baseline above proved it valid — put it
+            // back verbatim rather than just dropping the symlink, so the reload below
+            // actually restores the working relay instead of leaving the bad content on
+            // disk for the next reload/reboot to pick up.
+            sys.writeFile(NGINX_SITE, p) catch {};
+        } else {
+            _ = sys.exec(allocator, &.{ "rm", "-f", NGINX_LINK, NGINX_SITE }) catch {};
+        }
         _ = sys.exec(allocator, &.{ "systemctl", "reload", "nginx" }) catch {};
         ui.fail(tr(ui, "nginx rejected the relay vhost — rolled back, nginx left unchanged", "nginx отверг vhost релея — откатил, nginx не тронут"));
         return false;
@@ -756,26 +930,39 @@ fn nginxTestPasses(allocator: std.mem.Allocator) bool {
 /// `TomlDoc` round-trips add a trailing newline every time it saves, and
 /// `test/installer-e2e` asserts `mtbuddy update` leaves config.toml byte-identical. This
 /// module is re-run from `update`, so an unconditional save would fail that.
-fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: WebOpts) !void {
-    const mask_mode = opts.mode == .mask;
+fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: WebOpts) !bool {
     if (!sys.fileExists(config_path)) {
         ui.warn(tr(ui, "config.toml not found — skipping [web] update", "config.toml не найден — пропускаю обновление [web]"));
-        return;
+        return error.ConfigNotFound;
     }
     var doc = toml.TomlDoc.load(allocator, config_path) catch {
         ui.warn(tr(ui, "Could not read config.toml", "Не удалось прочитать config.toml"));
-        return;
+        return error.ConfigReadFailed;
     };
     defer doc.deinit();
 
+    const changed = try applyConfigDoc(&doc, domain, opts);
+    if (!changed) {
+        ui.ok(tr(ui, "[web] already up to date", "[web] уже актуален"));
+        return false;
+    }
+    try doc.save(config_path);
+    const owner = try sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path });
+    defer owner.deinit();
+    if (owner.exit_code != 0) return error.ConfigOwnershipFailed;
+    return true;
+}
+
+fn applyConfigDoc(doc: *toml.TomlDoc, domain: []const u8, opts: WebOpts) !bool {
+    const mask_mode = opts.mode == .mask;
     var quoted_domain_buf: [300]u8 = undefined;
-    const quoted_domain = std.fmt.bufPrint(&quoted_domain_buf, "\"{s}\"", .{domain}) catch return;
+    const quoted_domain = try std.fmt.bufPrint(&quoted_domain_buf, "\"{s}\"", .{domain});
     const quoted_mask_backend = "\"127.0.0.1:" ++ PROXY_PROTOCOL_PORT ++ "\"";
     var quoted_cert_buf: [560]u8 = undefined;
     var quoted_key_buf: [560]u8 = undefined;
     const byo_cert = opts.cert.len > 0 and opts.key.len > 0;
-    const quoted_cert = if (byo_cert) std.fmt.bufPrint(&quoted_cert_buf, "\"{s}\"", .{opts.cert}) catch return else "";
-    const quoted_key = if (byo_cert) std.fmt.bufPrint(&quoted_key_buf, "\"{s}\"", .{opts.key}) catch return else "";
+    const quoted_cert = if (byo_cert) try std.fmt.bufPrint(&quoted_cert_buf, "\"{s}\"", .{opts.cert}) else "";
+    const quoted_key = if (byo_cert) try std.fmt.bufPrint(&quoted_key_buf, "\"{s}\"", .{opts.key}) else "";
     // `only` is tri-state on the way in: null means "leave whatever is there", so an
     // `mtbuddy update` (which passes no flags) never flips a WEB-only deploy back.
     const only_text: ?[]const u8 = if (opts.only) |v| (if (v) "true" else "false") else null;
@@ -784,49 +971,49 @@ fn writeConfig(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts:
     // is already there. An `mtbuddy update` names none, and introducing a key on its own
     // would rewrite config.toml (and restart the proxy) on every update — which
     // test/installer-e2e asserts against.
-    const write_mode = opts.mode_explicit or hasValue(&doc, "mode");
+    const write_mode = opts.mode_explicit or hasValue(doc, "mode");
     const mode_text: []const u8 = if (mask_mode) "\"mask\"" else "\"behind\"";
 
     var changed = false;
-    changed = needsSet(&doc, "enabled", "true") or changed;
-    changed = needsSet(&doc, "domain", quoted_domain) or changed;
-    changed = needsSet(&doc, "port", opts.port) or changed;
-    if (mask_mode) changed = needsSet(&doc, "mask_backend", quoted_mask_backend) or changed;
-    if (write_mode) changed = needsSet(&doc, "mode", mode_text) or changed;
+    var host_buf: [128]u8 = undefined;
+    const quoted_host = if (opts.host) |host| try std.fmt.bufPrint(&host_buf, "\"{s}\"", .{host}) else null;
+    if (quoted_host) |host| changed = needsSet(doc, "host", host) or changed;
+    if (opts.lets_encrypt) changed = hasValue(doc, "cert") or hasValue(doc, "key") or changed;
+    changed = needsSet(doc, "enabled", "true") or changed;
+    changed = needsSet(doc, "domain", quoted_domain) or changed;
+    changed = needsSet(doc, "port", opts.port) or changed;
+    if (mask_mode) changed = needsSet(doc, "mask_backend", quoted_mask_backend) or changed;
+    if (!mask_mode) changed = hasValue(doc, "mask_backend") or changed;
+    if (write_mode) changed = needsSet(doc, "mode", mode_text) or changed;
     if (byo_cert) {
-        changed = needsSet(&doc, "cert", quoted_cert) or changed;
-        changed = needsSet(&doc, "key", quoted_key) or changed;
+        changed = needsSet(doc, "cert", quoted_cert) or changed;
+        changed = needsSet(doc, "key", quoted_key) or changed;
     }
-    if (only_text) |v| changed = needsSet(&doc, "only", v) or changed;
-    if (!changed) {
-        ui.ok(tr(ui, "[web] already up to date", "[web] уже актуален"));
-        return;
-    }
+    if (only_text) |v| changed = needsSet(doc, "only", v) or changed;
+    if (!changed) return false;
 
     try doc.set("web", "enabled", "true");
+    if (quoted_host) |host| try doc.set("web", "host", host);
+    if (opts.lets_encrypt) {
+        try doc.set("web", "cert", "\"\"");
+        try doc.set("web", "key", "\"\"");
+    }
     try doc.set("web", "domain", quoted_domain);
     try doc.set("web", "port", opts.port);
     // Only mode "mask" routes through the proxy, so only it has a PROXY-protocol
     // terminator to point at.
     if (mask_mode) try doc.set("web", "mask_backend", quoted_mask_backend);
+    if (!mask_mode and hasValue(doc, "mask_backend")) try doc.set("web", "mask_backend", "\"\"");
     if (write_mode) try doc.set("web", "mode", mode_text);
     if (byo_cert) {
         try doc.set("web", "cert", quoted_cert);
         try doc.set("web", "key", quoted_key);
     }
     if (only_text) |v| try doc.set("web", "only", v);
-    doc.save(config_path) catch {};
-    _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", config_path }) catch {};
 
-    // `[web].enabled` decides at startup whether the data plane trusts the relay, and
-    // it is not part of the SIGHUP reload set — the proxy has to restart.
-    ui.step(tr(ui, "Restarting the proxy to apply [web]...", "Перезапускаю прокси, чтобы применить [web]..."));
-    _ = sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" }) catch {};
+    return true;
 }
 
-/// True when `[web].key` differs from `value`, comparing without surrounding quotes on
-/// either side — `doc.get` may or may not return them, and a false "changed" here
-/// means an unnecessary config rewrite plus a proxy restart on every `mtbuddy update`.
 /// True when `[web].key` is present with a non-empty value. An empty string is how this
 /// module expresses "unset" (TomlDoc cannot delete a key), so it must not read as set.
 fn hasValue(doc: *toml.TomlDoc, key: []const u8) bool {
@@ -834,6 +1021,7 @@ fn hasValue(doc: *toml.TomlDoc, key: []const u8) bool {
     return std.mem.trim(u8, current, " \t\"").len > 0;
 }
 
+/// Compare a persisted value without surrounding TOML quotes.
 fn needsSet(doc: *toml.TomlDoc, key: []const u8, value: []const u8) bool {
     const current = doc.get("web", key) orelse return true;
     const cur = std.mem.trim(u8, current, " \t\"");
@@ -848,6 +1036,14 @@ fn unitContent() []const u8 {
     \\Documentation=https://github.com/sleep3r/mtproto.zig
     \\After=network-online.target mtproto-proxy.service
     \\Wants=network-online.target
+    \\StartLimitIntervalSec=0
+    \\# The relay reads [access.users] once, at startup, and derives one bridge capability
+    \\# per user from it — so a user added or removed later never reaches it and its WEB
+    \\# link answers with the cover page instead of the bridge. Every path that changes
+    \\# users (the dashboard, mtbuddy, install) restarts mtproto-proxy, and PartOf= makes
+    \\# systemd propagate that restart here. It costs nothing: a proxy restart already
+    \\# drops every relayed stream, since each one is a connection to the proxy.
+    \\PartOf=mtproto-proxy.service
     \\
     \\[Service]
     \\Type=simple
@@ -905,8 +1101,9 @@ fn installService(ui: *Tui, allocator: std.mem.Allocator) !void {
         return;
     };
     _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
-    _ = sys.exec(allocator, &.{ "systemctl", "enable", "--now", SERVICE_NAME }) catch {};
+    _ = sys.exec(allocator, &.{ "systemctl", "enable", SERVICE_NAME }) catch {};
     _ = sys.exec(allocator, &.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+    try @import("recovery.zig").installWebHealth(allocator);
 
     // Type=simple is "active" the instant it is exec'd; a relay that exits on a bad
     // config does so within the first second. Look after that, not before.
@@ -921,10 +1118,10 @@ fn installService(ui: *Tui, allocator: std.mem.Allocator) !void {
 
 /// Fetch the relay's own domain over the public path: browser → proxy :443 → masking →
 /// nginx → relay. Anything less than that does not prove the topology works.
-fn verifyEndToEnd(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) void {
-    if (!sys.commandExists("curl")) return;
+fn verifyEndToEnd(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) bool {
+    if (!sys.commandExists("curl")) return false;
     var url_buf: [320]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "https://{s}/", .{domain}) catch return;
+    const url = std.fmt.bufPrint(&url_buf, "https://{s}/", .{domain}) catch return false;
     // The proxy was restarted and the relay started moments ago; `is-active` on a
     // Type=simple unit says nothing about the listener being bound yet. Give the
     // chain a few seconds before declaring it broken.
@@ -943,9 +1140,11 @@ fn verifyEndToEnd(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) vo
     }
     if (std.mem.eql(u8, code, "200")) {
         ui.ok(tr(ui, "The relay site answers over the public HTTPS path", "Сайт релея отвечает по публичному HTTPS"));
+        return true;
     } else {
         ui.warn(tr(ui, "Could not fetch the relay site from this host", "Не удалось получить сайт релея с этого хоста"));
         ui.hint(tr(ui, "Check DNS, the certificate, and that [censorship].mask is on.", "Проверьте DNS, сертификат и что [censorship].mask включён."));
+        return false;
     }
 }
 
@@ -975,7 +1174,11 @@ fn printSummary(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts
         lines_buf[n] = .{ .label = tr(ui, "Certificate", "Сертификат"), .value = opts.cert };
         n += 1;
     }
-    lines_buf[n] = .{ .label = tr(ui, "Listener", "Слушает"), .value = "127.0.0.1:" ++ DEFAULT_PORT };
+    var listener_buf: [64]u8 = undefined;
+    var configured_host: [64]u8 = undefined;
+    const host = opts.host orelse readConfigured(allocator, "host", &configured_host) orelse "127.0.0.1";
+    const listener = std.fmt.bufPrint(&listener_buf, "{s}:{s}", .{ host, opts.port }) catch "";
+    lines_buf[n] = .{ .label = tr(ui, "Listener", "Слушает"), .value = listener };
     n += 1;
     lines_buf[n] = .{ .label = tr(ui, "Service", "Сервис"), .value = SERVICE_NAME };
     n += 1;
@@ -993,11 +1196,8 @@ fn printSummary(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts
         ));
     }
     if (opts.mode == .behind) {
-        ui.hint(tr(
-            ui,
-            "Point your terminator at 127.0.0.1:" ++ DEFAULT_PORT ++ ", forward Upgrade/Connection, and pass X-Forwarded-For.",
-            "Направьте терминатор на 127.0.0.1:" ++ DEFAULT_PORT ++ ", пробросьте Upgrade/Connection и X-Forwarded-For.",
-        ));
+        var hint_buf: [256]u8 = undefined;
+        ui.hint(std.fmt.bufPrint(&hint_buf, "Point your terminator at {s}; forward Upgrade/Connection. Use --host <IP> for a remote terminator and restrict access with your firewall.", .{listener}) catch "Configure your TLS terminator to forward Upgrade/Connection.");
     }
     ui.hint(if (only_now)
         tr(
@@ -1035,6 +1235,8 @@ pub fn remove(ui: *Tui, allocator: std.mem.Allocator) void {
     ui.section(tr(ui, "Remove the WEB proxy relay", "Удаление релея WEB-прокси"));
 
     ui.step(tr(ui, "Stopping the relay service...", "Останавливаю сервис релея..."));
+    sys.execSilent(allocator, &.{ "systemctl", "disable", "--now", "mtproto-web-health.timer", "mtproto-web-health.service" });
+    sys.execSilent(allocator, &.{ "rm", "-f", "/usr/local/bin/mtproto-web-health.sh", "/etc/systemd/system/mtproto-web-health.service", "/etc/systemd/system/mtproto-web-health.timer" });
     _ = sys.exec(allocator, &.{ "systemctl", "disable", "--now", SERVICE_NAME }) catch {};
     _ = sys.exec(allocator, &.{ "rm", "-f", SERVICE_FILE }) catch {};
     _ = sys.exec(allocator, &.{ "systemctl", "daemon-reload" }) catch {};
@@ -1068,8 +1270,8 @@ pub fn remove(ui: *Tui, allocator: std.mem.Allocator) void {
     ui.ok(tr(ui, "WEB proxy relay removed. The proxy keeps running.", "Релей WEB-прокси удалён. Прокси продолжает работать."));
     ui.hint(tr(
         ui,
-        "The Let's Encrypt certificate, its port-80 challenge responder and renewal hook were left in place (certbot delete --cert-name <domain> to drop them).",
-        "Сертификат Let's Encrypt, ACME-ответчик на порту 80 и hook продления оставлены (certbot delete --cert-name <domain>, чтобы убрать).",
+        "Retained shared resources: the Let's Encrypt certificate, mtproto-web-acme nginx site, /var/www/acme, certbot renewal hook, and firewall port 80. If no other service needs them, delete the certificate with certbot delete --cert-name <domain>, remove the ACME site/hook/root, reload nginx, and close port 80 manually.",
+        "Сохранены общие ресурсы: сертификат Let's Encrypt, сайт nginx mtproto-web-acme, /var/www/acme, hook certbot и порт 80 в firewall. Если они больше не нужны, удалите сертификат через certbot delete --cert-name <domain>, сайт/hook/каталог ACME, перезагрузите nginx и вручную закройте порт 80.",
     ));
 }
 
@@ -1133,6 +1335,12 @@ test "the systemd unit runs the relay mode of the proxy binary and drops all cap
     try std.testing.expect(std.mem.containsAtLeast(u8, unit, 1, "After=network-online.target mtproto-proxy.service"));
 }
 
+test "the relay unit restarts with the proxy, so user changes reach its capabilities" {
+    // Capabilities are built once from [access.users]; without this line adding a user
+    // restarts only mtproto-proxy and the new WEB link keeps getting the cover page.
+    try std.testing.expect(std.mem.containsAtLeast(u8, unitContent(), 1, "\nPartOf=mtproto-proxy.service\n"));
+}
+
 test "the relay vhost carries both listeners and never appends to X-Forwarded-For" {
     const rendered = try writeVhostContent(
         std.testing.allocator,
@@ -1152,9 +1360,42 @@ test "the relay vhost carries both listeners and never appends to X-Forwarded-Fo
 }
 
 test "the relay port may not collide with the proxy or the masking backend" {
-    // Guard rail encoded in execute(); assert the constants it compares are distinct.
-    try std.testing.expect(!std.mem.eql(u8, DEFAULT_PORT, masking.NGINX_PORT));
-    try std.testing.expect(!std.mem.eql(u8, DEFAULT_PORT, "443"));
+    for ([_]u16{ 0, 443, 9443, 8443, 8444 }) |port| try std.testing.expect(relayPortConflicts(port, 443, 9443));
+    try std.testing.expect(relayPortConflicts(try std.fmt.parseInt(u16, "08443", 10), 443, 9443));
+    try std.testing.expect(!relayPortConflicts(8081, 443, 9443));
+}
+
+test "WEB provisioning preserves only on update and clears stale mask and certificate keys" {
+    var doc = toml.TomlDoc.initEmpty(std.testing.allocator);
+    defer doc.deinit();
+    var opts: WebOpts = .{ .mode = .mask, .port = "8081", .only = true, .cert = "/cert.pem", .key = "/key.pem" };
+    try std.testing.expect(try applyConfigDoc(&doc, "relay.example.com", opts));
+    opts.only = null;
+    try std.testing.expect(!try applyConfigDoc(&doc, "relay.example.com", opts));
+    try std.testing.expect(!needsSet(&doc, "only", "true"));
+    opts.mode = .behind;
+    opts.mode_explicit = true;
+    opts.lets_encrypt = true;
+    opts.cert = "";
+    opts.key = "";
+    opts.only = false;
+    try std.testing.expect(try applyConfigDoc(&doc, "relay.example.com", opts));
+    try std.testing.expect(!hasValue(&doc, "mask_backend"));
+    try std.testing.expect(!hasValue(&doc, "cert"));
+    try std.testing.expect(!hasValue(&doc, "key"));
+    try std.testing.expect(!needsSet(&doc, "only", "false"));
+    try std.testing.expect(!try applyConfigDoc(&doc, "relay.example.com", opts));
+}
+
+test "changing [web].domain is refused without --force, same as tls_domain" {
+    // Same domain (or none configured yet, which execute() never routes through this
+    // helper): no gate needed either way.
+    try std.testing.expect(domainChangeAllowed("relay.example.com", "relay.example.com", false));
+    // A different domain silently written through would break every distributed
+    // tg://webproxy link's HMAC'd bridge capability the moment the relay restarts.
+    try std.testing.expect(!domainChangeAllowed("relay.example.com", "relay2.example.com", false));
+    // --force is the operator's informed override, same as masking.zig's tls_domain gate.
+    try std.testing.expect(domainChangeAllowed("relay.example.com", "relay2.example.com", true));
 }
 
 test "domain validation matches the client's own rules" {

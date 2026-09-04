@@ -35,6 +35,7 @@ const http_fetch = @import("http_fetch.zig");
 const fd_limits = @import("fd_limits.zig");
 const connection_phase = @import("connection_phase.zig");
 const net_helpers = @import("net_helpers.zig");
+const dns_cache = @import("dns_cache.zig");
 const connection_pool_mod = @import("connection_pool.zig");
 const relay_steps = @import("relay_steps.zig");
 const middle_proxy_frames = @import("middle_proxy_frames.zig");
@@ -82,6 +83,41 @@ test {
 
 const log = std.log.scoped(.proxy);
 
+fn configValueEqual(comptime T: type, a: T, b: T) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |o| if (a) |v| (if (b) |w| configValueEqual(o.child, v, w) else false) else b == null,
+        .pointer => |p| blk: {
+            if (p.size != .slice) break :blk a == b;
+            if (a.len != b.len) break :blk false;
+            for (a, b) |v, w| if (!configValueEqual(p.child, v, w)) break :blk false;
+            break :blk true;
+        },
+        .@"struct" => blk: {
+            if (@hasDecl(T, "iterator") and @hasDecl(T, "get") and @hasDecl(T, "count")) {
+                if (a.count() != b.count()) break :blk false;
+                var iter = a.iterator();
+                while (iter.next()) |entry| {
+                    const other = b.get(entry.key_ptr.*) orelse break :blk false;
+                    if (!configValueEqual(@TypeOf(other), entry.value_ptr.*, other)) break :blk false;
+                }
+            } else {
+                inline for (std.meta.fields(T)) |f| {
+                    if (!configValueEqual(f.type, @field(a, f.name), @field(b, f.name))) break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        else => std.meta.eql(a, b),
+    };
+}
+
+fn isHotConfigField(comptime name: []const u8) bool {
+    for ([_][]const u8{ "users", "direct_users", "idle_timeout_sec", "handshake_timeout_sec", "graceful_shutdown_timeout_sec", "rate_limit_per_subnet", "handshake_flood_guard_enabled", "handshake_flood_guard_threshold", "handshake_flood_guard_window_sec", "handshake_flood_guard_block_sec", "log_level", "mask", "mask_port", "mask_target", "desync", "drs", "fast_mode", "max_connections" }) |hot| {
+        if (std.mem.eql(u8, name, hot)) return true;
+    }
+    return false;
+}
+
 const tls_header_len = 5;
 /// Upper bound on SO_REUSEPORT epoll worker threads ([server].workers / 0=auto).
 const max_workers = 256;
@@ -101,7 +137,6 @@ const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_m
 const accept_batch_limit: usize = 256;
 const stats_log_interval_s: i64 = 10;
 const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.ns_per_s;
-const timer_scan_budget: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 // Telegram rotates the middleproxy DC addresses / proxy secret well within a day
@@ -118,12 +153,11 @@ const middle_proxy_reactive_cooldown_ns: u64 = 60 * std.time.ns_per_s;
 const tunnel_socket_mark: u32 = 200;
 const tunnel_route_table: u32 = 200;
 const tunnel_pool_state_path = "/run/mtproto-proxy/tunnel-pool.state";
-const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
-const read_buf_size: usize = 32 * 1024;
+const read_buf_size: usize = Config.relay_read_buffer_size;
 const max_pipelined_handshake_bytes: usize = 128 * 1024;
-const graceful_shutdown_check_ms: i32 = 100;
+const graceful_shutdown_check_ms: i32 = 25;
 
 const upstream_candidates_inline_cap: usize = 4;
 
@@ -173,7 +207,9 @@ fn formatFloodGuardTop(entries: []const HandshakeFloodGuard.TopEntry, buf: *[102
 
     for (entries) |entry| {
         var ip_buf: [64]u8 = undefined;
-        const ip = HandshakeFloodGuard.formatKey(entry.key, &ip_buf);
+        var redacted = entry.key;
+        if (redacted.family == .ip4) redacted.bytes[3] = 0 else @memset(redacted.bytes[8..], 0);
+        const ip = HandshakeFloodGuard.formatKey(redacted, &ip_buf);
         const blocked_for = if (entry.blocked_until_s > now_s) entry.blocked_until_s - now_s else 0;
 
         if (pos > 0 and pos < buf.len) {
@@ -206,17 +242,9 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return b == null;
 }
 
-// Lock around the shared middle-proxy snapshot. Zig 0.16 has no std.Thread.Mutex
-// / std.Thread.RwLock, so this wraps std.Io.Mutex — a real cross-thread futex
-// mutex (atomic CAS fast path + futex park/wake via the Io) driven by the global
-// single-threaded Io (which disables only async task spawning, NOT mutual
-// exclusion). Cross-thread correctness matters because the middle-proxy updater
-// runs on its own thread AND, under the SO_REUSEPORT multi-worker model, N worker
-// threads read the snapshot concurrently. Readers serialize (no real RwLock
-// available), which is fine — the snapshot is read once per connection at routing
-// time, not on the per-byte relay path.
+// Shared snapshots use a real reader/writer lock: concurrent readers, exclusive updates.
 const CompatRwLock = struct {
-    mutex: std.Io.Mutex = .init,
+    mutex: std.Io.RwLock = .init,
 
     fn io() std.Io {
         return std.Io.Threaded.global_single_threaded.io();
@@ -231,11 +259,11 @@ const CompatRwLock = struct {
     }
 
     fn lockShared(self: *CompatRwLock) void {
-        self.mutex.lockUncancelable(io());
+        self.mutex.lockSharedUncancelable(io());
     }
 
     fn unlockShared(self: *CompatRwLock) void {
-        self.mutex.unlock(io());
+        self.mutex.unlockShared(io());
     }
 };
 
@@ -300,6 +328,93 @@ test "middle-proxy refresh selects proxy route for explicit socks5 and http upst
 
     cfg.upstream_mode = .tunnel;
     try std.testing.expectEqual(MiddleProxyFetchRoute.tunnel, middleProxyFetchRouteForConfig(&cfg));
+}
+
+/// Whether it is safe to trust trySelectReachableMiddleProxy's verdict.
+/// isAddressReachable opens a plain, unmarked, unproxied TCP socket, so it
+/// measures reachability on the host's DEFAULT route — on a tunnel/socks5/http
+/// upstream that (a) leaks a direct probe to Telegram MP IPs on exactly the
+/// network path the egress choice exists to hide this traffic from, and (b)
+/// can pick a candidate that is "reachable" on the wrong path but unreachable
+/// through the real egress. Only `.direct` (no configured egress to bypass)
+/// makes the probe meaningful.
+fn middleProxyProbeAllowed(cfg: *const Config) bool {
+    return middleProxyFetchRouteForConfig(cfg) == .direct;
+}
+
+test "middle-proxy reachability probe is skipped on any non-direct egress" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    cfg.upstream_mode = .direct;
+    try std.testing.expect(middleProxyProbeAllowed(&cfg));
+
+    cfg.upstream_mode = .auto;
+    try std.testing.expect(middleProxyProbeAllowed(&cfg));
+
+    // Tunnel/socks5/http: a bare socket() probe would bypass the configured
+    // egress entirely, so it must not be trusted.
+    cfg.upstream_mode = .tunnel;
+    try std.testing.expect(!middleProxyProbeAllowed(&cfg));
+
+    cfg.upstream_mode = .socks5;
+    try std.testing.expect(!middleProxyProbeAllowed(&cfg));
+
+    cfg.upstream_mode = .http;
+    try std.testing.expect(!middleProxyProbeAllowed(&cfg));
+}
+
+/// Whether ANY connection this process serves could take a middle-proxy route,
+/// i.e. whether the background metadata updater thread is worth running at all.
+/// Same three-way predicate as the NAT-IP warning in ProxyState.init: regular
+/// traffic (use_middle_proxy), media/CDN traffic (force_media_middle_proxy,
+/// default true even with use_middle_proxy=false), and the ad-tag RPC (tag),
+/// which only takes effect over a middleproxy handshake.
+fn middleProxyUpdaterNeeded(cfg: *const Config) bool {
+    return cfg.use_middle_proxy or cfg.force_media_middle_proxy or cfg.tag != null;
+}
+
+/// Whether a specific connection's buildDcConnectPlan call should be handed a
+/// live middle-proxy snapshot. DC203 (CDN) has no direct address at all and
+/// always needs one; every other DC only needs one when regular MiddleProxy
+/// routing is on, or when force_media_middle_proxy could route ITS media path
+/// through MiddleProxy (buildDcConnectPlan itself gates that on dc_idx < 0, so
+/// handing a snapshot to a regular connection here is harmless — it's simply
+/// unused).
+fn middleProxySnapshotWanted(cfg: *const Config, dc_abs: usize) bool {
+    return cfg.use_middle_proxy or cfg.force_media_middle_proxy or dc_abs == 203;
+}
+
+test "middle-proxy updater runs whenever any MP route is reachable, not just use_middle_proxy" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    // Shipped defaults: use_middle_proxy=false, force_media_middle_proxy=true.
+    // The updater must still run, or DC203/media snapshots never refresh.
+    cfg.use_middle_proxy = false;
+    cfg.force_media_middle_proxy = true;
+    try std.testing.expect(middleProxyUpdaterNeeded(&cfg));
+    try std.testing.expect(middleProxySnapshotWanted(&cfg, 1));
+    try std.testing.expect(middleProxySnapshotWanted(&cfg, 203));
+
+    // Everything off: no route can ever use MiddleProxy, so no updater and no
+    // snapshot for a regular DC — except CDN 203, which has no direct address.
+    cfg.force_media_middle_proxy = false;
+    cfg.tag = null;
+    try std.testing.expect(!middleProxyUpdaterNeeded(&cfg));
+    try std.testing.expect(!middleProxySnapshotWanted(&cfg, 1));
+    try std.testing.expect(middleProxySnapshotWanted(&cfg, 203));
+
+    // An ad-tag alone (no use_middle_proxy, no force_media) still needs the
+    // updater — the promotion RPC only takes effect over a MiddleProxy handshake.
+    cfg.tag = [_]u8{0} ** 16;
+    try std.testing.expect(middleProxyUpdaterNeeded(&cfg));
 }
 
 const DcConnectPlan = middle_proxy_routing.DcConnectPlan;
@@ -367,6 +482,7 @@ pub const MaskSafelistEntry = struct {
     domain: []const u8,
     /// Resolved address (port 443) of that domain's real server.
     addr: Address,
+    dns_id: usize,
 };
 
 /// Fetch a public-IP echo service through the SAME egress middle-proxy traffic uses, so
@@ -415,9 +531,11 @@ fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8
     var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer io_instance.deinit();
 
-    const result = std.process.run(allocator, io_instance.io(), .{
+    const result = @import("child_process").run(allocator, io_instance.io(), .{
         .argv = argv,
-        .stdout_limit = std.Io.Limit.limited(512),
+        .expand_arg0 = .expand,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+        .stdout_limit = std.Io.Limit.limited(32 * 1024),
         .stderr_limit = std.Io.Limit.limited(512),
     }) catch return null;
     defer allocator.free(result.stdout);
@@ -439,11 +557,20 @@ fn runSmallCommand(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8
 fn fetchClockOffsetSeconds(allocator: std.mem.Allocator, url: []const u8) ?i64 {
     // `-w %header{date}` prints ONLY the Date header value (tiny, always within the small
     // runSmallCommand stdout cap), unlike full `-I` headers where Date could be truncated.
-    const out = runSmallCommand(allocator, &.{ "curl", "-sS", "-o", "/dev/null", "--max-time", "8", "-w", "%header{date}", url }) orelse return null;
+    if (!std.mem.startsWith(u8, url, "https://")) return null;
+    const out = runSmallCommand(allocator, &.{ "curl", "-sSI", "--proto", "=https", "--proto-redir", "=https", "--max-time", "8", "--", url }) orelse return null;
     defer allocator.free(out);
     const http_epoch = http_fetch.parseHttpDate(out) orelse return null;
-    const off = http_epoch - realtimeSeconds();
-    return @max(@as(i64, -86400), @min(@as(i64, 86400), off));
+    return validatedClockOffset(http_epoch, realtimeSeconds());
+}
+
+fn validatedClockOffset(http_epoch: i64, local_epoch: i64) ?i64 {
+    const off = std.math.sub(i64, http_epoch, local_epoch) catch return null;
+    if (off < constants.time_skew_min or off > constants.time_skew_max) {
+        log.warn("clock_sync: refusing offset {d}s outside handshake skew window; fix the host clock", .{off});
+        return null;
+    }
+    return off;
 }
 
 fn detectActiveTunnelInterface(allocator: std.mem.Allocator) ?[]u8 {
@@ -469,6 +596,10 @@ fn readTunnelPoolStateValue(allocator: std.mem.Allocator, key: []const u8) ?[]u8
     ) catch return null;
     defer allocator.free(content);
 
+    return parseTunnelPoolStateValue(allocator, content, key);
+}
+
+fn parseTunnelPoolStateValue(allocator: std.mem.Allocator, content: []const u8, key: []const u8) ?[]u8 {
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
@@ -480,6 +611,21 @@ fn readTunnelPoolStateValue(allocator: std.mem.Allocator, key: []const u8) ?[]u8
     }
 
     return null;
+}
+
+test "clock correction and tunnel state parsing are bounded" {
+    try std.testing.expectEqual(@as(?i64, 0), validatedClockOffset(1000, 1000));
+    try std.testing.expectEqual(@as(?i64, 42), validatedClockOffset(1042, 1000));
+    try std.testing.expect(validatedClockOffset(std.math.maxInt(i64), -1) == null);
+    try std.testing.expect(validatedClockOffset(100000, 0) == null);
+    const value = parseTunnelPoolStateValue(std.testing.allocator, "bad\nactive_old=wrong\n active = awg1 \r\n", "active").?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("awg1", value);
+    try std.testing.expect(parseTunnelPoolStateValue(std.testing.allocator, "active=\n", "active") == null);
+    try std.testing.expect(parseTunnelPoolStateValue(std.testing.allocator, "other=x\n", "active") == null);
+    var state: ProxyState = undefined;
+    state.middle_proxy_updater_shutdown = .init(true);
+    try std.testing.expect(state.waitForUpdaterDelay(std.time.ns_per_hour));
 }
 
 fn tryFetchMiddleProxyViaInterface(
@@ -557,8 +703,8 @@ const ConnectionSlot = struct {
     validation_digest: [32]u8 = [_]u8{0} ** 32,
     validation_session_id: [32]u8 = [_]u8{0} ** 32,
     validation_session_id_len: u8 = 0,
-    validation_user: [32]u8 = [_]u8{0} ** 32,
-    validation_user_len: u8 = 0,
+    validation_user: []const u8 = "",
+    validation_user_len: usize = 0,
 
     server_hello: ?[]u8 = null,
     server_hello_off: usize = 0,
@@ -575,6 +721,8 @@ const ConnectionSlot = struct {
     tg_encryptor: ?crypto.AesCtr = null,
     tg_decryptor: ?crypto.AesCtr = null,
     middle_ctx: ?middleproxy.MiddleProxyContext = null,
+    mp_secret: [256]u8 = undefined,
+    mp_secret_len: usize = 0,
 
     dc_idx: i16 = 0,
     dc_abs: u16 = 0,
@@ -590,6 +738,10 @@ const ConnectionSlot = struct {
     direct_fallback_addr: ?Address = null,
     direct_fallback_used: bool = false,
     current_upstream_addr: ?Address = null,
+    proxy_candidate_index: u8 = 0,
+    mask_candidate_next: u8 = 0,
+    resolved_candidates: ?*net_helpers.AddressCandidates = null,
+    mask_dns_override: ?usize = null,
 
     // Pending initial bytes for direct DC path (promotion tag)
     dc_initial_tail: ?[]u8 = null,
@@ -666,13 +818,11 @@ const ConnectionSlot = struct {
     mp_frame_need: usize = 0,
     mp_frame_total_len: usize = 0,
     mp_frame_padded_len: usize = 0,
-    mp_frame_encrypted: bool = false,
     mp_frame_first_decrypted: bool = false,
 
     // Non-blocking proxy handshake state (SOCKS5 / HTTP CONNECT)
-    proxy_handshake_buf: [http_connect.max_response_size]u8 = undefined,
+    proxy_handshake_buf: ?*[http_connect.max_response_size]u8 = null,
     proxy_handshake_pos: u16 = 0,
-    proxy_handshake_len: u16 = 0,
     proxy_target_addr: ?Address = null,
 
     // Current epoll interests
@@ -688,6 +838,26 @@ const ConnectionSlot = struct {
     relay_half_closed: bool = false,
     client_detached: bool = false,
     upstream_detached: bool = false,
+    client_read_eof: bool = false,
+    upstream_read_eof: bool = false,
+    client_write_shutdown: bool = false,
+    upstream_write_shutdown: bool = false,
+
+    /// Record what we just armed on the client fd in epoll. The cache MUST describe the
+    /// live kernel registration: syncInterests only issues an EPOLL_CTL_MOD when the two
+    /// differ, so a cache that under-reports (the zeroed slot vs. the EPOLLIN armed at
+    /// accept) silently skips the *disarm* — the fd stays level-readable with bytes
+    /// nobody consumes in .connecting_upstream and the worker spins at 100% CPU.
+    fn noteClientRegistered(self: *ConnectionSlot, want_in: bool, want_out: bool) void {
+        self.client_interest_in = want_in;
+        self.client_interest_out = want_out;
+    }
+
+    /// Same invariant for the upstream fd (see noteClientRegistered).
+    fn noteUpstreamRegistered(self: *ConnectionSlot, want_in: bool, want_out: bool) void {
+        self.upstream_interest_in = want_in;
+        self.upstream_interest_out = want_out;
+    }
 
     fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
@@ -723,7 +893,17 @@ const ConnectionSlot = struct {
         };
     }
 
+    fn freezeResolvedCandidates(self: *ConnectionSlot, allocator: std.mem.Allocator, candidates: net_helpers.AddressCandidates) !void {
+        if (self.resolved_candidates == null) self.resolved_candidates = try allocator.create(net_helpers.AddressCandidates);
+        self.resolved_candidates.?.* = candidates;
+    }
+
     fn resetOwnedBuffers(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
+        if (self.validation_user.len > 0) allocator.free(self.validation_user);
+        self.validation_user = "";
+        self.validation_user_len = 0;
+        if (self.proxy_handshake_buf) |buf| allocator.destroy(buf);
+        self.proxy_handshake_buf = null;
         self.client_queue.deinit();
         self.upstream_queue.deinit();
 
@@ -738,12 +918,21 @@ const ConnectionSlot = struct {
 
         if (self.mask_prebuffer) |buf| allocator.free(buf);
         self.mask_prebuffer = null;
+        if (self.resolved_candidates) |candidates| allocator.destroy(candidates);
+        self.resolved_candidates = null;
+        self.mask_dns_override = null;
 
         if (self.dc_initial_tail) |buf| allocator.free(buf);
         self.dc_initial_tail = null;
 
         if (self.middle_ctx) |*mp| mp.deinit(allocator);
         self.middle_ctx = null;
+        if (self.mp_enc) |*cipher| cipher.wipe();
+        if (self.mp_dec) |*cipher| cipher.wipe();
+        self.mp_enc = null;
+        self.mp_dec = null;
+        std.crypto.secureZero(u8, &self.mp_secret);
+        self.mp_secret_len = 0;
 
         if (self.upstream_candidates_heap) |buf| allocator.free(buf);
         self.upstream_candidates_heap = null;
@@ -752,6 +941,8 @@ const ConnectionSlot = struct {
         self.direct_fallback_addr = null;
         self.direct_fallback_used = false;
         self.current_upstream_addr = null;
+        self.proxy_candidate_index = 0;
+        self.mask_candidate_next = 0;
         self.dc_abs = 0;
         self.is_media_path = false;
         self.user_metrics = null;
@@ -812,6 +1003,126 @@ const ConnectionSlot = struct {
     }
 };
 
+/// The epoll interest pair each fd of a slot should hold in its current phase.
+const SlotInterests = struct {
+    client_in: bool,
+    client_out: bool,
+    upstream_in: bool,
+    upstream_out: bool,
+};
+
+/// Pure half of `syncInterests`: what the slot's phase asks for, independent of what
+/// the kernel currently holds. Split out so the cache-vs-wanted comparison — the thing
+/// that decides whether an EPOLL_CTL_MOD is issued at all — is unit-testable without
+/// an epoll fd.
+fn wantedInterests(slot: *const ConnectionSlot, now_ms: i64) SlotInterests {
+    var want = SlotInterests{
+        .client_in = false,
+        .client_out = slot.hasClientPending(),
+        .upstream_in = false,
+        .upstream_out = slot.hasUpstreamPending(),
+    };
+
+    switch (slot.phase) {
+        .reading_tls_header,
+        .reading_direct_obfuscated_handshake,
+        .reading_client_hello_body,
+        .reading_mtproto_tls_header,
+        .reading_mtproto_tls_body,
+        => {
+            want.client_in = slot.client_read_pause_until_ms == 0 or
+                now_ms >= slot.client_read_pause_until_ms;
+        },
+
+        .writing_server_hello_first,
+        .writing_server_hello_rest,
+        => {
+            want.client_out = true;
+        },
+
+        .desync_wait => {
+            // Wait for timer tick only; keeping EPOLLOUT enabled here can
+            // cause a busy loop because writable sockets trigger continuously.
+        },
+
+        .connecting_upstream => {
+            want.client_in = false;
+            want.upstream_out = true;
+        },
+
+        .proxy_socks5_greeting,
+        .proxy_socks5_auth,
+        .proxy_socks5_connect,
+        .proxy_http_connect,
+        => {
+            want.client_in = false;
+            want.upstream_out = true;
+        },
+
+        .proxy_socks5_greeting_resp,
+        .proxy_socks5_auth_resp,
+        .proxy_socks5_connect_resp,
+        .proxy_http_connect_resp,
+        => {
+            want.client_in = false;
+            want.upstream_in = true;
+        },
+
+        .writing_dc_nonce => {
+            want.client_in = false;
+            want.upstream_out = true;
+        },
+
+        .middle_proxy_handshake => {
+            want.upstream_out = want.upstream_out or
+                slot.mp_step == .sending_rpc_nonce or
+                slot.mp_step == .sending_rpc_handshake;
+            want.upstream_in = slot.mp_step == .waiting_rpc_nonce_response or
+                slot.mp_step == .waiting_rpc_handshake_response;
+        },
+
+        .relaying, .mask_relaying => {
+            want.client_in = !slot.client_read_eof and !slot.hasUpstreamPending();
+            want.upstream_in = !slot.upstream_read_eof and !slot.hasClientPending();
+        },
+
+        else => {},
+    }
+
+    return want;
+}
+
+test "epoll interest cache must be seeded at registration or the disarm is skipped" {
+    var slot: ConnectionSlot = .{};
+    slot.client_queue.allocator = std.testing.allocator;
+    slot.upstream_queue.allocator = std.testing.allocator;
+    defer slot.resetOwnedBuffers(std.testing.allocator);
+
+    // What acceptNewConnections registers with the kernel, recorded on the slot.
+    slot.client_fd = 3;
+    slot.noteClientRegistered(true, false);
+    try std.testing.expect(slot.client_interest_in);
+
+    // First client event ends in .connecting_upstream (a non-TLS byte under
+    // fake_tls_only → startMasking, or the trusted dd path). That phase wants the
+    // client fd disarmed; with an unseeded cache the pair would compare equal to the
+    // zeroed (false,false) and syncInterests would skip the EPOLL_CTL_MOD, leaving
+    // unread client bytes to spin the level-triggered loop at 100% CPU.
+    slot.phase = .connecting_upstream;
+    const want = wantedInterests(&slot, 0);
+    try std.testing.expect(!want.client_in);
+    try std.testing.expect(slot.client_interest_in != want.client_in);
+
+    // The upstream registration is seeded the same way: EPOLLOUT while the connect
+    // is in flight, which is exactly what .connecting_upstream wants — no redundant
+    // MOD on the first upstream event.
+    slot.upstream_fd = 4;
+    slot.noteUpstreamRegistered(false, true);
+    try std.testing.expect(!want.upstream_in and want.upstream_out);
+    try std.testing.expectEqual(slot.upstream_interest_in, want.upstream_in);
+    try std.testing.expectEqual(slot.upstream_interest_out, want.upstream_out);
+}
+
 pub const BenchCandidatePath = struct {
     slot: ConnectionSlot = .{},
 
@@ -832,6 +1143,18 @@ pub const BenchCandidatePath = struct {
 };
 
 const ConnectionPool = connection_pool_mod.ConnectionPool(ConnectionSlot);
+const EndpointPenalties = @import("endpoint_penalties.zig").EndpointPenalties;
+const WorkerHeartbeat = struct {
+    value: std.atomic.Value(i64) = .init(0),
+    tracked_fds: std.atomic.Value(u32) = .init(0),
+    padding: [52]u8 = undefined,
+    fn load(self: *const WorkerHeartbeat, comptime order: std.builtin.AtomicOrder) i64 {
+        return self.value.load(order);
+    }
+    fn store(self: *WorkerHeartbeat, value: i64, comptime order: std.builtin.AtomicOrder) void {
+        self.value.store(value, order);
+    }
+};
 
 const SignalController = struct {
     fd: posix.fd_t,
@@ -895,6 +1218,8 @@ pub const CloseReason = enum(u8) {
         if (has(reason, "replay")) return .replay_detected;
         if (has(reason, "budget")) return .handshake_budget;
         if (has(reason, "idle")) return .idle_timeout;
+        if (has(reason, "connect timeout") or has(reason, "wedge")) return .upstream_error;
+        if (has(reason, "half-close")) return .client_eof;
         if (has(reason, "timeout")) return .handshake_timeout;
         if (has(reason, "shutdown") or has(reason, "closing")) return .shutdown;
         if (has(reason, "bad ") or has(reason, "invalid") or has(reason, "unexpected") or has(reason, "alert")) return .bad_handshake;
@@ -961,17 +1286,14 @@ test "jitteredIdleTimeoutMs stays within bounds and respects the floor" {
     try std.testing.expect(jitteredIdleTimeoutMs(base_sec, 15, 1) != jitteredIdleTimeoutMs(base_sec, 15, 2));
 }
 
-/// Resolve a `host:port` string to a single address, or null when it is unusable.
-/// Used for the WEB relay's masking target; DNS is allowed so an operator may name a host.
-fn parseHostPort(allocator: std.mem.Allocator, spec: []const u8) ?Address {
+/// Parse a WEB masking `host:port` without resolving DNS.
+fn parseHostPort(spec: []const u8) ?struct { host: []const u8, port: u16 } {
     const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
     if (host.len == 0) return null;
     const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
-    const list = getAddressList(allocator, host, port) catch return null;
-    defer list.deinit();
-    if (list.addrs.len == 0) return null;
-    return list.addrs[0];
+    if (port == 0) return null;
+    return .{ .host = host, .port = port };
 }
 
 pub const ProxyState = struct {
@@ -1264,6 +1586,7 @@ pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config_path: []const u8,
     config: Config,
+    metrics_config_mutex: CompatRwLock = .{},
     user_secrets: []const obfuscation.UserSecret,
     user_metrics_lock: CompatRwLock = .{},
     user_metrics: []*UserMetrics,
@@ -1278,6 +1601,11 @@ pub const ProxyState = struct {
     accept_paused: std.atomic.Value(bool),
     saturation_paused: std.atomic.Value(bool),
     mask_addr: ?Address,
+    mask_candidates: net_helpers.AddressCandidates = .{},
+    dns: *dns_cache.Cache,
+    mask_dns_id: ?usize = null,
+    web_dns_id: ?usize = null,
+    proxy_dns_id: ?usize = null,
     /// Opt-in SNI-following mask targets (config.mask_sni_safelist), resolved at boot.
     mask_safelist: []const MaskSafelistEntry,
     /// Peers allowed to speak the direct-obfuscated transport under `fake_tls_only`
@@ -1323,12 +1651,14 @@ pub const ProxyState = struct {
     /// the watchdog require EVERY active worker to be fresh, so a wedged non-owner
     /// SO_REUSEPORT shard is detected (not masked by worker 0 staying alive). 0 until
     /// a worker starts ticking.
-    worker_heartbeats: [max_workers]std.atomic.Value(i64),
+    worker_heartbeats: [max_workers]WorkerHeartbeat,
+    accepted_since_log: std.atomic.Value(u64) = .init(0),
+    closed_since_log: std.atomic.Value(u64) = .init(0),
     /// Anti-flood + per-subnet rate guards are SHARED across workers (behind
     /// guard_lock) so an IP/subnet spread across SO_REUSEPORT shards is still limited
     /// globally, not ~N×threshold. Touched only on the accept/handshake path.
-    subnet_limiter: SubnetRateLimit,
-    flood_guard: *HandshakeFloodGuard,
+    subnet_limiter: ?*SubnetRateLimit = null,
+    flood_guard: ?*HandshakeFloodGuard = null,
     guard_lock: CompatRwLock = .{},
     /// True once graceful shutdown/drain has begun — drives /readyz.
     shutting_down: std.atomic.Value(bool),
@@ -1371,11 +1701,17 @@ pub const ProxyState = struct {
     // consumes it to refresh ahead of the periodic timer (debounced by the cooldown).
     middle_proxy_refresh_requested: std.atomic.Value(bool),
     middle_proxy_updater_thread: ?std.Thread,
+    middle_proxy_spawn_retry_ms: i64 = 0,
     upstream: upstream_mod.Upstream,
     tunnel_info: tunnel_mod.Tunnel,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config, config_path: []const u8) !ProxyState {
         if (cfg.users.count() == 0) return error.NoUsersConfigured;
+        const dns = try dns_cache.Cache.create(allocator);
+        errdefer dns.destroy();
+        var mask_dns_id: ?usize = null;
+        var web_dns_id: ?usize = null;
+        var proxy_dns_id: ?usize = null;
 
         const user_secrets = try buildUserSecrets(allocator, &cfg);
         errdefer allocator.free(user_secrets);
@@ -1384,6 +1720,7 @@ pub const ProxyState = struct {
         errdefer freeUserMetricsSlice(allocator, user_metrics_owned);
 
         var resolved_addr: ?Address = null;
+        var mask_candidates: net_helpers.AddressCandidates = .{};
         if (cfg.mask) {
             const mask_target = cfg.effectiveMaskTarget();
             if (cfg.mask_target) |configured_target| {
@@ -1399,29 +1736,32 @@ pub const ProxyState = struct {
                 defer al.deinit();
                 if (al.addrs.len > 0) {
                     resolved_addr = al.addrs[0];
-                    log.info("Mask target '{s}:{d}' resolved at startup", .{ mask_target, cfg.mask_port });
+                    mask_candidates = .init(al.addrs);
+                    log.info("Mask target '{s}:{d}': retained {d} DNS addresses", .{ mask_target, cfg.mask_port, mask_candidates.len });
                 }
             }
+            mask_dns_id = try dns.add(mask_target, cfg.mask_port, mask_candidates);
         }
 
         // Resolve the opt-in SNI-following mask safelist (each domain → its own server,
-        // port 443). Failed resolutions are skipped, not fatal.
+        // port 443). Failed resolutions stay registered for background recovery.
         var mask_safelist_buf: std.ArrayListUnmanaged(MaskSafelistEntry) = .empty;
         errdefer mask_safelist_buf.deinit(allocator);
         if (cfg.mask and cfg.mask_sni_safelist.len > 0) {
             for (cfg.mask_sni_safelist) |domain| {
-                const sl = getAddressList(allocator, domain, 443) catch {
-                    log.warn("mask_sni_safelist: could not resolve '{s}', skipping", .{domain});
-                    continue;
+                const sl = getAddressList(allocator, domain, 443) catch blk: {
+                    log.warn("mask_sni_safelist: could not resolve '{s}', retrying in background", .{domain});
+                    break :blk null;
                 };
-                defer sl.deinit();
-                if (sl.addrs.len > 0) {
-                    mask_safelist_buf.append(allocator, .{ .domain = domain, .addr = sl.addrs[0] }) catch continue;
-                    log.info("mask_sni_safelist: fronting '{s}' enabled", .{domain});
-                }
+                defer if (sl) |list| list.deinit();
+                const candidates: net_helpers.AddressCandidates = if (sl) |list| .init(list.addrs) else .{};
+                const id = try dns.add(domain, 443, candidates);
+                try mask_safelist_buf.append(allocator, .{ .domain = domain, .addr = if (candidates.len > 0) candidates.addresses[0] else ip4(.{ 0, 0, 0, 0 }, 443), .dns_id = id });
+                log.info("mask_sni_safelist: fronting '{s}' enabled", .{domain});
             }
         }
-        const mask_safelist = mask_safelist_buf.toOwnedSlice(allocator) catch &.{};
+        const mask_safelist = try mask_safelist_buf.toOwnedSlice(allocator);
+        errdefer allocator.free(mask_safelist);
 
         // Peers allowed to bypass `fake_tls_only` with the direct-obfuscated transport.
         // Loopback is implied by [web].enabled; anything else must be named explicitly.
@@ -1436,8 +1776,18 @@ pub const ProxyState = struct {
         var web_mask_addr: ?Address = null;
         if (cfg.web.enabled and cfg.web.domain != null) {
             if (cfg.web.mask_backend) |spec| {
-                if (parseHostPort(allocator, spec)) |addr| {
-                    web_mask_addr = addr;
+                if (parseHostPort(spec)) |target| {
+                    const addresses = getAddressList(allocator, target.host, target.port) catch null;
+                    defer if (addresses) |list| list.deinit();
+                    const candidates: net_helpers.AddressCandidates = if (addresses) |list| .init(list.addrs) else .{};
+                    if (candidates.len > 0) {
+                        const addr = candidates.addresses[0];
+                        if (trusted_peers.isLoopback(addr) and addr.getPort() == cfg.port) return error.MaskBackendLoopsToProxy;
+                    }
+                    // The marker is never used for a connection: startMasking consumes
+                    // the cache snapshot, rejecting an empty snapshot until DNS recovers.
+                    web_mask_addr = if (candidates.len > 0) candidates.addresses[0] else ip4(.{ 0, 0, 0, 0 }, target.port);
+                    web_dns_id = try dns.add(target.host, target.port, candidates);
                     log.info("[web] masked connections for '{s}' are fronted with a PROXY header", .{cfg.web.domain.?});
                 } else {
                     log.warn("[web].mask_backend '{s}' is not a usable host:port; ignoring", .{spec});
@@ -1467,7 +1817,7 @@ pub const ProxyState = struct {
         // fake_cert_size is set (else the default ~2878). Falls back to the default size
         // if the configured value can't be built.
         const fake_cert_size: usize = if (cfg.fake_cert_size == 0)
-            tls.default_fake_cert_size
+            2400 + crypto.randomRange(usize, 1201)
         else
             std.math.clamp(@as(usize, cfg.fake_cert_size), tls.min_fake_cert_size, tls.max_fake_cert_size);
         const tls_template = tls.buildServerHelloTemplateAlloc(allocator, fake_cert_size) catch
@@ -1495,7 +1845,7 @@ pub const ProxyState = struct {
         const owned_config_path = try allocator.dupe(u8, config_path);
         errdefer allocator.free(owned_config_path);
 
-        return .{
+        var result: ProxyState = .{
             .allocator = allocator,
             .config_path = owned_config_path,
             .config = cfg,
@@ -1512,6 +1862,10 @@ pub const ProxyState = struct {
             .accept_paused = std.atomic.Value(bool).init(false),
             .saturation_paused = std.atomic.Value(bool).init(false),
             .mask_addr = resolved_addr,
+            .dns = dns,
+            .mask_dns_id = mask_dns_id,
+            .web_dns_id = web_dns_id,
+            .mask_candidates = mask_candidates,
             .mask_safelist = mask_safelist,
             .trusted = trusted,
             .web_only = cfg.web.onlyActive(),
@@ -1533,21 +1887,21 @@ pub const ProxyState = struct {
             .stats_web_only_masked = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
-            .middle_proxy_addr_203 = constants.getDcAddressV4(203),
+            .middle_proxy_addr_203 = constants.getDcAddressV4(203).?,
             .middle_proxy_addrs_dc4 = [_]Address{constants.tg_middle_proxies_v4[3]} ++ ([_]Address{constants.tg_middle_proxies_v4[3]} ** 15),
             .middle_proxy_addrs_dc4_len = 1,
             .middle_proxy_addrs_media_dc4 = [_]Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
             .middle_proxy_addrs_media_dc4_len = 1,
-            .middle_proxy_addrs_203 = [_]Address{constants.getDcAddressV4(203)} ++ ([_]Address{constants.getDcAddressV4(203)} ** 7),
+            .middle_proxy_addrs_203 = [_]Address{constants.getDcAddressV4(203).?} ++ ([_]Address{constants.getDcAddressV4(203).?} ** 7),
             .middle_proxy_addrs_203_len = 1,
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_shutdown = std.atomic.Value(bool).init(false),
             .middle_proxy_refresh_requested = std.atomic.Value(bool).init(false),
-            .worker_heartbeats = [_]std.atomic.Value(i64){std.atomic.Value(i64).init(0)} ** max_workers,
-            .subnet_limiter = SubnetRateLimit.init(),
-            .flood_guard = try HandshakeFloodGuard.create(allocator),
+            .worker_heartbeats = [_]WorkerHeartbeat{.{}} ** max_workers,
+            .subnet_limiter = null,
+            .flood_guard = null,
             .shutting_down = std.atomic.Value(bool).init(false),
             .middle_proxy_updater_thread = null,
             .upstream = upblk: {
@@ -1566,8 +1920,9 @@ pub const ProxyState = struct {
                                 defer proxy_list.deinit();
                                 if (proxy_list.addrs.len > 0) {
                                     log.info("Upstream mode: SOCKS5 via {s}:{d}", .{ host, cfg.upstream_proxy_port });
-                                    break :upblk upstream_mod.Upstream.initSocks5(
-                                        proxy_list.addrs[0],
+                                    proxy_dns_id = try dns.add(host, cfg.upstream_proxy_port, .init(proxy_list.addrs));
+                                    break :upblk upstream_mod.Upstream.initSocks5Candidates(
+                                        proxy_list.addrs,
                                         cfg.upstream_proxy_username,
                                         cfg.upstream_proxy_password,
                                     );
@@ -1591,8 +1946,9 @@ pub const ProxyState = struct {
                                 defer proxy_list.deinit();
                                 if (proxy_list.addrs.len > 0) {
                                     log.info("Upstream mode: HTTP CONNECT via {s}:{d}", .{ host, cfg.upstream_proxy_port });
-                                    break :upblk upstream_mod.Upstream.initHttpConnect(
-                                        proxy_list.addrs[0],
+                                    proxy_dns_id = try dns.add(host, cfg.upstream_proxy_port, .init(proxy_list.addrs));
+                                    break :upblk upstream_mod.Upstream.initHttpConnectCandidates(
+                                        proxy_list.addrs,
                                         cfg.upstream_proxy_username,
                                         cfg.upstream_proxy_password,
                                     );
@@ -1632,15 +1988,19 @@ pub const ProxyState = struct {
                 }
             },
         };
+        result.proxy_dns_id = proxy_dns_id;
+        return result;
     }
 
     pub fn deinit(self: *ProxyState) void {
+        self.dns.destroy();
         self.middle_proxy_updater_shutdown.store(true, .release);
         if (self.middle_proxy_updater_thread) |thread| {
             thread.join();
             self.middle_proxy_updater_thread = null;
         }
-        self.flood_guard.destroy(self.allocator);
+        if (self.flood_guard) |guard| guard.destroy(self.allocator);
+        if (self.subnet_limiter) |limiter| self.allocator.destroy(limiter);
         self.allocator.free(self.mask_safelist);
         if (self.trusted.extra.len > 0) self.allocator.free(self.trusted.extra);
         self.allocator.free(self.tls_server_hello_template);
@@ -1688,30 +2048,45 @@ pub const ProxyState = struct {
     // worker threads. Only on the accept/handshake path, so contention is bounded.
 
     fn floodIsBlocked(self: *ProxyState, addr: Address, cfg: HandshakeFloodGuard.Settings) bool {
+        if (!cfg.enabled) return false;
         self.guard_lock.lock();
         defer self.guard_lock.unlock();
-        return self.flood_guard.isBlocked(addr, cfg);
+        const guard = self.flood_guard orelse return false;
+        return guard.isBlocked(addr, cfg);
     }
 
     fn floodRecord(self: *ProxyState, addr: Address, event: HandshakeFloodGuard.Event, cfg: HandshakeFloodGuard.Settings) bool {
+        if (!cfg.enabled) return false;
         self.guard_lock.lock();
         defer self.guard_lock.unlock();
-        return self.flood_guard.record(addr, event, cfg);
+        if (self.flood_guard == null) self.flood_guard = HandshakeFloodGuard.create(self.allocator) catch return true;
+        return self.flood_guard.?.record(addr, event, cfg);
     }
 
     fn floodTop(self: *ProxyState, cfg: HandshakeFloodGuard.Settings, out: []HandshakeFloodGuard.TopEntry) usize {
+        if (!cfg.enabled) return 0;
         self.guard_lock.lock();
         defer self.guard_lock.unlock();
-        return self.flood_guard.top(cfg, out);
+        const guard = self.flood_guard orelse return 0;
+        return guard.top(cfg, out);
     }
 
     fn subnetCheck(self: *ProxyState, addr: Address, max_per_sec: u8) bool {
+        if (max_per_sec == 0) return true;
         self.guard_lock.lock();
         defer self.guard_lock.unlock();
-        return self.subnet_limiter.check(addr, max_per_sec);
+        if (self.subnet_limiter == null) {
+            const limiter = self.allocator.create(SubnetRateLimit) catch return false;
+            limiter.* = SubnetRateLimit.init();
+            self.subnet_limiter = limiter;
+        }
+        return self.subnet_limiter.?.check(addr, max_per_sec);
     }
 
     pub fn getMetricsSnapshot(self: *const ProxyState) MetricsSnapshot {
+        const config_mutex = @constCast(&self.metrics_config_mutex);
+        config_mutex.lock();
+        defer config_mutex.unlock();
         const now = realtimeSeconds();
         const accepted_total = self.connection_count.load(.monotonic);
         var close_reasons: [CloseReason.count]u64 = undefined;
@@ -1752,10 +2127,21 @@ pub const ProxyState = struct {
     }
 
     pub fn run(self: *ProxyState) !void {
+        log.info("Effective egress: {s}", .{self.tunnel_info.name()});
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
         const io_ctx = std.Io.Threaded.global_single_threaded.io();
         var signal_controller = try SignalController.init();
         defer signal_controller.deinit();
+        // Resolver inherits the blocked service-signal mask like all workers.
+        try self.dns.start();
+
+        // Resolve the worker count: 1 = classic single loop (default, unchanged),
+        // 0 = auto (one per CPU), clamped to [1, max_workers]. Published on the
+        // shared state so SIGHUP reload can refuse a racy live-reload under >1.
+        var worker_count: usize = self.config.workers;
+        if (worker_count == 0) worker_count = std.Thread.getCpuCount() catch 1;
+        worker_count = std.math.clamp(worker_count, 1, max_workers);
+        self.effective_workers = worker_count;
 
         var ipv6_ok = true;
         var server: net.Server = undefined;
@@ -1769,13 +2155,10 @@ pub const ProxyState = struct {
                 log.err("Invalid bind_address '{s}', cannot start", .{bind_str});
                 return error.InvalidBindAddress;
             };
-            ipv6_ok = isIpv6(parsed);
             listen_addr = parsed;
-            server = try parsed.listen(io_ctx, .{
-                .reuse_address = true,
-                .kernel_backlog = @intCast(self.config.backlog),
-            });
-            log.info("Listening on {s}:{d} (epoll)", .{ bind_str, self.config.port });
+            server = try net_helpers.listen(parsed, @intCast(self.config.backlog), worker_count > 1);
+            var listen_buf: [64]u8 = undefined;
+            log.info("Listening on {s} (epoll)", .{formatAddress(parsed, &listen_buf)});
         } else {
             // Default: try [::] (dual-stack), fall back to 0.0.0.0
             const address = ip6(
@@ -1785,19 +2168,13 @@ pub const ProxyState = struct {
                 0,
             );
             listen_addr = address;
-            server = address.listen(io_ctx, .{
-                .reuse_address = true,
-                .kernel_backlog = @intCast(self.config.backlog),
-            }) catch |err| blk: {
+            server = net_helpers.listen(address, @intCast(self.config.backlog), worker_count > 1) catch |err| blk: {
                 if (err == error.AddressFamilyUnsupported) {
                     ipv6_ok = false;
                     log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
                     const address_v4 = ip4(.{ 0, 0, 0, 0 }, self.config.port);
                     listen_addr = address_v4;
-                    break :blk try address_v4.listen(io_ctx, .{
-                        .reuse_address = true,
-                        .kernel_backlog = @intCast(self.config.backlog),
-                    });
+                    break :blk try net_helpers.listen(address_v4, @intCast(self.config.backlog), worker_count > 1);
                 }
                 return err;
             };
@@ -1809,18 +2186,20 @@ pub const ProxyState = struct {
             }
         }
         defer server.deinit(io_ctx);
+        log.warn("Telegram DC routes require IPv4 egress; IPv6-only hosts need a configured SOCKS/HTTP or tunnel egress that reaches IPv4", .{});
 
         setNonBlocking(server.socket.handle);
 
-        // Resolve the worker count: 1 = classic single loop (default, unchanged),
-        // 0 = auto (one per CPU), clamped to [1, max_workers]. Published on the
-        // shared state so SIGHUP reload can refuse a racy live-reload under >1.
-        var worker_count: usize = self.config.workers;
-        if (worker_count == 0) worker_count = std.Thread.getCpuCount() catch 1;
-        worker_count = std.math.clamp(worker_count, 1, max_workers);
-        self.effective_workers = worker_count;
-
-        if (self.config.use_middle_proxy and self.config.datacenter_override == null) {
+        // Any of these three can route a connection through MiddleProxy (same
+        // predicate as the NAT-IP warning above): use_middle_proxy for regular
+        // traffic, force_media_middle_proxy (default true) for media/CDN even
+        // with use_middle_proxy=false, and tag for the ad-tag RPC that only
+        // takes effect over a middleproxy handshake. Gating the updater on
+        // use_middle_proxy alone left DC203's snapshot (always consulted for
+        // CDN media, see buildDcConnectPlan's dc_abs==203 case) frozen on the
+        // bundled constants for the life of the process under the shipped
+        // defaults, since Telegram rotates MP addresses within hours.
+        if (middleProxyUpdaterNeeded(&self.config) and self.config.datacenter_override == null) {
             // The INITIAL middle-proxy metadata refresh now runs inside the
             // updater thread (see middleProxyUpdaterMain), NOT synchronously
             // here, so a blocked/stalled core.telegram.org fetch on a censored
@@ -1833,9 +2212,7 @@ pub const ProxyState = struct {
                 self.middle_proxy_updater_thread = updater;
             } else |err| {
                 log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
-                // No background thread: best-effort synchronous refresh so
-                // metadata is still populated (bounded by the OS connect timeout).
-                self.refreshMiddleProxyInfo() catch {};
+                self.middle_proxy_spawn_retry_ms = nowMs() + 10_000;
             }
         }
 
@@ -1859,11 +2236,16 @@ pub const ProxyState = struct {
         // but each worker adds its own listener + epoll fd — account for that 2×N
         // overhead so the RLIMIT warning is accurate under the multi-worker model.
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections) + 2 * worker_count;
-        checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
+        checkNofileLimit(effective_needed_fds, self.config.max_connections);
 
-        if (self.config.metrics.enabled) {
-            try @import("../monitoring.zig").start(self);
-        }
+        const metrics: ?@import("../monitoring.zig").Handle = if (self.config.metrics.enabled)
+            @import("../monitoring.zig").start(self) catch |err| blk: {
+                log.warn("metrics endpoint unavailable: {any}", .{err});
+                break :blk null;
+            }
+        else
+            null;
+        defer if (metrics) |handle| handle.stop();
 
         if (worker_count <= 1) {
             // Classic single-threaded path — byte-for-byte the previous behavior.
@@ -1899,12 +2281,10 @@ pub const ProxyState = struct {
 
         var i: usize = 1;
         while (i < worker_count) : (i += 1) {
-            const extra = listen_addr.listen(io_ctx, .{
-                .reuse_address = true,
-                .kernel_backlog = @intCast(self.config.backlog),
-            }) catch |err| {
-                log.err("worker {d} listener failed ({any}); continuing with {d} workers", .{ i, err, i });
-                break;
+            const extra = net_helpers.listen(listen_addr, @intCast(self.config.backlog), worker_count > 1) catch |err| {
+                log.err("worker {d} listener failed: {any}", .{ i, err });
+                self.shutting_down.store(true, .release);
+                return err;
             };
             setNonBlocking(extra.socket.handle);
             // Spawn FIRST; only retain the listener (in extra_servers) once its
@@ -1915,7 +2295,8 @@ pub const ProxyState = struct {
                 log.err("worker {d} thread spawn failed ({any}); continuing with {d} workers", .{ i, err, extra_count });
                 var dead = extra;
                 dead.deinit(io_ctx); // remove the listenerless socket from the reuseport group
-                break;
+                self.shutting_down.store(true, .release);
+                return err;
             };
             extra_servers[extra_count] = extra;
             extra_count += 1;
@@ -1972,15 +2353,18 @@ pub const ProxyState = struct {
             .addrs_media_dc4_len = self.middle_proxy_addrs_media_dc4_len,
             .addrs_203 = self.middle_proxy_addrs_203,
             .addrs_203_len = self.middle_proxy_addrs_203_len,
-            .secret = self.middle_proxy_secret,
-            .secret_len = self.middle_proxy_secret_len,
         };
     }
 
-    /// Refresh helper. Tries the default route first; on any network-class
-    /// failure AND when the config selects tunnel upstream, retries via the
-    /// active tunnel route (`table 200`), pool state, then configured tunnel
-    /// candidates. This keeps the media MP cache warm after tunnel failover.
+    /// Refresh helper. When the config selects a configured egress (tunnel,
+    /// socks5, http), tries THAT route first — a host that chose non-direct
+    /// egress chose it to keep this exact traffic (fetching Telegram MP
+    /// metadata) off the local uplink, so trying direct first would emit the
+    /// SYNs the operator configured egress specifically to avoid, and on a
+    /// SYN-blackholing network could block the updater for the full kernel
+    /// connect timeout before ever trying the configured route. Falls back to
+    /// direct only when `allow_direct_fallback` allows it (fail-closed
+    /// otherwise, matching the socks5/http_connect branch below).
     fn fetchMiddleProxyAsset(self: *ProxyState, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
         switch (middleProxyFetchRouteForConfig(&self.config)) {
             .socks5, .http_connect => {
@@ -1996,10 +2380,15 @@ pub const ProxyState = struct {
                 }
             },
             .tunnel => {
-                if (fetchUrlBytes(allocator, url)) |bytes| {
+                if (self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, error.TunnelRouteUnavailable)) |bytes| {
                     return bytes;
-                } else |direct_err| {
-                    return self.fetchMiddleProxyAssetViaTunnelPool(allocator, url, direct_err);
+                } else |tunnel_err| {
+                    if (!self.config.allow_direct_fallback) return tunnel_err;
+                    log.warn("Middle-proxy asset {s} unavailable through the tunnel ({s}); trying direct fallback", .{
+                        url,
+                        @errorName(tunnel_err),
+                    });
+                    return fetchUrlBytes(allocator, url) catch tunnel_err;
                 }
             },
             .direct => return fetchUrlBytes(allocator, url),
@@ -2050,6 +2439,7 @@ pub const ProxyState = struct {
             }
         }
 
+        if (self.middle_proxy_updater_shutdown.load(.acquire)) return error.ShuttingDown;
         if (readTunnelPoolStateValue(allocator, "active")) |iface| {
             defer allocator.free(iface);
             if (tryFetchMiddleProxyViaInterface(allocator, url, iface, direct_err)) |bytes| {
@@ -2061,6 +2451,7 @@ pub const ProxyState = struct {
 
         var idx: usize = 0;
         while (self.config.tunnelCandidateAt(idx)) |iface| : (idx += 1) {
+            if (self.middle_proxy_updater_shutdown.load(.acquire)) return error.ShuttingDown;
             if (tryFetchMiddleProxyViaInterface(allocator, url, iface, direct_err)) |bytes| {
                 return bytes;
             } else |err| {
@@ -2075,9 +2466,9 @@ pub const ProxyState = struct {
         // The INITIAL refresh happens here (in this background thread) so it
         // never blocks the boot path. On a censored host it may fail (tunnel
         // handshake may not be up yet), so on failure run a short-cycle retry
-        // loop before falling back to the normal 24-hour cadence. This gets
+        // loop before falling back to the normal hourly cadence. This gets
         // media MP addresses into the cache within the first few minutes of
-        // uptime instead of the next day, all without delaying startup.
+        // uptime instead of the next hour, all without delaying startup.
         var initial_ok = false;
         if (self.refreshMiddleProxyInfo()) |_| {
             initial_ok = true;
@@ -2165,7 +2556,16 @@ pub const ProxyState = struct {
             std.mem.eql(u8, name, "NameServerFailure");
     }
 
+    fn selectReachableUntilShutdown(self: *ProxyState, candidates: []const Address, timeout: i32) ?Address {
+        for (candidates) |candidate| {
+            if (self.middle_proxy_updater_shutdown.load(.acquire)) return null;
+            if (trySelectReachableMiddleProxy(&.{candidate}, timeout)) |addr| return addr;
+        }
+        return null;
+    }
+
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
+        if (self.middle_proxy_updater_shutdown.load(.acquire)) return error.ShuttingDown;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const temp_alloc = arena.allocator();
@@ -2175,7 +2575,19 @@ pub const ProxyState = struct {
         // we transparently retry through the configured tunnel interface so
         // the runtime MP cache (including media endpoints) stays up to date.
         const cfg_bytes = self.fetchMiddleProxyAsset(temp_alloc, middle_proxy_config_url) catch |err| return err;
+        if (self.middle_proxy_updater_shutdown.load(.acquire)) return error.ShuttingDown;
         const next_secret = self.fetchMiddleProxyAsset(temp_alloc, middle_proxy_secret_url) catch |err| return err;
+
+        try self.mergeMiddleProxyAssets(cfg_bytes, next_secret, middleProxyProbeAllowed(&self.config));
+    }
+
+    /// Apply one fetched snapshot atomically. Kept separate from network fetches
+    /// so partial config responses and secret rotation can be tested directly.
+    fn mergeMiddleProxyAssets(self: *ProxyState, cfg_bytes: []const u8, next_secret: []const u8, probe_reachability: bool) !void {
+        // Reject the entire snapshot before probing or mutating cached routes.
+        if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
+            return error.BadMiddleProxySecret;
+        }
 
         var next_primary: [5]?Address = [_]?Address{null} ** 5;
         var next_media_primary: [5]?Address = [_]?Address{null} ** 5;
@@ -2198,9 +2610,9 @@ pub const ProxyState = struct {
 
             next_primary[i] = if (count == 0)
                 null
-            else if (i == 3)
+            else if (i == 3 or !probe_reachability)
                 candidates[0]
-            else if (trySelectReachableMiddleProxy(candidates[0..count], 1200)) |reachable|
+            else if (self.selectReachableUntilShutdown(candidates[0..count], 1200)) |reachable|
                 reachable
             else
                 candidates[0];
@@ -2219,16 +2631,17 @@ pub const ProxyState = struct {
 
             next_media_primary[i] = if (media_count == 0)
                 null
-            else if (i == 3)
+            else if (i == 3 or !probe_reachability)
                 media_candidates[0]
-            else if (trySelectReachableMiddleProxy(media_candidates[0..media_count], 1200)) |reachable|
+            else if (self.selectReachableUntilShutdown(media_candidates[0..media_count], 1200)) |reachable|
                 reachable
             else
                 media_candidates[0];
         }
 
         var candidates_203: [8]Address = undefined;
-        const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, .any, &candidates_203);
+        var count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, .negative_only, &candidates_203);
+        if (count_203 == 0) count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, .positive_only, &candidates_203);
         var next_203_candidates: [8]Address = undefined;
         var next_203_candidates_len: usize = 0;
         if (count_203 > 0) {
@@ -2237,10 +2650,6 @@ pub const ProxyState = struct {
             next_203_candidates_len = c203_n;
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
-
-        if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
-            return error.BadMiddleProxySecret;
-        }
 
         self.middle_proxy_lock.lock();
         defer self.middle_proxy_lock.unlock();
@@ -2326,6 +2735,8 @@ const EventLoop = struct {
     /// 0..N-1; worker 0 owns the signalfd + systemd watchdog. Indexes the shared
     /// per-worker heartbeat slot.
     worker_id: usize,
+    traffic_c2s_pending: std.atomic.Value(u64) = .init(0),
+    traffic_s2c_pending: std.atomic.Value(u64) = .init(0),
     pool: ConnectionPool,
     accept_paused: bool,
     accept_resume_ns: i128,
@@ -2336,8 +2747,6 @@ const EventLoop = struct {
     last_watchdog_ms: i64 = 0,
     timer_scan_cursor: u32,
     stats_next_log_ns: i128,
-    accepted_since_log: u64,
-    closed_since_log: u64,
     // Snapshot of degradation counters for delta logging
     prev_dropped_cap: u64,
     prev_dropped_saturation: u64,
@@ -2348,7 +2757,10 @@ const EventLoop = struct {
     prev_mp_fallback: u64,
     prev_dropped_pool: u64,
     shared_read_buf: [read_buf_size]u8,
+    server_hello_scratch: [65535 + 2048]u8 = undefined,
     desync_wait_slots: std.ArrayListUnmanaged(u32),
+    desync_next_ns: i128 = 0,
+    endpoint_penalties: EndpointPenalties = .{},
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
     /// Fds whose slot was closed during the current epoll batch. closeSlot unmaps them
@@ -2376,8 +2788,6 @@ const EventLoop = struct {
             .shutdown_deadline_ns = 0,
             .timer_scan_cursor = 0,
             .stats_next_log_ns = nowNs() + stats_log_interval_ns,
-            .accepted_since_log = 0,
-            .closed_since_log = 0,
             .prev_dropped_cap = 0,
             .prev_dropped_saturation = 0,
             .prev_dropped_rate_limit = 0,
@@ -2402,6 +2812,7 @@ const EventLoop = struct {
     }
 
     fn deinit(self: *EventLoop) void {
+        defer self.flushTrafficCounters();
         for (self.pool.slots) |slot_opt| {
             if (slot_opt) |slot| {
                 if (slot.phase != .idle) {
@@ -2435,6 +2846,7 @@ const EventLoop = struct {
     }
 
     fn run(self: *EventLoop) !void {
+        defer self.flushTrafficCounters();
         var events: [256]linux.epoll_event = undefined;
         const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
         var next_timer_tick_ns: i128 = nowNs();
@@ -2445,6 +2857,7 @@ const EventLoop = struct {
             // calls — guarantees a freed fd number is never recycled within the batch that
             // still has queued events for it. See pending_close_fds.
             self.drainPendingCloses();
+            self.flushTrafficCounters();
 
             // Per-worker liveness heartbeat (this worker's slot), and pet the
             // systemd watchdog at half the configured interval — ONLY from the
@@ -2452,6 +2865,14 @@ const EventLoop = struct {
             // non-owner shard stops the watchdog and triggers a restart.
             const tick_ms = nowMs();
             self.state.worker_heartbeats[@min(self.worker_id, max_workers - 1)].store(tick_ms, .monotonic);
+            if (self.worker_id == 0 and !self.shutting_down and self.state.middle_proxy_updater_thread == null and self.state.middle_proxy_spawn_retry_ms != 0 and tick_ms >= self.state.middle_proxy_spawn_retry_ms) {
+                self.state.middle_proxy_spawn_retry_ms = tick_ms + 10_000;
+                if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self.state})) |thread| {
+                    self.state.middle_proxy_updater_thread = thread;
+                    self.state.middle_proxy_spawn_retry_ms = 0;
+                } else |err| log.warn("Middle-proxy updater spawn retry failed: {any}", .{err});
+            }
+            self.state.worker_heartbeats[@min(self.worker_id, max_workers - 1)].tracked_fds.store(@intCast(self.pool.fd_to_slot.count()), .monotonic);
             if (self.signal_fd >= 0 and self.state.watchdog_usec > 0 and
                 tick_ms - self.last_watchdog_ms >= @as(i64, @intCast(self.state.watchdog_usec / 2000)) and
                 self.state.loopAlive(watchdog_stale_ms))
@@ -2537,7 +2958,7 @@ const EventLoop = struct {
                 self.onClientWritable(slot);
             }
             if (slot.phase == .idle) return;
-            if ((events & linux.EPOLL.IN) != 0) {
+            if ((events & (linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.HUP)) != 0 and !slot.client_read_eof) {
                 self.onClientReadable(slot);
             }
         } else if (fd == slot.upstream_fd) {
@@ -2545,7 +2966,7 @@ const EventLoop = struct {
                 self.onUpstreamWritable(slot);
             }
             if (slot.phase == .idle) return;
-            if ((events & linux.EPOLL.IN) != 0) {
+            if ((events & (linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.HUP)) != 0 and !slot.upstream_read_eof) {
                 self.onUpstreamReadable(slot);
             }
         }
@@ -2564,15 +2985,13 @@ const EventLoop = struct {
             // peer must not discard data already queued for the other peer. Detach the
             // hung-up fd from epoll and flush the surviving direction before tearing down;
             // a hard error (HUP/ERR) or an empty opposite queue still closes immediately.
-            const graceful = (events & (linux.EPOLL.HUP | linux.EPOLL.ERR)) == 0;
+            const graceful = (events & linux.EPOLL.ERR) == 0;
             const relaying = slot.phase == .relaying or slot.phase == .mask_relaying;
-            const opposite_pending = if (fd == slot.client_fd) slot.hasUpstreamPending() else slot.hasClientPending();
-            if (graceful and relaying and opposite_pending and !slot.relay_half_closed) {
-                self.beginRelayHalfClose(slot, fd);
+            const masking_connect = slot.phase == .connecting_upstream and slot.upstream_kind == .mask and fd == slot.client_fd;
+            if (!graceful or (!relaying and !masking_connect)) {
+                self.closeSlot(slot, "epoll hup/err");
                 return;
             }
-            self.closeSlot(slot, "epoll hup/err");
-            return;
         }
 
         if (slot.phase != .idle) {
@@ -2586,15 +3005,26 @@ const EventLoop = struct {
     fn acceptNewConnections(self: *EventLoop) !void {
         // Saturation hysteresis: if active > 90% of max, stop accepting entirely.
         // Resume only when active drops below 80% (checked in run() loop).
-        const active_now = self.state.active_connections.load(.monotonic);
+        var active_now = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
+        if (active_now >= (max * 8) / 10) {
+            // Reclaim silent unauthenticated sockets before pausing the listener.
+            // Existing authenticated users must not compete with idle probes.
+            for (self.pool.slots[0..self.pool.allocated_hi]) |candidate| {
+                const slot = candidate orelse continue;
+                if (slot.phase != .idle and slot.handshakeInProgress() and slot.first_byte_at_ms == 0) {
+                    self.closeSlot(slot, "silent connection capacity eviction");
+                    active_now = self.state.active_connections.load(.monotonic);
+                    if (active_now < (max * 8) / 10) break;
+                }
+            }
+        }
         if (active_now >= (max * 9) / 10) {
             // No connection is dropped here — the backlog is retained and served after the
             // 80% resume. Count only the transition INTO pause so the counter measures
             // saturation-pause events rather than every accept attempt while paused.
             if (!self.saturation_paused) {
-                self.pauseSaturation();
-                _ = self.state.stats_dropped_saturation.fetchAdd(1, .monotonic);
+                if (self.pauseSaturation()) _ = self.state.stats_dropped_saturation.fetchAdd(1, .monotonic);
             }
             return;
         }
@@ -2683,9 +3113,11 @@ const EventLoop = struct {
             };
 
             slot.active_reserved = true;
+            slot.client_queue.allocator = self.state.allocator;
+            slot.upstream_queue.allocator = self.state.allocator;
             slot.hs_counted = false;
-            slot.traffic_client_to_upstream_counter = &self.state.client_to_upstream_bytes_total;
-            slot.traffic_upstream_to_client_counter = &self.state.upstream_to_client_bytes_total;
+            slot.traffic_client_to_upstream_counter = &self.traffic_c2s_pending;
+            slot.traffic_upstream_to_client_counter = &self.traffic_s2c_pending;
             slot.user_metrics = null;
             slot.user_ip_key = null;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
@@ -2708,12 +3140,12 @@ const EventLoop = struct {
             );
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
 
-            if (self.addFd(cfd, true, false)) |_| {
+            if (self.addClientFd(slot, cfd, true, false)) |_| {
                 self.pool.mapFd(cfd, slot.index) catch {
                     self.closeSlot(slot, "fd map failed");
                     continue;
                 };
-                self.accepted_since_log += 1;
+                _ = self.state.accepted_since_log.fetchAdd(1, .monotonic);
             } else |_| {
                 self.closeSlot(slot, "epoll add client failed");
                 continue;
@@ -2722,6 +3154,9 @@ const EventLoop = struct {
     }
 
     fn logPeriodicStats(self: *EventLoop, now_ns: i128) void {
+        if (self.worker_id != 0) return;
+        var tracked_fds: u64 = 0;
+        for (&self.state.worker_heartbeats) |*heartbeat| tracked_fds += heartbeat.tracked_fds.load(.monotonic);
         const active = self.state.active_connections.load(.monotonic);
         const hs = self.state.handshakes_inflight.load(.monotonic);
         const accepted_total = self.state.connection_count.load(.monotonic);
@@ -2778,9 +3213,9 @@ const EventLoop = struct {
             active,
             self.state.config.max_connections,
             hs,
-            self.accepted_since_log,
-            self.closed_since_log,
-            self.pool.fd_to_slot.count(),
+            self.state.accepted_since_log.swap(0, .monotonic),
+            self.state.closed_since_log.swap(0, .monotonic),
+            tracked_fds,
             accepted_total,
             self.accept_paused,
             self.saturation_paused,
@@ -2799,7 +3234,7 @@ const EventLoop = struct {
         // ME) is silently NOT applied for those connections. Surface it instead of letting it
         // pass unnoticed — the usual cause is a wrong/undetected egress NAT IP.
         if (d_mpf > 0 and (self.state.config.use_middle_proxy or self.state.config.tag != null)) {
-            log.warn("ad-tag likely inactive: {d} middle-proxy handshake(s) fell back to direct this interval — those connections carry no ad-tag/ME media. Check egress reachability and [server].middle_proxy_nat_ip.", .{d_mpf});
+            log.warn("middle-proxy degraded: {d} middle-proxy handshake(s) fell back to direct this interval — those connections lose middle-proxy media routing (direct promo tags remain). Check egress reachability and [server].middle_proxy_nat_ip.", .{d_mpf});
         }
 
         var top_entries: [5]HandshakeFloodGuard.TopEntry = undefined;
@@ -2813,12 +3248,16 @@ const EventLoop = struct {
             }
         }
 
-        self.accepted_since_log = 0;
-        self.closed_since_log = 0;
-
         while (self.stats_next_log_ns <= now_ns) {
             self.stats_next_log_ns += stats_log_interval_ns;
         }
+    }
+
+    fn flushTrafficCounters(self: *EventLoop) void {
+        const c2s = self.traffic_c2s_pending.swap(0, .monotonic);
+        const s2c = self.traffic_s2c_pending.swap(0, .monotonic);
+        if (c2s != 0) _ = self.state.client_to_upstream_bytes_total.fetchAdd(c2s, .monotonic);
+        if (s2c != 0) _ = self.state.upstream_to_client_bytes_total.fetchAdd(s2c, .monotonic);
     }
 
     fn pauseAccepting(self: *EventLoop, err: anyerror) void {
@@ -2854,12 +3293,13 @@ const EventLoop = struct {
         self.state.accept_paused.store(false, .monotonic);
     }
 
-    fn pauseSaturation(self: *EventLoop) void {
-        if (self.saturation_paused) return;
+    fn pauseSaturation(self: *EventLoop) bool {
+        if (self.saturation_paused) return true;
 
         self.modFd(self.listen_fd, false, false) catch |mod_err| {
             log.err("failed to pause accepts for saturation: {any}", .{mod_err});
-            return;
+            self.state.shutting_down.store(true, .release);
+            return false;
         };
 
         self.saturation_paused = true;
@@ -2872,6 +3312,7 @@ const EventLoop = struct {
                 "To handle more clients, increase max_connections or upgrade VPS RAM.",
             .{ active, max, @as(u32, 90), (max * 8) / 10, @as(u32, 80) },
         );
+        return true;
     }
 
     fn resumeSaturation(self: *EventLoop) void {
@@ -2992,6 +3433,7 @@ const EventLoop = struct {
     }
 
     fn reloadConfigFromDisk(self: *EventLoop) void {
+        @setEvalBranchQuota(100000);
         // With multiple SO_REUSEPORT workers, a live reload would swap and FREE
         // shared config string slices (tls_domain, mask_target, …) that the other
         // worker threads read on the handshake hot path — a torn-pointer /
@@ -3005,6 +3447,8 @@ const EventLoop = struct {
             return;
         };
         defer next.deinit(self.state.allocator);
+        self.state.metrics_config_mutex.lock();
+        defer self.state.metrics_config_mutex.unlock();
 
         if (next.users.count() == 0) {
             log.err("SIGHUP: reload rejected (no users configured)", .{});
@@ -3049,6 +3493,16 @@ const EventLoop = struct {
         if (next.web.onlyActive() != self.state.web_only) static_changes += 1;
         if (next.web.enabled != self.state.config.web.enabled) static_changes += 1;
         if (next.allow_direct_fallback != self.state.config.allow_direct_fallback) static_changes += 1;
+        // Every non-hot field, including nested sections and per-user limits,
+        // must report restart-required. New configuration fields are covered too.
+        inline for (std.meta.fields(Config)) |field| {
+            if (comptime !isHotConfigField(field.name)) {
+                if (!configValueEqual(field.type, @field(next, field.name), @field(self.state.config, field.name))) {
+                    static_changes += 1;
+                    log.warn("SIGHUP: {s} changed; restart required", .{field.name});
+                }
+            }
+        }
 
         if (next.idle_timeout_sec != self.state.config.idle_timeout_sec) {
             self.state.config.idle_timeout_sec = next.idle_timeout_sec;
@@ -3084,52 +3538,27 @@ const EventLoop = struct {
         }
         if (next.log_level != self.state.config.log_level) {
             self.state.config.log_level = next.log_level;
-            runtime_log.level = next.log_level;
+            runtime_log.level.store(next.log_level, .monotonic);
             applied += 1;
         }
         const tls_domain_changed = !std.mem.eql(u8, next.tls_domain, self.state.config.tls_domain);
         const mask_target_changed = !optionalStringEql(next.mask_target, self.state.config.mask_target);
-        if (next.mask != self.state.config.mask or next.mask_port != self.state.config.mask_port or tls_domain_changed or mask_target_changed) {
-            const resolved_mask_addr = self.resolveMaskAddress(&next);
-            if (next.mask) {
-                if (resolved_mask_addr) |addr| {
-                    self.state.mask_addr = addr;
-                } else {
-                    log.warn("SIGHUP: failed to resolve new mask target, keeping previous mask address", .{});
-                }
+        if (tls_domain_changed) {
+            static_changes += 1;
+            log.err("SIGHUP: tls_domain change requires restart and redistribution of every ee link; keeping current domain", .{});
+        }
+        if (!tls_domain_changed and (next.mask != self.state.config.mask or next.mask_port != self.state.config.mask_port or mask_target_changed)) {
+            const same_host = std.mem.eql(u8, next.effectiveMaskTarget(), self.state.config.effectiveMaskTarget());
+            if (!same_host or (next.mask and self.state.mask_addr == null)) {
+                static_changes += 1;
+                log.warn("SIGHUP: mask target change requires restart; DNS is never resolved on the event loop", .{});
             } else {
-                self.state.mask_addr = null;
+                if (self.state.mask_addr) |*addr| addr.setPort(next.mask_port);
+                for (self.state.mask_candidates.addresses[0..self.state.mask_candidates.len]) |*addr| addr.setPort(next.mask_port);
+                self.state.config.mask = next.mask;
+                self.state.config.mask_port = next.mask_port;
+                applied += 1;
             }
-            self.state.config.mask = next.mask;
-            self.state.config.mask_port = next.mask_port;
-            if (tls_domain_changed) {
-                if (self.state.allocator.dupe(u8, next.tls_domain)) |owned_tls_domain| {
-                    if (self.state.config.ownsTlsDomain()) {
-                        self.state.allocator.free(self.state.config.tls_domain);
-                    }
-                    self.state.config.tls_domain = owned_tls_domain;
-                } else |_| {
-                    log.warn("SIGHUP: failed to apply new tls_domain due to allocation error", .{});
-                }
-            }
-            if (mask_target_changed) {
-                if (next.mask_target) |target| {
-                    if (self.state.allocator.dupe(u8, target)) |owned_mask_target| {
-                        if (self.state.config.ownsMaskTarget()) {
-                            self.state.allocator.free(self.state.config.mask_target.?);
-                        }
-                        self.state.config.mask_target = owned_mask_target;
-                    } else |_| {
-                        log.warn("SIGHUP: failed to apply new mask_target due to allocation error", .{});
-                    }
-                } else {
-                    if (self.state.config.ownsMaskTarget()) {
-                        self.state.allocator.free(self.state.config.mask_target.?);
-                    }
-                    self.state.config.mask_target = null;
-                }
-            }
-            applied += 1;
         }
         if (next.desync != self.state.config.desync) {
             self.state.config.desync = next.desync;
@@ -3209,10 +3638,8 @@ const EventLoop = struct {
 
         // Relay half-close: upstream gracefully closed and we were draining its already-read
         // s2c data to a slow client. Once that queue empties, the connection is done.
-        if (slot.upstream_detached and !slot.hasClientPending()) {
-            self.closeSlot(slot, "relay drained after peer half-close");
-            return;
-        }
+        self.finishRelayHalfClose(slot);
+        if (slot.phase == .idle) return;
 
         switch (slot.phase) {
             .writing_server_hello_first => {
@@ -3300,10 +3727,8 @@ const EventLoop = struct {
 
                 // Relay half-close: client gracefully closed and we were draining its
                 // already-read c2s data to upstream. Once that queue empties, we're done.
-                if (slot.client_detached and !slot.hasUpstreamPending()) {
-                    self.closeSlot(slot, "relay drained after peer half-close");
-                    return;
-                }
+                self.finishRelayHalfClose(slot);
+                if (slot.phase == .idle) return;
 
                 if (slot.phase == .writing_dc_nonce and !slot.hasUpstreamPending()) {
                     self.onDcNonceWritable(slot);
@@ -3357,6 +3782,7 @@ const EventLoop = struct {
     fn enqueueDesyncWait(self: *EventLoop, slot: *ConnectionSlot) !void {
         if (slot.desync_wait_enqueued) return;
         try self.desync_wait_slots.append(self.state.allocator, slot.index);
+        if (self.desync_next_ns == 0 or slot.desync_deadline_ns < self.desync_next_ns) self.desync_next_ns = slot.desync_deadline_ns;
         slot.desync_wait_enqueued = true;
     }
 
@@ -3364,6 +3790,8 @@ const EventLoop = struct {
         if (self.desync_wait_slots.items.len == 0) return;
 
         const now_ns = nowNs();
+        if (now_ns < self.desync_next_ns) return;
+        self.desync_next_ns = 0;
         var write_idx: usize = 0;
         var read_idx: usize = 0;
 
@@ -3377,6 +3805,7 @@ const EventLoop = struct {
             }
 
             if (now_ns < slot.desync_deadline_ns) {
+                if (self.desync_next_ns == 0 or slot.desync_deadline_ns < self.desync_next_ns) self.desync_next_ns = slot.desync_deadline_ns;
                 self.desync_wait_slots.items[write_idx] = slot_idx;
                 write_idx += 1;
                 continue;
@@ -3441,7 +3870,7 @@ const EventLoop = struct {
     /// drain exactly its bytes (leaving the TLS ClientHello untouched in the socket buffer)
     /// so peer_addr reflects the real client behind a load balancer.
     fn tryConsumeProxyHeader(self: *EventLoop, slot: *ConnectionSlot) ProxyHeaderStep {
-        var peek: [256]u8 = undefined;
+        var peek: [4096]u8 = undefined;
         const msg_peek: u32 = 0x2; // MSG_PEEK (Linux)
         const rc = posix.system.recvfrom(slot.client_fd, &peek, peek.len, msg_peek, null, null);
         const n: usize = switch (posix.errno(rc)) {
@@ -3507,7 +3936,23 @@ const EventLoop = struct {
                     }
                     left -= got;
                 }
-                if (res.src) |real| slot.peer_addr = real;
+                if (res.src) |real| {
+                    slot.peer_addr = real;
+                    if (!slot.trusted_peer or !trusted_peers.isLoopback(real)) {
+                        const flood_cfg = floodGuardSettings(&self.state.config);
+                        if (self.state.floodIsBlocked(real, flood_cfg)) {
+                            _ = self.state.stats_dropped_flood_guard.fetchAdd(1, .monotonic);
+                            self.closeSlot(slot, "proxy client flood blocked");
+                            return .closed;
+                        }
+                        if (!self.state.subnetCheck(real, self.state.config.rate_limit_per_subnet)) {
+                            _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
+                            _ = self.state.floodRecord(real, .rate_limit, flood_cfg);
+                            self.closeSlot(slot, "proxy client rate limited");
+                            return .closed;
+                        }
+                    }
+                }
                 slot.expect_proxy_header = false;
                 slot.proxy_header_optional = false;
                 slot.proxy_header_peeked = 0;
@@ -3549,7 +3994,7 @@ const EventLoop = struct {
                     // Feed the flood guard so a client that repeatedly burns the budget
                     // accrues a score (and the per-IP handshake_budget column is no longer
                     // dead telemetry). This is a client-driven, first-byte event.
-                    if (!slot.trusted_peer) {
+                    if (!slot.trusted_peer or !trusted_peers.isLoopback(slot.peer_addr)) {
                         _ = self.state.floodRecord(slot.peer_addr, .handshake_budget, floodGuardSettings(&self.state.config));
                     }
                     self.closeSlot(slot, "handshake budget exhausted");
@@ -3631,6 +4076,8 @@ const EventLoop = struct {
                 // masking cover for whatever was buffered instead of a bare
                 // silent close, so the response matches the masking target
                 // rather than fingerprinting the proxy.
+                slot.client_read_eof = true;
+                slot.relay_half_closed = true;
                 self.startMasking(slot, slot.handshake_buf[0..slot.handshake_pos]) catch {
                     self.closeSlot(slot, "client eof during direct obfuscated handshake");
                 };
@@ -3646,6 +4093,14 @@ const EventLoop = struct {
             };
             return;
         };
+
+        if (!slot.trusted_peer) {
+            const digest = crypto.sha256(slot.handshake_buf[8..56]);
+            if (self.state.replay_cache.checkAndInsert(&digest)) {
+                self.startMasking(slot, &slot.handshake_buf) catch self.closeSlot(slot, "dd replay masking failed");
+                return;
+            }
+        }
 
         self.finishParsedClientHandshake(slot, result);
     }
@@ -3706,12 +4161,14 @@ const EventLoop = struct {
         }
 
         const validation = tls.validateTlsHandshake(
-            self.state.allocator,
             client_hello,
             self.state.user_secrets,
             false,
             self.state.clock_offset_seconds,
-        ) catch null;
+        ) catch |err| blk: {
+            if (err == error.ClockSkew) log.warn("valid FakeTLS authentication rejected for clock skew; check host time synchronization", .{});
+            break :blk null;
+        };
 
         if (validation == null) {
             self.startMasking(slot, client_hello) catch {
@@ -3733,9 +4190,11 @@ const EventLoop = struct {
         slot.validation_digest = v.digest;
         slot.validation_session_id_len = @intCast(v.session_id.len);
         @memcpy(slot.validation_session_id[0..v.session_id.len], v.session_id);
-        const ulen = @min(v.user.len, slot.validation_user.len);
-        slot.validation_user_len = @intCast(ulen);
-        @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
+        slot.validation_user = self.state.allocator.dupe(u8, v.user) catch {
+            self.closeSlot(slot, "username allocation failed");
+            return;
+        };
+        slot.validation_user_len = v.user.len;
 
         // Echo a client-offered cipher in the ServerHello (naturalistic, matches
         // how a real server negotiates) instead of a constant. Falls back to the
@@ -3762,6 +4221,10 @@ const EventLoop = struct {
         // A PQ-offering client (X25519MLKEM768 0x11ec) must be answered with a 0x11ec
         // key_share, else we emit a passive group-downgrade tell.
         const offers_pq = tls.clientOffersPqKeyShare(client_hello_bytes);
+        if (!offers_pq and !tls.clientOffersX25519KeyShare(client_hello_bytes)) {
+            self.startMasking(slot, client_hello_bytes) catch self.closeSlot(slot, "unsupported TLS key share");
+            return;
+        }
         if (fp_consumed) {
             var fp_buf: [256]u8 = undefined;
             if (tls.formatClientHelloFingerprint(client_hello_bytes, &fp_buf)) |fp| {
@@ -3774,6 +4237,21 @@ const EventLoop = struct {
 
         const echoed_cipher = tls.extractFirstTls13Cipher(client_hello_bytes);
         const session_id = slot.validation_session_id[0..slot.validation_session_id_len];
+        if (!self.state.config.desync) {
+            const response = (if (offers_pq)
+                tls.buildServerHelloPqInto(&self.server_hello_scratch, &slot.validation_secret, &slot.validation_digest, session_id, echoed_cipher, self.state.tls_server_hello_template.len - tls.server_hello_prefix_len)
+            else
+                tls.buildServerHelloWithTemplateInto(&self.server_hello_scratch, self.state.tls_server_hello_template, &slot.validation_secret, &slot.validation_digest, session_id, echoed_cipher)) catch {
+                self.closeSlot(slot, "build server hello failed");
+                return;
+            };
+            slot.phase = .writing_server_hello_rest;
+            _ = queueClient(slot, self.state.allocator, response) catch {
+                self.closeSlot(slot, "queue server hello failed");
+                return;
+            };
+            return;
+        }
         slot.server_hello = (if (offers_pq)
             tls.buildServerHelloPq(
                 self.state.allocator,
@@ -3935,6 +4413,13 @@ const EventLoop = struct {
     }
 
     fn finishParsedClientHandshake(self: *EventLoop, slot: *ConnectionSlot, result: anytype) void {
+        if (slot.validation_user.len == 0) {
+            slot.validation_user = self.state.allocator.dupe(u8, result.user) catch {
+                self.closeSlot(slot, "username allocation failed");
+                return;
+            };
+            slot.validation_user_len = result.user.len;
+        }
         slot.obf_params = result.params;
         slot.proto_tag = result.params.proto_tag;
         slot.dc_idx = result.params.dc_idx;
@@ -3951,12 +4436,18 @@ const EventLoop = struct {
             return;
         };
 
-        const snapshot = if (self.state.config.datacenter_override == null and (self.state.config.use_middle_proxy or dc_abs == 203))
+        // force_media_middle_proxy (default true) must see a snapshot for every
+        // media path (dc_idx < 0), not just DC203 — otherwise buildDcConnectPlan's
+        // `middle_addr != null` guard always fails for DC1..5 media under the
+        // shipped use_middle_proxy=false default, silently sending media direct
+        // and making the flag dead code for anything but CDN.
+        const snapshot = if (self.state.config.datacenter_override == null and middleProxySnapshotWanted(&self.state.config, dc_abs))
             self.state.getMiddleProxySnapshot()
         else
             null;
 
-        const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, result.user);
+        var plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, result.user);
+        self.endpoint_penalties.prioritize(plan.candidates[0..plan.count], nowMs());
         if (plan.count == 0) {
             self.closeSlot(slot, "no upstream candidates");
             return;
@@ -4055,8 +4546,8 @@ const EventLoop = struct {
         slot.upstream_candidate_next = 1;
         slot.current_upstream_addr = candidates[0];
 
-        self.startConnectUpstream(slot, candidates[0], .dc) catch {
-            self.closeSlot(slot, "upstream connect start failed");
+        self.startConnectUpstream(slot, candidates[0], .dc) catch |err| {
+            if (!self.tryNextDcEndpoint(slot, err)) self.closeSlot(slot, "upstream connect start failed");
         };
     }
 
@@ -4066,6 +4557,20 @@ const EventLoop = struct {
     /// like nginx ssl_reject_handshake and closes, `drop` closes silently. Validation-failed /
     /// replay cases (SNI matched) keep masking — they're not handled here.
     fn handleInvalidSni(self: *EventLoop, slot: *ConnectionSlot, client_hello: []const u8, sni: ?[]const u8, reason: []const u8) void {
+        // The configured WEB domain is a legitimate carrier, not an unknown SNI.
+        if (sni) |name| {
+            if (self.state.web_mask_addr) |addr| {
+                if (self.state.config.web.domain) |domain| {
+                    if (std.ascii.eqlIgnoreCase(name, domain)) {
+                        slot.mask_addr_override = addr;
+                        slot.mask_dns_override = self.state.web_dns_id;
+                        slot.mask_send_proxy_header = true;
+                        self.startMasking(slot, client_hello) catch self.closeSlot(slot, reason);
+                        return;
+                    }
+                }
+            }
+        }
         _ = self.state.stats_unknown_sni.fetchAdd(1, .monotonic);
         switch (self.state.config.unknown_sni_action) {
             .mask => {
@@ -4080,6 +4585,7 @@ const EventLoop = struct {
                         if (self.state.config.web.domain) |domain| {
                             if (std.ascii.eqlIgnoreCase(s, domain)) {
                                 slot.mask_addr_override = web_addr;
+                                slot.mask_dns_override = self.state.web_dns_id;
                                 slot.mask_send_proxy_header = true;
                             }
                         }
@@ -4088,6 +4594,7 @@ const EventLoop = struct {
                         for (self.state.mask_safelist) |entry| {
                             if (std.ascii.eqlIgnoreCase(s, entry.domain)) {
                                 slot.mask_addr_override = entry.addr;
+                                slot.mask_dns_override = entry.dns_id;
                                 break;
                             }
                         }
@@ -4116,42 +4623,68 @@ const EventLoop = struct {
         if (!self.state.config.mask) return error.MaskingDisabled;
 
         // Consume a one-shot SNI-following override if set; otherwise the default target.
-        const addr = blk: {
+        const candidates = blk: {
             if (slot.mask_addr_override) |override| {
                 slot.mask_addr_override = null;
-                break :blk override;
+                const id = slot.mask_dns_override;
+                slot.mask_dns_override = null;
+                break :blk if (id) |value| self.state.dns.snapshot(value) else net_helpers.AddressCandidates.init(&.{override});
             }
-            break :blk self.state.mask_addr orelse return error.NoMaskAddress;
+            var current = if (self.state.mask_dns_id) |id| self.state.dns.snapshot(id) else self.state.mask_candidates;
+            for (current.addresses[0..current.len]) |*address| address.setPort(self.state.config.mask_port);
+            break :blk current;
         };
-        // A PROXY header, when the target expects one, must lead the stream — the
-        // terminator reads it before the ClientHello.
-        var header_buf: [64]u8 = undefined;
-        const header: []const u8 = if (slot.mask_send_proxy_header) blk: {
-            slot.mask_send_proxy_header = false;
-            break :blk proxy_protocol.buildV2(&header_buf, slot.peer_addr, addr);
-        } else "";
+        if (candidates.len == 0) return error.NoMaskAddress;
+        try slot.freezeResolvedCandidates(self.state.allocator, candidates);
+        slot.mask_candidate_next = 1;
+        var addr = candidates.addresses[0];
+        // Reject a cover target that routes back into this listener, including the
+        // public ingress address (not just the configured loopback address).
+        while (addr.getPort() == self.state.config.port) {
+            const local = try socket_utils.localSocketAddress(slot.client_fd);
+            if (!addressEql(addr, local) and !trusted_peers.isLoopback(addr)) break;
+            if (slot.mask_candidate_next >= candidates.len) return error.MaskBackendLoopsToProxy;
+            addr = candidates.addresses[slot.mask_candidate_next];
+            slot.mask_candidate_next += 1;
+        }
+        // Build any PROXY header only after a backend connects, so a DNS retry
+        // across address families uses the actual destination and header length.
+        slot.mask_prebuffer = try self.state.allocator.dupe(u8, buffered);
 
-        const pre = try self.state.allocator.alloc(u8, header.len + buffered.len);
-        if (header.len > 0) @memcpy(pre[0..header.len], header);
-        @memcpy(pre[header.len..], buffered);
-        slot.mask_prebuffer = pre;
-
-        try self.startConnectUpstream(slot, addr, .mask);
+        self.startConnectUpstream(slot, addr, .mask) catch |err| {
+            if (!self.tryNextResolvedEndpoint(slot, .mask, addr)) return err;
+        };
     }
 
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: Address, kind: UpstreamKind) !void {
         const connect_result = if (kind == .mask) blk: {
-            const direct = upstream_mod.Upstream.initDirect();
+            const direct = if (self.state.config.upstream_mode == .tunnel) upstream_mod.Upstream.initDirectWithMark(tunnel_socket_mark) else upstream_mod.Upstream.initDirect();
             break :blk try direct.connect(addr);
-        } else try self.state.upstream.connect(addr);
+        } else blk: {
+            if (slot.resolved_candidates == null) {
+                if (self.state.proxy_dns_id) |id| {
+                    const candidates = self.state.dns.snapshot(id);
+                    if (candidates.len == 0) return error.NoProxyAddress;
+                    try slot.freezeResolvedCandidates(self.state.allocator, candidates);
+                }
+            }
+            while (true) {
+                const connector = if (slot.resolved_candidates) |candidates| self.state.upstream.withProxyAddress(candidates.addresses[slot.proxy_candidate_index]) else self.state.upstream.withProxyCandidate(slot.proxy_candidate_index);
+                break :blk connector.connect(addr) catch |err| {
+                    const count = if (slot.resolved_candidates) |candidates| candidates.len else self.state.upstream.proxyCandidateCount();
+                    if (slot.proxy_candidate_index + 1 >= count) return err;
+                    slot.proxy_candidate_index += 1;
+                    continue;
+                };
+            }
+        };
         const fd = connect_result.fd;
         errdefer closeFd(fd);
 
-        try self.addFd(fd, false, true);
+        try self.addUpstreamFd(slot, fd, false, true);
         errdefer _ = self.delFd(fd) catch {};
 
         try self.pool.mapFd(fd, slot.index);
-        errdefer self.pool.unmapFd(fd);
 
         slot.upstream_fd = fd;
         slot.upstream_kind = kind;
@@ -4166,13 +4699,6 @@ const EventLoop = struct {
             slot.proxy_target_addr = addr;
         }
 
-        errdefer {
-            slot.upstream_fd = -1;
-            slot.upstream_kind = .none;
-            slot.current_upstream_addr = null;
-            slot.proxy_target_addr = null;
-        }
-
         if (!connect_result.pending) {
             self.onUpstreamConnectComplete(slot);
         }
@@ -4181,7 +4707,10 @@ const EventLoop = struct {
     fn onUpstreamConnectComplete(self: *EventLoop, slot: *ConnectionSlot) void {
         if (checkSocketConnectError(slot.upstream_fd)) |_| {} else |err| {
             const failed_kind = slot.upstream_kind;
+            const failed_target = slot.current_upstream_addr;
             self.cleanupFailedUpstreamConnect(slot);
+
+            if (self.tryNextResolvedEndpoint(slot, failed_kind, failed_target)) return;
 
             if (failed_kind == .dc and self.tryNextDcEndpoint(slot, err)) {
                 return;
@@ -4199,8 +4728,18 @@ const EventLoop = struct {
 
         configureRelaySocket(slot.client_fd);
         configureRelaySocket(slot.upstream_fd);
+        if (slot.upstream_kind == .dc) if (slot.current_upstream_addr) |addr| self.endpoint_penalties.succeeded(addr);
 
         if (slot.upstream_kind == .mask) {
+            if (slot.mask_send_proxy_header) {
+                var header_buf: [64]u8 = undefined;
+                const header = proxy_protocol.buildV2(&header_buf, slot.peer_addr, slot.current_upstream_addr.?);
+                _ = queueUpstream(slot, self.state.allocator, header) catch {
+                    self.closeSlot(slot, "mask PROXY header failed");
+                    return;
+                };
+                slot.mask_send_proxy_header = false;
+            }
             if (slot.mask_prebuffer) |pre| {
                 if (queueUpstream(slot, self.state.allocator, pre)) |_| {
                     self.state.allocator.free(pre);
@@ -4214,6 +4753,7 @@ const EventLoop = struct {
             // Handshake complete (mask path) — release from handshake budget
             self.releaseHandshakeBudget(slot);
             slot.phase = .mask_relaying;
+            self.finishRelayHalfClose(slot);
             return;
         }
 
@@ -4297,15 +4837,45 @@ const EventLoop = struct {
             const fd = slot.upstream_fd;
             _ = self.delFd(fd) catch {};
             self.pool.unmapFd(fd);
-            closeFd(fd);
+            self.deferClose(fd);
             slot.upstream_fd = -1;
+            // The fd left epoll: keep the cache describing the kernel, so the next
+            // endpoint's registration starts from a truthful (false,false).
+            slot.noteUpstreamRegistered(false, false);
         }
         slot.upstream_kind = .none;
         slot.current_upstream_addr = null;
         slot.upstream_queue.clear();
     }
 
+    fn tryNextResolvedEndpoint(self: *EventLoop, slot: *ConnectionSlot, kind: UpstreamKind, target: ?Address) bool {
+        if (kind == .mask) {
+            const candidates = slot.resolved_candidates orelse return false;
+            while (slot.mask_candidate_next > 0 and slot.mask_candidate_next < candidates.len) {
+                const addr = candidates.addresses[slot.mask_candidate_next];
+                slot.mask_candidate_next += 1;
+                if (addr.getPort() == self.state.config.port) {
+                    const local = socket_utils.localSocketAddress(slot.client_fd) catch return false;
+                    if (addressEql(addr, local) or trusted_peers.isLoopback(addr)) continue;
+                }
+                self.startConnectUpstream(slot, addr, .mask) catch continue;
+                return true;
+            }
+            return false;
+        }
+        if (kind != .dc or self.state.upstream == .direct) return false;
+        const addr = target orelse return false;
+        const count = if (slot.resolved_candidates) |candidates| candidates.len else self.state.upstream.proxyCandidateCount();
+        if (slot.proxy_candidate_index + 1 >= count) return false;
+        slot.proxy_candidate_index += 1;
+        self.startConnectUpstream(slot, addr, kind) catch return false;
+        return true;
+    }
+
     fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror) bool {
+        slot.proxy_candidate_index = 0;
+        const candidates = slot.upstreamCandidates();
+        if (candidates.len > 0) self.endpoint_penalties.failed(slot.current_upstream_addr orelse candidates[@min(slot.upstream_candidate_next -| 1, candidates.len - 1)], nowMs());
         return upstream_failover.tryNextDcEndpoint(
             self,
             slot,
@@ -4350,6 +4920,10 @@ const EventLoop = struct {
             null;
 
         const progress = relayClientToUpstreamStep(slot, self.state.allocator, mp_c2s_scratch, self.shared_read_buf[0..]) catch |err| {
+            if (err == error.EndOfStream) {
+                self.beginRelayHalfClose(slot, slot.client_fd);
+                return;
+            }
             if (slot.is_media_path) {
                 log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -4380,6 +4954,10 @@ const EventLoop = struct {
             null;
 
         const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch, self.shared_read_buf[0..]) catch |err| {
+            if (err == error.EndOfStream) {
+                self.beginRelayHalfClose(slot, slot.upstream_fd);
+                return;
+            }
             if (slot.is_media_path) {
                 log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -4401,7 +4979,7 @@ const EventLoop = struct {
             return;
         };
         if (n == 0) {
-            self.closeSlot(slot, "direct obfuscated c2s eof");
+            self.beginRelayHalfClose(slot, slot.client_fd);
             return;
         }
 
@@ -4450,7 +5028,7 @@ const EventLoop = struct {
             return;
         };
         if (n == 0) {
-            self.closeSlot(slot, "direct obfuscated s2c eof");
+            self.beginRelayHalfClose(slot, slot.upstream_fd);
             return;
         }
 
@@ -4494,6 +5072,7 @@ const EventLoop = struct {
             self.shared_read_buf[0..],
             proxyHandshakeQueueUpstream,
             proxyHandshakeCloseSlot,
+            beginRelayHalfClose,
         );
     }
 
@@ -4504,6 +5083,7 @@ const EventLoop = struct {
             self.shared_read_buf[0..],
             relayQueueClient,
             proxyHandshakeCloseSlot,
+            beginRelayHalfClose,
         );
     }
 
@@ -4515,6 +5095,7 @@ const EventLoop = struct {
             mpLockMiddleProxyShared,
             mpUnlockMiddleProxyShared,
             mpHandshakeCloseSlot,
+            mpHandshakeFallbackToDirect,
         );
     }
 
@@ -4576,7 +5157,7 @@ const EventLoop = struct {
         var idx: usize = @intCast(self.timer_scan_cursor);
         if (idx >= hi) idx = 0;
 
-        const budget = @min(hi, timer_scan_budget);
+        const budget = hi; // Visit every deadline this tick; inactive slots are cheap pointer checks.
         var scanned: usize = 0;
         while (scanned < budget) : (scanned += 1) {
             const slot_opt = self.pool.slots[idx];
@@ -4586,11 +5167,6 @@ const EventLoop = struct {
             const slot = slot_opt orelse continue;
             if (slot.phase == .idle) continue;
 
-            if (slot.phase == .closing) {
-                self.closeSlot(slot, "closing phase");
-                continue;
-            }
-
             // Per-endpoint upstream connect deadline. Fires only while a connect() is still
             // in flight; lets failover advance to the next DC endpoint quickly instead of
             // burning the whole (global) handshake_timeout_sec on one black-holed endpoint.
@@ -4599,7 +5175,9 @@ const EventLoop = struct {
                 now_ms - slot.upstream_connect_started_ms > secondsToMs(self.state.config.dc_connect_timeout_sec))
             {
                 const failed_kind = slot.upstream_kind;
+                const failed_target = slot.current_upstream_addr;
                 self.cleanupFailedUpstreamConnect(slot);
+                if (self.tryNextResolvedEndpoint(slot, failed_kind, failed_target)) continue;
                 // Mirror onUpstreamConnectComplete's failure path: DC endpoints fail over to
                 // the next candidate; any other upstream kind (mask/proxy/middle) just closes.
                 if (failed_kind == .dc and self.tryNextDcEndpoint(slot, error.ConnectTimedOut)) continue;
@@ -4609,8 +5187,11 @@ const EventLoop = struct {
 
             if (slot.handshakeInProgress()) {
                 if (slot.first_byte_at_ms == 0) {
-                    if (now_ms - slot.created_at_ms > (if (slot.idle_timeout_ms > 0) slot.idle_timeout_ms else secondsToMs(self.state.config.idle_timeout_sec))) {
-                        self.closeSlot(slot, "idle pre-first-byte timeout");
+                    if (now_ms - slot.created_at_ms > jitteredIdleTimeoutMs(self.state.config.handshake_timeout_sec, self.state.config.idle_timeout_jitter_pct, slot.conn_id ^ @as(u64, @bitCast(slot.created_at_ms)))) {
+                        _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
+                        if (!slot.trusted_peer and !self.state.config.accept_proxy_protocol)
+                            _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
+                        self.closeSlot(slot, "silent handshake timeout");
                         continue;
                     }
                 } else if (slot.phase == .reading_direct_obfuscated_handshake and
@@ -4627,14 +5208,14 @@ const EventLoop = struct {
                         self.closeSlot(slot, "dd handshake decision timeout");
                     };
                     continue;
-                } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
+                } else if (now_ms - slot.first_byte_at_ms > jitteredIdleTimeoutMs(self.state.config.handshake_timeout_sec, self.state.config.idle_timeout_jitter_pct, slot.conn_id ^ @as(u64, @bitCast(slot.created_at_ms)))) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
                     // Only blame the client's IP when the stall is client-driven. An
                     // upstream-side timeout (DC unreachable, slow upstream proxy, stale
                     // middleproxy secret) is not the client's fault, and feeding it to the
                     // flood guard would block legit secret-holders behind a shared NAT
                     // during an upstream outage.
-                    if (isClientDrivenHandshakePhase(slot.phase) and !slot.mp_step.awaitingMiddleProxy() and !slot.trusted_peer) {
+                    if (isClientDrivenHandshakePhase(slot.phase) and !slot.mp_step.awaitingMiddleProxy() and (!slot.trusted_peer or !trusted_peers.isLoopback(slot.peer_addr))) {
                         _ = self.state.floodRecord(slot.peer_addr, .handshake_timeout, floodGuardSettings(&self.state.config));
                     }
                     // A timeout while still waiting on the middleproxy RPC handshake
@@ -4669,7 +5250,7 @@ const EventLoop = struct {
                     self.closeSlot(slot, "client silence wedge breaker");
                     continue;
                 }
-                if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
+                if (slot.phase == .mask_relaying and !slot.mask_send_proxy_header and self.state.config.mask_relay_max_secs > 0 and
                     now_ms - slot.created_at_ms > secondsToMs(self.state.config.mask_relay_max_secs))
                 {
                     self.closeSlot(slot, "mask relay max duration");
@@ -4691,99 +5272,43 @@ const EventLoop = struct {
     }
 
     fn syncInterests(self: *EventLoop, slot: *ConnectionSlot) !void {
-        var want_client_in = false;
-        var want_client_out = slot.hasClientPending();
-        var want_upstream_in = false;
-        var want_upstream_out = slot.hasUpstreamPending();
-
-        switch (slot.phase) {
-            .reading_tls_header,
-            .reading_direct_obfuscated_handshake,
-            .reading_client_hello_body,
-            .reading_mtproto_tls_header,
-            .reading_mtproto_tls_body,
-            => {
-                want_client_in = slot.client_read_pause_until_ms == 0 or
-                    nowMs() >= slot.client_read_pause_until_ms;
-            },
-
-            .writing_server_hello_first,
-            .writing_server_hello_rest,
-            => {
-                want_client_out = true;
-            },
-
-            .desync_wait => {
-                // Wait for timer tick only; keeping EPOLLOUT enabled here can
-                // cause a busy loop because writable sockets trigger continuously.
-            },
-
-            .connecting_upstream => {
-                want_client_in = false;
-                want_upstream_out = true;
-            },
-
-            .proxy_socks5_greeting,
-            .proxy_socks5_auth,
-            .proxy_socks5_connect,
-            .proxy_http_connect,
-            => {
-                want_client_in = false;
-                want_upstream_out = true;
-            },
-
-            .proxy_socks5_greeting_resp,
-            .proxy_socks5_auth_resp,
-            .proxy_socks5_connect_resp,
-            .proxy_http_connect_resp,
-            => {
-                want_client_in = false;
-                want_upstream_in = true;
-            },
-
-            .writing_dc_nonce => {
-                want_client_in = false;
-                want_upstream_out = true;
-            },
-
-            .middle_proxy_handshake => {
-                want_upstream_out = want_upstream_out or
-                    slot.mp_step == .sending_rpc_nonce or
-                    slot.mp_step == .sending_rpc_handshake;
-                want_upstream_in = slot.mp_step == .waiting_rpc_nonce_response or
-                    slot.mp_step == .waiting_rpc_handshake_response;
-            },
-
-            .relaying, .mask_relaying => {
-                if (slot.relay_half_closed) {
-                    // One side gracefully closed; only drain the surviving direction's
-                    // queued data (want_*_out already reflects hasXPending). Don't read
-                    // from either peer — c2s has nowhere to go and the closed side is gone.
-                    want_client_in = false;
-                    want_upstream_in = false;
-                } else {
-                    want_client_in = !slot.hasUpstreamPending();
-                    want_upstream_in = !slot.hasClientPending();
-                }
-            },
-
-            else => {},
+        const want = wantedInterests(slot, nowMs());
+        const relaying = slot.phase == .relaying or slot.phase == .mask_relaying;
+        if (relaying and slot.client_fd != -1) {
+            if (!want.client_in and !want.client_out and !slot.client_detached) {
+                try self.delFd(slot.client_fd);
+                slot.client_detached = true;
+                slot.noteClientRegistered(false, false);
+            } else if ((want.client_in or want.client_out) and slot.client_detached) {
+                try self.addClientFd(slot, slot.client_fd, want.client_in, want.client_out);
+                slot.client_detached = false;
+            }
+        }
+        if (relaying and slot.upstream_fd != -1) {
+            if (!want.upstream_in and !want.upstream_out and !slot.upstream_detached) {
+                try self.delFd(slot.upstream_fd);
+                slot.upstream_detached = true;
+                slot.noteUpstreamRegistered(false, false);
+            } else if ((want.upstream_in or want.upstream_out) and slot.upstream_detached) {
+                try self.addUpstreamFd(slot, slot.upstream_fd, want.upstream_in, want.upstream_out);
+                slot.upstream_detached = false;
+            }
         }
 
         // A detached fd (relay half-close) has left epoll — never modFd it.
         if (slot.client_fd != -1 and !slot.client_detached) {
-            if (slot.client_interest_in != want_client_in or slot.client_interest_out != want_client_out) {
-                try self.modFd(slot.client_fd, want_client_in, want_client_out);
-                slot.client_interest_in = want_client_in;
-                slot.client_interest_out = want_client_out;
+            if (slot.client_interest_in != want.client_in or slot.client_interest_out != want.client_out) {
+                try self.modFd(slot.client_fd, want.client_in, want.client_out);
+                slot.client_interest_in = want.client_in;
+                slot.client_interest_out = want.client_out;
             }
         }
 
         if (slot.upstream_fd != -1 and !slot.upstream_detached) {
-            if (slot.upstream_interest_in != want_upstream_in or slot.upstream_interest_out != want_upstream_out) {
-                try self.modFd(slot.upstream_fd, want_upstream_in, want_upstream_out);
-                slot.upstream_interest_in = want_upstream_in;
-                slot.upstream_interest_out = want_upstream_out;
+            if (slot.upstream_interest_in != want.upstream_in or slot.upstream_interest_out != want.upstream_out) {
+                try self.modFd(slot.upstream_fd, want.upstream_in, want.upstream_out);
+                slot.upstream_interest_in = want.upstream_in;
+                slot.upstream_interest_out = want.upstream_out;
             }
         }
     }
@@ -4791,18 +5316,9 @@ const EventLoop = struct {
     fn ensureMpC2sScratch(self: *EventLoop) ![]u8 {
         if (self.mp_c2s_scratch) |buf| return buf;
 
-        // Worst-case RPC_PROXY_REQ expansion.
-        // The smallest consumable input is a single abridged header byte with
-        // len_val=0 → 0-byte payload → encrypted_len = 96 with ad_tag.
-        // A pathological client pipelining 1MB of such bytes would expand to
-        // ~96MB of encapsulated frames. Sizing the scratch buffer to match
-        // keeps encapsulateC2S overflow-free under adversarial load and
-        // prevents the spurious connection drops observed in production.
-        //
-        // One allocation per EventLoop (single-threaded), so the memory cost
-        // is bounded regardless of connection count.
-        const mp_max_expansion: usize = 96;
-        const capacity = self.state.config.middleProxyBufferBytes() * mp_max_expansion + 256;
+        // At most one prior buffered frame plus the current bounded read can
+        // complete here. Charge worst-case framing overhead per new input byte.
+        const capacity = self.state.config.middleProxyC2sScratchBytes();
         const buf = try self.state.allocator.alloc(u8, capacity);
         self.mp_c2s_scratch = buf;
         return buf;
@@ -4810,42 +5326,36 @@ const EventLoop = struct {
 
     fn ensureMpS2cScratch(self: *EventLoop) ![]u8 {
         if (self.mp_s2c_scratch) |buf| return buf;
-        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
+        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes() + read_buf_size + 16);
         self.mp_s2c_scratch = buf;
         return buf;
     }
 
-    /// Begin a relay half-close drain: the peer on `hung_fd` gracefully closed while data
-    /// was still queued for the other peer. Detach `hung_fd` from epoll (it stays open so
-    /// closeSlot still closes it) and let the surviving direction flush; the writable
-    /// handler closes the slot once its queue drains, with the relay idle timer as backstop.
+    /// EOF is only recorded after read() returns zero, never from RDHUP alone.
     fn beginRelayHalfClose(self: *EventLoop, slot: *ConnectionSlot, hung_fd: posix.fd_t) void {
-        _ = self.delFd(hung_fd) catch {};
-        if (hung_fd == slot.client_fd) {
-            slot.client_detached = true;
-            slot.client_interest_in = false;
-            slot.client_interest_out = false;
-        } else {
-            slot.upstream_detached = true;
-            slot.upstream_interest_in = false;
-            slot.upstream_interest_out = false;
-        }
+        if (hung_fd == slot.client_fd) slot.client_read_eof = true else slot.upstream_read_eof = true;
         slot.relay_half_closed = true;
-        slot.last_activity_ms = nowMs();
-        self.syncInterests(slot) catch {
-            self.closeSlot(slot, "half-close sync failed");
-            return;
-        };
-        // If the surviving direction had nothing buffered after all, close now.
-        if (slot.upstream_detached and !slot.hasClientPending()) {
-            self.closeSlot(slot, "relay drained after peer half-close");
-        } else if (slot.client_detached and !slot.hasUpstreamPending()) {
-            self.closeSlot(slot, "relay drained after peer half-close");
+        self.finishRelayHalfClose(slot);
+    }
+
+    fn finishRelayHalfClose(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (!slot.relay_half_closed) return;
+        if (slot.client_read_eof and !slot.hasUpstreamPending() and !slot.upstream_write_shutdown) {
+            _ = linux.shutdown(slot.upstream_fd, linux.SHUT.WR);
+            slot.upstream_write_shutdown = true;
         }
+        if (slot.upstream_read_eof and !slot.hasClientPending() and !slot.client_write_shutdown) {
+            _ = linux.shutdown(slot.client_fd, linux.SHUT.WR);
+            slot.client_write_shutdown = true;
+        }
+        if (slot.client_read_eof and slot.upstream_read_eof and !slot.hasClientPending() and !slot.hasUpstreamPending())
+            self.closeSlot(slot, "relay drained after peer half-close");
     }
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
+        std.crypto.secureZero(u8, &slot.mp_secret);
+        slot.mp_secret_len = 0;
         // s2c counts payload handed to the client queue, so a large `qlen` here means we
         // decapsulated the bytes but never got them onto the socket.
         log.debug("[{d}] closing: user={s} dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d} qlen={d} relay={}", .{
@@ -4898,7 +5408,7 @@ const EventLoop = struct {
             // RED errors + evasion signal: bucket the close reason once per slot.
             _ = self.state.close_reasons[@intFromEnum(CloseReason.classify(reason))].fetchAdd(1, .monotonic);
             slot.active_reserved = false;
-            self.closed_since_log += 1;
+            _ = self.state.closed_since_log.fetchAdd(1, .monotonic);
         }
         // Release the handshake-budget slot exactly once, keyed on hs_counted
         // (set at first byte). Pre-first-byte sessions were never counted, and
@@ -4916,9 +5426,25 @@ const EventLoop = struct {
         self.pool.release(slot);
     }
 
+    /// Register a slot's client fd and record the registration in one step. Slot fds must
+    /// go through this (never bare addFd): the interest cache is what syncInterests
+    /// compares against, so a registration it never saw makes a later disarm a no-op.
+    fn addClientFd(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
+        try self.addFd(fd, want_in, want_out);
+        slot.noteClientRegistered(want_in, want_out);
+    }
+
+    /// Register a slot's upstream fd and record the registration (see addClientFd).
+    fn addUpstreamFd(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
+        try self.addFd(fd, want_in, want_out);
+        slot.noteUpstreamRegistered(want_in, want_out);
+    }
+
+    /// Low-level epoll registration. Only for fds with no slot behind them (the
+    /// listener, the signalfd) — everything else uses addClientFd/addUpstreamFd.
     fn addFd(self: *EventLoop, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
-        var events: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP;
-        if (want_in) events |= linux.EPOLL.IN;
+        var events: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP;
+        if (want_in) events |= linux.EPOLL.IN | linux.EPOLL.RDHUP;
         if (want_out) events |= linux.EPOLL.OUT;
 
         var ev = linux.epoll_event{ .events = events, .data = .{ .fd = fd } };
@@ -4930,8 +5456,8 @@ const EventLoop = struct {
     }
 
     fn modFd(self: *EventLoop, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
-        var events: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP;
-        if (want_in) events |= linux.EPOLL.IN;
+        var events: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP;
+        if (want_in) events |= linux.EPOLL.IN | linux.EPOLL.RDHUP;
         if (want_out) events |= linux.EPOLL.OUT;
 
         var ev = linux.epoll_event{ .events = events, .data = .{ .fd = fd } };
@@ -4969,10 +5495,8 @@ const EventLoop = struct {
         }
 
         const prev = slot.pipelined_data.?;
-        const next = try self.state.allocator.alloc(u8, next_len);
-        @memcpy(next[0..prev.len], prev);
+        const next = try self.state.allocator.realloc(prev, next_len);
         @memcpy(next[prev.len..], extra);
-        self.state.allocator.free(prev);
         slot.pipelined_data = next;
     }
 };
@@ -4986,7 +5510,11 @@ fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
 }
 
 fn queueTlsAppRecords(slot: *ConnectionSlot, allocator: std.mem.Allocator, payload: []u8) !void {
-    return relay_steps.queueTlsAppRecords(slot, allocator, payload, slotQueueClientPair);
+    return relay_steps.queueTlsAppRecords(slot, allocator, payload, slotQueueClientParts);
+}
+
+fn slotQueueClientParts(slot: *ConnectionSlot, _: std.mem.Allocator, parts: []const []const u8) !bool {
+    return queue_io.queueOrWriteParts(slot.client_fd, &slot.client_queue, parts, slot.traffic_upstream_to_client_counter orelse &noop_counter, if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null);
 }
 
 /// Dummy counter for slots that don't yet have traffic counters attached
@@ -5012,17 +5540,6 @@ fn slotQueueClientPair(slot: *ConnectionSlot, allocator: std.mem.Allocator, firs
         &slot.client_queue,
         first,
         second,
-        slot.traffic_upstream_to_client_counter orelse &noop_counter,
-        if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null,
-    );
-}
-
-fn slotQueueClientOwned(slot: *ConnectionSlot, allocator: std.mem.Allocator, owned: []u8) !bool {
-    _ = allocator;
-    return queue_io.queueOrWriteOwnedMsg(
-        slot.client_fd,
-        &slot.client_queue,
-        owned,
         slot.traffic_upstream_to_client_counter orelse &noop_counter,
         if (slot.user_metrics) |entry| &entry.upstream_to_client_bytes_total else null,
     );
@@ -5068,10 +5585,6 @@ fn queueClient(self: *ConnectionSlot, allocator: std.mem.Allocator, data: []cons
     return slotQueueClient(self, allocator, data);
 }
 
-fn queueClientOwned(self: *ConnectionSlot, allocator: std.mem.Allocator, data: []u8) !bool {
-    return slotQueueClientOwned(self, allocator, data);
-}
-
 fn queueUpstream(self: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
     return slotQueueUpstream(self, allocator, data);
 }
@@ -5093,6 +5606,10 @@ fn proxyHandshakeQueueUpstream(loop: *EventLoop, slot: *ConnectionSlot, data: []
 }
 
 fn proxyHandshakeCloseSlot(loop: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
+    if (std.mem.eql(u8, reason, "socks5 connect rejected") or std.mem.eql(u8, reason, "http connect rejected")) {
+        loop.cleanupFailedUpstreamConnect(slot);
+        if (loop.tryNextDcEndpoint(slot, error.ConnectionRefused)) return;
+    }
     return loop.closeSlot(slot, reason);
 }
 
@@ -5153,42 +5670,401 @@ fn mpHandshakeFallbackToDirect(loop: *EventLoop, slot: *ConnectionSlot) bool {
     return loop.fallbackFromMiddleProxyToDirect(slot);
 }
 
+test "worker traffic counters batch global writes without losing bytes" {
+    var state: ProxyState = undefined;
+    state.client_to_upstream_bytes_total = .init(100);
+    state.upstream_to_client_bytes_total = .init(200);
+    var loop: EventLoop = undefined;
+    loop.state = &state;
+    loop.traffic_c2s_pending = .init(7);
+    loop.traffic_s2c_pending = .init(11);
+    loop.flushTrafficCounters();
+    loop.flushTrafficCounters();
+    try std.testing.expectEqual(@as(u64, 107), state.client_to_upstream_bytes_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 211), state.upstream_to_client_bytes_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), loop.traffic_c2s_pending.load(.monotonic));
+}
+
 test "handshakeInProgress - phases" {
     var slot: ConnectionSlot = undefined;
 
-    const hs_phases = [_]ConnectionPhase{
-        .reading_tls_header,
-        .reading_client_hello_body,
-        .writing_server_hello_first,
-        .desync_wait,
-        .writing_server_hello_rest,
-        .reading_mtproto_tls_header,
-        .reading_mtproto_tls_body,
-        .connecting_upstream,
-        .writing_dc_nonce,
-        .middle_proxy_handshake,
-    };
-    for (hs_phases) |phase| {
-        slot.phase = phase;
-        try std.testing.expect(slot.handshakeInProgress());
+    inline for (@typeInfo(ConnectionPhase).@"enum".fields) |field| {
+        slot.phase = @enumFromInt(field.value);
+        const expected = switch (slot.phase) {
+            .idle, .relaying, .mask_relaying => false,
+            else => true,
+        };
+        try std.testing.expectEqual(expected, slot.handshakeInProgress());
     }
+}
 
-    // Non-handshake phases
-    slot.phase = .idle;
-    try std.testing.expect(!slot.handshakeInProgress());
-    slot.phase = .relaying;
-    try std.testing.expect(!slot.handshakeInProgress());
-    slot.phase = .mask_relaying;
-    try std.testing.expect(!slot.handshakeInProgress());
-    slot.phase = .closing;
-    try std.testing.expect(!slot.handshakeInProgress());
+test "resolved retry exhaustion and overrides preserve masking prebuffer" {
+    const addr = ip4(.{ 192, 0, 2, 1 }, 443);
+    var state: ProxyState = undefined;
+    state.mask_candidates = .init(&.{addr});
+    state.upstream = upstream_mod.Upstream.initSocks5Candidates(&.{addr}, "user", "pass");
+    var loop: EventLoop = undefined;
+    loop.state = &state;
+    var pre = [_]u8{ 1, 2, 3 };
+    var slot = ConnectionSlot{ .mask_prebuffer = &pre, .mask_candidate_next = 0 };
+    try std.testing.expect(!loop.tryNextResolvedEndpoint(&slot, .mask, addr)); // An override never falls back to default.
+    slot.mask_candidate_next = 1;
+    try std.testing.expect(!loop.tryNextResolvedEndpoint(&slot, .mask, addr));
+    try std.testing.expect(!loop.tryNextResolvedEndpoint(&slot, .dc, addr));
+    try std.testing.expectEqualSlices(u8, &pre, slot.mask_prebuffer.?);
+    try std.testing.expectEqual(@as(u8, 0), slot.proxy_candidate_index);
+}
+
+test "connection DNS candidates are frozen copies and retain every override address" {
+    const allocator = std.testing.allocator;
+    var slot: ConnectionSlot = .{};
+    defer slot.resetOwnedBuffers(allocator);
+    const first = ip4(.{ 192, 0, 2, 1 }, 443);
+    const second = ip4(.{ 192, 0, 2, 2 }, 443);
+    var source = net_helpers.AddressCandidates.init(&.{ first, second });
+    try slot.freezeResolvedCandidates(allocator, source);
+    source = .init(&.{second});
+    try std.testing.expectEqual(@as(usize, 2), slot.resolved_candidates.?.len);
+    try std.testing.expect(addressEql(first, slot.resolved_candidates.?.addresses[0]));
+    try std.testing.expect(addressEql(second, slot.resolved_candidates.?.addresses[1]));
+    // A future connection receives the new snapshot; an in-flight retry does not.
+    var next: ConnectionSlot = .{};
+    defer next.resetOwnedBuffers(allocator);
+    try next.freezeResolvedCandidates(allocator, source);
+    try std.testing.expectEqual(@as(usize, 1), next.resolved_candidates.?.len);
+}
+
+test "relay FIN drains more than one read buffer and preserves reverse traffic" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |from_upstream| {
+        var client: [2]i32 = undefined;
+        var upstream_pair: [2]i32 = undefined;
+        try std.testing.expectEqual(posix.E.SUCCESS, linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &client)));
+        defer for (client) |fd| closeFd(fd);
+        try std.testing.expectEqual(posix.E.SUCCESS, linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &upstream_pair)));
+        defer for (upstream_pair) |fd| closeFd(fd);
+        var state: ProxyState = undefined;
+        state.allocator = std.testing.allocator;
+        var loop: EventLoop = undefined;
+        loop.state = &state;
+        loop.epoll_fd = try epollCreate();
+        defer closeFd(loop.epoll_fd);
+        var slot = ConnectionSlot{ .phase = .mask_relaying, .client_fd = client[0], .upstream_fd = upstream_pair[0] };
+        slot.client_queue.allocator = std.testing.allocator;
+        slot.upstream_queue.allocator = std.testing.allocator;
+        defer slot.client_queue.deinit();
+        defer slot.upstream_queue.deinit();
+        try loop.addClientFd(&slot, slot.client_fd, true, false);
+        try loop.addUpstreamFd(&slot, slot.upstream_fd, true, false);
+        const sender = if (from_upstream) upstream_pair[1] else client[1];
+        const receiver = if (from_upstream) client[1] else upstream_pair[1];
+        const source_fd = if (from_upstream) slot.upstream_fd else slot.client_fd;
+        const reverse_fd = if (from_upstream) slot.client_fd else slot.upstream_fd;
+        const send_buffer: u32 = 4096;
+        try posix.setsockopt(reverse_fd, posix.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+        const payload = [_]u8{0x5a} ** (read_buf_size * 2 + 17);
+        try std.testing.expectEqual(payload.len, linux.write(sender, &payload, payload.len));
+        try std.testing.expectEqual(posix.E.SUCCESS, linux.errno(linux.shutdown(sender, linux.SHUT.WR)));
+        var received: usize = 0;
+        var buffer: [read_buf_size]u8 = undefined;
+        var reached_eof = false;
+        for (0..16) |_| {
+            loop.processSlotEvent(&slot, source_fd, linux.EPOLL.IN | linux.EPOLL.RDHUP);
+            loop.processSlotEvent(&slot, reverse_fd, linux.EPOLL.OUT);
+            while (true) {
+                const n = posix.read(receiver, &buffer) catch |err| switch (err) {
+                    error.WouldBlock => break,
+                    else => return err,
+                };
+                if (n == 0) {
+                    reached_eof = true;
+                    break;
+                }
+                try std.testing.expect(std.mem.allEqual(u8, buffer[0..n], 0x5a));
+                received += n;
+            }
+            if (reached_eof) break;
+        }
+        try std.testing.expectEqual(payload.len, received);
+        try std.testing.expect(reached_eof);
+        try std.testing.expectEqual(ConnectionPhase.mask_relaying, slot.phase);
+        try std.testing.expectEqual(@as(usize, 5), linux.write(receiver, "reply", 5));
+        loop.processSlotEvent(&slot, reverse_fd, linux.EPOLL.IN);
+        const reply_len = try posix.read(sender, &buffer);
+        try std.testing.expectEqualStrings("reply", buffer[0..reply_len]);
+    }
+}
+
+test "middle proxy response rejection falls back without starting relay" {
+    const Harness = struct {
+        state: *ProxyState,
+        payload: [32]u8 = @splat(0),
+        response_len: usize = 32,
+        fallbacks: usize = 0,
+        closed: bool = false,
+        started: bool = false,
+        fn read(self: *@This(), _: *ConnectionSlot, _: bool) !?[]const u8 {
+            return self.payload[0..self.response_len];
+        }
+        fn write(_: *@This(), _: *ConnectionSlot, _: []const u8, _: bool) !void {}
+        fn lock(_: *@This()) void {}
+        fn start(self: *@This(), _: *ConnectionSlot) void {
+            self.started = true;
+        }
+        fn close(self: *@This(), _: *ConnectionSlot, _: []const u8) void {
+            self.closed = true;
+        }
+        fn fallback(self: *@This(), _: *ConnectionSlot) bool {
+            self.fallbacks += 1;
+            return true;
+        }
+    };
+    var state: ProxyState = undefined;
+    var harness = Harness{ .state = &state };
+    var slot = ConnectionSlot{};
+    for ([_]MiddleProxyHandshakeStep{ .waiting_rpc_nonce_response, .waiting_rpc_handshake_response }) |step| {
+        for ([_]usize{ 0, 31, 32 }) |len| {
+            slot.mp_step = step;
+            harness.response_len = len;
+            middle_proxy_handshake.onReadable(&harness, &slot, Harness.read, Harness.write, Harness.lock, Harness.lock, Harness.start, Harness.close, Harness.fallback);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), harness.fallbacks);
+    try std.testing.expect(!harness.closed);
+    try std.testing.expect(!harness.started);
+    if (builtin.os.tag == .linux) {
+        // A SOCKS transport may be IPv6 while the logical MP endpoint is IPv4.
+        // The announced NAT address must follow the latter, not getsockname.
+        const fd_result = linux.socket(posix.AF.INET6, posix.SOCK.STREAM, 0);
+        try std.testing.expectEqual(posix.E.SUCCESS, linux.errno(fd_result));
+        const fd: i32 = @intCast(fd_result);
+        defer closeFd(fd);
+        state.allocator = std.testing.allocator;
+        state.config = .{ .users = std.StringHashMap([16]u8).init(std.testing.allocator), .direct_users = std.StringHashMap(void).init(std.testing.allocator) };
+        state.middle_proxy_nat_ip4 = .{ 203, 0, 113, 7 };
+        slot.upstream_fd = fd;
+        slot.current_upstream_addr = ip4(.{ 149, 154, 167, 50 }, 443);
+        slot.peer_addr = ip4(.{ 192, 0, 2, 8 }, 1234);
+        slot.mp_secret_len = 32;
+        @memset(slot.mp_secret[0..32], 0x42);
+        slot.mp_nonce = @splat(0x11);
+        slot.mp_timestamp = 0x12345678;
+        slot.mp_step = .waiting_rpc_nonce_response;
+        @memcpy(harness.payload[0..4], &middleproxy.rpc_nonce_req);
+        @memcpy(harness.payload[4..8], slot.mp_secret[0..4]);
+        @memcpy(harness.payload[8..12], &middleproxy.rpc_crypto_aes);
+        @memset(harness.payload[16..32], 0x22);
+        middle_proxy_handshake.onReadable(&harness, &slot, Harness.read, Harness.write, Harness.lock, Harness.lock, Harness.start, Harness.close, Harness.fallback);
+        try std.testing.expectEqual(MiddleProxyHandshakeStep.waiting_rpc_handshake_response, slot.mp_step);
+        try std.testing.expectEqual(@as(usize, 6), harness.fallbacks);
+        const expected_enc = try middleproxy.getAesKeyAndIv(&([_]u8{0x22} ** 16), &slot.mp_nonce, &.{ 0x78, 0x56, 0x34, 0x12 }, &.{ 50, 167, 154, 149 }, &.{ 0, 0 }, "CLIENT", &.{ 7, 113, 0, 203 }, &.{ 0xbb, 1 }, slot.mp_secret[0..32], null, null);
+        const expected_dec = try middleproxy.getAesKeyAndIv(&([_]u8{0x22} ** 16), &slot.mp_nonce, &.{ 0x78, 0x56, 0x34, 0x12 }, &.{ 50, 167, 154, 149 }, &.{ 0, 0 }, "SERVER", &.{ 7, 113, 0, 203 }, &.{ 0xbb, 1 }, slot.mp_secret[0..32], null, null);
+        try std.testing.expectEqualSlices(u8, &expected_enc[0], &slot.mp_enc.?.key);
+        try std.testing.expectEqualSlices(u8, &expected_enc[1], &slot.mp_enc.?.iv);
+        try std.testing.expectEqualSlices(u8, &expected_dec[0], &slot.mp_dec.?.key);
+        try std.testing.expectEqualSlices(u8, &expected_dec[1], &slot.mp_dec.?.iv);
+        @memcpy(harness.payload[0..4], &middleproxy.rpc_handshake);
+        @memcpy(harness.payload[20..32], "IPIPPRPDTIME");
+        middle_proxy_handshake.onReadable(&harness, &slot, Harness.read, Harness.write, Harness.lock, Harness.lock, Harness.start, Harness.close, Harness.fallback);
+        try std.testing.expect(harness.started);
+        try std.testing.expectEqual(MiddleProxyHandshakeStep.done, slot.mp_step);
+        defer slot.middle_ctx.?.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, &.{ 203, 0, 113, 7 }, slot.middle_ctx.?.our_ip_port[12..16]);
+    }
+}
+
+test "multicore handshake budget is bounded and released exactly once" {
+    var state: ProxyState = undefined;
+    state.config = .{ .users = std.StringHashMap([16]u8).init(std.testing.allocator), .direct_users = std.StringHashMap(void).init(std.testing.allocator) };
+    state.config.max_connections = 10;
+    state.handshakes_inflight = .init(0);
+    state.stats_dropped_hs_budget = .init(0);
+    var loop: EventLoop = undefined;
+    loop.state = &state;
+    var slots = [_]ConnectionSlot{.{}} ** 8;
+    const Worker = struct {
+        fn run(shared: *EventLoop, slot: *ConnectionSlot) void {
+            if (shared.reserveHandshakeBudget(slot)) {
+                std.debug.assert(shared.reserveHandshakeBudget(slot));
+            }
+        }
+    };
+    var threads: [8]std.Thread = undefined;
+    for (&threads, &slots) |*thread, *slot| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &loop, slot });
+    for (threads) |thread| thread.join();
+    try std.testing.expectEqual(@as(u64, 3), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 5), state.stats_dropped_hs_budget.load(.monotonic));
+    for (&slots) |*slot| {
+        loop.releaseHandshakeBudget(slot);
+        loop.releaseHandshakeBudget(slot);
+    }
+    try std.testing.expectEqual(@as(u64, 0), state.handshakes_inflight.load(.monotonic));
+    // Refusal must happen before touching config_path or allocator.
+    state.effective_workers = 2;
+    loop.reloadConfigFromDisk();
+    try std.testing.expectEqual(@as(u32, 10), state.config.max_connections);
+}
+
+test "SOCKS response state machine authenticates and connects logical destination" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const Harness = struct {
+        state: *ProxyState,
+        closed: bool = false,
+        complete: bool = false,
+        message: [512]u8 = undefined,
+        message_len: usize = 0,
+        fn queue(self: *@This(), _: *ConnectionSlot, bytes: []const u8) !bool {
+            @memcpy(self.message[0..bytes.len], bytes);
+            self.message_len = bytes.len;
+            return true;
+        }
+        fn close(self: *@This(), _: *ConnectionSlot, _: []const u8) void {
+            self.closed = true;
+        }
+        fn done(self: *@This(), _: *ConnectionSlot) void {
+            self.complete = true;
+        }
+    };
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(posix.E.SUCCESS, linux.errno(linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0, &fds)));
+    defer for (fds) |fd| closeFd(fd);
+    var state: ProxyState = undefined;
+    state.allocator = std.testing.allocator;
+    state.upstream = upstream_mod.Upstream.initSocks5(ip4(.{ 127, 0, 0, 1 }, 1080), "user", "pass");
+    var harness = Harness{ .state = &state };
+    var slot = ConnectionSlot{ .upstream_fd = fds[0], .proxy_target_addr = ip4(.{ 149, 154, 167, 50 }, 443) };
+    defer if (slot.proxy_handshake_buf) |buf| std.testing.allocator.destroy(buf);
+    proxy_upstream_handshake.startSocks5(&harness, &slot, Harness.queue, Harness.close);
+    try std.testing.expectEqual(ConnectionPhase.proxy_socks5_greeting_resp, slot.phase);
+    // Split the greeting across readable events; no premature phase advance.
+    try std.testing.expectEqual(@as(usize, 1), linux.write(fds[1], &.{5}, 1));
+    proxy_upstream_handshake.onSocks5Readable(&harness, &slot, Harness.queue, Harness.close, Harness.done);
+    try std.testing.expectEqual(ConnectionPhase.proxy_socks5_greeting_resp, slot.phase);
+    try std.testing.expectEqual(@as(usize, 1), linux.write(fds[1], &.{2}, 1));
+    proxy_upstream_handshake.onSocks5Readable(&harness, &slot, Harness.queue, Harness.close, Harness.done);
+    try std.testing.expectEqual(ConnectionPhase.proxy_socks5_auth_resp, slot.phase);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 4, 'u', 's', 'e', 'r', 4, 'p', 'a', 's', 's' }, harness.message[0..harness.message_len]);
+    try std.testing.expectEqual(@as(usize, 2), linux.write(fds[1], &.{ 1, 0 }, 2));
+    proxy_upstream_handshake.onSocks5Readable(&harness, &slot, Harness.queue, Harness.close, Harness.done);
+    try std.testing.expectEqual(ConnectionPhase.proxy_socks5_connect_resp, slot.phase);
+    try std.testing.expectEqualSlices(u8, &.{ 149, 154, 167, 50 }, harness.message[4..8]);
+    try std.testing.expectEqual(@as(usize, 10), linux.write(fds[1], &.{ 5, 0, 0, 1, 127, 0, 0, 1, 0, 80 }, 10));
+    proxy_upstream_handshake.onSocks5Readable(&harness, &slot, Harness.queue, Harness.close, Harness.done);
+    try std.testing.expect(harness.complete);
+    try std.testing.expect(!harness.closed);
+    state.upstream = upstream_mod.Upstream.initHttpConnect(ip4(.{ 127, 0, 0, 1 }, 8080), "user", "pass");
+    harness.complete = false;
+    proxy_upstream_handshake.startHttpConnect(&harness, &slot, Harness.queue, Harness.close);
+    try std.testing.expectEqual(ConnectionPhase.proxy_http_connect_resp, slot.phase);
+    const prefix = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nX-Padding: ";
+    try std.testing.expectEqual(prefix.len, linux.write(fds[1], prefix, prefix.len));
+    proxy_upstream_handshake.onHttpConnectReadable(&harness, &slot, Harness.close, Harness.done);
+    try std.testing.expect(!harness.complete);
+    const padding = [_]u8{'x'} ** 5000;
+    try std.testing.expectEqual(padding.len, linux.write(fds[1], &padding, padding.len));
+    proxy_upstream_handshake.onHttpConnectReadable(&harness, &slot, Harness.close, Harness.done);
+    try std.testing.expect(!harness.complete);
+    try std.testing.expectEqual(@as(usize, 4), linux.write(fds[1], "\r\n\r\n", 4));
+    proxy_upstream_handshake.onHttpConnectReadable(&harness, &slot, Harness.close, Harness.done);
+    try std.testing.expect(harness.complete);
+    try std.testing.expect(!harness.closed);
+}
+
+test "middle proxy fetched snapshot merges partial routes and rotates secret atomically" {
+    const cfg = try Config.parse(std.testing.allocator, "[server]\nport=443\nmax_connections=32\nmiddle_proxy_nat_ip=\"192.0.2.1\"\n[censorship]\nmask=false\n[access.users]\nalice=\"00000000000000000000000000000001\"\n");
+    var state = try ProxyState.init(std.testing.allocator, cfg, "/tmp/mtproto-snapshot-test.toml");
+    defer state.deinit();
+    const before = state.getMiddleProxySnapshot();
+    const secret = [_]u8{0xa5} ** 32;
+    const partial =
+        "proxy_for 1 192.0.2.11:443;\n" ++
+        "proxy_for 4 192.0.2.41:443;\n" ++
+        "proxy_for 4 192.0.2.42:8443;\n" ++
+        "proxy_for -4 192.0.2.44:443;\n" ++
+        "proxy_for 203 192.0.2.203:443;\n" ++
+        "proxy_for -203 192.0.2.204:443;\n";
+    try state.mergeMiddleProxyAssets(partial, &secret, false);
+    const after = state.getMiddleProxySnapshot();
+    try std.testing.expect(addressEql(after.addrs_primary[0], try Address.parse("192.0.2.11", 443)));
+    for ([_]usize{ 1, 2, 4 }) |i| {
+        try std.testing.expect(addressEql(before.addrs_primary[i], after.addrs_primary[i]));
+    }
+    for ([_]usize{ 0, 1, 2, 4 }) |i| {
+        try std.testing.expect(addressEql(before.addrs_media_primary[i], after.addrs_media_primary[i]));
+    }
+    try std.testing.expectEqual(@as(usize, 2), after.addrs_dc4_len);
+    try std.testing.expect(addressEql(after.addrs_dc4[0], after.addrs_primary[3]));
+    try std.testing.expect(addressEql(after.addrs_dc4[1], try Address.parse("192.0.2.42", 8443)));
+    try std.testing.expectEqual(@as(usize, 1), after.addrs_media_dc4_len);
+    try std.testing.expect(addressEql(after.addrs_media_dc4[0], after.addrs_media_primary[3]));
+    try std.testing.expectEqual(@as(usize, 1), after.addrs_203_len);
+    try std.testing.expect(addressEql(after.addrs_203[0], try Address.parse("192.0.2.204", 443)));
+    try std.testing.expect(addressEql(after.addr_203, after.addrs_203[0]));
+    try std.testing.expectEqualSlices(u8, &secret, state.middle_proxy_secret[0..state.middle_proxy_secret_len]);
+
+    // Empty route data preserves the last good snapshot while a shorter secret
+    // replaces the old one and wipes its now-unused tail.
+    const shorter_secret = [_]u8{0x5a} ** 16;
+    try state.mergeMiddleProxyAssets("", &shorter_secret, false);
+    const retained = state.getMiddleProxySnapshot();
+    try std.testing.expect(addressesEqual(&after.addrs_primary, &retained.addrs_primary));
+    try std.testing.expect(addressesEqual(&after.addrs_media_primary, &retained.addrs_media_primary));
+    try std.testing.expect(addressesEqual(after.addrs_dc4[0..after.addrs_dc4_len], retained.addrs_dc4[0..retained.addrs_dc4_len]));
+    try std.testing.expect(addressesEqual(after.addrs_media_dc4[0..after.addrs_media_dc4_len], retained.addrs_media_dc4[0..retained.addrs_media_dc4_len]));
+    try std.testing.expect(addressesEqual(after.addrs_203[0..after.addrs_203_len], retained.addrs_203[0..retained.addrs_203_len]));
+    try std.testing.expect(addressEql(after.addr_203, retained.addr_203));
+    try std.testing.expectEqualSlices(u8, &shorter_secret, state.middle_proxy_secret[0..state.middle_proxy_secret_len]);
+    for (state.middle_proxy_secret[shorter_secret.len..]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    // Invalid secrets reject otherwise valid changed routes without a partial
+    // commit of endpoints or destruction of the previous usable secret.
+    const changed_routes = "proxy_for 1 192.0.2.99:443;\n";
+    const oversized = [_]u8{1} ** 257;
+    for ([_][]const u8{ "short", &oversized }) |bad_secret| {
+        try std.testing.expectError(error.BadMiddleProxySecret, state.mergeMiddleProxyAssets(changed_routes, bad_secret, false));
+        const rejected = state.getMiddleProxySnapshot();
+        try std.testing.expect(addressesEqual(&retained.addrs_primary, &rejected.addrs_primary));
+        try std.testing.expectEqualSlices(u8, &shorter_secret, state.middle_proxy_secret[0..state.middle_proxy_secret_len]);
+    }
+}
+
+test "disk reload applies hot settings without replacing startup capacity" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/config.toml", .{tmp.sub_path});
+    const initial = "[server]\nport=443\nmax_connections=64\nmiddle_proxy_nat_ip=\"192.0.2.1\"\n[censorship]\nmask=false\n[access.users]\nalice=\"00000000000000000000000000000001\"\n";
+    const cfg = try Config.parse(allocator, initial);
+    var state = try ProxyState.init(allocator, cfg, path);
+    defer state.deinit();
+    state.effective_workers = 1;
+    var loop: EventLoop = undefined;
+    loop.state = &state;
+    loop.pool = try ConnectionPool.init(allocator, 64);
+    defer loop.pool.deinit();
+    const next = "[server]\nport=8443\nmax_connections=128\nidle_timeout_sec=123\nmiddle_proxy_nat_ip=\"192.0.2.1\"\n[censorship]\nmask=false\n[access.users]\nalice=\"00000000000000000000000000000002\"\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = next });
+    loop.reloadConfigFromDisk();
+    try std.testing.expectEqual(@as(u16, 443), state.config.port);
+    try std.testing.expectEqual(@as(u32, 64), state.config.max_connections);
+    try std.testing.expectEqual(@as(u32, 123), state.config.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u8, 2), state.user_secrets[0].secret[15]);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.toml", .data = "[server]\nmax_connections=32\n[censorship]\nmask=false\n[access.users]\nalice=\"00000000000000000000000000000002\"\n" });
+    loop.reloadConfigFromDisk();
+    try std.testing.expectEqual(@as(u32, 32), state.config.max_connections);
+    try std.testing.expectEqual(@as(usize, 64), loop.pool.slots.len);
 }
 
 test "ProxyState access reload keeps active metrics safe" {
     const allocator = std.testing.allocator;
 
     const initial_cfg = try Config.parse(allocator,
+        \\[censorship]
+        \\mask = false
         \\[server]
+        \\middle_proxy_nat_ip = "192.0.2.1"
         \\port = 443
         \\
         \\[access.users]
@@ -5247,7 +6123,10 @@ test "ProxyState per-user unique-IP quota is allocated per config and survives r
     // `later` has a cap but no secret yet: it is added by the reload below, which
     // proves the quota comes from the STARTUP config rather than from the reloaded one.
     const initial_cfg = try Config.parse(allocator,
+        \\[censorship]
+        \\mask = false
         \\[server]
+        \\middle_proxy_nat_ip = "192.0.2.1"
         \\port = 443
         \\
         \\[access.users]
@@ -5306,9 +6185,11 @@ test "ProxyState per-user unique-IP quota is allocated per config and survives r
 fn reloadAccessUsersInThread(
     state: *ProxyState,
     next_cfg: *Config,
+    started: *std.atomic.Value(bool),
     done: *std.atomic.Value(bool),
     failed: *std.atomic.Value(bool),
 ) void {
+    started.store(true, .release);
     state.reloadAccessUsersForTest(next_cfg) catch {
         failed.store(true, .release);
     };
@@ -5319,7 +6200,10 @@ test "ProxyState access reload waits for metrics readers" {
     const allocator = std.testing.allocator;
 
     const initial_cfg = try Config.parse(allocator,
+        \\[censorship]
+        \\mask = false
         \\[server]
+        \\middle_proxy_nat_ip = "192.0.2.1"
         \\port = 443
         \\
         \\[access.users]
@@ -5340,10 +6224,12 @@ test "ProxyState access reload waits for metrics readers" {
 
     state.lockUserMetricsForReadForTest();
 
+    var started = std.atomic.Value(bool).init(false);
     var done = std.atomic.Value(bool).init(false);
     var failed = std.atomic.Value(bool).init(false);
-    const thread = try std.Thread.spawn(.{}, reloadAccessUsersInThread, .{ &state, &next_cfg, &done, &failed });
+    const thread = try std.Thread.spawn(.{}, reloadAccessUsersInThread, .{ &state, &next_cfg, &started, &done, &failed });
 
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(20 * std.time.ns_per_ms);
     const completed_while_reader_locked = done.load(.acquire);
 

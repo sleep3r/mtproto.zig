@@ -27,6 +27,8 @@ pub const UpdateOpts = struct {
     version: ?[]const u8 = null,
     force_service_update: bool = false,
     insecure: bool = false,
+    force: bool = false,
+    allow_downgrade: bool = false,
 };
 
 /// Run update in CLI (non-interactive) mode.
@@ -38,8 +40,15 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             opts.version = args.next();
         } else if (std.mem.eql(u8, arg, "--force-service")) {
             opts.force_service_update = true;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            opts.force = true;
+        } else if (std.mem.eql(u8, arg, "--allow-downgrade")) {
+            opts.allow_downgrade = true;
         } else if (std.mem.eql(u8, arg, "--insecure")) {
             opts.insecure = true;
+        } else {
+            ui.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
         }
     }
 
@@ -147,6 +156,26 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     }
 
     // ── Download + validate proxy binary ──
+    if (sys.fileExists(INSTALL_DIR ++ "/mtproto-proxy")) {
+        const current = try sys.exec(allocator, &.{ INSTALL_DIR ++ "/mtproto-proxy", "--version" });
+        defer current.deinit();
+        if (current.exit_code != 0) return error.InstalledVersionUnavailable;
+        const installed = installedVersion(current.stdout, current.stderr) orelse return error.InstalledVersionUnavailable;
+        const desired = versionFromOutput(tag.slice()) orelse return error.InvalidReleaseVersion;
+        switch (desired.order(installed)) {
+            .eq => if (!opts.force and !opts.force_service_update) {
+                ui.ok("Already up to date (use update --force to reapply host repairs)");
+                return;
+            },
+            .lt => if (!opts.allow_downgrade) {
+                ui.fail("Refusing downgrade; pass --allow-downgrade explicitly");
+                return error.DowngradeRefused;
+            },
+            .gt => {},
+        }
+    }
+
+    // ── Download + validate proxy binary ──
     var artifact = release.Artifact{};
     defer release.cleanup(allocator, &artifact);
     {
@@ -198,28 +227,21 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 
     // ── Backup current binary ──
     ui.step(ui.str(.update_backing_up));
-    var backup_path_buf: [256]u8 = undefined;
     var backup_path: ?[]const u8 = null;
+    const previous_unit = sys.readFileAllocAbsolute(allocator, SERVICE_FILE, 128 * 1024);
+    defer if (previous_unit) |content| allocator.free(content);
+    if (previous_unit == null and sys.fileExists(SERVICE_FILE)) return error.ServiceBackupFailed;
 
     if (sys.fileExists(INSTALL_DIR ++ "/mtproto-proxy")) {
-        const timestamp = sys.exec(allocator, &.{ "date", "+%Y%m%d%H%M%S" }) catch null;
-        if (timestamp) |t| {
-            const ts = std.mem.trim(u8, t.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-            backup_path = std.fmt.bufPrint(&backup_path_buf, "{s}/mtproto-proxy.backup.{s}", .{ INSTALL_DIR, ts }) catch null;
-            // Don't deinit t here — with ArenaAllocator it's freed at exit
-        } else {
-            backup_path = std.fmt.bufPrint(&backup_path_buf, "{s}/mtproto-proxy.backup", .{INSTALL_DIR}) catch null;
-        }
-
-        if (backup_path) |bp| {
-            _ = sys.execForward(&.{ "cp", INSTALL_DIR ++ "/mtproto-proxy", bp }) catch {};
-            ui.stepOk(ui.str(.update_backing_up), bp);
-        }
+        const bp = INSTALL_DIR ++ "/mtproto-proxy.backup.prev";
+        if (try sys.execForward(&.{ "cp", INSTALL_DIR ++ "/mtproto-proxy", bp }) != 0) return error.BackupFailed;
+        backup_path = bp;
+        ui.stepOk(ui.str(.update_backing_up), bp);
     }
 
     // ── Stop service ──
     ui.step(ui.str(.update_stopping));
-    _ = sys.execForward(&.{ "systemctl", "stop", SERVICE_NAME }) catch {};
+    if (try sys.execForward(&.{ "systemctl", "stop", SERVICE_NAME }) != 0) return error.StopFailed;
 
     // ── Install new binary ──
     ui.step(ui.str(.update_installing));
@@ -229,38 +251,60 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
     // so the proxy comes back up, and abort.
     const proxy_install_rc = sys.execForward(&.{ "install", "-m", "0755", artifact.binaryPath(), INSTALL_DIR ++ "/mtproto-proxy" }) catch 1;
     if (proxy_install_rc != 0) {
-        ui.fail("Failed to install the new mtproto-proxy binary — keeping the current version");
-        _ = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch {};
-        return;
+        ui.fail("Failed to install the new mtproto-proxy binary — restoring backup");
+        if (backup_path) |bp| {
+            if (try sys.execForward(&.{ "install", "-m", "0755", bp, INSTALL_DIR ++ "/mtproto-proxy" }) != 0) return error.RollbackRestoreFailed;
+        }
+        if (try sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) != 0) return error.RollbackRestartFailed;
+        return error.UpdateFailed;
     }
 
     if (buddy_path) |bp| {
         const buddy_rc = sys.execForward(&.{ "install", "-m", "0755", bp, "/usr/local/bin/mtbuddy" }) catch 1;
-        if (buddy_rc != 0) ui.warn("Failed to update the mtbuddy CLI (proxy binary was updated)");
+        if (buddy_rc != 0) {
+            ui.warn("Failed to update the mtbuddy CLI (proxy binary was updated)");
+        } else {
+            ui.info("This run finishes with the previous updater logic; run mtbuddy update --force once to apply the new updater's host repairs");
+        }
     }
 
     // Fix ownership
-    _ = sys.exec(allocator, &.{ "chown", "-R", "mtproto:mtproto", INSTALL_DIR }) catch {};
+    // The dashboard runs as root: never give its code, interpreter or token to
+    // the network-facing service account.
+    _ = sys.exec(allocator, &.{ "chown", "root:root", INSTALL_DIR }) catch {};
+    if (sys.fileExists(INSTALL_DIR ++ "/monitor")) {
+        _ = sys.exec(allocator, &.{ "chown", "-R", "root:root", INSTALL_DIR ++ "/monitor" }) catch {};
+    }
+    _ = sys.exec(allocator, &.{ "chown", "mtproto:mtproto", INSTALL_DIR ++ "/config.toml" }) catch {};
 
     // ── Update service file (unless tunnel-aware) ──
+    var preparation_failed = false;
     if (opts.force_service_update or !isTunnelServiceUnit()) {
-        release.writeServiceFile();
+        release.writeServiceFile() catch |err| {
+            ui.print("Failed to write proxy service: {any}; restoring the previous installation\n", .{err});
+            preparation_failed = true;
+        };
     }
-    _ = sys.execForward(&.{ "systemctl", "daemon-reload" }) catch {};
+    if ((sys.execForward(&.{ "systemctl", "daemon-reload" }) catch 1) != 0) preparation_failed = true;
+    @import("synlimit.zig").repairInstalled(allocator);
 
     // ── Start service ──
     ui.step(ui.str(.update_starting));
-    const start_result = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch 1;
+    const start_result = if (preparation_failed) 1 else sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch 1;
 
     if (start_result != 0 or !sys.isServiceActive(SERVICE_NAME)) {
         ui.fail(ui.str(.error_service_failed));
         // Rollback
         if (backup_path) |bp| {
             ui.step(ui.str(.update_rollback));
-            _ = sys.execForward(&.{ "cp", bp, INSTALL_DIR ++ "/mtproto-proxy" }) catch {};
-            _ = sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) catch {};
+            if (try sys.execForward(&.{ "systemctl", "stop", SERVICE_NAME }) != 0) return error.RollbackStopFailed;
+            if (try sys.execForward(&.{ "install", "-m", "0755", bp, INSTALL_DIR ++ "/mtproto-proxy" }) != 0) return error.RollbackRestoreFailed;
+            if (previous_unit) |content| try sys.writeFile(SERVICE_FILE, content);
+            if (try sys.execForward(&.{ "systemctl", "daemon-reload" }) != 0) return error.RollbackReloadFailed;
+            if (try sys.execForward(&.{ "systemctl", "restart", SERVICE_NAME }) != 0 or !sys.isServiceActive(SERVICE_NAME)) return error.RollbackRestartFailed;
+            ui.warn("Update failed; previous binary and service unit restored");
         }
-        return;
+        return error.UpdateFailed;
     }
 
     ui.ok(ui.str(.update_starting));
@@ -310,13 +354,37 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: UpdateOpts) !void {
 // ── Helpers ─────────────────────────────────────────────────────
 
 /// Check if the current service file is a tunnel-aware unit.
-fn isTunnelServiceUnit() bool {
+/// Also consulted by `install`, which must not stamp the stock unit (no CAP_NET_ADMIN,
+/// no ExecStartPre) over a tunnel egress on a re-run.
+pub fn isTunnelServiceUnit() bool {
     if (!sys.fileExists(SERVICE_FILE)) return false;
-    const result = sys.exec(std.heap.page_allocator, &.{
-        "grep", "-Eq", "setup_(netns|tunnel)\\.sh|ip[[:space:]]+netns[[:space:]]+exec|AmneziaWG[[:space:]]+Tunnel|Tunnel[[:space:]]+Policy[[:space:]]+Routing", SERVICE_FILE,
-    }) catch return false;
-    defer result.deinit();
-    return result.exit_code == 0;
+    const content = sys.readFileAllocAbsolute(std.heap.page_allocator, SERVICE_FILE, 128 * 1024) orelse return true;
+    defer std.heap.page_allocator.free(content);
+    for ([_][]const u8{ "setup_netns.sh", "setup_tunnel.sh", "netns", "AmneziaWG", "Tunnel Policy Routing", "CAP_NET_ADMIN", "SO_MARK" }) |marker| {
+        if (std.mem.indexOf(u8, content, marker) != null) return true;
+    }
+    return false;
+}
+
+fn versionFromOutput(output: []const u8) ?std.SemanticVersion {
+    var words = std.mem.tokenizeAny(u8, output, " \r\n\t");
+    while (words.next()) |word| {
+        const value = if (std.mem.startsWith(u8, word, "v")) word[1..] else word;
+        return std.SemanticVersion.parse(value) catch continue;
+    }
+    return null;
+}
+
+fn installedVersion(stdout: []const u8, stderr: []const u8) ?std.SemanticVersion {
+    // Released proxies before this audit printed --version to stderr.
+    return versionFromOutput(stdout) orelse versionFromOutput(stderr);
+}
+
+test "release version parsing handles binary output and v-prefixed tags" {
+    try std.testing.expectEqual(std.math.Order.gt, versionFromOutput("v1.13.1").?.order(versionFromOutput("mtproto-proxy 1.13.0\n").?));
+    try std.testing.expect(versionFromOutput("garbage") == null);
+    try std.testing.expectEqual(std.math.Order.eq, installedVersion("", "mtproto-proxy v1.13.0\n").?.order(try std.SemanticVersion.parse("1.13.0")));
+    try std.testing.expectEqual(std.math.Order.eq, installedVersion("mtproto-proxy v1.13.1\n", "").?.order(try std.SemanticVersion.parse("1.13.1")));
 }
 
 fn localized(ui: *const Tui, en: []const u8, ru: []const u8) []const u8 {

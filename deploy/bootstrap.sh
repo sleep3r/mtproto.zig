@@ -26,6 +26,8 @@ FORWARD_ARGS=()
 for arg in "$@"; do
   if [ "$arg" = "--insecure" ]; then
     INSECURE_MODE=1
+    export MTPROTO_INSECURE=1
+    continue
   fi
   FORWARD_ARGS+=("$arg")
 done
@@ -226,13 +228,15 @@ download_artifact() {
     # (and possibly vulnerable) build as the current 'latest'.
     printf '%s\n' "$sig_out" | grep -Fq "tag:${TAG} " \
       || fail "Signature trusted-comment tag mismatch for $sha_name (expected tag:${TAG})"
-    printf '%s\n' "$sig_out" | grep -Fq "artifact:${artifact}" \
+    printf '%s\n' "$sig_out" | awk -v token="artifact:${artifact}" '{ for (i=1;i<=NF;i++) if ($i == token) found=1 } END { exit !found }' \
       || fail "Signature trusted-comment artifact mismatch for $sha_name (expected artifact:${artifact})"
   else
     step "INSECURE mode: skipping minisign signature verification"
   fi
 
   step "Verifying checksum for $artifact"
+  awk -v artifact="$artifact" 'NF != 2 || ($2 != artifact && $2 != "*" artifact) { bad=1 } END { exit (bad || NR != 1) }' "$TMP/${sha_name}" \
+    || fail "Checksum filename mismatch for $artifact"
   if command -v sha256sum >/dev/null 2>&1; then
     (cd "$TMP" && sha256sum -c "${sha_name}" >/dev/null) || fail "Checksum verification failed: $artifact"
   elif command -v shasum >/dev/null 2>&1; then

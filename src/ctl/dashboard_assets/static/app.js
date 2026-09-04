@@ -503,7 +503,7 @@ function openShareModal(name, link) {
 async function apiCall(url, body) {
   const r = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'mtbuddy' },
     body: JSON.stringify(body)
   });
   const data = await r.json();
@@ -644,7 +644,9 @@ function setupTunnelDeleteModal() {
     try {
       const data = await apiCall('/api/routing/tunnel-delete', { interface: iface });
       const left = Array.isArray(data.remaining_pool) ? data.remaining_pool.length : 0;
-      const msg = data.removed_last
+      const msg = data.kept_config
+        ? ('Tunnel ' + iface + ': foreign configuration retained; ' + (data.restarted ? 'removed from proxy routing.' : 'nothing changed.'))
+        : data.removed_last
         ? ('Tunnel ' + iface + ' deleted. No tunnels left; upstream switched to auto.')
         : ('Tunnel ' + iface + ' deleted. ' + left + ' tunnel(s) remain.');
       showToast(msg, 'success');
@@ -1009,7 +1011,12 @@ function setupRoutingControls() {
       setRoutingAction('Updating ' + proxyType + ' target…');
 
       try {
-        const data = await apiCall('/api/routing/proxy-target', { type: proxyType, host, port, username, password });
+        const body = { type: proxyType, host, port, username };
+        if ($('routingProxyClearPass').checked) body.password = '';
+        else if (password) body.password = password;
+        const data = await apiCall('/api/routing/proxy-target', body);
+        proxyPassInput.value = '';
+        $('routingProxyClearPass').checked = false;
         setRoutingAction('Updated ' + data.type + ' target to ' + data.host + ':' + data.port + '. Proxy restarted.', 'ok');
         showToast('Updated ' + data.type + ' target. Proxy restarted.', 'success');
         await runPoll();
@@ -1118,7 +1125,6 @@ function renderRouting(routing) {
       const host = String(cfg.host || '');
       const port = Number(cfg.port || 0);
       const username = String(cfg.username || '');
-      const password = String(cfg.password || '');
 
       proxyHostLabel.textContent = upstreamType + ' host';
       proxyHost.placeholder = upstreamType === 'socks5' ? '127.0.0.1' : '127.0.0.1';
@@ -1130,7 +1136,7 @@ function renderRouting(routing) {
         proxyHost.value = host;
         proxyPort.value = port > 0 ? String(port) : '';
         proxyUser.value = username;
-        proxyPass.value = password;
+        proxyPass.placeholder = cfg.password_set ? 'Saved password — leave blank to keep' : 'Password';
       }
     } else {
       proxyCtl.style.display = 'none';
@@ -1266,7 +1272,7 @@ function renderEgress(egress, opts) {
   list.innerHTML = tunnels.map((tun) => {
     const iface = esc(tun.interface || '—');
     const isPrimary = tun.is_primary;
-    const quality = tun.quality || 'unknown';
+    const quality = ['good', 'degraded', 'poor', 'up', 'down', 'unknown'].includes(tun.quality) ? tun.quality : 'unknown';
     const rttText = tun.rtt_ms !== null && tun.rtt_ms !== undefined
       ? tun.rtt_ms.toFixed(1) + ' ms'
       : '—';
@@ -1336,15 +1342,16 @@ async function poll() {
   const r = await fetch('/api/stats', { cache: 'no-store' });
   if (!r.ok) throw new Error('stats request failed: ' + r.status);
   const d = await r.json();
+  if (d.errors && d.errors.length) throw new Error(d.errors.join('; '));
 
   lastData = d;
 
   // CPU
   setGauge('cpuArc', 'cpuPct', d.cpu);
-  $('cpuVal').innerHTML = d.cpu + '<span style="font-size:18px;font-weight:400">%</span>';
+  $('cpuVal').innerHTML = esc(d.cpu) + '<span style="font-size:18px;font-weight:400">%</span>';
   // Memory
   setGauge('memArc', 'memPct', d.mem_pct);
-  $('memVal').innerHTML = d.mem_used + '<span style="font-size:14px;font-weight:400"> MB</span>';
+  $('memVal').innerHTML = esc(d.mem_used) + '<span style="font-size:14px;font-weight:400"> MB</span>';
   $('memSub').textContent = d.mem_used + ' / ' + d.mem_total + ' MB';
 
   // Sparklines
@@ -1521,10 +1528,14 @@ async function runPoll() {
   try {
     await poll();
     hasPollError = false;
+    $('dataBadge').title = '';
     lastSuccessAt = Date.now();
     appRoot.classList.remove('is-loading');
   } catch (e) {
+    if ($('dataBadge').title !== e.message) showToast(e.message, 'error');
+    $('dataBadge').title = e.message;
     hasPollError = true;
+    appRoot.classList.remove('is-loading');
     console.error(e);
   } finally {
     pollInFlight = false;

@@ -13,8 +13,8 @@ fn ip4(bytes: [4]u8, port: u16) net.IpAddress {
 
 fn nowNs() u64 {
     var ts: std.posix.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
-    if (std.os.linux.errno(rc) != .SUCCESS) return 0;
+    const rc = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    if (std.posix.errno(rc) != .SUCCESS) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (opts.mode) {
         .bench => try runBench(allocator),
-        .handshake => try runHandshakeBench(allocator, opts.iterations),
+        .handshake => try runHandshakeBench(opts.iterations),
         .handshake_path => try runHandshakePathBench(allocator, opts),
         .soak => try runSoak(allocator, opts),
     }
@@ -125,17 +125,27 @@ fn runBench(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
-    const bench_secret = [_]u8{0x42} ** 16;
-    const user_secrets = [_]tls.UserSecret{.{ .name = "bench", .secret = bench_secret }};
+fn runHandshakeBench(iterations: usize) !void {
+    for ([_]usize{ 1, 32, 256, 1024 }) |users| {
+        for ([_]usize{ 200, 2048, tls.max_authenticated_hello_len }) |hello_len| {
+            try runHandshakeCase(@max(1, iterations / users), users, hello_len);
+        }
+    }
+}
 
-    var handshake = [_]u8{0} ** 96;
+fn runHandshakeCase(iterations: usize, users: usize, hello_len: usize) !void {
+    const bench_secret = [_]u8{0x42} ** 16;
+    var secrets: [1024]tls.UserSecret = undefined;
+    for (secrets[0..users]) |*secret| secret.* = .{ .name = "miss", .secret = .{0x11} ** 16 };
+    secrets[users - 1] = .{ .name = "bench", .secret = bench_secret };
+    const user_secrets = secrets[0..users];
+
+    var handshake_buf = [_]u8{0} ** tls.max_authenticated_hello_len;
+    const handshake = handshake_buf[0..hello_len];
     handshake[constants.tls_digest_pos + constants.tls_digest_len] = 32;
     @memset(handshake[44..76], 0xaa);
 
-    var canonical_input = handshake;
-    @memset(canonical_input[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
-    const canonical = crypto.sha256Hmac(&bench_secret, &canonical_input);
+    const canonical = crypto.sha256Hmac(&bench_secret, handshake);
 
     @memcpy(handshake[constants.tls_digest_pos..][0..28], canonical[0..28]);
     const ts: u32 = 0x11223344;
@@ -146,8 +156,8 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
     handshake[constants.tls_digest_pos + 31] = canonical[31] ^ ts_bytes[3];
 
     var warmup: usize = 0;
-    while (warmup < 1000) : (warmup += 1) {
-        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true, 0);
+    while (warmup < @min(iterations, 10)) : (warmup += 1) {
+        const ok = try tls.validateTlsHandshake(handshake, user_secrets, true, 0);
         if (ok == null) return error.BenchmarkValidationFailed;
     }
 
@@ -155,7 +165,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
     var matched: usize = 0;
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const ok = try tls.validateTlsHandshake(allocator, &handshake, &user_secrets, true, 0);
+        const ok = try tls.validateTlsHandshake(handshake, user_secrets, true, 0);
         if (ok != null) matched += 1;
     }
 
@@ -166,7 +176,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
     else
         @as(u64, @intCast((@as(u128, iterations) * std.time.ns_per_s) / elapsed_ns));
 
-    std.debug.print("benchmark: validateTlsHandshake\n", .{});
+    std.debug.print("benchmark: validateTlsHandshake users={d} hello_bytes={d} MiB_hashed_per_sec={d}\n", .{ users, hello_len, bytesPerSecToMiB(@intCast(iterations * users * hello_len), elapsed_ns) });
     std.debug.print("iterations matched ns_per_op ops_per_sec\n", .{});
     std.debug.print("{d} {d} {d} {d}\n", .{ iterations, matched, ns_per_op, ops_per_sec });
 }
@@ -259,6 +269,8 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
 
     var threads: std.ArrayList(std.Thread) = .empty;
     defer threads.deinit(allocator);
+    try threads.ensureTotalCapacity(allocator, opts.threads);
+    errdefer for (threads.items) |thread| thread.join();
 
     for (0..opts.threads) |worker_id| {
         const worker = WorkerArgs{
@@ -267,7 +279,7 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
             .shared = &shared,
         };
         const thread = try std.Thread.spawn(.{}, soakWorker, .{worker});
-        try threads.append(allocator, thread);
+        threads.appendAssumeCapacity(thread);
     }
 
     for (threads.items) |thread| {
@@ -429,7 +441,7 @@ fn parseArgs(args_source: std.process.Args, allocator: std.mem.Allocator) !Optio
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--threads=")) {
-            opts.threads = try parsePositiveUsize(arg["--threads=".len..]);
+            opts.threads = try std.fmt.parseInt(usize, arg["--threads=".len..], 10);
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--max-payload=")) {
@@ -488,6 +500,9 @@ fn printUsage() void {
         \\Flags:
         \\  --iterations=N       iterations for handshake and handshake-path
         \\  --candidate-count=N  candidate list size for handshake-path (1..16)
+        \\  --seconds=N          soak duration
+        \\  --threads=N          soak workers (0 = auto)
+        \\  --max-payload=N      maximum soak payload bytes
         \\
     , .{});
 }

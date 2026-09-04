@@ -90,7 +90,9 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
     // address is not part of any link it can hand out — and a host reached only through
     // a CDN may have none to detect. Not having one stops being fatal there.
     const web_only = cfg.web.onlyActive();
-    const server = opts.server orelse cfg.public_ip orelse sys.detectPublicIp(allocator) orelse blk: {
+    const detected = if (opts.server == null and cfg.public_ip == null) sys.detectPublicIp(allocator) else null;
+    defer if (detected) |owned| allocator.free(owned);
+    const server = opts.server orelse cfg.public_ip orelse detected orelse blk: {
         if (web_only) break :blk "";
         ui.fail("Could not determine public server address");
         ui.hint("Pass --server <ip-or-domain>, or set [server].public_ip in config.toml");
@@ -132,8 +134,11 @@ fn printLinks(ui: *Tui, allocator: std.mem.Allocator, opts: LinkOpts) !void {
         var secret_hex: [32]u8 = undefined;
         bytesToHex(entry.value_ptr.*, &secret_hex);
 
-        var ee_buf: [512]u8 = undefined;
-        const ee_secret = buildEeSecret(secret_hex[0..], domain, &ee_buf);
+        var ee_buf: [576]u8 = undefined;
+        const ee_secret = buildEeSecret(secret_hex[0..], domain, &ee_buf) catch {
+            ui.fail("Cannot encode FakeTLS link: secret or domain is invalid or too long.");
+            return;
+        };
 
         var encoded_server_buf: [768]u8 = undefined;
         const safe_server = encodeServerForProxyLink(server, &encoded_server_buf);
@@ -232,20 +237,19 @@ fn printLinksHelp(ui: *Tui) void {
     ui.writeRaw("  Prints a fresh 32-hex MTProto secret.\n\n");
 }
 
-fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: *[512]u8) []const u8 {
+fn buildEeSecret(secret: []const u8, tls_domain: []const u8, ee_buf: []u8) ![]const u8 {
+    if (secret.len != 32 or tls_domain.len == 0 or tls_domain.len > 253) return error.InvalidSecretOrDomain;
+    if (ee_buf.len < 34) return error.NoSpaceLeft;
     var pos: usize = 0;
     @memcpy(ee_buf[pos..][0..2], "ee");
     pos += 2;
 
-    const sec_len = @min(secret.len, ee_buf.len - pos);
+    const sec_len = secret.len;
     @memcpy(ee_buf[pos..][0..sec_len], secret[0..sec_len]);
     pos += sec_len;
 
-    var domain_hex_buf: [512]u8 = undefined;
-    const domain_hex = sys.domainToHex(tls_domain, &domain_hex_buf);
-    const domain_len = @min(domain_hex.len, ee_buf.len - pos);
-    @memcpy(ee_buf[pos..][0..domain_len], domain_hex[0..domain_len]);
-    pos += domain_len;
+    const domain_hex = try sys.domainToHex(tls_domain, ee_buf[pos..]);
+    pos += domain_hex.len;
 
     return ee_buf[0..pos];
 }
@@ -306,8 +310,18 @@ fn bytesToHex(bytes: [16]u8, out: *[32]u8) void {
 
 test "links - ee secret includes domain hex" {
     var buf: [512]u8 = undefined;
-    const ee = buildEeSecret("0123456789abcdef0123456789abcdef", "wb.ru", &buf);
+    const ee = try buildEeSecret("0123456789abcdef0123456789abcdef", "wb.ru", &buf);
     try std.testing.expectEqualStrings("ee0123456789abcdef0123456789abcdef77622e7275", ee);
+}
+
+test "links - long domains are complete or explicitly rejected" {
+    const secret = "0123456789abcdef0123456789abcdef";
+    const domain = [_]u8{'a'} ** 253;
+    var full: [576]u8 = undefined;
+    const result = try buildEeSecret(secret, &domain, &full);
+    try std.testing.expectEqual(@as(usize, 540), result.len);
+    var small: [512]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, buildEeSecret(secret, &domain, &small));
 }
 
 test "links - dd secret uses secure transport prefix" {

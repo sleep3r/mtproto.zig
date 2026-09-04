@@ -19,7 +19,7 @@ fn sendSocks5Auth(
     const username = loop.state.upstream.proxyUsername() orelse "";
     const password = loop.state.upstream.proxyPassword() orelse "";
 
-    const msg = socks5.buildAuthRequest(&slot.proxy_handshake_buf, username, password);
+    const msg = socks5.buildAuthRequest(slot.proxy_handshake_buf.?, username, password);
     if (msg.len == 0) {
         close_slot(loop, slot, "socks5 auth request build failed");
         return;
@@ -49,7 +49,7 @@ fn sendSocks5Connect(
         return;
     };
 
-    const msg = socks5.buildConnectRequest(&slot.proxy_handshake_buf, target);
+    const msg = socks5.buildConnectRequest(slot.proxy_handshake_buf.?, target);
     if (msg.len == 0) {
         close_slot(loop, slot, "socks5 connect request build failed");
         return;
@@ -74,8 +74,15 @@ pub fn startSocks5(
     comptime queue_upstream: fn (@TypeOf(loop), @TypeOf(slot), []const u8) anyerror!bool,
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
 ) void {
+    if (slot.proxy_handshake_buf == null) {
+        slot.proxy_handshake_buf = loop.state.allocator.create([http_connect.max_response_size]u8) catch {
+            close_slot(loop, slot, "proxy handshake allocation failed");
+            return;
+        };
+    }
+
     const needs_auth = loop.state.upstream.socks5.needsAuth();
-    const msg = socks5.buildGreeting(&slot.proxy_handshake_buf, needs_auth);
+    const msg = socks5.buildGreeting(slot.proxy_handshake_buf.?, needs_auth);
     if (msg.len == 0) {
         close_slot(loop, slot, "socks5 greeting build failed");
         return;
@@ -103,7 +110,7 @@ pub fn onSocks5Readable(
 ) void {
     // Read into proxy_handshake_buf at current pos
     const pos: usize = slot.proxy_handshake_pos;
-    const space = slot.proxy_handshake_buf[pos..];
+    const space = slot.proxy_handshake_buf.?[pos..];
     if (space.len == 0) {
         close_slot(loop, slot, "socks5 response buffer overflow");
         return;
@@ -122,7 +129,7 @@ pub fn onSocks5Readable(
     }
 
     slot.proxy_handshake_pos += @intCast(n);
-    const have = slot.proxy_handshake_buf[0..slot.proxy_handshake_pos];
+    const have = slot.proxy_handshake_buf.?[0..slot.proxy_handshake_pos];
 
     switch (slot.phase) {
         .proxy_socks5_greeting_resp => {
@@ -147,6 +154,10 @@ pub fn onSocks5Readable(
                     sendSocks5Connect(loop, slot, queue_upstream, close_slot);
                 },
                 .username_password => {
+                    if (loop.state.upstream.proxyUsername() == null) {
+                        close_slot(loop, slot, "socks5 selected unoffered authentication method");
+                        return;
+                    }
                     sendSocks5Auth(loop, slot, queue_upstream, close_slot);
                 },
                 .no_acceptable => {
@@ -219,6 +230,13 @@ pub fn startHttpConnect(
     comptime queue_upstream: fn (@TypeOf(loop), @TypeOf(slot), []const u8) anyerror!bool,
     comptime close_slot: fn (@TypeOf(loop), @TypeOf(slot), []const u8) void,
 ) void {
+    if (slot.proxy_handshake_buf == null) {
+        slot.proxy_handshake_buf = loop.state.allocator.create([http_connect.max_response_size]u8) catch {
+            close_slot(loop, slot, "proxy handshake allocation failed");
+            return;
+        };
+    }
+
     const target = slot.proxy_target_addr orelse {
         close_slot(loop, slot, "http proxy no target addr");
         return;
@@ -228,7 +246,7 @@ pub fn startHttpConnect(
     const password = loop.state.upstream.proxyPassword();
 
     const msg = http_connect.buildConnectRequest(
-        &slot.proxy_handshake_buf,
+        slot.proxy_handshake_buf.?,
         target,
         username,
         password,
@@ -258,7 +276,7 @@ pub fn onHttpConnectReadable(
     comptime handshake_complete: fn (@TypeOf(loop), @TypeOf(slot)) void,
 ) void {
     const pos: usize = slot.proxy_handshake_pos;
-    const space = slot.proxy_handshake_buf[pos..];
+    const space = slot.proxy_handshake_buf.?[pos..];
     if (space.len == 0) {
         close_slot(loop, slot, "http connect response buffer overflow");
         return;
@@ -277,7 +295,7 @@ pub fn onHttpConnectReadable(
     }
 
     slot.proxy_handshake_pos += @intCast(n);
-    const have = slot.proxy_handshake_buf[0..slot.proxy_handshake_pos];
+    const have = slot.proxy_handshake_buf.?[0..slot.proxy_handshake_pos];
 
     const result = http_connect.parseResponse(have) orelse return; // need more
 

@@ -23,6 +23,7 @@ pub const tg_datacenters_v4 = [5]net.IpAddress{
     ip4(.{ 149, 154, 171, 5 }, tg_datacenter_port),
 };
 
+/// Reference addresses only: current direct and MiddleProxy routing requires IPv4 egress.
 pub const tg_datacenters_v6 = [5]net.IpAddress{
     ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
     ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port),
@@ -57,7 +58,7 @@ pub const tg_media_middle_proxies_v4 = [5]net.IpAddress{
 };
 
 /// Resolves physical Datacenter IP by its index, handling special media DCs.
-pub fn getDcAddressV4(abs_dc: usize) net.IpAddress {
+pub fn getDcAddressV4(abs_dc: usize) ?net.IpAddress {
     if (abs_dc == 203) {
         // Media DC 203 has a dedicated network, resolving to MiddleProxy IP
         return ip4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
@@ -65,9 +66,15 @@ pub fn getDcAddressV4(abs_dc: usize) net.IpAddress {
     if (abs_dc >= 1 and abs_dc <= tg_datacenters_v4.len) {
         return tg_datacenters_v4[abs_dc - 1];
     }
-    // Fallback to modulo arithmetic for unknown DC indices
-    const fallback_idx = (abs_dc - 1) % tg_datacenters_v4.len;
-    return tg_datacenters_v4[fallback_idx];
+    return null;
+}
+
+test "unknown datacenters never alias a production endpoint" {
+    try std.testing.expect(getDcAddressV4(0) == null);
+    try std.testing.expect(getDcAddressV4(6) == null);
+    try std.testing.expect(getDcAddressV4(std.math.maxInt(usize)) == null);
+    for (1..6) |dc| try std.testing.expect(getDcAddressV4(dc) != null);
+    try std.testing.expect(getDcAddressV4(203) != null);
 }
 
 // ============= Protocol Tags =============
@@ -128,18 +135,12 @@ pub const min_tls_client_hello_size: usize = 100;
 
 // ============= Message Limits =============
 
-pub const min_msg_len: usize = 12;
-pub const max_msg_len: usize = 1 << 24; // 16 MB
-
 // ============= Buffer Sizes =============
-
-pub const default_buffer_size: usize = 16384;
 
 // ============= TLS Handshake Constants =============
 
 pub const tls_digest_len: usize = 32;
 pub const tls_digest_pos: usize = 11;
-pub const tls_digest_half_len: usize = 16;
 
 /// Time skew limits for anti-replay (seconds)
 pub const time_skew_min: i64 = -2 * 60;

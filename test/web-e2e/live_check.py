@@ -46,7 +46,7 @@ def fail(m): print("  FAIL " + m); sys.exit(1)
 def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     host = hostname.encode()
     sni_list_len = 1 + 2 + len(host); sni_ext_len = 2 + sni_list_len; sv_len = 3
-    body_len = 2+32+1+32+2+2+1+1+2+4+sni_ext_len+4+sv_len
+    body_len = 2+32+1+32+2+2+1+1+2+4+sni_ext_len+4+sv_len+42
     rec_len = 4 + body_len
     p = bytearray(5 + rec_len)
     p[0]=0x16; p[1]=3; p[2]=1; p[3:5]=struct.pack(">H", rec_len)
@@ -56,12 +56,14 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     p[pos]=0x20; pos+=1; p[pos:pos+32]=os.urandom(32); pos+=32
     p[pos:pos+2]=struct.pack(">H",2); pos+=2; p[pos:pos+2]=b"\x13\x01"; pos+=2
     p[pos]=1; pos+=1; p[pos]=0; pos+=1
-    p[pos:pos+2]=struct.pack(">H",4+sni_ext_len+4+sv_len); pos+=2
+    p[pos:pos+2]=struct.pack(">H",4+sni_ext_len+4+sv_len+42); pos+=2
     p[pos:pos+2]=b"\x00\x00"; pos+=2; p[pos:pos+2]=struct.pack(">H",sni_ext_len); pos+=2
     p[pos:pos+2]=struct.pack(">H",sni_list_len); pos+=2; p[pos]=0; pos+=1
     p[pos:pos+2]=struct.pack(">H",len(host)); pos+=2; p[pos:pos+len(host)]=host; pos+=len(host)
     p[pos:pos+2]=b"\x00\x2b"; pos+=2; p[pos:pos+2]=struct.pack(">H",sv_len); pos+=2
     p[pos]=2; pos+=1; p[pos:pos+2]=b"\x03\x04"; pos+=2
+    p[pos:pos+10]=bytes.fromhex("003300260024001d0020")
+    p[pos+10:pos+42]=os.urandom(32); pos+=42
     assert pos==len(p)
     mi=bytearray(p)
     for i in range(rnd, rnd+32): mi[i]=0
@@ -171,11 +173,13 @@ def baseline():
     o = Obf(secret, 2)
     s = socket.create_connection((HOST, PORT), timeout=8)
     s.sendall(o.first); msg, _ = req_pq_multi(); s.sendall(o.send(padded_frame(msg)))
-    s.settimeout(5); got = b""; reset = False
+    s.settimeout(5); got = b""; reset = False; closed = False
     try:
         while True:
             c = s.recv(4096)
-            if not c: break
+            if not c:
+                closed = True
+                break
             got += c
             if len(got) > 64: break
     except (socket.timeout, ConnectionResetError) as e:
@@ -186,6 +190,8 @@ def baseline():
         plain = o.recv(got)
         served = len(plain) >= 12 and struct.unpack("<I", plain[0:4])[0] + 4 <= len(plain) + 16 and b"\x63\x24\x16\x05" in plain
     if served: fail("dd handshake from the INTERNET was served — fake_tls_only gate is open!")
+    if not got and not reset and not closed:
+        fail("dd rejection is inconclusive: connection stayed open with no response")
     ok(f"dd from the internet is not served ({'RST' if reset else str(len(got))+' bytes back, not MTProto'})")
 
 def tls_records(buf: bytes):
@@ -234,6 +240,7 @@ def faketls_e2e(name: str, dc: int = 2):
     if len(plain) < 4: fail(f"FakeTLS {name}: no reply from Telegram")
     ln = struct.unpack("<I", plain[0:4])[0]; payload = plain[4:4+ln]
     check_server_padding(f"FakeTLS {name}", ln, payload)
+    payload = strip_padding(payload)
     ctor = struct.unpack("<I", payload[20:24])[0]; echoed = payload[24:40]
     if ctor != 0x05162463 or echoed != nonce: fail(f"FakeTLS {name}: unexpected reply ctor={ctor:#x}")
     ok(f"FakeTLS {name}: req_pq_multi -> res_pq from DC{dc} ({int((time.time()-t0)*1000)} ms)")
@@ -262,15 +269,33 @@ async def web():
     issuer = dict(x[0] for x in cert["issuer"])
     ok(f"TLS cert issuer: {issuer.get('organizationName')} / {issuer.get('commonName')}, CN={dict(x[0] for x in cert['subject']).get('commonName')}")
     if "200" not in st or b"TelegramWebProxy" in body: fail(f"cover page: {st}, bridge leaked={b'TelegramWebProxy' in body}")
+    cover_body = body
+    def normalized_headers(raw):
+        return sorted(line.lower().strip() for line in raw.split("\r\n")[1:]
+                      if line and not line.lower().startswith(("date:", "connection:")))
+    cover_headers = normalized_headers(head)
     ok(f"cover page: {st}, {len(body)} bytes, no bridge script")
 
     st, head, body, _ = https_get("/?bridge=" + "A" * 43)
     if "200" not in st or b"TelegramWebProxy" in body: fail("bad capability leaked the bridge page")
+    if body != cover_body or normalized_headers(head) != cover_headers:
+        fail("bad capability differs from the ordinary cover response")
     ok("bad capability -> same cover page")
+    unknown_status, unknown_headers, unknown_body, _ = https_get("/unknown-" + os.urandom(8).hex())
+    if "404" not in unknown_status or unknown_body != cover_body:
+        fail("unknown path must return 404 with the cover body")
 
     st, head, body, _ = https_get("/?bridge=" + cap)
     if "200" not in st or b"TelegramWebProxy" not in body or b"tproxy-init" not in body: fail(f"bridge page: {st}")
     csp = [l for l in head.split("\r\n") if l.lower().startswith("content-security-policy")]
+    if not csp or "frame-ancestors" not in csp[0] or "connect-src" not in csp[0]:
+        fail("bridge CSP is absent or missing frame-ancestors/connect-src")
+    if "cache-control: no-store" not in head.lower() or "x-frame-options:" in head.lower():
+        fail("bridge needs no-store and must allow the client's iframe")
+    for other_name, other_secret in list(USERS.items())[1:2]:
+        _, _, other_body, _ = https_get("/?bridge=" + capability(HOST, bytes.fromhex(other_secret)))
+        if other_body != body:
+            fail(f"bridge content varies by user ({name}, {other_name})")
     ok(f"bridge page for '{name}': {st}, {len(body)} bytes, CSP present={bool(csp)}")
 
     # WSS with a bad capability must look like any unknown path
@@ -278,6 +303,11 @@ async def web():
         async with websockets.connect(f"wss://{HOST}{WS_PATH}?b=" + "A"*43, origin=f"https://{HOST}", open_timeout=10, ssl=SSL_CTX) as w:
             fail("websocket upgraded with a bad capability")
     except websockets.exceptions.InvalidStatus as e:
+        if e.response.status_code != 404:
+            fail(f"bad capability returned {e.response.status_code}, expected 404")
+        rejected_headers = "HTTP/1.1 404 Not Found\r\n" + str(e.response.headers)
+        if bytes(e.response.body) != unknown_body or normalized_headers(rejected_headers) != normalized_headers(unknown_headers):
+            fail("bad websocket capability differs from an ordinary unknown-path response")
         ok(f"bad capability -> websocket refused with {e.response.status_code}")
 
     async with websockets.connect(f"wss://{HOST}{WS_PATH}?b={cap}", origin=f"https://{HOST}", open_timeout=10, max_size=2*1024*1024, ssl=SSL_CTX) as w:
@@ -306,6 +336,7 @@ async def web():
         ln = struct.unpack("<I", plain[0:4])[0]; payload = plain[4:4+ln]
         # unencrypted MTProto: auth_key_id(8) msg_id(8) len(4) body
         check_server_padding("WEB relay", ln, payload)
+        payload = strip_padding(payload)
         ctor = struct.unpack("<I", payload[20:24])[0]; echoed = payload[24:40]
         if ctor != 0x05162463 or echoed != nonce: fail(f"unexpected reply ctor={ctor:#x} nonce_match={echoed==nonce}")
         ok(f"req_pq_multi -> res_pq from Telegram DC2 via relay (RTT {int((time.time()-t0)*1000)} ms, {len(plain)} bytes), nonce echoed")
@@ -356,6 +387,7 @@ async def idle(seconds: int = 210):
             if len(plain) >= 4 and len(plain) >= 4 + struct.unpack("<I", plain[0:4])[0]: break
         ln = struct.unpack("<I", plain[0:4])[0]; payload = plain[4:4+ln]
         check_server_padding("WEB relay after idle", ln, payload)
+        payload = strip_padding(payload)
         if struct.unpack("<I", payload[20:24])[0] != 0x05162463 or payload[24:40] != nonce: fail("bad res_pq after idle")
         ok(f"after {seconds}s idle: req_pq -> res_pq (DC2, user {name}) in {int((time.time()-t1)*1000)} ms")
         await w.send(frame(0x03, 7))

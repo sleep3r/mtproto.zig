@@ -1,10 +1,9 @@
 //! Minimal HTTP/1.1 request parsing for the WEB proxy relay.
 //!
 //! The relay is a small public website: it serves a cover page, one bridge page, and a
-//! WebSocket upgrade. It never proxies HTTP, never reads a request body, and only ever
-//! answers `GET`/`HEAD`. That makes the safe subset tiny — and lets us reject the whole
-//! class of smuggling tricks (bodies, `Transfer-Encoding`, duplicate `Content-Length`)
-//! outright instead of implementing them correctly.
+//! WebSocket upgrade. It never proxies HTTP and only answers `GET`/`HEAD`. Body-bearing
+//! requests receive a response with Connection: close: their bodies cannot become a
+//! second request or a WebSocket stream. Ambiguous framing is always rejected.
 //!
 //! `src/monitoring.zig` already serves `/metrics` with prefix matching and a single
 //! 2 KiB read. That is fine for a loopback endpoint but cannot extract
@@ -44,6 +43,7 @@ pub const Request = struct {
     http_1_0: bool,
     headers_buf: [max_headers]Header,
     headers_len: usize,
+    has_body: bool = false,
 
     pub fn headers(self: *const Request) []const Header {
         return self.headers_buf[0..self.headers_len];
@@ -55,6 +55,22 @@ pub const Request = struct {
             if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         }
         return null;
+    }
+
+    /// **Last** header matching `name` (ASCII case-insensitive), or null.
+    ///
+    /// RFC 9110 §5.2 makes repeated field lines equivalent to one comma-joined value, in
+    /// order, so any rule that reads the right-most entry of a list has to read the last
+    /// line. A terminator that *appends* its own `X-Forwarded-For` line instead of
+    /// replacing ours (a CDN, or an operator's own front) would otherwise hand
+    /// `header()`'s first match — the line the client wrote — to `forwardedForClient`,
+    /// and a hostile client would pick the address Telegram is told.
+    pub fn lastHeader(self: *const Request, name: []const u8) ?[]const u8 {
+        var found: ?[]const u8 = null;
+        for (self.headers()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) found = h.value;
+        }
+        return found;
     }
 
     /// True when a comma-separated list header contains `token` (case-insensitive).
@@ -79,6 +95,7 @@ pub const Request = struct {
     /// keep-alive and HTTP/1.0 to close; the relay honours both so its cover site
     /// behaves like an ordinary server rather than a one-shot responder.
     pub fn keepAlive(self: *const Request) bool {
+        if (self.has_body) return false;
         if (self.headerHasToken("connection", "close")) return false;
         if (self.http_1_0) return self.headerHasToken("connection", "keep-alive");
         return true;
@@ -95,6 +112,7 @@ pub fn listHasToken(value: []const u8, token: []const u8) bool {
 
 pub fn pathOf(target: []const u8) []const u8 {
     const q = std.mem.indexOfScalar(u8, target, '?') orelse return target;
+    if (q == 0) return "/";
     return target[0..q];
 }
 
@@ -127,13 +145,20 @@ pub fn parse(buf: []const u8) ParseError!Request {
     const request_line = lines.next() orelse return error.Malformed;
     var parts = std.mem.splitScalar(u8, request_line, ' ');
     const method_text = parts.next() orelse return error.Malformed;
-    const target = parts.next() orelse return error.Malformed;
+    const raw_target = parts.next() orelse return error.Malformed;
+    var target = raw_target;
+    if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://")) {
+        const scheme_len: usize = if (target[4] == ':') 7 else 8;
+        const authority_end = std.mem.indexOfAnyPos(u8, target, scheme_len, "/?") orelse target.len;
+        if (authority_end == scheme_len) return error.Malformed;
+        target = if (authority_end == target.len) "/" else target[authority_end..];
+    }
     const version = parts.next() orelse return error.Malformed;
     if (parts.next() != null) return error.Malformed;
     const http_1_0 = std.mem.eql(u8, version, "HTTP/1.0");
     if (!std.mem.eql(u8, version, "HTTP/1.1") and !http_1_0) return error.Malformed;
-    if (target.len == 0 or target[0] != '/') return error.Malformed;
-    for (target) |c| {
+    if (target.len == 0 or (target[0] != '/' and target[0] != '?')) return error.Malformed;
+    for (raw_target) |c| {
         if (c <= 0x20 or c == 0x7f) return error.Malformed;
     }
 
@@ -168,16 +193,15 @@ pub fn parse(buf: []const u8) ParseError!Request {
         for (value) |c| {
             if (c < 0x20 and c != '\t') return error.Malformed;
         }
-        // We serve no endpoint that takes a body, so no body may be framed. Refusing
-        // `Transfer-Encoding` outright and allowing only a single `Content-Length: 0`
-        // keeps the anti-smuggling property — there is nothing to consume, so nothing to
-        // desynchronise — while still answering the one request an ordinary static host
-        // would answer. Rejecting `Content-Length: 0` outright is a free discriminator:
-        // one header, no secret, and every real site returns 200 where we would 400.
-        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return error.Malformed;
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            if (!std.ascii.eqlIgnoreCase(value, "chunked") or request.header("transfer-encoding") != null or request.header("content-length") != null) return error.Malformed;
+            request.has_body = true;
+        }
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            if (!std.mem.eql(u8, value, "0")) return error.Malformed;
-            if (request.header("content-length") != null) return error.Malformed;
+            if (value.len == 0 or request.header("content-length") != null or request.header("transfer-encoding") != null) return error.Malformed;
+            for (value) |c| if (!std.ascii.isDigit(c)) return error.Malformed;
+            const length = std.fmt.parseInt(u64, value, 10) catch return error.Malformed;
+            request.has_body = length != 0;
         }
         if (request.headers_len >= max_headers) return error.Malformed;
         request.headers_buf[request.headers_len] = .{ .name = name, .value = value };
@@ -189,7 +213,7 @@ pub fn parse(buf: []const u8) ParseError!Request {
 
 /// True when the request is a well-formed RFC 6455 upgrade handshake.
 pub fn isWebSocketUpgrade(req: *const Request) bool {
-    if (req.method != .get) return false;
+    if (req.method != .get or req.has_body) return false;
     if (!req.headerHasToken("upgrade", "websocket")) return false;
     if (!req.headerHasToken("connection", "upgrade")) return false;
     const version = req.header("sec-websocket-version") orelse return false;
@@ -209,6 +233,9 @@ pub fn isWebSocketUpgrade(req: *const Request) bool {
 /// and cannot be forged. With a terminator that overwrites rather than appends (which is
 /// what our own vhost does) the list has exactly one entry and the two readings agree.
 /// A single-value header such as `CF-Connecting-IP` also lands here unchanged.
+///
+/// Repeated header *lines* are one and the same list (RFC 9110 §5.2), so the value fed
+/// in here must come from `Request.lastHeader`, never `Request.header`.
 pub fn forwardedForClient(value: []const u8) ?[]const u8 {
     var it = std.mem.splitBackwardsScalar(u8, value, ',');
     const last = std.mem.trim(u8, it.next() orelse return null, " \t");
@@ -223,6 +250,14 @@ const sample_get =
     "User-Agent: test\r\n" ++
     "Accept: */*\r\n" ++
     "\r\n";
+
+test "absolute-form targets route as origin-form without accepting ambiguous framing" {
+    const req = try parse("GET https://example.com/path?bridge=abc HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    try std.testing.expectEqualStrings("/path", req.path());
+    try std.testing.expectEqualStrings("abc", req.query("bridge").?);
+    try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n"));
+}
 
 test "parses a plain GET" {
     const req = try parse(sample_get);
@@ -280,11 +315,14 @@ test "a duplicated content-length is still refused" {
     try std.testing.expectError(error.Malformed, parse(dup));
 }
 
-test "bodies and folded headers are refused" {
+test "body requests force connection close and folded headers are refused" {
     const with_len = "GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc";
-    try std.testing.expectError(error.Malformed, parse(with_len));
+    const body = try parse(with_len);
+    try std.testing.expect(!body.keepAlive());
+    try std.testing.expect(!isWebSocketUpgrade(&body));
     const chunked = "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
-    try std.testing.expectError(error.Malformed, parse(chunked));
+    const chunks = try parse(chunked);
+    try std.testing.expect(!chunks.keepAlive());
     const folded = "GET / HTTP/1.1\r\nHost: h\r\n  continued\r\n\r\n";
     try std.testing.expectError(error.Malformed, parse(folded));
 }
@@ -292,7 +330,7 @@ test "bodies and folded headers are refused" {
 test "malformed request lines are refused" {
     try std.testing.expectError(error.Malformed, parse("GET /\r\n\r\n"));
     try std.testing.expectError(error.Malformed, parse("GET / HTTP/2.0\r\n\r\n"));
-    try std.testing.expectError(error.Malformed, parse("GET http://x/ HTTP/1.1\r\n\r\n"));
+    try std.testing.expectError(error.Malformed, parse("GET http:/// HTTP/1.1\r\n\r\n"));
     try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1 extra\r\n\r\n"));
     try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1\r\nBad Header: x\r\n\r\n"));
     try std.testing.expectError(error.Malformed, parse("GET / HTTP/1.1\r\nnovalue\r\n\r\n"));
@@ -328,6 +366,24 @@ test "forwarded-for takes the right-most entry, which the client cannot forge" {
     try std.testing.expectEqualStrings("2001:db8::1", forwardedForClient(" 2001:db8::1 ").?);
     try std.testing.expectEqual(@as(?[]const u8, null), forwardedForClient(""));
     try std.testing.expectEqual(@as(?[]const u8, null), forwardedForClient("1.2.3.4, "));
+
+    // Two header LINES are one comma-joined list, so the right-most entry lives on the
+    // last line. Reading the first one hands the address the client typed to the proxy
+    // — and from there to RPC_PROXY_REQ.remote_ip_port and the per-user IP quota.
+    const two_lines =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: relay.example.com\r\n" ++
+        "X-Forwarded-For: 9.9.9.9\r\n" ++
+        "X-Forwarded-For: 203.0.113.7\r\n" ++
+        "\r\n";
+    const req = try parse(two_lines);
+    try std.testing.expectEqualStrings("9.9.9.9", req.header("x-forwarded-for").?);
+    try std.testing.expectEqualStrings("203.0.113.7", req.lastHeader("X-Forwarded-For").?);
+    try std.testing.expectEqualStrings("203.0.113.7", forwardedForClient(req.lastHeader("x-forwarded-for").?).?);
+    // One line still reads the same through both accessors.
+    const one_line = try parse("GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 1.2.3.4, 10.0.0.1\r\n\r\n");
+    try std.testing.expectEqualStrings("10.0.0.1", forwardedForClient(one_line.lastHeader("x-forwarded-for").?).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), one_line.lastHeader("cf-connecting-ip"));
 }
 
 test "token list matching is case-insensitive and comma aware" {

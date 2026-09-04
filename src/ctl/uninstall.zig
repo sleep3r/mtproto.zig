@@ -22,7 +22,7 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
     try execute(ui, allocator);
 }
 
-pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) void {
+pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Iterator) !void {
     var yes_flag = false;
 
     while (args.next()) |arg| {
@@ -30,7 +30,7 @@ pub fn run(ui: *Tui, allocator: std.mem.Allocator, args: *std.process.Args.Itera
             yes_flag = true;
         } else {
             ui.fail("Unknown flag for uninstall. See mtbuddy --help");
-            return;
+            return error.UnknownOption;
         }
     }
 
@@ -89,7 +89,10 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         "mtproto-tunnel-pool.timer",
         "mtproto-tunnel-pool.service",
         "mtproto-singbox-egress.service",
+        "mtproto-ipv6.service",
         "mtproto-web-relay",
+        "mtproto-web-health.timer",
+        "mtproto-web-health.service",
     };
     for (services) |svc| {
         // Quiet: this runs under a spinner and most of these units aren't present in any
@@ -117,7 +120,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     // uninstall leaves credentials on disk.
     _ = sys.execForward(&.{ "rm", "-f", "/etc/mtproto-proxy/singbox-egress.json", "/etc/mtproto-proxy/singbox-egress.json.bak" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtproto-singbox-route.sh" }) catch {};
-    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/sing-box" }) catch {};
+    // The binary may predate mtbuddy; without an ownership marker retain it.
     // rmdir, not rm -rf: it removes the directory only once it is empty, so anything an
     // operator put there of their own is left alone rather than silently deleted.
     // Wrapped like the nginx drop-in rmdir below, because a deploy that never created
@@ -129,6 +132,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     // is installed" and silently re-enables the whole timer stack. Remove it on uninstall
     // so a later reinstall+update doesn't resurrect recovery.
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtproto-mask-health.sh" }) catch {};
+    _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/mtproto-web-health.sh" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.timer" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/etc/systemd/system/mtproto-tunnel-pool.service" }) catch {};
 
@@ -143,7 +147,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     // 2. Remove directories
     _ = sys.execForward(&.{ "rm", "-rf", "/opt/mtproto-proxy" }) catch {};
-    _ = sys.execForward(&.{ "rm", "-rf", "/opt/zapret" }) catch {};
+    // Retain unmarked third-party software: it may serve another application.
 
     // 3. Remove user
     const userdel = sys.commandOrPath("userdel", &.{ "/usr/sbin/userdel", "/sbin/userdel" });
@@ -156,6 +160,8 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
     // Quiet: an empty/absent table 200 or netns makes these print "FIB table does not
     // exist" / "Cannot remove namespace" even though there's simply nothing to clean.
     sys.execSilent(allocator, &.{ "ip", "-4", "route", "flush", "table", "200" });
+    sys.execSilent(allocator, &.{ "sh", "-c", "while ip -6 rule del fwmark 200 table 200 2>/dev/null; do :; done" });
+    sys.execSilent(allocator, &.{ "ip", "-6", "route", "flush", "table", "200" });
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_tunnel.sh" }) catch {};
     _ = sys.execForward(&.{ "rm", "-f", "/usr/local/bin/setup_netns.sh" }) catch {};
     sys.execSilent(allocator, &.{ "ip", "netns", "del", "tg_proxy_ns" });
@@ -285,10 +291,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
         \\  done
         \\done
         \\rm -f /usr/local/sbin/mtproto-tcpmss.sh
-        \\if [ -d /etc/iptables ]; then
-        \\  command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        \\  command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-        \\fi
+        \\# Do not overwrite the operator's persisted firewall with a live snapshot.
     ;
     _ = sys.execForward(&.{ "bash", "-c", tcpmss_cleanup }) catch {};
 
@@ -325,6 +328,7 @@ fn execute(ui: *Tui, allocator: std.mem.Allocator) !void {
 
     ui.writeRaw("\n");
     ui.print("  {s}{s} {s}{s}\n", .{ Color.ok, "✔", ui.str(.uninstall_success), Color.reset });
+    ui.hint("Shared resources retained if present: mtproto group; /usr/local/bin/{uv,uvx,minisign,sing-box}; /opt/zapret; /etc/apt/sources.list.d/amnezia-ppa.list; /usr/share/keyrings/amnezia-ppa.gpg. Remove them manually only after checking that no other service uses them. The Amnezia apt source remains enabled until removed.");
 
     // Said after the spinner, not under it, and deliberately not phrased as a failure:
     // these files are still there because mtbuddy is not sure it created them, which is

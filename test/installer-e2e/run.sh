@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+BUILD_DIR=""
 DOCKERFILE="$ROOT/test/installer-e2e/Dockerfile"
 LOG_DIR="${MTPROTO_INSTALLER_E2E_LOG_DIR:-$ROOT/test/installer-e2e/logs}"
 IMAGES="${MTPROTO_INSTALLER_E2E_IMAGES:-debian:11 debian:12 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04}"
@@ -103,6 +105,11 @@ cleanup_containers() {
       docker rm -f "$container" >/dev/null 2>&1 || true
     fi
   done
+  if [[ -n "$BUILD_DIR" && -d "$BUILD_DIR" ]]; then
+    case "$BUILD_DIR" in
+      */mtproto-installer-build.*) rm -rf -- "$BUILD_DIR" ;;
+    esac
+  fi
 }
 
 trap cleanup_containers EXIT
@@ -148,6 +155,9 @@ verify_install_once() {
     test -f /opt/mtproto-proxy/config.toml
     test -x /opt/zapret/nfq/nfqws
     test -L /etc/nginx/sites-enabled/mtproto-masking
+    test -x /usr/local/sbin/mtproto-tcpmss.sh
+    systemctl is-enabled --quiet mtproto-tcpmss
+    iptables -t mangle -S OUTPUT | grep -- "! -o lo" | grep -- "--set-mss 88" >/dev/null
 
     for unit in mtproto-proxy nginx nfqws-mtproto mtproto-mask-health.timer; do
       systemctl is-active --quiet "$unit"
@@ -162,6 +172,14 @@ verify_install_once() {
     ss -lnt "( sport = :443 or sport = :8443 )" | grep "127.0.0.1:8443" >/dev/null
     curl -kfsS --resolve "wb.ru:8443:127.0.0.1" https://wb.ru:8443/ >/dev/null
   '
+  docker cp "$ROOT/test/capacity_connections_probe.py" "$container:/tmp/capacity_connections_probe.py"
+  run_in_container "$container" python3 -c '
+import socket, sys
+sys.path.insert(0, "/tmp")
+from capacity_connections_probe import maybe_send_payload
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3) as peer:
+    assert maybe_send_payload(peer, "tls-auth-full", bytes.fromhex(sys.argv[3]), sys.argv[2]), "installed secret/SNI did not authenticate"
+' "$PORT" "$DOMAIN" "$SECRET"
 }
 
 install_fake_tunnel_tools() {
@@ -399,6 +417,14 @@ verify_uninstall() {
   run_script_in_container "$container" <<'CONTAINER_SCRIPT'
 set -Eeuo pipefail
 
+# Exercise WEB provisioning before asserting that uninstall removes its artifacts.
+mtbuddy setup web --mode behind --domain relay.example.test --yes
+test -f /etc/systemd/system/mtproto-web-relay.service
+# Explicit sing-box cleanup fixtures: these test removal, not a provider connection.
+mkdir -p /etc/mtproto-proxy
+printf '{}\n' > /etc/mtproto-proxy/singbox-egress.json
+printf '[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/mtproto-singbox-egress.service
+systemctl daemon-reload
 out="$(mtbuddy uninstall --yes 2>&1)"
 printf '%s\n' "$out"
 
@@ -417,12 +443,16 @@ for f in \
   /usr/local/bin/setup_tunnel.sh \
   /usr/local/bin/sing-box \
   /usr/local/bin/mtproto-singbox-route.sh \
+  /etc/mtproto-proxy/singbox-egress.json \
+  /usr/local/sbin/mtproto-tcpmss.sh \
+  /usr/local/sbin/mtproto-syn-limit.sh \
+  /usr/local/bin/mtproto-mask-health.sh \
   /usr/local/bin/mtbuddy ; do
   if [ -e "$f" ]; then echo "FAIL: leftover $f"; fail=1; fi
 done
 
 # No mtproto unit files registered with systemd anymore.
-leftover_units="$(systemctl list-unit-files 2>/dev/null | grep -E "mtproto-(proxy|singbox|tunnel-pool|mask|web)" || true)"
+leftover_units="$(systemctl list-unit-files 2>/dev/null | grep -E "mtproto-(proxy|singbox|tunnel-pool|mask|web|tcpmss|syn-limit)" || true)"
 if [ -n "$leftover_units" ]; then
   echo "FAIL: mtproto unit files still registered:"; printf '%s\n' "$leftover_units"; fail=1
 fi
@@ -483,7 +513,7 @@ verify_update_preserves_config() {
     set -Eeuo pipefail
     cfg=/opt/mtproto-proxy/config.toml
     before_hash="$(sha256sum "$cfg" | cut -d" " -f1)"
-    mtbuddy update --version "'"$VERSION"'" --yes
+    mtbuddy update --version "'"$VERSION"'" --force
     after_hash="$(sha256sum "$cfg" | cut -d" " -f1)"
     if [ "$before_hash" != "$after_hash" ]; then
       echo "FAIL: config.toml changed across mtbuddy update ($before_hash -> $after_hash)"
@@ -514,6 +544,16 @@ fi
 test -x "$singbox"
 "$singbox" version | grep -F "sing-box" >/dev/null
 CONTAINER_SCRIPT
+}
+
+restore_proxy_under_test() {
+  local container="$1"
+  docker cp "$BUILD_DIR/bin/mtproto-proxy" "$container:/tmp/mtproto-proxy-under-test"
+  run_in_container "$container" bash -lc '
+    install -m 0755 /tmp/mtproto-proxy-under-test /opt/mtproto-proxy/mtproto-proxy
+    systemctl restart mtproto-proxy
+    systemctl is-active --quiet mtproto-proxy
+  '
 }
 
 run_case() {
@@ -549,7 +589,7 @@ run_case() {
   echo "::endgroup::"
 
   echo "::group::Install local mtbuddy ($base_image)"
-  docker cp "$ROOT/zig-out/bin/mtbuddy" "$container:/tmp/mtbuddy"
+  docker cp "$BUILD_DIR/bin/mtbuddy" "$container:/tmp/mtbuddy"
   run_in_container "$container" bash -lc '
     set -Eeuo pipefail
     install -m 0755 /tmp/mtbuddy /usr/local/bin/mtbuddy
@@ -571,6 +611,7 @@ run_case() {
   echo "::endgroup::"
 
   echo "::group::Verify install ($base_image)"
+  restore_proxy_under_test "$container"
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify.log"
   echo "::endgroup::"
 
@@ -587,6 +628,7 @@ run_case() {
 
   echo "::group::Update preserves config.toml + keeps service active ($base_image)"
   verify_update_preserves_config "$container" 2>&1 | tee "$LOG_DIR/$safe.update.log"
+  restore_proxy_under_test "$container"
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-update.log"
   echo "::endgroup::"
 
@@ -596,7 +638,7 @@ run_case() {
   # `uninstall` could pass this whole suite without once being run. Put the local
   # binary back; the update step above has already proved the self-update path works.
   echo "::group::Restore the mtbuddy under test after the update ($base_image)"
-  docker cp "$ROOT/zig-out/bin/mtbuddy" "$container:/tmp/mtbuddy"
+  docker cp "$BUILD_DIR/bin/mtbuddy" "$container:/tmp/mtbuddy"
   run_in_container "$container" bash -lc '
     set -Eeuo pipefail
     install -m 0755 /tmp/mtbuddy /usr/local/bin/mtbuddy
@@ -606,6 +648,18 @@ run_case() {
   echo "::endgroup::"
 
   echo "::group::Setup tunnel with failing Telegram probe ($base_image)"
+  run_in_container "$container" bash -lc '
+    set -Eeuo pipefail
+    mtbuddy status
+    mtbuddy links
+    mtbuddy config validate
+    mtbuddy reload
+    mtbuddy setup syn-limit --preset soft
+    mtbuddy setup syn-limit --preset soft
+    test "$(iptables -S INPUT | grep -c -- "-j MTPROTO_SYNLIMIT")" = 1
+    iptables -S MTPROTO_SYNLIMIT | grep -- "--hashlimit-name mtproto_syn" >/dev/null
+    test -x /usr/local/sbin/mtproto-syn-limit.sh
+  '
   install_fake_tunnel_tools "$container"
   verify_tunnel_probe_failure_is_nonfatal "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-probe-failure.log"
   echo "::endgroup::"
@@ -636,7 +690,8 @@ main() {
   echo "Docker architecture target: $target"
   echo "Installer release version under test: $VERSION"
 
-  zig build -Dtarget="$target" -Doptimize=ReleaseFast
+  BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mtproto-installer-build.XXXXXX")"
+  zig build --prefix "$BUILD_DIR" -Dtarget="$target" -Doptimize=ReleaseFast
 
   local image
   for image in $IMAGES; do

@@ -4,7 +4,7 @@ zig-out/
 telemt/
 .DS_Store
 VALIDATION.md
-config.toml
+/config.toml
 .env
 .ruff_cache/
 *.session
@@ -21,10 +21,16 @@ fix_tui.py
 bundle.sh
 codebase.txt
 .agent/skills/local-env/
+.agents/
+.codex/
+.worktrees/
 
-# Internal planning docs — kept local, not published
+# Local Markdown documents, plans and audits are not release inputs.
+# Existing published README/CHANGELOG files remain tracked.
+*.md
+AUDIT-*.md
 ROADMAP_1.0.md
 PRODUCT_VISION.md
 
-# dashboard auth token (generated at runtime)
+# Dashboard authentication token generated at runtime.
 src/ctl/dashboard_assets/dashboard.token

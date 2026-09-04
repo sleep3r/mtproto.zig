@@ -14,6 +14,8 @@ Default profile paths are tuned for the benchmark host layout used in README:
 from __future__ import annotations
 
 import argparse
+import errno
+import functools
 import hashlib
 import hmac
 import json
@@ -216,6 +218,14 @@ def listener_pids(port: int) -> list[int]:
     return sorted(set(ids))
 
 
+def listener_backlog(port: int) -> int:
+    try:
+        output = subprocess.check_output(["ss", "-H", "-ltn", "sport", "=", f":{port}"], text=True)
+        return sum(int(line.split()[1]) for line in output.splitlines() if len(line.split()) >= 5)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise RuntimeError(f"cannot measure accept backlog: {error}") from error
+
+
 def established_count(port: int) -> int:
     est_state = "01"
     port_hex = f"{port:04X}"
@@ -245,7 +255,7 @@ def established_count(port: int) -> int:
                 total += 1
         return total
 
-    return count_in("/proc/net/tcp") + count_in("/proc/net/tcp6")
+    return max(0, count_in("/proc/net/tcp") + count_in("/proc/net/tcp6") - listener_backlog(port))
 
 
 def kill_tree(root_pid: Optional[int]) -> None:
@@ -341,20 +351,6 @@ def kill_profile_processes(
             pass
 
 
-def wait_for_listen(port: int, timeout_sec: float) -> bool:
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.05)
-        try:
-            if s.connect_ex(("127.0.0.1", port)) == 0:
-                return True
-        finally:
-            s.close()
-        time.sleep(0.02)
-    return False
-
-
 def wait_for_profile_listen(
     process: subprocess.Popen[object], port: int, timeout_sec: float
 ) -> tuple[bool, str]:
@@ -414,6 +410,7 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
         + sni_ext_len
         + 4  # supported_versions ext header
         + supported_versions_ext_len
+        + 42
     )
 
     record_payload_len = 4 + body_len
@@ -455,7 +452,7 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     pos += 1
 
     packet[pos : pos + 2] = struct.pack(
-        ">H", 4 + sni_ext_len + 4 + supported_versions_ext_len
+        ">H", 4 + sni_ext_len + 4 + supported_versions_ext_len + 42
     )
     pos += 2
 
@@ -482,6 +479,9 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     pos += 1
     packet[pos : pos + 2] = b"\x03\x04"
     pos += 2
+    packet[pos:pos + 10] = bytes.fromhex("003300260024001d0020")
+    packet[pos + 10:pos + 42] = os.urandom(32)
+    pos += 42
 
     if pos != len(packet):
         raise RuntimeError("internal tls-auth packet builder length mismatch")
@@ -502,10 +502,12 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     return bytes(packet)
 
 
+@functools.lru_cache(maxsize=32)
 def build_realistic_client_hello(hostname: str) -> bytes:
     """Build a realistic TLS ClientHello with SNI using stdlib ssl."""
 
     client_sock, server_sock = socket.socketpair()
+    tls_client = None
     try:
         client_sock.setblocking(False)
         server_sock.setblocking(False)
@@ -542,6 +544,8 @@ def build_realistic_client_hello(hostname: str) -> bytes:
             raise RuntimeError("failed to synthesize TLS ClientHello")
         return payload
     finally:
+        if tls_client is not None:
+            tls_client.close()
         try:
             server_sock.close()
         except OSError:
@@ -573,7 +577,13 @@ def maybe_send_payload(
         payload = build_realistic_client_hello(tls_domain)
         try:
             s.sendall(payload)
-            return True
+            header = bytearray()
+            while len(header) < 5:
+                chunk = s.recv(5 - len(header))
+                if not chunk:
+                    return False
+                header.extend(chunk)
+            return header[0] == 0x16 and header[1] == 3 and 1 <= header[2] <= 3
         except OSError:
             return False
     if traffic_mode == "tls-auth-full":
@@ -648,6 +658,7 @@ def open_connections(
     traffic_mode: str,
     secret_bytes: Optional[bytes],
     tls_domain: str,
+    local_errors: Optional[dict[str, int]] = None,
 ) -> tuple[list[socket.socket], int, int, int]:
     sockets: list[socket.socket] = []
     failures = 0
@@ -657,9 +668,22 @@ def open_connections(
     deadline = time.time() + open_budget_sec
 
     while len(sockets) < target and time.time() < deadline:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(connect_timeout_sec)
-        rc = s.connect_ex(("127.0.0.1", port))
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as error:
+            failures += 1
+            if local_errors is not None:
+                key = errno.errorcode.get(error.errno, str(error.errno))
+                local_errors[key] = local_errors.get(key, 0) + 1
+            break
+        try:
+            s.settimeout(connect_timeout_sec)
+            rc = s.connect_ex(("127.0.0.1", port))
+        except OSError as error:
+            rc = error.errno or errno.EIO
+        if rc in (errno.EADDRNOTAVAIL, errno.EADDRINUSE, errno.EMFILE, errno.ENFILE) and local_errors is not None:
+            key = errno.errorcode[rc]
+            local_errors[key] = local_errors.get(key, 0) + 1
         if rc == 0:
             connect_ok += 1
             if maybe_send_payload(s, traffic_mode, secret_bytes, tls_domain):
@@ -703,8 +727,11 @@ def tune_nofile(target: int) -> None:
     desired = max(desired, soft)
     try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as error:
+        print(f"WARN: RLIMIT_NOFILE update failed: {error}")
+    effective = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if effective < target:
+        print(f"WARN: RLIMIT_NOFILE requested={target}, effective={effective}; client EMFILE may limit the sweep")
 
 
 def tune_nproc(target: int) -> None:
@@ -730,11 +757,10 @@ def maybe_apply_sysctl(args: argparse.Namespace) -> None:
     ]
     for cmd in cmds:
         try:
-            subprocess.run(
-                cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except (OSError, FileNotFoundError):
-            pass
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            print(f"sysctl {cmd[-1]}: rc={result.returncode} {(result.stdout or result.stderr).strip()}")
+        except OSError as error:
+            print(f"WARN: sysctl failed: {error}")
 
 
 def run_profile(
@@ -744,12 +770,8 @@ def run_profile(
     kill_profile_processes(profile)
     cleanup_port(profile.port)
 
-    if profile.prep == "set_low_pid":
-        try:
-            Path("/proc/sys/kernel/ns_last_pid").write_text("50000")
-        except OSError:
-            pass
-    elif profile.prep == "mtproto_zig_autocap":
+    autocap: object = "not applied for this profile; use its configured cap"
+    if profile.prep == "mtproto_zig_autocap":
         # Keep max_connections comfortably above the highest probed level,
         # so the probe measures host/runtime limits rather than config cap.
         levels = profile.levels
@@ -772,8 +794,12 @@ def run_profile(
             )
             if replaced:
                 cfg_path.write_text(next_text)
-        except OSError:
-            pass
+                autocap = desired
+            else:
+                autocap = "autocap_failed: max_connections assignment not found"
+        except OSError as error:
+            autocap = f"autocap_failed: {error}"
+        print(f"autocap: {autocap}")
 
     safe = profile.name.replace(" ", "_").replace(".", "_")
     log_path = results_dir / f"capacity_{safe}.log"
@@ -781,118 +807,130 @@ def run_profile(
     with log_path.open("w") as log_file:
         process = subprocess.Popen(profile.command, stdout=log_file, stderr=log_file)
 
-    startup_wait_total = args.startup_timeout_sec
-    started, startup_state = wait_for_profile_listen(
-        process, profile.port, args.startup_timeout_sec
-    )
-    if (not started) and startup_state != "exited" and args.startup_grace_sec > 0:
-        startup_wait_total += args.startup_grace_sec
+    connections: list[socket.socket] = []
+    try:
+        startup_wait_total = args.startup_timeout_sec
         started, startup_state = wait_for_profile_listen(
-            process, profile.port, args.startup_grace_sec
+            process, profile.port, args.startup_timeout_sec
         )
+        if (not started) and startup_state != "exited" and args.startup_grace_sec > 0:
+            startup_wait_total += args.startup_grace_sec
+            started, startup_state = wait_for_profile_listen(
+                process, profile.port, args.startup_grace_sec
+            )
 
-    if not started:
-        rc = process.poll()
-        err = "startup_exited" if startup_state == "exited" else "startup_timeout"
-        if rc is None:
+        if not started:
+            rc = process.poll()
+            err = "startup_exited" if startup_state == "exited" else "startup_timeout"
+            if rc is None:
+                kill_tree(process.pid)
+                rc = -999
+            kill_profile_processes(profile, exclude={process.pid})
+            tail = read_log_tail(log_path)
+            return {
+                "name": profile.name,
+                "ok": False,
+                "error": err,
+                "rc": rc,
+                "startup_wait_sec": startup_wait_total,
+                "log_tail": tail,
+                "log": str(log_path),
+                "command": profile.command,
+            }
+
+        time.sleep(1.0)
+        root_pid = process.pid
+        base_rss = tree_rss_kb(root_pid)
+
+        levels = profile.levels
+        if args.levels:
+            levels = [int(x) for x in args.levels.split(",") if x.strip()]
+
+        level_results: list[dict[str, object]] = []
+        max_established = 0
+        max_stable_target = 0
+        secret_bytes = bytes.fromhex(profile.secret_hex) if profile.secret_hex else None
+
+        if args.traffic_mode in ("tls-auth", "tls-auth-full") and not secret_bytes:
+            kill_tree(root_pid)
             kill_tree(process.pid)
-            rc = -999
-        kill_profile_processes(profile, exclude={process.pid})
-        tail = read_log_tail(log_path)
-        return {
-            "name": profile.name,
-            "ok": False,
-            "error": err,
-            "rc": rc,
-            "startup_wait_sec": startup_wait_total,
-            "log_tail": tail,
-            "log": str(log_path),
-            "command": profile.command,
-        }
+            cleanup_port(profile.port)
+            return {
+                "name": profile.name,
+                "ok": False,
+                "error": "missing_profile_secret",
+                "log": str(log_path),
+                "command": profile.command,
+                "traffic_mode": args.traffic_mode,
+            }
 
-    time.sleep(1.0)
-    root_pid = listener_pid(profile.port) or process.pid
-    base_rss = tree_rss_kb(root_pid)
+        for level in levels:
+            local_errors: dict[str, int] = {}
+            connections, failures, connect_ok, payload_ok = open_connections(
+                profile.port,
+                level,
+                args.connect_timeout_sec,
+                args.open_budget_sec,
+                args.fail_streak_limit,
+                args.traffic_mode,
+                secret_bytes,
+                args.tls_domain,
+                local_errors,
+            )
+            time.sleep(args.hold_seconds)
 
-    levels = profile.levels
-    if args.levels:
-        levels = [int(x) for x in args.levels.split(",") if x.strip()]
+            established = established_count(profile.port)
+            rss_now = tree_rss_kb(root_pid)
+            if should_expect_established(args.traffic_mode):
+                stable = established >= int(level * args.stable_ratio)
+            else:
+                stable = payload_ok >= int(level * args.stable_ratio)
 
-    level_results: list[dict[str, object]] = []
-    max_established = 0
-    max_stable_target = 0
-    secret_bytes = bytes.fromhex(profile.secret_hex) if profile.secret_hex else None
+            if established > max_established:
+                max_established = established
+            if stable and level > max_stable_target:
+                max_stable_target = level
 
-    if args.traffic_mode in ("tls-auth", "tls-auth-full") and not secret_bytes:
+            level_results.append(
+                {
+                    "target": level,
+                    "connect_ok": connect_ok,
+                    "connected_client_side": len(connections),
+                    "payload_ok": payload_ok,
+                    "established_server_side": established,
+                    "failures": failures,
+                    "local_resource_errors": local_errors,
+                    "listen_backlog": listener_backlog(profile.port),
+                    "rss_kb": rss_now,
+                    "stable": stable,
+                }
+            )
+
+            close_connections(connections)
+            time.sleep(args.settle_seconds)
+
         kill_tree(root_pid)
         kill_tree(process.pid)
+        kill_profile_processes(profile, exclude={process.pid, root_pid})
         cleanup_port(profile.port)
+
         return {
             "name": profile.name,
-            "ok": False,
-            "error": "missing_profile_secret",
+            "ok": True,
+            "base_rss_kb": base_rss,
+            "measurement_root_pid": root_pid,
+            "autocap": autocap,
+            "max_established_observed": max_established,
+            "max_stable_target": max_stable_target,
+            "levels": level_results,
             "log": str(log_path),
             "command": profile.command,
             "traffic_mode": args.traffic_mode,
         }
-
-    for level in levels:
-        connections, failures, connect_ok, payload_ok = open_connections(
-            profile.port,
-            level,
-            args.connect_timeout_sec,
-            args.open_budget_sec,
-            args.fail_streak_limit,
-            args.traffic_mode,
-            secret_bytes,
-            args.tls_domain,
-        )
-        time.sleep(args.hold_seconds)
-
-        established = established_count(profile.port)
-        rss_now = tree_rss_kb(root_pid)
-        if should_expect_established(args.traffic_mode):
-            stable = established >= int(level * args.stable_ratio)
-        else:
-            stable = payload_ok >= int(level * args.stable_ratio)
-
-        if established > max_established:
-            max_established = established
-        if stable and level > max_stable_target:
-            max_stable_target = level
-
-        level_results.append(
-            {
-                "target": level,
-                "connect_ok": connect_ok,
-                "connected_client_side": len(connections),
-                "payload_ok": payload_ok,
-                "established_server_side": established,
-                "failures": failures,
-                "rss_kb": rss_now,
-                "stable": stable,
-            }
-        )
-
+    finally:
         close_connections(connections)
-        time.sleep(args.settle_seconds)
-
-    kill_tree(root_pid)
-    kill_tree(process.pid)
-    kill_profile_processes(profile, exclude={process.pid, root_pid})
-    cleanup_port(profile.port)
-
-    return {
-        "name": profile.name,
-        "ok": True,
-        "base_rss_kb": base_rss,
-        "max_established_observed": max_established,
-        "max_stable_target": max_stable_target,
-        "levels": level_results,
-        "log": str(log_path),
-        "command": profile.command,
-        "traffic_mode": args.traffic_mode,
-    }
+        kill_tree(process.pid)
+        process.wait()
 
 
 def select_profiles(all_profiles: list[Profile], selectors: list[str]) -> list[Profile]:
@@ -1001,10 +1039,27 @@ def main() -> int:
     maybe_apply_sysctl(args)
 
     all_results: list[dict[str, object]] = []
+    output_path = Path(args.output) if args.output else results_dir / (
+        f"capacity_connections_{selected[0].name.lower().replace(' ', '_').replace('.', '_')}.json"
+        if len(selected) == 1 else "capacity_connections.json"
+    )
+    try:
+        port_range = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().strip()
+    except OSError:
+        port_range = "unavailable"
+    try:
+        time_wait_count = len(subprocess.check_output(["ss", "-H", "-tan", "state", "time-wait"], text=True).splitlines())
+    except (OSError, subprocess.SubprocessError):
+        time_wait_count = None
     for profile in selected:
         print(f"=== {profile.name} ===", flush=True)
-        result = run_profile(profile, args, results_dir)
+        try:
+            result = run_profile(profile, args, results_dir)
+        except (OSError, RuntimeError, ValueError) as error:
+            result = {"name": profile.name, "ok": False, "error": str(error)}
+        result["client_environment"] = {"ip_local_port_range": port_range, "initial_time_wait_count": time_wait_count, "nofile": resource.getrlimit(resource.RLIMIT_NOFILE)[0]}
         all_results.append(result)
+        output_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False))
         print(json.dumps(result, ensure_ascii=False), flush=True)
 
     if args.output:
@@ -1017,7 +1072,7 @@ def main() -> int:
 
     output_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False))
     print(f"RESULT_FILE {output_path}")
-    return 0
+    return 0 if all(result.get("ok") for result in all_results) else 1
 
 
 if __name__ == "__main__":
