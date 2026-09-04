@@ -524,7 +524,9 @@ verify_update_preserves_config() {
     set -Eeuo pipefail
     cfg=/opt/mtproto-proxy/config.toml
     before_hash="$(sha256sum "$cfg" | cut -d" " -f1)"
-    mtbuddy update --version "'"$VERSION"'" --force
+    # A release PR builds the next version, above the latest published fixture.
+    # This scenario intentionally installs that fixture to test config preservation.
+    mtbuddy update --version "'"$VERSION"'" --force --allow-downgrade
     after_hash="$(sha256sum "$cfg" | cut -d" " -f1)"
     if [ "$before_hash" != "$after_hash" ]; then
       echo "FAIL: config.toml changed across mtbuddy update ($before_hash -> $after_hash)"
