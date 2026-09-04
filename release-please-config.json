@@ -5,6 +5,7 @@
     ".": {
       "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
+      "skip-changelog": true,
       "include-component-in-tag": false,
       "include-v-in-tag": true,
       "draft": false,
