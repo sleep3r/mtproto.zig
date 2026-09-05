@@ -7,6 +7,11 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
 RUN set -eux; \
+    # The CDN returns 404 for some Bullseye security package URLs with encoded '+'.
+    # Use Debian's security endpoint; keep package signature verification enabled.
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://deb.debian.org/debian-security|http://security.debian.org/debian-security|g' /etc/apt/sources.list; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
