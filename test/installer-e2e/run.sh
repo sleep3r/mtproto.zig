@@ -633,6 +633,11 @@ run_case() {
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-nfqws-rerun.log"
   echo "::endgroup::"
 
+  echo "::group::Dashboard install, redeploy, removal and reinstall ($base_image)"
+  docker cp "$ROOT/test/installer-e2e/dashboard.sh" "$container:/tmp/dashboard-e2e.sh"
+  run_in_container "$container" bash /tmp/dashboard-e2e.sh 2>&1 | tee "$LOG_DIR/$safe.dashboard.log"
+  echo "::endgroup::"
+
   if [[ "$VERIFY_TUNNEL_DEPS" != "0" ]]; then
     echo "::group::Install tunnel dependency set ($base_image)"
     verify_tunnel_dependency_installers "$container" 2>&1 | tee "$LOG_DIR/$safe.tunnel-deps.log"
@@ -643,6 +648,7 @@ run_case() {
   verify_update_preserves_config "$container" 2>&1 | tee "$LOG_DIR/$safe.update.log"
   restore_proxy_under_test "$container"
   verify_install "$container" 2>&1 | tee "$LOG_DIR/$safe.verify-after-update.log"
+  run_in_container "$container" bash /tmp/dashboard-e2e.sh check 2>&1 | tee "$LOG_DIR/$safe.dashboard-after-update.log"
   echo "::endgroup::"
 
   # `mtbuddy update` installs the RELEASED mtbuddy over /usr/local/bin/mtbuddy

@@ -29,7 +29,7 @@ const SERVICE_NAME = "proxy-monitor";
 const SERVICE_FILE = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
 
 const VENV_CREATE_ARGV = [_][]const u8{
-    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, UV_BIN, "venv", STAGED_VENV_DIR, "--python", "python3",
+    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, UV_BIN, "venv", STAGED_VENV_DIR, "--python", ">=3.11",
 };
 
 const PIP_INSTALL_ARGV = [_][]const u8{
@@ -146,7 +146,27 @@ pub fn runInteractive(ui: *Tui, allocator: std.mem.Allocator) !void {
 fn uvExists(allocator: std.mem.Allocator) bool {
     const result = sys.exec(allocator, &.{ UV_BIN, "--version" }) catch return false;
     defer result.deinit();
-    return result.exit_code == 0 and std.mem.eql(u8, std.mem.trim(u8, result.stdout, " \r\n\t"), "uv " ++ UV_VERSION);
+    return result.exit_code == 0 and pinnedUvVersion(result.stdout);
+}
+
+fn pinnedUvVersion(output: []const u8) bool {
+    // uv appends optional platform/build metadata after the exact version.
+    var fields = std.mem.tokenizeAny(u8, output, " \r\n\t");
+    const name = fields.next() orelse return false;
+    const version = fields.next() orelse return false;
+    return std.mem.eql(u8, name, "uv") and std.mem.eql(u8, version, UV_VERSION);
+}
+
+test "dashboard accepts pinned uv with platform or build metadata" {
+    try std.testing.expect(pinnedUvVersion("uv " ++ UV_VERSION ++ "\n"));
+    try std.testing.expect(pinnedUvVersion("uv " ++ UV_VERSION ++ " (x86_64-unknown-linux-gnu)\n"));
+    try std.testing.expect(pinnedUvVersion("uv " ++ UV_VERSION ++ " (abc123 2026-09-01)\n"));
+}
+
+test "dashboard rejects other uv versions and malformed output" {
+    for ([_][]const u8{ "", "uv", "uvx " ++ UV_VERSION, "uv 0.0.1", "uv " ++ UV_VERSION ++ "0", "uv " ++ UV_VERSION ++ "-rc1" }) |output| {
+        try std.testing.expect(!pinnedUvVersion(output));
+    }
 }
 
 /// Install `uv` from GitHub releases (astral.sh is blocked in some regions).
@@ -396,4 +416,6 @@ test "dashboard venv keeps uv-managed Python outside ProtectHome paths" {
     try std.testing.expectEqualStrings("UV_PYTHON_INSTALL_DIR=/opt/mtproto-proxy/monitor/.uv-python", argv[2]);
     try std.testing.expectEqualStrings(UV_BIN, argv[3]);
     try std.testing.expectEqualStrings(STAGED_VENV_DIR, argv[5]);
+    try std.testing.expectEqualStrings("--python", argv[6]);
+    try std.testing.expectEqualStrings(">=3.11", argv[7]);
 }
