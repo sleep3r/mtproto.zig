@@ -8,12 +8,15 @@ check_dashboard() {
   /opt/mtproto-proxy/monitor/.venv/bin/python - <<'PY'
 import base64
 import json
+import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+assert sys.version_info >= (3, 11)
 base = "http://127.0.0.1:61208"
 for attempt in range(40):
     try:

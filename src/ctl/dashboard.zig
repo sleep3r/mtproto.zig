@@ -29,7 +29,7 @@ const SERVICE_NAME = "proxy-monitor";
 const SERVICE_FILE = "/etc/systemd/system/" ++ SERVICE_NAME ++ ".service";
 
 const VENV_CREATE_ARGV = [_][]const u8{
-    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, UV_BIN, "venv", STAGED_VENV_DIR, "--python", "python3",
+    "env", UV_SUBPROCESS_PATH, UV_PYTHON_INSTALL_ENV, UV_BIN, "venv", STAGED_VENV_DIR, "--python", ">=3.11",
 };
 
 const PIP_INSTALL_ARGV = [_][]const u8{
@@ -416,4 +416,6 @@ test "dashboard venv keeps uv-managed Python outside ProtectHome paths" {
     try std.testing.expectEqualStrings("UV_PYTHON_INSTALL_DIR=/opt/mtproto-proxy/monitor/.uv-python", argv[2]);
     try std.testing.expectEqualStrings(UV_BIN, argv[3]);
     try std.testing.expectEqualStrings(STAGED_VENV_DIR, argv[5]);
+    try std.testing.expectEqualStrings("--python", argv[6]);
+    try std.testing.expectEqualStrings(">=3.11", argv[7]);
 }
