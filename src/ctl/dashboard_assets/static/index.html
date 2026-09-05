@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MTProto Proxy — Dashboard</title>
-  <link rel="stylesheet" href="/style.css?v=20260610-paper12">
+  <link rel="stylesheet" href="/style.css?v=20260905-traffic1">
 </head>
 <body>
 <div class="app is-loading">
@@ -222,9 +222,15 @@
       <div class="title" data-i18n="users.title">Users</div>
       <div class="masthead-rule"></div>
       <div class="users-meta" id="usersMeta">—</div>
+      <div class="traffic-period" role="group" aria-label="Traffic period">
+        <button type="button" data-traffic-days="7" aria-pressed="false">7d</button>
+        <button type="button" data-traffic-days="14" aria-pressed="false">14d</button>
+        <button type="button" data-traffic-days="30" aria-pressed="true">30d</button>
+      </div>
     </div>
 
     <div class="users-note" id="usersNote">—</div>
+    <div class="traffic-heading" id="trafficHeading">Traffic · 30 days ↓ + ↑</div>
 
     <!-- Add user form (hidden by default) -->
     <div class="add-user-form" id="addUserForm" style="display:none">
@@ -250,6 +256,7 @@
     <!-- Add-user action moved BELOW the list (Paper AddUser-wrap). #addUserBtn id preserved. -->
     <div class="add-user-wrap">
       <button class="ui-btn add-user-btn" id="addUserBtn" type="button"><!--ICON:plus--><span data-i18n="users.add">Add user</span></button>
+      <div class="traffic-note" id="trafficNote" role="status">Collecting traffic history…</div>
     </div>
   </div>
 
@@ -474,6 +481,6 @@
 </div>
 
 </div>
-<script src="/app.js?v=20260613-wsticket1"></script>
+<script src="/app.js?v=20260905-traffic1"></script>
 </body>
 </html>

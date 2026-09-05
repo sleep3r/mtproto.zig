@@ -34,3 +34,4 @@ PRODUCT_VISION.md
 
 # Dashboard authentication token generated at runtime.
 src/ctl/dashboard_assets/dashboard.token
+src/ctl/dashboard_assets/traffic.sqlite3*

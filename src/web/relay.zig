@@ -164,10 +164,22 @@ pub const Options = struct {
     }
 };
 
-/// Parse `[web].backend` (`host:port`), defaulting to this proxy on loopback.
+/// A specific listener must be reached on its bound address; another service
+/// may own loopback on that port. Wildcard listeners still use loopback.
+fn defaultBackendHost(cfg: *const config.Config) ![]const u8 {
+    const host = cfg.bind_address orelse return "127.0.0.1";
+    const addr = try Address.parse(host, cfg.port);
+    switch (addr) {
+        .ip4 => |v4| if (std.mem.allEqual(u8, &v4.bytes, 0)) return "127.0.0.1",
+        .ip6 => |v6| if (std.mem.allEqual(u8, &v6.bytes, 0)) return "::1",
+    }
+    return host;
+}
+
+/// Parse `[web].backend` (`host:port`), defaulting to this proxy's listener.
 pub fn resolveBackend(allocator: std.mem.Allocator, cfg: *const config.Config) !Address {
     const spec = cfg.web.backend orelse {
-        return net_helpers.ip4(.{ 127, 0, 0, 1 }, cfg.port);
+        return Address.parse(try defaultBackendHost(cfg), cfg.port);
     };
     const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.InvalidBackend;
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
@@ -332,6 +344,8 @@ pub const Relay = struct {
     opts: Options,
     backend_dns: ?*dns_cache.Cache = null,
     backend_dns_id: usize = 0,
+    /// Only the implicit backend is guaranteed to be this host's proxy.
+    local_backend: bool = false,
     caps: []UserCapability,
     /// Pre-rendered responses; the bridge page carries no per-user bytes.
     /// The cover page is generated per deployment (see `page.renderCover`), so it is
@@ -424,7 +438,7 @@ pub const Relay = struct {
         errdefer cache.destroy();
         const spec = cfg.web.backend;
         const colon = if (spec) |s| std.mem.lastIndexOfScalar(u8, s, ':') orelse return error.InvalidBackend else 0;
-        const host = if (spec) |s| std.mem.trim(u8, s[0..colon], "[] ") else "127.0.0.1";
+        const host = if (spec) |s| std.mem.trim(u8, s[0..colon], "[] ") else try defaultBackendHost(cfg);
         const port = if (spec) |s| try std.fmt.parseInt(u16, s[colon + 1 ..], 10) else cfg.port;
         const addresses = try net_helpers.getAddressList(allocator, host, port);
         defer addresses.deinit();
@@ -436,6 +450,7 @@ pub const Relay = struct {
             .opts = opts,
             .backend_dns = cache,
             .backend_dns_id = dns_id,
+            .local_backend = spec == null,
             .caps = caps,
             .cover_page = cover_page,
             .bridge_page = bridge_page,
@@ -1516,7 +1531,7 @@ pub const Relay = struct {
 
         const candidates = if (self.backend_dns) |cache| cache.snapshot(self.backend_dns_id) else net_helpers.AddressCandidates.init(&.{self.opts.backend});
         var next: usize = 0;
-        const dialed_fd = dialCandidate(candidates, &next) catch |err| {
+        const dialed_fd = self.dialCandidate(candidates, &next) catch |err| {
             log.debug("backend dial failed: {any}", .{err});
             self.closeStream(stream, true);
             return;
@@ -1539,17 +1554,17 @@ pub const Relay = struct {
         self.syncConn(conn);
     }
 
-    fn dialCandidate(candidates: net_helpers.AddressCandidates, next: *usize) !posix.fd_t {
+    fn dialCandidate(self: *Relay, candidates: net_helpers.AddressCandidates, next: *usize) !posix.fd_t {
         while (next.* < candidates.len) {
             const address = candidates.addresses[next.*];
             next.* += 1;
-            return dialBackend(address) catch continue;
+            return dialBackend(address, self.local_backend) catch continue;
         }
         return error.BackendAddressesExhausted;
     }
 
     fn retryBackend(self: *Relay, conn: *Conn) bool {
-        const fd = dialCandidate(conn.backend_candidates, &conn.backend_next) catch return false;
+        const fd = self.dialCandidate(conn.backend_candidates, &conn.backend_next) catch return false;
         // Preserve the old fd until the event batch ends; preserve the connection's queue.
         self.pending_close.ensureTotalCapacity(self.allocator, self.conns.count() + self.pending_close.items.len + 1) catch {
             closeFd(fd);
@@ -1576,7 +1591,7 @@ pub const Relay = struct {
         return true;
     }
 
-    fn dialBackend(address: Address) !posix.fd_t {
+    fn dialBackend(address: Address, local_backend: bool) !posix.fd_t {
         const family: u32 = if (net_helpers.isIpv6(address)) posix.AF.INET6 else posix.AF.INET;
         const flags = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
         const rc = posix.system.socket(family, flags, posix.IPPROTO.TCP);
@@ -1586,6 +1601,21 @@ pub const Relay = struct {
         };
         errdefer closeFd(fd);
         var storage: posix.sockaddr.storage = undefined;
+        if (local_backend) {
+            // Preserve the existing loopback-only trust boundary even when the
+            // proxy binds a specific public IP. Never do this for remote backends.
+            const source = switch (address) {
+                .ip4 => net_helpers.ip4(.{ 127, 0, 0, 1 }, 0),
+                .ip6 => |v6| try Address.parse(if (std.mem.allEqual(u8, v6.bytes[0..10], 0) and
+                    v6.bytes[10] == 0xff and v6.bytes[11] == 0xff)
+                    "::ffff:127.0.0.1"
+                else
+                    "::1", 0),
+            };
+            const source_len = addressToSockaddr(source, &storage);
+            if (posix.errno(posix.system.bind(fd, @ptrCast(&storage), source_len)) != .SUCCESS)
+                return error.BackendSourceBindFailed;
+        }
         const len = addressToSockaddr(address, &storage);
         socket_utils.connectSockaddr(fd, @ptrCast(&storage), len) catch |err| {
             if (err != error.WouldBlock) return err;
@@ -2031,6 +2061,46 @@ fn addressToSockaddr(addr: Address, storage: *posix.sockaddr.storage) posix.sock
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+test "implicit local backend keeps a trusted loopback source on a specific IPv4 listener" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // UDP connect selects a local interface without sending any packets.
+    const rc = posix.system.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
+    const probe: posix.fd_t = @intCast(rc);
+    defer closeFd(probe);
+    var storage: posix.sockaddr.storage = undefined;
+    const len = addressToSockaddr(net_helpers.ip4(.{ 192, 0, 2, 1 }, 9), &storage);
+    try socket_utils.connectSockaddr(probe, @ptrCast(&storage), len);
+    var target = try socket_utils.localSocketAddress(probe);
+    target.ip4.port = 0;
+    try std.testing.expect(!trusted_peers.isLoopback(target));
+    const server = try net_helpers.listen(target, 8, false);
+    defer closeFd(server.socket.handle);
+    target = try socket_utils.localSocketAddress(server.socket.handle);
+    const fd = try Relay.dialBackend(target, true);
+    defer closeFd(fd);
+    const source = try socket_utils.localSocketAddress(fd);
+    try std.testing.expect(trusted_peers.isLoopback(source));
+    const peers = trusted_peers.TrustedPeers{ .enabled = true };
+    try std.testing.expect(peers.contains(source));
+    // Explicit remote backends must retain normal routing, not a loopback source.
+    const explicit = try Relay.dialBackend(target, false);
+    defer closeFd(explicit);
+    try std.testing.expect(!peers.contains(try socket_utils.localSocketAddress(explicit)));
+}
+
+test "local backend source binding supports IPv6 and IPv4-mapped listeners" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_][]const u8{ "::1", "::ffff:127.0.0.1" }) |host| {
+        const server = try net_helpers.listen(try Address.parse(host, 0), 8, false);
+        defer closeFd(server.socket.handle);
+        const target = try socket_utils.localSocketAddress(server.socket.handle);
+        const fd = try Relay.dialBackend(target, true);
+        defer closeFd(fd);
+        try std.testing.expect(trusted_peers.isLoopback(try socket_utils.localSocketAddress(fd)));
+    }
+}
+
 test "backend retry freezes candidates and preserves queued bytes while retiring stale fd" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -2058,7 +2128,7 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
     defer relay.pending_free.deinit(allocator);
     defer relay.tick_scratch.deinit(allocator);
     defer relay.drainPendingCloses();
-    const first = try Relay.dialBackend(target);
+    const first = try Relay.dialBackend(target, false);
     const conn = try relay.createConn(first, .backend, target);
     defer {
         closeFd(conn.fd);
@@ -2090,7 +2160,7 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
     // A stale event has no mapped connection, and exhausted candidates cannot loop.
     try std.testing.expect(!relay.retryBackend(conn));
     var empty_next: usize = 0;
-    try std.testing.expectError(error.BackendAddressesExhausted, Relay.dialCandidate(.{}, &empty_next));
+    try std.testing.expectError(error.BackendAddressesExhausted, relay.dialCandidate(.{}, &empty_next));
 }
 
 test "proxy v2 header round-trips through the proxy's own parser" {
@@ -2211,6 +2281,34 @@ test "dropFront compacts a buffer" {
     try std.testing.expectEqualStrings("cdef", list.items);
     dropFront(&list, 4);
     try std.testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "default backend follows the proxy bind address" {
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .port = 9443,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    const cases = .{
+        .{ "192.0.2.7", "192.0.2.7" },
+        .{ "2001:db8::7", "2001:db8::7" },
+        .{ "0.0.0.0", "127.0.0.1" },
+        .{ "::", "::1" },
+    };
+    inline for (cases) |case| {
+        cfg.bind_address = try std.testing.allocator.dupe(u8, case[0]);
+        const addr = try resolveBackend(std.testing.allocator, &cfg);
+        try std.testing.expect(trusted_peers.sameHost(try Address.parse(case[1], 9443), addr));
+        try std.testing.expectEqual(@as(u16, 9443), addr.getPort());
+        std.testing.allocator.free(cfg.bind_address.?);
+        cfg.bind_address = null;
+    }
+    cfg.bind_address = try std.testing.allocator.dupe(u8, "192.0.2.7");
+    cfg.web.backend = try std.testing.allocator.dupe(u8, "127.0.0.1:8443");
+    const explicit = try resolveBackend(std.testing.allocator, &cfg);
+    try std.testing.expect(trusted_peers.isLoopback(explicit));
+    try std.testing.expectEqual(@as(u16, 8443), explicit.getPort());
 }
 
 test "backend spec parsing rejects nonsense" {

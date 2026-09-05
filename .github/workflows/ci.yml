@@ -101,7 +101,7 @@ jobs:
           # suite into a green skip that proves nothing. Import them here first so that
           # failure is loud and the pytest run below can only be a real result.
           /tmp/dashboard-venv/bin/python -c "import fastapi, httpx, psutil, uvicorn"
-          /tmp/dashboard-venv/bin/python -m pytest -q src/ctl/dashboard_assets/test_server.py
+          /tmp/dashboard-venv/bin/python -m pytest -q src/ctl/dashboard_assets/test_server.py src/ctl/dashboard_assets/test_traffic.py
 
   e2e:
     name: E2E Integration

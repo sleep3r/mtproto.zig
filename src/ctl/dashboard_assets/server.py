@@ -19,6 +19,8 @@ import queue
 import subprocess
 import sys
 import shutil
+import urllib.request
+from traffic import TrafficHistory, parse_metrics
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -171,8 +173,15 @@ def _proxy_version() -> str | None:
 
 @asynccontextmanager
 async def _lifespan(app):
-    yield
-    await asyncio.to_thread(stop_log_thread)
+    _traffic_stop.clear()
+    worker = threading.Thread(target=_traffic_loop, daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        _traffic_stop.set()
+        await asyncio.to_thread(worker.join, 8)
+        await asyncio.to_thread(stop_log_thread)
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -1663,6 +1672,61 @@ def _masking_status() -> dict:
     return result
 
 
+_traffic_stop = threading.Event()
+_traffic_snapshot = {"available": False, "error": "collecting", "items": {}}
+
+
+def _traffic_sample():
+    global _traffic_snapshot
+    try:
+        path = _find_config_path()
+        if path is None or tomllib is None:
+            raise ValueError("config_unavailable")
+        cfg = tomllib.loads("\n".join(_strip_inline_comment(line) for line in path.read_text().splitlines()))
+        metrics = cfg.get("metrics", {})
+        if not metrics.get("enabled", False):
+            raise ValueError("metrics_disabled")
+        host = str(metrics.get("host") or "127.0.0.1")
+        if host in ("0.0.0.0", "::"):
+            host = "127.0.0.1" if host == "0.0.0.0" else "::1"
+        # Only IP literals from the local config, no credentials, redirects or env proxies.
+        ip = ipaddress.ip_address(host)
+        authority = f"[{ip}]" if ip.version == 6 else str(ip)
+        port = int(metrics.get("port", 9400))
+        if not 1 <= port <= 65535:
+            raise ValueError("metrics_unavailable")
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(f"http://{authority}:{port}/metrics", timeout=3) as response:
+            raw = response.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("metrics_unavailable")
+        process, counters = parse_metrics(raw.decode())
+        access = _load_proxy_runtime_config()
+        users = {**access.get("disabled_users", {}), **access.get("users", {})}
+        # Reusing a username with a different secret starts a new history.
+        identities = {name: hashlib.sha256((name + "\0" + str(secret).lower()).encode()).hexdigest() for name, secret in users.items()}
+        history = TrafficHistory(Path(__file__).parent / "traffic.sqlite3")
+        now = int(time.time())
+        history.record(now, process, {identities[name]: value for name, value in counters.items() if name in identities})
+        totals = {days: history.totals(now, days) for days in (7, 14, 30)}
+        starts = history.starts()
+        _traffic_snapshot = {"available": True, "updated_at": now, "items": {
+            name: {"started_at": starts.get(identity), "totals": {str(days): totals[days].get(identity, 0) for days in totals}}
+            for name, identity in identities.items()}}
+    except Exception as exc:
+        reason = str(exc) if str(exc) in ("metrics_disabled", "config_unavailable") else "metrics_unavailable"
+        _traffic_snapshot = {**_traffic_snapshot, "available": False, "error": reason}
+
+
+def _traffic_loop():
+    while not _traffic_stop.is_set():
+        _traffic_sample()
+        _traffic_stop.wait(30)
+
+
 _users_cache = {"ts": 0, "data": None}
 USERS_CACHE_TTL = 8  # seconds
 
@@ -2718,6 +2782,7 @@ def api_stats():
             "routing": _routing_status(),
             "masking": _masking_status(),
             "users": _users_status(),
+            "traffic": _traffic_snapshot,
         }
     )
 

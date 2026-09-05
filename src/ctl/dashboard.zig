@@ -50,6 +50,7 @@ const PIP_INSTALL_ARGV = [_][]const u8{
 
 // Embed dashboard assets at comptime
 const server_py = @embedFile("dashboard_assets/server.py");
+const traffic_py = @embedFile("dashboard_assets/traffic.py");
 const index_html = @embedFile("dashboard_assets/static/index.html");
 const style_css = @embedFile("dashboard_assets/static/style.css");
 const app_js = @embedFile("dashboard_assets/static/app.js");
@@ -246,6 +247,7 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts: DashboardOpts) !voi
         return;
     };
     try sys.writeFile(INSTALL_DIR ++ "/proxy.service", @import("build_options").proxy_service);
+    try sys.writeFile(INSTALL_DIR ++ "/traffic.py", traffic_py);
     try sys.writeFile(INSTALL_DIR ++ "/static/index.html", index_html);
     try sys.writeFile(INSTALL_DIR ++ "/static/style.css", style_css);
     try sys.writeFile(INSTALL_DIR ++ "/static/app.js", app_js);

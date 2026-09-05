@@ -18,6 +18,7 @@ Runs real proxy process + fake upstream/mask servers and validates critical flow
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import os
@@ -379,7 +380,7 @@ class ProxyInstance:
         return "\n".join(lines[-max_lines:])
 
 
-def start_proxy(config_text: str, port: int) -> ProxyInstance:
+def start_proxy(config_text: str, port: int, host: str = "127.0.0.1") -> ProxyInstance:
     if not ACTIVE_PROXY_BIN.exists():
         raise RuntimeError(f"proxy binary not found: {ACTIVE_PROXY_BIN}; run `zig build` first")
 
@@ -399,7 +400,7 @@ def start_proxy(config_text: str, port: int) -> ProxyInstance:
     )
     log_file.close()
 
-    if not wait_for_listen("127.0.0.1", port, timeout_sec=8.0) or proc.poll() is not None:
+    if not wait_for_listen(host, port, timeout_sec=8.0) or proc.poll() is not None:
         if proc.poll() is None:
             proc.terminate()
             try:
@@ -1634,6 +1635,68 @@ def scenario_guard_admission_metrics() -> None:
             proxy.stop()
 
 
+def scenario_web_specific_bind() -> None:
+    """Issue #407: real WEB relay reaches a specific listener, not another service
+    on loopback at the same port, without trusting ordinary non-loopback clients."""
+    host = _local_non_loopback_ipv4()
+    assert host, "WEB bind regression needs a non-loopback IPv4"
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+    port, relay_port = free_port(), free_port()
+    cfg = base_config(port=port, web_enabled=True, mask=False, upstream_type="socks5",
+                      upstream_host="127.0.0.1", upstream_port=socks.port,
+                      web_domain="relay.example.test")
+    cfg = cfg.replace('bind_address = "127.0.0.1"', f'bind_address = "{host}"')
+    cfg = cfg.replace("[web]", f"[web]\nport = {relay_port}")
+    proxy = start_proxy(cfg, port, host)
+    relay = None
+    try:
+        with socket.socket() as other:
+            other.bind(("127.0.0.1", port))
+            other.listen()
+            with open(proxy.workdir / "relay.log", "wb") as log:
+                relay = subprocess.Popen([str(ACTIVE_PROXY_BIN), "web-relay", str(proxy.cfg_path)],
+                                         stdout=log, stderr=subprocess.STDOUT)
+            assert wait_for_listen("127.0.0.1", relay_port, 8), "WEB relay did not start"
+            mac = hmac.new(b"\xdd" + bytes.fromhex(DEFAULT_SECRET_HEX),
+                           b"tdesktop-web-proxy-bridge-v1\nrelay.example.test", hashlib.sha256).digest()
+            cap = base64.urlsafe_b64encode(mac).decode().rstrip("=")
+            with socket.create_connection(("127.0.0.1", relay_port), timeout=3) as ws:
+                ws.sendall((f"GET /api/v1/socket?b={cap} HTTP/1.1\r\n"
+                            "Host: relay.example.test\r\nOrigin: https://relay.example.test\r\n"
+                            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                            "Sec-WebSocket-Version: 13\r\n"
+                            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").encode())
+                assert b"101" in recv_until(ws, b"\r\n\r\n").split(b"\r\n")[0]
+
+                def send_frame(kind: int, stream: int, payload: bytes = b"") -> None:
+                    data = bytes([kind]) + stream.to_bytes(3, "big") + struct.pack(">I", len(payload)) + payload
+                    mask = b"\x12\x34\x56\x78"
+                    size = bytes([0x80 | len(data)]) if len(data) < 126 else b"\xfe" + struct.pack(">H", len(data))
+                    ws.sendall(b"\x82" + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+                send_frame(0x10, 0, b"\x01")
+                assert recv_exact(ws, 10) == b"\x82\x08\x11\x00\x00\x00\x00\x00\x00\x00", "no WEB WELCOME"
+                send_frame(0x01, 1)
+                send_frame(0x02, 1, generate_obf_handshake(DEFAULT_SECRET_HEX, 1, "secure") + b"\x55" * 128)
+                assert_client_payload_relayed(socks, 128, "WEB specific-bind stream did not reach DC", 5)
+            with connect_from(host, host, port) as direct:
+                direct.sendall(generate_obf_handshake(DEFAULT_SECRET_HEX, 1, "secure"))
+                assert_socket_closed_soon(direct)
+            assert len(socks.connect_targets) == 1, "non-loopback client bypassed the FakeTLS gate"
+            assert not select.select([other], [], [], 0)[0], "relay dialed the unrelated loopback service"
+    finally:
+        if relay is not None:
+            relay.terminate()
+            try:
+                relay.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                relay.kill()
+                relay.wait(timeout=3)
+        proxy.stop()
+        socks.stop()
+
+
 def scenario_explicit_relay_source() -> None:
     source = _local_non_loopback_ipv4()
     if source is None:
@@ -1708,6 +1771,7 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "middleproxy_fallback_to_direct": scenario_middleproxy_fallback_to_direct,
     "mask_fallback_local_nginx": scenario_mask_fallback_local_nginx,
     "mask_fallback_custom_target": scenario_mask_fallback_custom_target,
+    "web_specific_bind": scenario_web_specific_bind,
     "web_only_serves_relay": scenario_web_only_still_serves_the_relay,
     "web_only_masks_direct_client": scenario_web_only_masks_a_direct_client,
     "web_only_inert_without_web": scenario_web_only_ignored_without_web_enabled,

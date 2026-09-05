@@ -251,7 +251,7 @@ pub const Config = struct {
         host: ?[]const u8 = null,
         port: u16 = 8081,
         /// `host:port` of the stock MTProxy the relay dials on every OPEN.
-        /// Defaults to this proxy on loopback.
+        /// Defaults to this proxy's bind_address (loopback for wildcard listeners).
         backend: ?[]const u8 = null,
         /// `host:port` of a TLS terminator that accepts a PROXY-protocol header, used
         /// ONLY for masked connections whose SNI is `domain`.
