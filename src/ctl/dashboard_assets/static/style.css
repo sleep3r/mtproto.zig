@@ -1759,7 +1759,18 @@ body::before, body::after { content: none; }
 
 /* ── Corrective: user-row has 4 grid children (.user-name holds the toggle),
    not 5 — the toggle is NOT a separate column. Name column must be wide. ── */
-.user-row { grid-template-columns: minmax(150px, 1.4fr) 104px minmax(0, 2fr) auto; }
+.user-row { grid-template-columns: minmax(150px, 1.4fr) 104px minmax(0, 2fr) 150px auto; }
+.traffic-period { display: flex; flex-shrink: 0; border: 1px solid var(--border); border-radius: 3px; }
+.traffic-period button { padding: 6px 10px; border: 0; background: transparent; color: var(--text-mid); font: 12px/16px 'JetBrains Mono', monospace; cursor: pointer; }
+.traffic-period button[aria-pressed="true"] { color: #ffae32; background: #ffae321a; }
+.traffic-period button:focus-visible { outline: 2px solid #ffae32; outline-offset: 2px; }
+.traffic-period button:active { transform: scale(.97); }
+.traffic-heading { margin-top: 14px; padding-right: 196px; text-align: right; color: var(--text-mid); font: 12px/16px 'JetBrains Mono', monospace; }
+.add-user-wrap { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+.traffic-note { color: var(--text-mid); font: 12px/18px 'JetBrains Mono', monospace; margin: 8px 0; }
+.user-traffic { text-align: right; color: var(--text-hi); font: 14px/20px 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+@media (max-width: 1000px) { .user-row { grid-template-columns: minmax(110px, 1fr) 80px minmax(0, 1fr) 110px auto; } .users-head { flex-wrap: wrap; } }
+@media (max-width: 680px) { .traffic-heading { padding-right: 0; text-align: left; } .user-traffic { text-align: left; } .user-traffic::before { content: '↓ + ↑ '; color: var(--text-mid); } }
 .user-name { display: flex; align-items: center; gap: 0; min-width: 0; }
 .user-name-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 680px) { .user-row { grid-template-columns: 1fr; } }

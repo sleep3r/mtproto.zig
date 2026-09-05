@@ -62,6 +62,52 @@ def test_unauthenticated_api_rejected(client):
     assert client.get("/api/stats").status_code == 401
 
 
+@pytest.mark.parametrize("username", ["alice", "alice.phone"])
+def test_traffic_collector_reads_metrics_and_keeps_database(monkeypatch, tmp_path, username):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from traffic import TrafficHistory
+    counts = [100, 200]
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == "/metrics"
+            body = ("mtproto_start_time_seconds 123\n"
+                    f'mtproto_user_client_to_upstream_bytes_total{{user="{username}"}} {counts[0]}\n'
+                    f'mtproto_user_upstream_to_client_bytes_total{{user="{username}"}} {counts[1]}\n').encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[metrics]\nenabled = true\nport = {http.server_port}\n[access.users]\n{username} = "' + 'a' * 32 + '"\n')
+    monkeypatch.setattr(server, "_find_config_path", lambda: cfg)
+    monkeypatch.setattr(server, "TrafficHistory", lambda path: TrafficHistory(tmp_path / "history.db"))
+    monkeypatch.setattr(server, "_traffic_snapshot", {})
+    try:
+        server._traffic_sample()
+        assert server._traffic_snapshot["available"]
+        counts[:] = [150, 350]
+        server._traffic_sample()
+        assert server._traffic_snapshot["items"][username]["totals"]["30"] == 200
+        assert 'a' * 32 not in (tmp_path / "history.db").read_bytes().decode(errors="replace")
+        cfg.write_text(cfg.read_text().replace('a' * 32, 'A' * 32))
+        counts[:] = [160, 360]
+        server._traffic_sample()
+        assert server._traffic_snapshot["items"][username]["totals"]["30"] == 220
+        cfg.write_text('[metrics]\nenabled = false\n')
+        server._traffic_sample()
+        assert server._traffic_snapshot["error"] == "metrics_disabled"
+        assert server._traffic_snapshot["items"][username]["totals"]["30"] == 220
+    finally:
+        http.shutdown()
+        http.server_close()
+        thread.join()
+
+
 def test_authenticated_api_ok(client, monkeypatch):
     monkeypatch.setattr(server, "_unit_active", lambda unit: False)
     monkeypatch.setattr(server, "_unit_enabled", lambda unit: False)

@@ -698,6 +698,56 @@ function _users_cache_bust() {
   }
 }
 
+let trafficDays = 30;
+let trafficSnapshot = null;
+function renderTraffic(snapshot) {
+  trafficSnapshot = snapshot;
+  const ru = LANG === 'ru';
+  $('trafficHeading').textContent = (ru ? 'Трафик · ' : 'Traffic · ') + trafficDays + (ru ? ' дней' : ' days') + ' ↓ + ↑';
+  document.querySelectorAll('[data-traffic-days]').forEach(button => {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.trafficDays) === trafficDays));
+    button.textContent = button.dataset.trafficDays + (ru ? 'д' : 'd');
+  });
+  const entries = snapshot?.items || {};
+  const starts = Object.values(entries).map(v => v.started_at).filter(v => Number.isFinite(v));
+  let note = ru ? 'Сбор истории…' : 'Collecting traffic history…';
+  if (snapshot?.available && starts.length) {
+    const since = new Date(Math.min(...starts) * 1000).toLocaleDateString(ru ? 'ru-RU' : 'en-GB');
+    note = (ru ? '↓ + ↑ · Сбор с ' : '↓ + ↑ · Collected since ') + since +
+      (ru ? ' · История сохраняется при перезапуске' : ' · History survives restarts');
+  } else if (snapshot?.error === 'metrics_disabled') {
+    note = ru ? 'Для сбора трафика включите enabled = true в [metrics] конфига прокси и перезапустите прокси. Метрики оставьте на localhost.' :
+      'To collect traffic, set enabled = true in [metrics] and restart the proxy. Keep metrics bound to localhost.';
+  } else if (snapshot && !snapshot.available && snapshot.error !== 'collecting') {
+    note = ru ? 'Метрики недоступны · История сохранена, значения временно не обновляются' :
+      'Metrics unavailable · History is saved; values are temporarily not updating';
+  }
+  $('trafficNote').textContent = note;
+  document.querySelectorAll('.user-traffic').forEach(cell => {
+    const entry = entries[cell.dataset.trafficUser];
+    const bytes = entry?.totals?.[String(trafficDays)];
+    cell.textContent = snapshot?.available && entry?.started_at != null && Number.isFinite(bytes) ?
+      formatTrafficBytes(bytes) : '—';
+    cell.title = ru ? 'Сумма скачанного и отправленного через прокси. Скользящий период, точность до минуты. Паузы сбора более 5 минут не учитываются.' :
+      'Downloaded + uploaded through the proxy. Rolling period, minute resolution. Collection gaps longer than 5 minutes are excluded.';
+    if (Number.isFinite(entry?.started_at)) {
+      cell.title += (ru ? ' Сбор с ' : ' Collected since ') + new Date(entry.started_at * 1000).toLocaleDateString(ru ? 'ru-RU' : 'en-GB') + '.';
+    }
+  });
+}
+function formatTrafficBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let value = Math.max(0, Number(bytes)), unit = 0;
+  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit++; }
+  return (unit ? value.toFixed(value >= 100 ? 1 : 2).replace(/\.?0+$/, '') : String(Math.round(value))) + ' ' + units[unit];
+}
+document.querySelectorAll('[data-traffic-days]').forEach(button => {
+  button.addEventListener('click', () => {
+    trafficDays = Number(button.dataset.trafficDays);
+    renderTraffic(trafficSnapshot);
+  });
+});
+
 function renderUsers(users, perUserActive, proxyStats) {
   const card = $('usersCard');
   if (!card) return;
@@ -771,6 +821,7 @@ function renderUsers(users, perUserActive, proxyStats) {
       '<div class="user-name">' + toggleSwitch + '<span class="user-name-text">' + displayName + '</span>' + sessionsBadge + '</div>' +
       '<div class="user-route">' + directToggle + '</div>' +
       '<div class="user-link" title="' + esc(tg || tme || (isEnabled ? 'link unavailable' : 'disabled')) + '">' + esc(preview) + '</div>' +
+      '<div class="user-traffic" data-traffic-user="' + userName + '">—</div>' +
       '<div class="user-actions">' +
       '<button class="ui-btn user-share" type="button" data-link="' + tmeData + '" data-name="' + userName + '" data-label="' + displayName + '"' + (tme && isEnabled ? '' : ' disabled') + ' title="Share via QR">' + ICON['qr-share'] + '</button>' +
       '<button class="ui-btn user-copy" type="button" data-link="' + tgData + '"' + (tg && isEnabled ? '' : ' disabled') + ' title="Copy tg:// link">tg://</button>' +
@@ -1469,6 +1520,7 @@ async function poll() {
   }
 
   renderUsers(d.users || null, (d.proxy || {}).per_user_active || {}, d.proxy || {});
+  renderTraffic(d.traffic || null);
 }
 
 function setDataBadge(state, text) {
