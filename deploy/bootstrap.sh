@@ -235,7 +235,7 @@ download_artifact() {
   fi
 
   step "Verifying checksum for $artifact"
-  awk -v artifact="$artifact" 'NF != 2 || ($2 != artifact && $2 != "*" artifact) { bad=1 } END { exit (bad || NR != 1) }' "$TMP/${sha_name}" \
+  awk -v artifact="$tar_name" 'NF != 2 || ($2 != artifact && $2 != "*" artifact) { bad=1 } END { exit (bad || NR != 1) }' "$TMP/${sha_name}" \
     || fail "Checksum filename mismatch for $artifact"
   if command -v sha256sum >/dev/null 2>&1; then
     (cd "$TMP" && sha256sum -c "${sha_name}" >/dev/null) || fail "Checksum verification failed: $artifact"
