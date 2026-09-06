@@ -1,1 +1,1 @@
-pub const version = "1.15.1"; // x-release-please-version
+pub const version = "1.15.2"; // x-release-please-version
