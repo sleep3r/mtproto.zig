@@ -2466,3 +2466,14 @@ body::before, body::after { content: none; }
     animation: none !important;
   }
 }
+
+/* Keep configuration failures visible while independent telemetry remains live. */
+.config-error {
+  margin: 20px var(--gutter) 0;
+  padding: 14px 18px;
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.config-error[hidden] { display: none; }

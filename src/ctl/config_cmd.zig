@@ -10,6 +10,7 @@ const tui_mod = @import("tui.zig");
 const sys = @import("sys.zig");
 const fronting_domain = @import("fronting_domain.zig");
 const Config = @import("proxy_config").Config;
+const config_lint = @import("config_lint.zig");
 const http_fetch = @import("proxy_http_fetch");
 const net_helpers = @import("proxy_net_helpers");
 
@@ -116,10 +117,27 @@ fn defaultConfigPath() []const u8 {
 }
 
 fn loadConfig(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !Config {
-    return Config.loadFromFile(allocator, path) catch |err| {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| {
         ui.print("  failed to load {s}: {any}\n", .{ path, err });
         return error.ConfigLoadFailed;
     };
+    defer allocator.free(content);
+    if (try config_lint.check(allocator, content)) |issue| {
+        ui.print("  {s}: line {d}, column {d}: {s}\n", .{ path, issue.line, issue.column, issue.message() });
+        ui.hint("Edit the config and run this command again. Config diagnostics do not modify files.");
+        return error.ConfigLoadFailed;
+    }
+    var cfg = Config.parse(allocator, content) catch |err| {
+        ui.print("  failed to load {s}: {any}\n", .{ path, err });
+        return error.ConfigLoadFailed;
+    };
+    errdefer cfg.deinit(allocator);
+    cfg.validate() catch |err| {
+        ui.print("  failed to validate {s}: {any}\n", .{ path, err });
+        return error.ConfigLoadFailed;
+    };
+    return cfg;
 }
 
 fn validate(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !void {

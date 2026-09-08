@@ -231,3 +231,19 @@ coverage:
   (`mtbuddy setup egress 'vless://…'`) is not — it needs a stub `sing-box` that creates a
   dummy TUN interface. Link parsing + config JSON generation are covered by unit tests in
   `src/ctl/`.
+
+## Configuration diagnostics and dashboard regressions
+
+```bash
+zig build
+python3 test/config_diagnostics.py zig-out/bin/mtbuddy  # Linux runtime
+zig test src/ctl/config_lint.zig                        # also runs on macOS
+node --test src/ctl/dashboard_assets/test_app.js
+python3 -m pytest -q src/ctl/dashboard_assets/test_server.py src/ctl/dashboard_assets/test_traffic.py
+```
+
+The CLI test checks that missing quotes and duplicate sections/keys fail with a
+location, valid configs pass, and diagnostics never modify the input or print
+secret values. The dashboard tests cover partial telemetry, blocked mutations,
+and automatic recovery after the configuration is repaired. Python tests need
+`fastapi`, `httpx`, `psutil`, `uvicorn`, and `pytest`.

@@ -35,6 +35,9 @@ jobs:
       - name: Debug build
         run: zig build
 
+      - name: Config diagnostics regression tests
+        run: python3 test/config_diagnostics.py zig-out/bin/mtbuddy
+
       - name: Release build (native)
         run: zig build -Doptimize=ReleaseFast
 
@@ -94,6 +97,9 @@ jobs:
         run: |
           python3 -m venv /tmp/dashboard-venv
           /tmp/dashboard-venv/bin/pip install --quiet fastapi httpx psutil uvicorn pytest
+
+      - name: Run dashboard polling regression tests
+        run: node --test src/ctl/dashboard_assets/test_app.js
 
       - name: Run dashboard security tests
         run: |

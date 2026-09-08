@@ -348,3 +348,78 @@ def test_logs_fanout_is_per_client_cursor():
     server._recent_logs.append({"m": "c"})
     more, cur_a = server._logs_since(cur_a)
     assert more == [{"m": "c"}] and cur_a == 3
+
+
+@pytest.mark.parametrize("content, line, hint", [
+    ('[server]\n  public_ip = tg.domain.ru\n', 2, "quotes"),
+    ('[server]\nport = 443\n[server]\n', 3, "section"),
+    ('[server]\nport = 443\nport = 8443\n', 3, "key"),
+    ('[upstream.socks5]\npassword = "private-secret\n', 2, "string"),
+    ('[upstream.socks5]\npassword = "private-secret', 2, "string"),
+    ('[server]\nport = 443\nport = 8443', 3, "key"),
+])
+def test_config_error_has_location_and_action_without_secret(tmp_path, monkeypatch, content, line, hint):
+    cfg = tmp_path / "broken.toml"
+    cfg.write_text(content)
+    monkeypatch.setattr(server, "_proxy_config_candidates", lambda: [cfg])
+    error = server._load_proxy_runtime_config()["error"]
+    assert f"line {line}" in error
+    assert hint in error.lower()
+    assert "private-secret" not in error
+    assert "mtbuddy config doctor" in error
+
+
+def test_stats_keep_system_data_and_disable_config_panels_until_repaired(client, tmp_path, monkeypatch):
+    cfg = tmp_path / "repair.toml"
+    cfg.write_text('[server]\npublic_ip = tg.domain.ru\n')
+    monkeypatch.setattr(server, "_proxy_config_candidates", lambda: [cfg])
+    monkeypatch.setattr(server, "_proxy_stats", lambda: {"active": 7})
+    # These operations depend on a valid config and must not probe defaults on failure.
+    def unexpected():
+        pytest.fail("config-dependent panel was evaluated for a broken config")
+    with monkeypatch.context() as blocked:
+        for name in ("_routing_status", "_masking_status", "_users_status", "_awg_status"):
+            blocked.setattr(server, name, unexpected)
+        response = client.get("/api/stats", headers=_auth())
+        assert response.status_code == 200
+        data = response.json()
+        assert data["config_error"] and data["errors"]
+        assert data["proxy"]["active"] == 7
+        assert isinstance(data["cpu"], (float, int))
+        assert data["mem_total"] > 0
+        assert data["users"] is None and data["routing"] is None and data["masking"] is None
+    cfg.write_text('[server]\npublic_ip = "tg.domain.ru"\n')
+    assert server._load_proxy_runtime_config().get("error") is None
+    response = client.get("/api/stats", headers=_auth())
+    assert response.json()["config_error"] is None
+    assert response.json()["users"] is not None
+
+
+def test_bad_config_rejects_user_mutation_without_writing_or_restarting(client, tmp_path, monkeypatch):
+    cfg = tmp_path / "broken.toml"
+    content = '[server]\npublic_ip = tg.domain.ru\n[access.users]\n'
+    cfg.write_text(content)
+    monkeypatch.setattr(server, "_proxy_config_candidates", lambda: [cfg])
+    monkeypatch.setattr(server, "_find_config_path", lambda: cfg)
+    def unexpected_restart():
+        raise AssertionError("broken configuration must not be restarted")
+    monkeypatch.setattr(server, "_restart_proxy", unexpected_restart)
+    response = client.post("/api/users/add", headers={**_auth(), "Origin": "http://localhost"}, json={"name": "alice"})
+    assert response.status_code == 503
+    assert "line 2" in response.json()["error"]
+    assert cfg.read_text() == content
+
+
+def test_config_error_does_not_guess_listener_port(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(server.psutil, "process_iter", lambda fields: [SimpleNamespace(info={
+        "name": "mtproto-proxy", "create_time": server.time.time() - 60,
+        "pid": 42, "memory_info": None, "cmdline": ["mtproto-proxy"],
+    })])
+    monkeypatch.setattr(server, "_load_proxy_runtime_config", lambda: {"error": "invalid config"})
+    def unexpected_probe(port):
+        raise AssertionError("must not guess a port from defaults")
+    monkeypatch.setattr(server, "_proxy_listening", unexpected_probe)
+    info = server._proxy_info()
+    assert info["online"] and info["pid"] == 42
+    assert info["listening"] is None and info["state"] == "unknown"

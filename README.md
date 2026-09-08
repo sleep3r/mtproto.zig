@@ -194,6 +194,17 @@ sudo mtbuddy update --insecure
 
 ## Other mtbuddy commands
 
+`config validate`, `doctor`, and `print-effective` report common TOML mistakes
+(strings without quotes, duplicate sections/keys, and unclosed quotes) with a line
+number and a correction hint. These commands do not modify the file. For example,
+put `public_ip = "proxy.example.com"` inside the existing `[server]` section; do not
+add a second `[server]`. This compatibility check supplements the runtime's
+semantic validation; it is not a full TOML implementation.
+
+If the dashboard cannot parse the config, it shows the location and keeps updating
+system/process telemetry. Config-dependent panels and management actions are
+unavailable until the file is corrected; the next refresh loads the repaired file.
+
 ```bash
 # Show proxy and module status
 sudo mtbuddy status

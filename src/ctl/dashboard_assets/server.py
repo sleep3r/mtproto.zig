@@ -72,6 +72,41 @@ def _strip_inline_comment(value: str) -> str:
     return value.strip()
 
 
+def _toml_source(raw: str) -> str:
+    # Keep indentation so parser columns refer to the operator's file. Retain
+    # legacy semicolon-comment support shared with existing dashboard configs.
+    return "\n".join(line[:len(line) - len(line.lstrip())] + _strip_inline_comment(line)
+                     for line in raw.split("\n"))
+
+
+def _config_read_error(exc: Exception, source: str = "") -> str:
+    if tomllib is None or not isinstance(exc, tomllib.TOMLDecodeError):
+        return f"Proxy config could not be read ({type(exc).__name__}). Check the config file and its permissions."
+    # Python 3.11-3.13 expose location through the message, newer versions also
+    # have lineno/colno. Never echo the raw message: it can contain source text.
+    message = str(exc)
+    match = re.search(r"\(at line (\d+), column (\d+)\)$", message)
+    if match:
+        location = f" at line {match[1]}, column {match[2]}"
+    else:
+        # Older tomllib versions say only "at end of document" for a duplicate
+        # final key or an unclosed string in a file without a final newline.
+        line = source.count("\n") + 1
+        column = len(source.rsplit("\n", 1)[-1]) + 1
+        location = f" at line {line}, column {column} (end of file)"
+    if message.startswith("Cannot declare"):
+        hint = "Duplicate or conflicting section. Keep one section header and merge its settings."
+    elif message.startswith("Cannot overwrite a value"):
+        hint = "Duplicate or conflicting key. Keep one definition of each key."
+    elif "string" in message.lower() or message.startswith("Illegal character"):
+        hint = "Invalid string. Check its closing quote and escape sequences."
+    elif message.startswith("Invalid value"):
+        hint = 'Invalid value. Put strings in quotes, for example public_ip = "proxy.example.com".'
+    else:
+        hint = "Check the TOML syntax at this location."
+    return f"Invalid TOML{location}. {hint} Run mtbuddy config doctor for config diagnostics."
+
+
 def _load_dashboard_config() -> dict:
     """Load [monitor] section from config.toml (host, port).
 
@@ -601,11 +636,8 @@ def _proxy_info() -> dict:
                 if proc.info["memory_info"]
                 else 0
             )
-            try:
-                listen_port = int(_load_proxy_runtime_config().get("port", 443))
-            except Exception:
-                listen_port = 443
-            listening = _proxy_listening(listen_port)
+            cfg = _load_proxy_runtime_config()
+            listening = None if cfg.get("error") else _proxy_listening(int(cfg.get("port", 443)))
             # Process up but the port isn't accepting → the event loop is wedged.
             return dict(
                 uptime=up,
@@ -613,7 +645,7 @@ def _proxy_info() -> dict:
                 rss_mb=round(rss, 1),
                 online=True,
                 listening=listening,
-                state="online" if listening else "stalled",
+                state="unknown" if listening is None else ("online" if listening else "stalled"),
             )
     return dict(uptime="offline", pid=0, rss_mb=0, online=False, listening=False, state="offline")
 
@@ -773,10 +805,11 @@ def _load_proxy_runtime_config() -> dict:
     }
 
     section = ""
+    raw = ""
     try:
         if tomllib is not None:
-            raw = cfg_path.read_text(encoding="utf-8")
-            tomllib.loads("\n".join(_strip_inline_comment(line) for line in raw.splitlines()))
+            raw = _toml_source(cfg_path.read_text(encoding="utf-8"))
+            tomllib.loads(raw)
         with open(cfg_path, "r", encoding="utf-8", errors="replace") as f:
             for raw_line in f:
                 line = raw_line.strip()
@@ -886,7 +919,7 @@ def _load_proxy_runtime_config() -> dict:
                         result["disabled_users"][key] = value
 
     except Exception as exc:
-        defaults["error"] = f"Proxy config could not be read ({type(exc).__name__})"
+        defaults["error"] = _config_read_error(exc, raw)
         return defaults
 
     if not result["upstream_tunnel_interfaces"] and not result["upstream_tunnel_interfaces_configured"]:
@@ -1682,7 +1715,7 @@ def _traffic_sample():
         path = _find_config_path()
         if path is None or tomllib is None:
             raise ValueError("config_unavailable")
-        cfg = tomllib.loads("\n".join(_strip_inline_comment(line) for line in path.read_text().splitlines()))
+        cfg = tomllib.loads(_toml_source(path.read_text()))
         metrics = cfg.get("metrics", {})
         if not metrics.get("enabled", False):
             raise ValueError("metrics_disabled")
@@ -2729,6 +2762,12 @@ def _serialized(lock):
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
             with lock:
+                # Also protect stale forms and direct API calls. Never rewrite or
+                # restart a config we could only interpret as empty defaults.
+                if lock is _mutation_lock:
+                    config_error = _load_proxy_runtime_config().get("error")
+                    if config_error:
+                        return JSONResponse({"ok": False, "error": config_error}, status_code=503)
                 return fn(*args, **kwargs)
         return wrapped
     return decorate
@@ -2760,9 +2799,12 @@ def api_stats():
         while len(lst) > MAX_HISTORY:
             lst.pop(0)
 
+    config_error = _load_proxy_runtime_config().get("error")
+    proxy_stats = _proxy_stats()
     return JSONResponse(
         {
-            "errors": [message for message in (_load_proxy_runtime_config().get("error"), _proxy_stats().get("error")) if message],
+            "errors": [message for message in (config_error, proxy_stats.get("error")) if message],
+            "config_error": config_error,
             "cpu": round(cpu, 1),
             "cpu_history": list(_cpu_history),
             "mem_used": round(mem.used / 1048576),
@@ -2775,14 +2817,14 @@ def api_stats():
             "net_tx_total": net.bytes_sent,
             "net_history": _net_history[-MAX_HISTORY:],
             "uptime": f"{d}d {h}h {rem2 // 60}m",
-            "proxy": _proxy_stats(),
+            "proxy": proxy_stats,
             "proxy_info": _proxy_info(),
             "proxy_version": _proxy_version(),
-            "awg": _awg_status(),
-            "routing": _routing_status(),
-            "masking": _masking_status(),
-            "users": _users_status(),
-            "traffic": _traffic_snapshot,
+            "awg": None if config_error else _awg_status(),
+            "routing": None if config_error else _routing_status(),
+            "masking": None if config_error else _masking_status(),
+            "users": None if config_error else _users_status(),
+            "traffic": {"available": False, "error": "config_unavailable", "items": {}} if config_error else _traffic_snapshot,
         }
     )
 
@@ -2811,6 +2853,9 @@ def api_egress():
     }
     """
     global _egress_cache
+    config_error = _load_proxy_runtime_config().get("error")
+    if config_error:
+        return JSONResponse({"ok": False, "error": config_error}, status_code=503)
     now = time.time()
     if now - _egress_cache["ts"] < EGRESS_CACHE_TTL and _egress_cache["data"]:
         return JSONResponse(_egress_cache["data"])

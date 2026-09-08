@@ -45,6 +45,8 @@ const I18N = {
     'logs.title': 'Live Logs', 'logs.error': 'Error', 'logs.warn': 'Warn', 'logs.stats': 'Stats', 'logs.searchPh': 'Search logs', 'logs.jumpLatest': 'Jump to latest',
     'modal.deleteUser': 'Delete User', 'modal.deleteTunnel': 'Delete Tunnel', 'modal.restartNote': 'The proxy will be restarted to apply changes.',
     'share.subtitle': 'Point their phone camera at this code to connect.', 'share.copyLink': 'Copy link', 'share.send': 'Send', 'share.with': 'Share with',
+    'config.unavailable': 'Configuration unavailable. Fix the error above to manage users and settings.',
+    'status.running': 'Running', 'hero.vUnknown': 'Process running', 'hero.unknown': 'The process is running. Fix the configuration error to check its listener and settings.',
     'status.online': 'Online', 'status.offline': 'Offline', 'status.stuck': 'Stuck',
     'status.healthy': 'Healthy', 'status.needsAttention': 'Needs attention', 'status.disabled': 'Disabled', 'status.remoteMode': 'Remote mode', 'status.endpointOk': 'OK', 'status.endpointDown': 'not responding',
     'hero.checking': 'Checking…', 'hero.offline': "Your proxy is offline — friends can't connect until it's back.",
@@ -76,6 +78,8 @@ const I18N = {
     'logs.title': 'Логи', 'logs.error': 'Ошибки', 'logs.warn': 'Предупр.', 'logs.stats': 'Статы', 'logs.searchPh': 'Поиск в логах', 'logs.jumpLatest': 'К последним',
     'modal.deleteUser': 'Удалить пользователя', 'modal.deleteTunnel': 'Удалить туннель', 'modal.restartNote': 'Прокси будет перезапущен для применения изменений.',
     'share.subtitle': 'Наведите камеру их телефона на этот код, чтобы подключиться.', 'share.copyLink': 'Скопировать ссылку', 'share.send': 'Отправить', 'share.with': 'Поделиться с',
+    'config.unavailable': 'Конфигурация недоступна. Исправьте ошибку выше, чтобы управлять пользователями и настройками.',
+    'status.running': 'Запущен', 'hero.vUnknown': 'Процесс запущен', 'hero.unknown': 'Процесс запущен. Исправьте ошибку конфигурации, чтобы проверить порт и настройки.',
     'status.online': 'Онлайн', 'status.offline': 'Офлайн', 'status.stuck': 'Завис',
     'status.healthy': 'Здоров', 'status.needsAttention': 'Требует внимания', 'status.disabled': 'Выключено', 'status.remoteMode': 'Удалённый режим', 'status.endpointOk': 'OK', 'status.endpointDown': 'не отвечает',
     'hero.checking': 'Проверка…', 'hero.offline': 'Прокси офлайн — близкие не смогут подключиться, пока он не запустится.',
@@ -448,6 +452,8 @@ function setStatusHero(online, active, state) {
   let color, signalColor, verdict, subline;
   if (!online) {
     color = 'var(--signal-stop)'; signalColor = color; verdict = t('hero.vOffline'); subline = t('hero.offline');
+  } else if (state === 'unknown') {
+    color = 'var(--signal-caution)'; signalColor = color; verdict = t('hero.vUnknown'); subline = t('hero.unknown');
   } else if (state === 'stalled') {
     color = 'var(--signal-caution)'; signalColor = color; verdict = t('hero.vStalled'); subline = t('hero.stalled');
   } else if (active > 0) {
@@ -759,7 +765,15 @@ function renderUsers(users, perUserActive, proxyStats) {
   const list = $('usersList');
   card.style.display = '';
 
-  const items = (users && Array.isArray(users.items)) ? users.items : [];
+  $('addUserBtn').disabled = !users;
+  if (!users) {
+    meta.textContent = '—';
+    note.textContent = t('config.unavailable');
+    list.innerHTML = '';
+    $('addUserForm').style.display = 'none';
+    return;
+  }
+  const items = Array.isArray(users.items) ? users.items : [];
   const total = Number(users?.total || 0);
   const directTotal = Number(users?.direct_total || 0);
   const disabledTotal = Number(users?.disabled_total || 0);
@@ -1393,7 +1407,12 @@ async function poll() {
   const r = await fetch('/api/stats', { cache: 'no-store' });
   if (!r.ok) throw new Error('stats request failed: ' + r.status);
   const d = await r.json();
-  if (d.errors && d.errors.length) throw new Error(d.errors.join('; '));
+  const configError = $('configError');
+  // Component errors must not discard CPU, memory, network and process data.
+  const message = (d.errors || []).join('; ');
+  configError.hidden = !message;
+  // Avoid announcing the same alert to screen readers on every poll.
+  if (configError.textContent !== message) configError.textContent = message;
 
   lastData = d;
 
@@ -1419,7 +1438,7 @@ async function poll() {
   // Server
   const pi = d.proxy_info || {};
   const proxyUpEl = $('proxyUp');
-  if (proxyUpEl) proxyUpEl.textContent = !pi.online ? t('status.offline') : (pi.state === 'stalled' ? t('status.stuck') : t('status.online'));
+  if (proxyUpEl) proxyUpEl.textContent = !pi.online ? t('status.offline') : (pi.state === 'unknown' ? t('status.running') : (pi.state === 'stalled' ? t('status.stuck') : t('status.online')));
   const pidEl = $('proxyPid');
   if (pidEl) pidEl.textContent = pi.pid || '—';
   const rssEl = $('proxyRss');
@@ -1462,14 +1481,15 @@ async function poll() {
   }
 
   renderRouting(d.routing || null);
-  renderEgressFromRouting(d.routing || null);
+  if (d.config_error) renderEgress(null);
+  else renderEgressFromRouting(d.routing || null);
 
   // Egress / tunnel quality — fire-and-forget so a slow server-side ping/wg probe
   // never blocks rendering of the already-fetched masking/users data or stalls the
   // poll cycle. The card updates whenever this resolves.
-  fetch('/api/egress', { cache: 'no-store' })
+  if (!d.config_error) fetch('/api/egress', { cache: 'no-store' })
     .then((r) => (r.ok ? r.json() : null))
-    .then((egressData) => { if (egressData && egressData.ok) renderEgress(egressData); })
+    .then((egressData) => { if (egressData && egressData.ok && !lastData?.config_error) renderEgress(egressData); })
     .catch(() => {}); // silent; egress monitoring is optional
 
   // Masking health
