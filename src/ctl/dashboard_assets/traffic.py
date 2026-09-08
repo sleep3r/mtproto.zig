@@ -44,7 +44,7 @@ class TrafficHistory:
         finally:
             db.close()
 
-    def record(self, now, process, counters):
+    def record(self, now, process, counters, *, count_delta=True):
         now = int(now)
         with self.connect() as db:
             for identity, (tx, rx) in counters.items():
@@ -54,7 +54,7 @@ class TrafficHistory:
                 delta = 0
                 # A long collection gap cannot be dated reliably. Do not assign
                 # days of missed traffic to the current minute/window.
-                if old and now - old[3] <= 300:
+                if count_delta and old and now - old[3] <= 300:
                     delta = sum(v if process != old[0] or v < before else v - before
                                 for v, before in zip((tx, rx), old[1:3]))
                 if delta:

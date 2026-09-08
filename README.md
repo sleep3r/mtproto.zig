@@ -486,6 +486,7 @@ alice = true   # bypass MiddleProxy for this user
 | `[server] unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` |
 | `[monitor] host` | `"127.0.0.1"` | Dashboard bind address |
 | `[monitor] port` | `61208` | Dashboard port |
+| `[monitor] traffic_history_enabled` | `true` | Collect local dashboard traffic history; re-read every 30 seconds, independent of Prometheus |
 | `[metrics] enabled` | `false` | Enable embedded Prometheus `/metrics` endpoint |
 | `[metrics] host` | `"127.0.0.1"` | Metrics bind address |
 | `[metrics] port` | `9400` | Metrics port |
@@ -680,6 +681,13 @@ The dashboard requires **HTTP Basic auth** (username: any; password auto-generat
 ---
 
 ## Prometheus metrics
+
+Local dashboard history can be disabled independently of Prometheus/Grafana. Set
+`traffic_history_enabled = false` in the existing `[monitor]` section and leave
+`[metrics].enabled = true`. At the next sample (normally within 30 seconds), the dashboard stops scraping metrics
+and writing history; it keeps the database and shows that history is disabled.
+Set the option back to `true` to resume. The first sample after startup or resume
+establishes a baseline, so traffic from a collection pause is not added later.
 
 `mtproto-proxy` can expose an embedded Prometheus-compatible metrics endpoint on a dedicated port.
 

@@ -72,3 +72,14 @@ test('transport errors still mark polling failed', async () => {
   assert.equal(c.hasPollError, true);
   assert.equal(c.lastSuccessAt, 0);
 });
+
+test('disabled local history is shown separately from unavailable metrics', () => {
+  const c = harness();
+  vm.runInContext(source.slice(source.indexOf('let trafficDays ='), source.indexOf('function renderUsers(')), c);
+  c.renderTraffic({ available: false, error: 'history_disabled', items: {} });
+  assert.match(c.$('trafficNote').textContent, /disabled/i);
+  assert.doesNotMatch(c.$('trafficNote').textContent, /metrics unavailable/i);
+  c.LANG = 'ru';
+  c.renderTraffic({ available: false, error: 'history_disabled', items: {} });
+  assert.match(c.$('trafficNote').textContent, /отключ/i);
+});

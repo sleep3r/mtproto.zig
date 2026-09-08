@@ -247,3 +247,8 @@ location, valid configs pass, and diagnostics never modify the input or print
 secret values. The dashboard tests cover partial telemetry, blocked mutations,
 and automatic recovery after the configuration is repaired. Python tests need
 `fastapi`, `httpx`, `psutil`, `uvicorn`, and `pytest`.
+
+The dashboard suite also checks that traffic sampling creates no TLS contexts,
+ignores environment proxies, refuses redirects and oversized responses, and can
+pause/resume local history independently of Prometheus without modifying its
+saved database while paused or counting the paused interval.

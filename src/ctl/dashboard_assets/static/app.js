@@ -721,6 +721,12 @@ function renderTraffic(snapshot) {
     const since = new Date(Math.min(...starts) * 1000).toLocaleDateString(ru ? 'ru-RU' : 'en-GB');
     note = (ru ? '↓ + ↑ · Сбор с ' : '↓ + ↑ · Collected since ') + since +
       (ru ? ' · История сохраняется при перезапуске' : ' · History survives restarts');
+  } else if (snapshot?.error === 'history_config_invalid') {
+    note = ru ? 'В [monitor] задайте traffic_history_enabled = true или false, без кавычек.' :
+      'In [monitor], set traffic_history_enabled to true or false, without quotes.';
+  } else if (snapshot?.error === 'history_disabled') {
+    note = ru ? 'Локальная история трафика отключена в [monitor]. Сохранённая история остаётся на диске.' :
+      'Local traffic history is disabled in [monitor]. Saved history remains on disk.';
   } else if (snapshot?.error === 'metrics_disabled') {
     note = ru ? 'Для сбора трафика включите enabled = true в [metrics] конфига прокси и перезапустите прокси. Метрики оставьте на localhost.' :
       'To collect traffic, set enabled = true in [metrics] and restart the proxy. Keep metrics bound to localhost.';

@@ -150,6 +150,14 @@ port = 443
 # TCP port for the monitoring dashboard.
 # port = 61208
 
+# Local dashboard traffic history (SQLite, 7/14/30-day totals). Default: true.
+# Set false if Prometheus/Grafana already collects your traffic: this disables
+# dashboard scraping and history writes, NOT the [metrics] endpoint.
+# Re-read every 30 seconds; no proxy or dashboard restart needed.
+# The database is retained. The first sample after startup/resume establishes
+# a baseline, so traffic during a collection pause is not counted on resumption.
+# traffic_history_enabled = true
+
 [metrics]
 # Embedded Prometheus-compatible metrics endpoint.
 # Disabled by default; enable explicitly when scraping from Docker/Prometheus.

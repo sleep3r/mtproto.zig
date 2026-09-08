@@ -1707,17 +1707,41 @@ def _masking_status() -> dict:
 
 _traffic_stop = threading.Event()
 _traffic_snapshot = {"available": False, "error": "collecting", "items": {}}
+# Establish a baseline after startup or an explicit pause; do not assign traffic
+# collected while the dashboard was off to the minute in which it resumes.
+_traffic_collection_paused = True
+
+
+@functools.cache
+def _traffic_http_opener():
+    # build_opener() also installs HTTPSHandler, which allocates an SSL context
+    # and certificate store even for HTTP. Its handler cycles survive until GC.
+    # Metrics use an IP literal over HTTP, so install only the required handlers.
+    # No proxy discovery and no redirect handler: neither env proxies nor a 3xx
+    # response may send the metrics request to another endpoint.
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.HTTPHandler(), urllib.request.HTTPDefaultErrorHandler(),
+                    urllib.request.HTTPErrorProcessor(), urllib.request.UnknownHandler()):
+        opener.add_handler(handler)
+    return opener
 
 
 def _traffic_sample():
-    global _traffic_snapshot
+    global _traffic_snapshot, _traffic_collection_paused
     try:
         path = _find_config_path()
         if path is None or tomllib is None:
             raise ValueError("config_unavailable")
         cfg = tomllib.loads(_toml_source(path.read_text()))
+        history_enabled = cfg.get("monitor", {}).get("traffic_history_enabled", True)
+        if not isinstance(history_enabled, bool) or not history_enabled:
+            _traffic_collection_paused = True
+            reason = "history_disabled" if history_enabled is False else "history_config_invalid"
+            _traffic_snapshot = {"available": False, "error": reason, "items": {}}
+            return
         metrics = cfg.get("metrics", {})
         if not metrics.get("enabled", False):
+            _traffic_collection_paused = True
             raise ValueError("metrics_disabled")
         host = str(metrics.get("host") or "127.0.0.1")
         if host in ("0.0.0.0", "::"):
@@ -1728,11 +1752,7 @@ def _traffic_sample():
         port = int(metrics.get("port", 9400))
         if not 1 <= port <= 65535:
             raise ValueError("metrics_unavailable")
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *args, **kwargs):
-                return None
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(f"http://{authority}:{port}/metrics", timeout=3) as response:
+        with _traffic_http_opener().open(f"http://{authority}:{port}/metrics", timeout=3) as response:
             raw = response.read(4 * 1024 * 1024 + 1)
         if len(raw) > 4 * 1024 * 1024:
             raise ValueError("metrics_unavailable")
@@ -1743,7 +1763,9 @@ def _traffic_sample():
         identities = {name: hashlib.sha256((name + "\0" + str(secret).lower()).encode()).hexdigest() for name, secret in users.items()}
         history = TrafficHistory(Path(__file__).parent / "traffic.sqlite3")
         now = int(time.time())
-        history.record(now, process, {identities[name]: value for name, value in counters.items() if name in identities})
+        history.record(now, process, {identities[name]: value for name, value in counters.items() if name in identities},
+                       count_delta=not _traffic_collection_paused)
+        _traffic_collection_paused = False
         totals = {days: history.totals(now, days) for days in (7, 14, 30)}
         starts = history.starts()
         _traffic_snapshot = {"available": True, "updated_at": now, "items": {

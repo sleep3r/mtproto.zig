@@ -51,3 +51,14 @@ mtproto_user_upstream_to_client_bytes_total{user="a\\\"b"} 20
     import pytest
     with pytest.raises(ValueError):
         parse_metrics(raw.splitlines()[1])
+
+
+def test_resuming_history_only_resets_baseline(tmp_path):
+    h = TrafficHistory(tmp_path / "history.db")
+    h.record(100, "boot", {"alice": (100, 200)})
+    h.record(130, "boot", {"alice": (120, 200)})
+    h.record(160, "boot", {"alice": (1000, 2000)}, count_delta=False)
+    assert h.totals(160, 30)["alice"] == 20
+    assert h.starts()["alice"] == 100
+    h.record(190, "boot", {"alice": (1010, 2020)})
+    assert h.totals(190, 30)["alice"] == 50

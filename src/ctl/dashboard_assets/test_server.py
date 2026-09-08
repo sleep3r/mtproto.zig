@@ -50,6 +50,7 @@ def _hermetic_host(monkeypatch, tmp_path):
     monkeypatch.setattr(server.subprocess, "check_output", lambda *a, **kw: "")
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw: server.subprocess.CompletedProcess(a[0], 0, "", ""))
     monkeypatch.setattr(server, "ensure_log_thread", lambda: None)
+    monkeypatch.setattr(server, "_traffic_collection_paused", True)
 
 
 @pytest.fixture
@@ -423,3 +424,121 @@ def test_config_error_does_not_guess_listener_port(monkeypatch):
     info = server._proxy_info()
     assert info["online"] and info["pid"] == 42
     assert info["listening"] is None and info["state"] == "unknown"
+
+
+@pytest.fixture
+def traffic_probe(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from types import SimpleNamespace
+    from traffic import TrafficHistory
+    state = SimpleNamespace(tx=100, requests=0, status=200, payload=None)
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state.requests += 1
+            self.send_response(state.status)
+            if state.status == 302:
+                self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/redirected")
+            self.end_headers()
+            body = state.payload or (f'mtproto_start_time_seconds 123\n'
+                f'mtproto_user_client_to_upstream_bytes_total{{user="alice"}} {state.tx}\n'
+                'mtproto_user_upstream_to_client_bytes_total{user="alice"} 0\n').encode()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        def log_message(self, *args):
+            pass
+    http = HTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=http.serve_forever, daemon=True)
+    worker.start()
+    state.cfg = tmp_path / "config.toml"
+    state.database = tmp_path / "history.db"
+    def configure(enabled=True):
+        state.cfg.write_text(f'[monitor]\ntraffic_history_enabled = {str(enabled).lower()}\n'
+            f'[metrics]\nenabled = true\nport = {http.server_port}\n'
+            '[access.users]\nalice = "0123456789abcdef0123456789abcdef"\n')
+    state.configure = configure
+    configure()
+    monkeypatch.setattr(server, "_find_config_path", lambda: state.cfg)
+    monkeypatch.setattr(server, "_proxy_config_candidates", lambda: [state.cfg])
+    monkeypatch.setattr(server, "TrafficHistory", lambda _: TrafficHistory(state.database))
+    monkeypatch.setattr(server, "_traffic_snapshot", {})
+    yield state
+    http.shutdown()
+    http.server_close()
+    worker.join()
+
+
+def test_traffic_http_never_creates_tls_contexts(traffic_probe, monkeypatch):
+    import ssl
+    server._traffic_http_opener.cache_clear()
+    def unexpected_context(*args, **kwargs):
+        raise AssertionError("HTTP metrics must not allocate TLS certificate stores")
+    monkeypatch.setattr(ssl, "_create_default_https_context", unexpected_context)
+    for _ in range(3):
+        server._traffic_sample()
+        assert server._traffic_snapshot["available"]
+    assert traffic_probe.requests == 3
+
+
+def test_disabled_history_does_not_scrape_or_create_database(traffic_probe):
+    traffic_probe.configure(False)
+    server._traffic_sample()
+    assert server._traffic_snapshot == {"available": False, "error": "history_disabled", "items": {}}
+    assert traffic_probe.requests == 0
+    assert not traffic_probe.database.exists()
+    assert server.tomllib.loads(traffic_probe.cfg.read_text())["metrics"]["enabled"] is True
+
+
+def test_history_pause_keeps_database_and_excludes_paused_bytes(traffic_probe):
+    server._traffic_sample()
+    traffic_probe.tx = 150
+    server._traffic_sample()
+    assert server._traffic_snapshot["items"]["alice"]["totals"]["30"] == 50
+    before = traffic_probe.database.read_bytes()
+    traffic_probe.configure(False)
+    server._traffic_sample()
+    assert traffic_probe.database.read_bytes() == before
+    assert traffic_probe.requests == 2
+    traffic_probe.tx = 1000
+    traffic_probe.configure(True)
+    server._traffic_sample()
+    assert server._traffic_snapshot["items"]["alice"]["totals"]["30"] == 50
+    traffic_probe.tx = 1025
+    server._traffic_sample()
+    assert server._traffic_snapshot["items"]["alice"]["totals"]["30"] == 75
+
+
+def test_traffic_http_rejects_redirects(traffic_probe):
+    traffic_probe.status = 302
+    server._traffic_sample()
+    assert server._traffic_snapshot["error"] == "metrics_unavailable"
+    assert traffic_probe.requests == 1
+    assert not traffic_probe.database.exists()
+
+
+@pytest.mark.parametrize("value", ['"false"', '0', '[]'])
+def test_invalid_history_flag_does_not_silently_enable_collection(traffic_probe, value):
+    traffic_probe.cfg.write_text(traffic_probe.cfg.read_text().replace('traffic_history_enabled = true', f'traffic_history_enabled = {value}'))
+    server._traffic_sample()
+    assert server._traffic_snapshot["error"] == "history_config_invalid"
+    assert traffic_probe.requests == 0
+    assert not traffic_probe.database.exists()
+
+
+def test_traffic_scrape_ignores_environment_proxies(traffic_probe, monkeypatch):
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    server._traffic_sample()
+    assert server._traffic_snapshot["available"]
+    assert traffic_probe.requests == 1
+
+
+def test_traffic_scrape_keeps_response_size_limit(traffic_probe):
+    traffic_probe.payload = b"x" * (4 * 1024 * 1024 + 1)
+    server._traffic_sample()
+    assert server._traffic_snapshot["error"] == "metrics_unavailable"
+    assert not traffic_probe.database.exists()
