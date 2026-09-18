@@ -9,6 +9,14 @@ This folder contains practical tools to validate **capacity**, **stability**, an
 - `e2e/run.py` — process-level integration harness (`make e2e` / `zig build e2e`).
 - `installer-e2e/run.sh` — distro-matrix installer smoke, including tunnel dependency installers.
 
+The Debian 11 installer fixture uses the official final-LTS snapshots from
+2026-08-31: [Debian](https://snapshot.debian.org/archive/debian/20260831T204404Z/)
+and [Debian security](https://snapshot.debian.org/archive/debian-security/20260831T211327Z/).
+This avoids [removed bullseye-security packages](https://lists.debian.org/debian-mirrors/2026/09/msg00001.html)
+after LTS ended. Only those immutable test-image sources disable `Valid-Until`;
+APT still verifies Debian archive signatures and package hashes. Other distro
+fixtures, host APT configuration and production installation sources are unchanged.
+
 ## E2E Harness
 
 Run all integration scenarios in one command:
