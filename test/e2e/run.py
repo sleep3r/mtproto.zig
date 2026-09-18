@@ -131,6 +131,60 @@ def recv_until(sock: socket.socket, marker: bytes, limit: int = 8192) -> bytes:
     return bytes(buf)
 
 
+def web_capability(domain: str, secret_hex: str = DEFAULT_SECRET_HEX) -> str:
+    mac = hmac.new(b"\xdd" + bytes.fromhex(secret_hex),
+                   b"tdesktop-web-proxy-bridge-v1\n" + domain.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode().rstrip("=")
+
+
+def relay_http_request(port: int, target: str, domain: str, extra_headers: tuple[str, ...] = ()) -> tuple[bytes, bytes]:
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+        lines = [f"GET {target} HTTP/1.1", f"Host: {domain}", "Connection: close", *extra_headers, "", ""]
+        client.sendall("\r\n".join(lines).encode())
+        response = bytearray()
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response.extend(chunk)
+    head, marker, body = bytes(response).partition(b"\r\n\r\n")
+    assert marker, f"incomplete HTTP response for {target}: {bytes(response[:100])!r}"
+    return head, body
+
+
+def bridge_token(body: bytes) -> str:
+    marker = b'<meta name="tproxy-token" content="'
+    start = body.find(marker)
+    assert start >= 0, "bridge response omitted token metadata"
+    start += len(marker)
+    end = body.find(b'">', start)
+    token = body[start:end].decode()
+    assert len(token) == 43 and all(c.isalnum() or c in "-_" for c in token), "malformed bridge token"
+    return token
+
+
+def relay_websocket(port: int, domain: str, token: str, *, target: str = "/api/v1/socket", duplicate_protocol: bool = False) -> tuple[socket.socket, bytes]:
+    client = socket.create_connection(("127.0.0.1", port), timeout=3)
+    protocol = f"tproxy-v1.{token}"
+    headers = (f"GET {target} HTTP/1.1\r\n"
+               f"Host: {domain}\r\nOrigin: https://{domain}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Version: 13\r\n"
+               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+               f"Sec-WebSocket-Protocol: {protocol}\r\n")
+    if duplicate_protocol:
+        headers += f"Sec-WebSocket-Protocol: {protocol}\r\n"
+    client.sendall((headers + "\r\n").encode())
+    return client, recv_until(client, b"\r\n\r\n")
+
+
+def send_websocket_frame(client: socket.socket, kind: int, stream: int, payload: bytes = b"") -> None:
+    data = bytes([kind]) + stream.to_bytes(3, "big") + struct.pack(">I", len(payload)) + payload
+    mask = b"\x12\x34\x56\x78"
+    size = bytes([0x80 | len(data)]) if len(data) < 126 else b"\xfe" + struct.pack(">H", len(data))
+    client.sendall(b"\x82" + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
 def build_tls_record(record_type: int, payload: bytes) -> bytes:
     return bytes([record_type, 0x03, 0x03]) + struct.pack(">H", len(payload)) + payload
 
@@ -1635,6 +1689,105 @@ def scenario_guard_admission_metrics() -> None:
             proxy.stop()
 
 
+def scenario_web_http_contract() -> None:
+    """Bridge bootstrap tokens stay out of URLs and public files remain independent."""
+    domain = "relay.example.test"
+    socks = FakeSocks5Server(mode="success")
+    socks.start()
+
+    def start(public_dir: Optional[Path] = None):
+        proxy_port, relay_port = free_port(), free_port()
+        cfg = base_config(port=proxy_port, web_enabled=True, mask=False, upstream_type="socks5",
+                          upstream_host="127.0.0.1", upstream_port=socks.port, web_domain=domain)
+        cfg = cfg.replace("[web]", f"[web]\nport = {relay_port}")
+        if public_dir is not None:
+            cfg = cfg.replace("only = false", f'only = false\npublic_dir = "{public_dir}"')
+        proxy = start_proxy(cfg, proxy_port)
+        log = open(proxy.workdir / "relay.log", "wb")
+        relay = subprocess.Popen([str(ACTIVE_PROXY_BIN), "web-relay", str(proxy.cfg_path)],
+                                 stdout=log, stderr=subprocess.STDOUT)
+        log.close()
+        assert wait_for_listen("127.0.0.1", relay_port, 8), "WEB relay did not start"
+        return proxy, relay, relay_port
+
+    def stop(proxy: ProxyInstance, relay: subprocess.Popen[bytes]) -> None:
+        relay.terminate()
+        try:
+            relay.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            relay.kill()
+            relay.wait(timeout=3)
+        proxy.stop()
+
+    proxy, relay, relay_port = start()
+    try:
+        head, body = relay_http_request(relay_port, "/", domain)
+        assert b" 404 " in head.split(b"\r\n", 1)[0] and body == b"Not Found\n", "unset public_dir must be an ordinary 404"
+
+        cap = web_capability(domain)
+        bridge_head, bridge_body = relay_http_request(relay_port, "/?bridge=" + cap, domain)
+        assert b" 200 " in bridge_head.split(b"\r\n", 1)[0]
+        token = bridge_token(bridge_body)
+        assert token.encode() not in bridge_head, "carrier token leaked into response headers"
+        assert b"script-src 'nonce-" in bridge_head and b"'unsafe-inline'" not in bridge_head
+
+        malformed_head, _ = relay_http_request(relay_port, "/?bridge=" + cap + "&x=1", domain)
+        assert b" 404 " in malformed_head.split(b"\r\n", 1)[0], "malformed genuine bridge navigation selected public content"
+
+        duplicate, duplicate_head = relay_websocket(relay_port, domain, token, duplicate_protocol=True)
+        duplicate.close()
+        assert b" 404 " in duplicate_head.split(b"\r\n", 1)[0], "duplicate subprotocol header upgraded"
+
+        query, query_head = relay_websocket(relay_port, domain, cap, target="/api/v1/socket?b=" + cap)
+        query.close()
+        assert b" 404 " in query_head.split(b"\r\n", 1)[0], "permanent query capability upgraded"
+
+        first, first_head = relay_websocket(relay_port, domain, token)
+        assert b" 101 " in first_head.split(b"\r\n", 1)[0], "issued carrier token did not upgrade"
+        concurrent, concurrent_head = relay_websocket(relay_port, domain, token)
+        concurrent.close()
+        assert b" 404 " in concurrent_head.split(b"\r\n", 1)[0], "one token attached two active sockets"
+        first.close()
+
+        retried = None
+        retry_head = b""
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            retried, retry_head = relay_websocket(relay_port, domain, token)
+            if b" 101 " in retry_head.split(b"\r\n", 1)[0]:
+                break
+            retried.close()
+            time.sleep(0.03)
+        assert retried is not None and b" 101 " in retry_head.split(b"\r\n", 1)[0], "unused token was not reusable after disconnect"
+        send_websocket_frame(retried, 0x10, 0, b"\x01")
+        assert recv_exact(retried, 10) == b"\x82\x08\x11\x00\x00\x00\x00\x00\x00\x00"
+        retried.close()
+        time.sleep(0.05)
+        consumed, consumed_head = relay_websocket(relay_port, domain, token)
+        consumed.close()
+        assert b" 404 " in consumed_head.split(b"\r\n", 1)[0], "HELLO-consumed token resumed a session"
+    finally:
+        stop(proxy, relay)
+
+    with tempfile.TemporaryDirectory(prefix="mtproto-web-public-") as temp:
+        public_dir = Path(temp)
+        (public_dir / "index.html").write_bytes(b"operator home")
+        (public_dir / "style.css").write_bytes(b"body{color:navy}")
+        proxy, relay, relay_port = start(public_dir)
+        try:
+            head, body = relay_http_request(relay_port, "/", domain)
+            assert b" 200 " in head.split(b"\r\n", 1)[0] and body == b"operator home"
+            css_head, css = relay_http_request(relay_port, "/style.css", domain)
+            assert b"Content-Type: text/css; charset=utf-8" in css_head and css == b"body{color:navy}"
+            missing_head, missing = relay_http_request(relay_port, "/missing", domain)
+            assert b" 404 " in missing_head.split(b"\r\n", 1)[0] and missing == b"Not Found\n"
+            bad_head, bad_body = relay_http_request(relay_port, "/?bridge=" + "A" * 43, domain)
+            assert b" 200 " in bad_head.split(b"\r\n", 1)[0] and bad_body == b"operator home"
+        finally:
+            stop(proxy, relay)
+    socks.stop()
+
+
 def scenario_web_specific_bind() -> None:
     """Issue #407: real WEB relay reaches a specific listener, not another service
     on loopback at the same port, without trusting ordinary non-loopback clients."""
@@ -1658,27 +1811,19 @@ def scenario_web_specific_bind() -> None:
                 relay = subprocess.Popen([str(ACTIVE_PROXY_BIN), "web-relay", str(proxy.cfg_path)],
                                          stdout=log, stderr=subprocess.STDOUT)
             assert wait_for_listen("127.0.0.1", relay_port, 8), "WEB relay did not start"
-            mac = hmac.new(b"\xdd" + bytes.fromhex(DEFAULT_SECRET_HEX),
-                           b"tdesktop-web-proxy-bridge-v1\nrelay.example.test", hashlib.sha256).digest()
-            cap = base64.urlsafe_b64encode(mac).decode().rstrip("=")
-            with socket.create_connection(("127.0.0.1", relay_port), timeout=3) as ws:
-                ws.sendall((f"GET /api/v1/socket?b={cap} HTTP/1.1\r\n"
-                            "Host: relay.example.test\r\nOrigin: https://relay.example.test\r\n"
-                            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                            "Sec-WebSocket-Version: 13\r\n"
-                            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").encode())
-                assert b"101" in recv_until(ws, b"\r\n\r\n").split(b"\r\n")[0]
+            cap = web_capability("relay.example.test")
+            bridge_head, bridge_body = relay_http_request(relay_port, "/?bridge=" + cap, "relay.example.test")
+            assert b" 200 " in bridge_head.split(b"\r\n", 1)[0], "bridge bootstrap rejected"
+            token = bridge_token(bridge_body)
+            ws, upgrade = relay_websocket(relay_port, "relay.example.test", token)
+            with ws:
+                assert b"101" in upgrade.split(b"\r\n")[0]
+                assert f"Sec-WebSocket-Protocol: tproxy-v1.{token}".encode() in upgrade
 
-                def send_frame(kind: int, stream: int, payload: bytes = b"") -> None:
-                    data = bytes([kind]) + stream.to_bytes(3, "big") + struct.pack(">I", len(payload)) + payload
-                    mask = b"\x12\x34\x56\x78"
-                    size = bytes([0x80 | len(data)]) if len(data) < 126 else b"\xfe" + struct.pack(">H", len(data))
-                    ws.sendall(b"\x82" + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
-
-                send_frame(0x10, 0, b"\x01")
+                send_websocket_frame(ws, 0x10, 0, b"\x01")
                 assert recv_exact(ws, 10) == b"\x82\x08\x11\x00\x00\x00\x00\x00\x00\x00", "no WEB WELCOME"
-                send_frame(0x01, 1)
-                send_frame(0x02, 1, generate_obf_handshake(DEFAULT_SECRET_HEX, 1, "secure") + b"\x55" * 128)
+                send_websocket_frame(ws, 0x01, 1)
+                send_websocket_frame(ws, 0x02, 1, generate_obf_handshake(DEFAULT_SECRET_HEX, 1, "secure") + b"\x55" * 128)
                 assert_client_payload_relayed(socks, 128, "WEB specific-bind stream did not reach DC", 5)
             with connect_from(host, host, port) as direct:
                 direct.sendall(generate_obf_handshake(DEFAULT_SECRET_HEX, 1, "secure"))
@@ -1771,6 +1916,7 @@ SCENARIOS: dict[str, Callable[[], None]] = {
     "middleproxy_fallback_to_direct": scenario_middleproxy_fallback_to_direct,
     "mask_fallback_local_nginx": scenario_mask_fallback_local_nginx,
     "mask_fallback_custom_target": scenario_mask_fallback_custom_target,
+    "web_http_contract": scenario_web_http_contract,
     "web_specific_bind": scenario_web_specific_bind,
     "web_only_serves_relay": scenario_web_only_still_serves_the_relay,
     "web_only_masks_direct_client": scenario_web_only_masks_a_direct_client,

@@ -1,32 +1,15 @@
-//! The two pages the relay serves: an ordinary cover site, and the bridge.
+//! HTML generation for the authenticated browser bridge.
 //!
-//! ## Why they look identical
-//!
-//! Telegram Desktop only ever navigates to `https://<host>/?bridge=<capability>`, and
-//! that capability is `HMAC-SHA256(user secret)` — so a visitor who cannot present one
-//! derived from a configured user secret never receives the bridge at all. Both
-//! responses therefore render the *same* visible page; the bridge response merely adds
-//! an inline script. An active prober without a valid secret sees a plain website, and
-//! a curious human who opens the bridge link sees the same plain website too.
-//!
-//! ## Why the cover page is generated, not a constant
-//!
-//! It used to be one comptime string, which meant every mtproto.zig relay on earth
-//! answered `GET /` with byte-identical HTML: one SHA-256 of the body — or one grep for
-//! "This host serves static content only." — turned the list of relay domains anybody
-//! can lift out of CT logs into a list of confirmed deployments, no secret and no
-//! behavioural probing needed. `renderCover` picks the wording, the palette, the type
-//! and the layout from a hash of the relay's own hostname instead, so there is no
-//! cross-deployment signature left to match. Its only input is the hostname the visitor
-//! already typed, so nothing about the operator or their users can reach the page.
+//! The public response is owned by the configured site directory. The bridge is a
+//! minimal script-only document with no styles or external dependencies, so public
+//! markup, closing tags, and resources cannot change the carrier protocol.
 //!
 //! ## What the bridge script may use
 //!
-//! It runs inside `lib_webview`'s restricted profile, whose document-start lock script
-//! `undefined`s storage, workers, WebAssembly, WebRTC, WebTransport, media capture and
-//! more, and installs a `<meta>` CSP that permits only inline script plus connections to
-//! this exact origin. So the script below is deliberately ES5-ish, allocation-light, and
-//! uses nothing but `WebSocket`, `postMessage`, `setInterval` and the DOM.
+//! It runs inside `lib_webview`'s restricted profile. The relay supplies a short-lived
+//! carrier bearer and CSP nonce to `renderSessionBridge`; the bearer is sent only as the
+//! WebSocket subprotocol and never copied into the WebSocket URL. The script is
+//! deliberately ES5-ish and uses a small browser API surface.
 //!
 //! ## The two client transports it must speak
 //!
@@ -47,307 +30,229 @@
 
 const std = @import("std");
 
-/// The closing tags every cover page ends with. `renderBridge` splits here to inject the
-/// bridge script, so a generated page that does not end exactly like this is rejected.
-const cover_tail = "\n</body></html>";
+const bridge_document_head =
+    \\<!doctype html>
+    \\<html lang="en"><head>
+    \\<meta charset="utf-8">
+    \\<meta name="viewport" content="width=device-width,initial-scale=1">
+    \\<meta name="tproxy-token" content="
+;
 
-/// One placeholder site's words. Deliberately unremarkable and interchangeable: a domain
-/// that serves a small static placeholder is the least interesting thing on the internet,
-/// and there are millions of these pages already.
-const CoverText = struct {
-    title: []const u8,
-    heading: []const u8,
-    body: []const u8,
-};
+const bridge_path_meta =
+    \\">
+    \\<meta name="tproxy-ws-path" content="
+;
 
-const cover_texts = [_]CoverText{
-    .{ .title = "Welcome", .heading = "Welcome", .body = "This server is up and running. There is no content at this address yet." },
-    .{ .title = "Coming soon", .heading = "Coming soon", .body = "This site has not been published yet. Please check back later." },
-    .{ .title = "Placeholder", .heading = "Placeholder page", .body = "The site for this domain has not been set up." },
-    .{ .title = "Under construction", .heading = "Under construction", .body = "This page is still being worked on. Thanks for your patience." },
-    .{ .title = "Maintenance", .heading = "Down for maintenance", .body = "The site is temporarily offline while some changes are made." },
-    .{ .title = "New site", .heading = "It works!", .body = "The web server is installed and working. Replace this page with your own." },
-    .{ .title = "Parked domain", .heading = "Domain parked", .body = "No website has been configured for this address." },
-    .{ .title = "Index", .heading = "Nothing here yet", .body = "This address serves no content at the moment." },
-};
+const bridge_script_open =
+    \\">
+    \\<title>Connection</title>
+    \\</head><body>
+    \\<script nonce="
+;
 
-const Palette = struct {
-    bg: []const u8,
-    fg: []const u8,
-    muted: []const u8,
-    dark_bg: []const u8,
-    dark_fg: []const u8,
-    dark_muted: []const u8,
-};
-
-const palettes = [_]Palette{
-    .{ .bg = "#fbfbfc", .fg = "#1c1e21", .muted = "#6b7280", .dark_bg = "#0f1115", .dark_fg = "#e7e9ee", .dark_muted = "#9aa1ad" },
-    .{ .bg = "#ffffff", .fg = "#222222", .muted = "#767676", .dark_bg = "#121212", .dark_fg = "#ededed", .dark_muted = "#a0a0a0" },
-    .{ .bg = "#f7f6f3", .fg = "#2b2a27", .muted = "#7a776f", .dark_bg = "#1a1917", .dark_fg = "#e8e6e1", .dark_muted = "#a5a29a" },
-    .{ .bg = "#f4f6f8", .fg = "#1f2933", .muted = "#69707d", .dark_bg = "#141a20", .dark_fg = "#e3e8ee", .dark_muted = "#95a0ad" },
-    .{ .bg = "#fdfdfb", .fg = "#33322e", .muted = "#77756d", .dark_bg = "#17171a", .dark_fg = "#eceaea", .dark_muted = "#9c9a9a" },
-    .{ .bg = "#f5f5f5", .fg = "#111111", .muted = "#666666", .dark_bg = "#101010", .dark_fg = "#f0f0f0", .dark_muted = "#909090" },
-};
-
-const font_stacks = [_][]const u8{
-    "-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif",
-    "system-ui,-apple-system,\"Segoe UI\",Roboto,Arial,sans-serif",
-    "\"Helvetica Neue\",Helvetica,Arial,sans-serif",
-    "Georgia,\"Times New Roman\",Times,serif",
-};
-
-const line_heights = [_][]const u8{ "1.45", "1.5", "1.55", "1.6" };
-const heading_sizes = [_][]const u8{ "1.125rem", "1.25rem", "1.375rem", "1.5rem" };
-const paddings = [_][]const u8{ "1.5rem", "2rem", "2.5rem" };
-
-/// Domain separation for the page seed, so the digest can never collide with any other
-/// use of the hostname (the bridge capability HMACs the same string under a user secret).
-const cover_label = "mtproto.zig web cover page v1\n";
-
-/// Render this deployment's cover page.
-///
-/// Everything visible is selected from a hash of `domain`: the same host always gets the
-/// same page (so it looks like a site, not like something regenerating itself), and two
-/// hosts get different ones (so no single body hash or grep string identifies a relay).
-/// The domain itself never appears in the output — the page must say nothing the visitor
-/// did not already know.
-pub fn renderCover(allocator: std.mem.Allocator, domain: []const u8) ![]u8 {
-    var seed: [32]u8 = undefined;
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(cover_label);
-    hasher.update(domain);
-    hasher.final(&seed);
-
-    const text = cover_texts[seed[0] % cover_texts.len];
-    const palette = palettes[seed[1] % palettes.len];
-    const font = font_stacks[seed[2] % font_stacks.len];
-    const base_px: u8 = 15 + seed[3] % 3;
-    const line_height = line_heights[seed[4] % line_heights.len];
-    const width_rem: u8 = 28 + seed[5] % 7;
-    const padding = paddings[seed[6] % paddings.len];
-    const heading_size = heading_sizes[seed[7] % heading_sizes.len];
-    // A placeholder is as often pinned to the top of the page as centred in it.
-    const layout = if (seed[8] & 1 == 0)
-        "min-height:100vh;display:grid;place-items:center;"
-    else
-        "padding:4rem 1rem;";
-    const align_rule = if (seed[9] & 1 == 0) "text-align:center" else "text-align:left";
-    const robots = if (seed[10] & 1 == 0) "<meta name=\"robots\" content=\"noindex,nofollow\">\n" else "";
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.print(allocator,
-        \\<!doctype html>
-        \\<html lang="en"><head>
-        \\<meta charset="utf-8">
-        \\<meta name="viewport" content="width=device-width,initial-scale=1">
-        \\{s}<title>{s}</title>
-        \\<style>
-        \\:root{{color-scheme:light dark}}
-        \\body{{margin:0;{s}
-        \\font:{d}px/{s} {s};
-        \\background:{s};color:{s}}}
-        \\main{{width:min({d}rem,calc(100% - 3rem));margin:0 auto;padding:{s};{s}}}
-        \\h1{{margin:0 0 .5rem;font-size:{s};font-weight:600;letter-spacing:-.01em}}
-        \\p{{margin:0;color:{s};font-size:.9375rem}}
-        \\@media (prefers-color-scheme:dark){{body{{background:{s};color:{s}}}p{{color:{s}}}}}
-        \\</style>
-        \\</head><body>
-        \\<main><h1>{s}</h1><p>{s}</p></main>
-        \\</body></html>
-    , .{
-        robots,          text.title,
-        layout,          base_px,
-        line_height,     font,
-        palette.bg,      palette.fg,
-        width_rem,       padding,
-        align_rule,      heading_size,
-        palette.muted,   palette.dark_bg,
-        palette.dark_fg, palette.dark_muted,
-        text.heading,    text.body,
-    });
-    return out.toOwnedSlice(allocator);
-}
-
-const script_head =
-    \\
-    \\<script>
+const bridge_script_vars =
+    \\">
     \\(function(){"use strict";
     \\var WS_PATH=
 ;
 
-const script_body =
+const bridge_token_var =
+    \\,TOKEN=
+;
+
+const bridge_script_body =
     \\;
-    \\var CAP=null,NONCE=null,client=null,ws=null,wsReady=false,adopted=false;
-    \\var toClient=[],toRelay=[],preAdopt=[],attempts=0,dead=false,up=0,down=0,lastUp=0,lastDown=0;
-    \\try{var m=/[?&]bridge=([A-Za-z0-9_-]{43})(?:&|$)/.exec(location.search);if(m)CAP=m[1];
-    \\// The nonce is base64url, which needs no escaping, but decode once anyway so a
-    \\// platform that percent-encodes the fragment still matches what the client expects.
-    \\var hash=location.hash||"";
-    \\if(hash.indexOf("#android=")===0){
-    \\ var raw=hash.slice(9);
-    \\ try{raw=decodeURIComponent(raw)}catch(e){}
-    \\ if(raw.length&&raw.length<=128)NONCE=raw;
-    \\}}catch(e){}
-    \\
-    \\function control(obj){
-    \\ if(!client)return;
-    \\ try{client.control(obj)}catch(e){}
+    \\var QUEUE_BYTES=33554432,QUEUE_ITEMS=16384,MAX_FRAME=1048576,MAX_FRAMES=4096;
+    \\var client=null,nativeBridge=null,ws=null,wsReady=false,adopted=false,dead=false;
+    \\// Keep bounded pre-WELCOME payload references for retry. Browser send() only
+    \\// queues bytes locally; it does not prove the relay parsed HELLO. If it did parse
+    \\// HELLO, the relay consumes the token and correctly rejects the retry.
+    \\var replay=[],replayBytes=0,replayItems=0,sendIndex=0,attempts=0,retryTimer=0,pumpTimer=0;
+    \\// socketQueue holds remaining payload bytes per WebSocket message. Its head index
+    \\// avoids front-removal copies; bufferedAmount deltas retire whole or partial heads.
+    \\var socketQueue=[],socketHead=0,socketItems=0,socketBytes=0;
+    \\var up=0,down=0,lastUp=0,lastDown=0;
+    \\var match=/^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash||""),androidNonce=match?match[1]:null;
+    \\function control(value){if(client&&!dead)try{client.control(value)}catch(e){}}
+    \\function status(value){control({t:"status",state:value})}
+    \\function clearReplay(){replay.length=0;replayBytes=0;replayItems=0;sendIndex=0}
+    \\function clearSocketQueue(){socketQueue.length=0;socketHead=0;socketItems=0;socketBytes=0}
+    \\function rawBuffered(){
+    \\ if(!ws||!wsReady)return 0;
+    \\ var value=Number(ws.bufferedAmount);return isFinite(value)&&value>0?value:0;
     \\}
-    \\function status(state){control({t:"status",state:state})}
-    \\function fail(){
-    \\ if(dead)return;dead=true;status("failed");
-    \\ try{if(ws)ws.close(1000)}catch(e){}
-    \\ ws=null;wsReady=false;
+    \\function compactSocketQueue(){
+    \\ if(socketHead===socketQueue.length){clearSocketQueue();return}
+    \\ if(socketHead>=1024&&socketHead*2>=socketQueue.length){socketQueue=socketQueue.slice(socketHead);socketHead=0}
     \\}
-    \\function toClientDeliver(buf){
+    \\function reconcileSocketQueue(){
+    \\ var transmitted=socketBytes-rawBuffered();
+    \\ if(transmitted<=0)return;
+    \\ if(transmitted>socketBytes)transmitted=socketBytes;
+    \\ while(transmitted>0&&socketHead<socketQueue.length){
+    \\  var remaining=socketQueue[socketHead];
+    \\  if(transmitted<remaining){socketQueue[socketHead]=remaining-transmitted;socketBytes-=transmitted;transmitted=0;break}
+    \\  transmitted-=remaining;socketBytes-=remaining;socketItems--;socketHead++;
+    \\ }
+    \\ compactSocketQueue();
+    \\}
+    \\function recordSocketMessage(bytes){socketQueue.push(bytes);socketItems++;socketBytes+=bytes}
+    \\function finish(report){
     \\ if(dead)return;
-    \\ if(!client){toClient.push(buf);return}
-    \\ try{client.binary(buf);adopted=true}catch(e){fail()}
+    \\ if(report)status("failed");
+    \\ dead=true;wsReady=false;
+    \\ if(retryTimer)try{clearTimeout(retryTimer)}catch(e){}
+    \\ if(pumpTimer)try{clearTimeout(pumpTimer)}catch(e){}
+    \\ retryTimer=0;pumpTimer=0;clearReplay();clearSocketQueue();
+    \\ var socket=ws;ws=null;if(socket)try{socket.close(1000)}catch(e){}
+    \\ if(nativeBridge)try{nativeBridge.onmessage=null}catch(e){}
+    \\ if(client)try{client.close()}catch(e){}
+    \\ client=null;nativeBridge=null;
     \\}
-    \\function flushToClient(){
-    \\ while(client&&toClient.length){toClientDeliver(toClient.shift())}
+    \\function fail(){finish(true)}
+    \\function knownType(value){return value===1||value===2||value===3||value===4||value===5||value===6||value===16||value===17||value===18||value===19||value===31}
+    \\function splitFrames(value){
+    \\ var view=new DataView(value),result=[],offset=0;
+    \\ while(offset<value.byteLength){
+    \\  if(value.byteLength-offset<8||result.length>=MAX_FRAMES)throw new Error("invalid frame batch");
+    \\  var type=view.getUint8(offset),size=view.getUint32(offset+4),end=offset+8+size;
+    \\  if(!knownType(type)||size>MAX_FRAME||end>value.byteLength)throw new Error("invalid frame");
+    \\  result.push({type:type,id:(view.getUint8(offset+1)<<16)|(view.getUint8(offset+2)<<8)|view.getUint8(offset+3),size:size,data:value.slice(offset,end)});
+    \\  offset=end;
+    \\ }
+    \\ if(!result.length)throw new Error("empty frame batch");
+    \\ return result;
     \\}
-    \\function toRelaySend(buf){
-    \\ if(dead)return;
-    \\ // Until the carrier is adopted the only thing the client has sent is HELLO, and a
-    \\ // reconnect would land on a fresh relay session that never received it — so keep a
-    \\ // copy and replay it. After adoption a reconnect is not attempted at all.
-    \\ if(!adopted&&preAdopt.indexOf(buf)<0)preAdopt.push(buf);
-    \\ if(!wsReady){toRelay.push(buf);return}
-    \\ try{up+=buf.byteLength;ws.send(buf)}catch(e){fail()}
+    \\function deliver(value){
+    \\ var frames;
+    \\ try{frames=splitFrames(value)}catch(e){fail();return}
+    \\ reconcileSocketQueue();
+    \\ if(!adopted){
+    \\  if(frames.length!==1||frames[0].type!==17||frames[0].id!==0||frames[0].size!==0){fail();return}
+    \\  adopted=true;clearReplay();
+    \\ }
+    \\ down+=value.byteLength;
+    \\ try{
+    \\  if(client.native)for(var i=0;i<frames.length;i++)client.binary(frames[i].data);
+    \\  else client.binary(value);
+    \\ }catch(e){fail()}
     \\}
-    \\function flushToRelay(){
-    \\ while(wsReady&&toRelay.length){toRelaySend(toRelay.shift())}
+    \\function schedulePump(){
+    \\ if(!pumpTimer)pumpTimer=setTimeout(function(){pumpTimer=0;pump()},10);
     \\}
-    \\
+    \\function pump(){
+    \\ if(dead||adopted||!wsReady)return;
+    \\ while(sendIndex<replay.length){
+    \\  reconcileSocketQueue();
+    \\  if(replayItems+socketItems>=QUEUE_ITEMS){schedulePump();return}
+    \\  var value=replay[sendIndex],held=replayBytes+rawBuffered();
+    \\  if(value.byteLength>QUEUE_BYTES-held){schedulePump();return}
+    \\  try{ws.send(value)}catch(e){fail();return}
+    \\  recordSocketMessage(value.byteLength);up+=value.byteLength;sendIndex++;
+    \\ }
+    \\}
+    \\function send(value){
+    \\ if(dead||!(value instanceof ArrayBuffer)||!value.byteLength)return;
+    \\ reconcileSocketQueue();
+    \\ if(adopted){
+    \\  if(socketItems>=QUEUE_ITEMS||value.byteLength>QUEUE_BYTES-rawBuffered()){fail();return}
+    \\  try{ws.send(value);recordSocketMessage(value.byteLength);up+=value.byteLength}catch(e){fail()}
+    \\  return;
+    \\ }
+    \\ if(replayItems+socketItems>=QUEUE_ITEMS||value.byteLength>QUEUE_BYTES-replayBytes-rawBuffered()){fail();return}
+    \\ replay.push(value);replayBytes+=value.byteLength;replayItems++;pump();
+    \\}
     \\function connect(){
-    \\ if(dead||ws||!CAP)return;
+    \\ if(dead||ws)return;
     \\ status(attempts?"reconnecting":"connecting");
-    \\ var scheme="wss://";
     \\ var socket;
-    \\ try{socket=new WebSocket(scheme+location.host+WS_PATH+"?b="+CAP)}catch(e){fail();return}
+    \\ try{socket=new WebSocket("wss://"+location.host+WS_PATH,"tproxy-v1."+TOKEN)}catch(e){fail();return}
     \\ ws=socket;socket.binaryType="arraybuffer";
-    \\ socket.onopen=function(){
-    \\  if(ws!==socket)return;
-    \\  wsReady=true;
-    \\  if(attempts){toRelay=preAdopt.slice()}
-    \\  flushToRelay();status("connected");
-    \\ };
-    \\ socket.onmessage=function(ev){
-    \\  if(ws!==socket)return;
-    \\  var d=ev.data;if(!(d instanceof ArrayBuffer)||!d.byteLength)return;
-    \\  down+=d.byteLength;toClientDeliver(d);
-    \\ };
+    \\ socket.onopen=function(){if(ws!==socket||dead)return;wsReady=true;sendIndex=0;pump();status("connected")};
+    \\ socket.onmessage=function(event){if(ws!==socket||dead)return;var value;try{value=event.data}catch(e){fail();return}if(!(value instanceof ArrayBuffer)||!value.byteLength){fail();return}deliver(value)};
     \\ socket.onerror=function(){};
     \\ socket.onclose=function(){
-    \\  if(ws!==socket)return;
-    \\  ws=null;wsReady=false;
-    \\  // Once the client has adopted this carrier its logical sockets live in the relay
-    \\  // session we just lost; no session is migrated across carriers, so reconnecting
-    \\  // here would hand the client a second WELCOME and it would drop us anyway.
-    \\  if(adopted||dead){fail();return}
-    \\  if(attempts>=2){fail();return}
-    \\  attempts++;setTimeout(connect,attempts*1000);
+    \\  if(ws!==socket)return;ws=null;wsReady=false;clearSocketQueue();
+    \\  if(dead)return;
+    \\  if(adopted||attempts>=2){fail();return}
+    \\  attempts++;retryTimer=setTimeout(function(){retryTimer=0;connect()},attempts*1000);
     \\ };
     \\}
-    \\
-    \\function clientControl(text){
-    \\ var obj=null;try{obj=JSON.parse(text)}catch(e){return}
-    \\ if(obj&&obj.t==="close")fail();
-    \\}
+    \\function clientControl(text){var value=null;try{value=JSON.parse(text)}catch(e){return}if(value&&value.t==="close")finish(false)}
     \\function useNative(bridge){
-    \\ if(client)return;
-    \\ client={
-    \\  binary:function(buf){bridge.postMessage(buf)},
-    \\  control:function(obj){bridge.postMessage(JSON.stringify(obj))}
-    \\ };
-    \\ bridge.onmessage=function(ev){
-    \\  try{
-    \\   var d=ev.data;
-    \\   if(typeof d==="string"){clientControl(d);return}
-    \\   if(d instanceof ArrayBuffer&&d.byteLength)toRelaySend(d);
-    \\  }catch(e){}
-    \\ };
-    \\ // Announce only after onmessage is live: HELLO follows this message immediately.
-    \\ control({t:"tproxy-android-init",v:1,nonce:NONCE});
-    \\ flushToClient();connect();
+    \\ if(client||dead)return;nativeBridge=bridge;
+    \\ client={native:true,binary:function(value){bridge.postMessage(value)},control:function(value){bridge.postMessage(JSON.stringify(value))},close:function(){bridge.onmessage=null}};
+    \\ bridge.onmessage=function(event){try{var value=event.data;if(typeof value==="string"){clientControl(value);return}send(value)}catch(e){}};
+    \\ control({t:"tproxy-android-init",v:1,nonce:androidNonce});connect();
     \\}
     \\function useParentPort(port){
-    \\ if(client)return;
-    \\ client={
-    \\  binary:function(buf){port.postMessage(buf,[buf])},
-    \\  control:function(obj){port.postMessage(obj)}
-    \\ };
-    \\ port.onmessage=function(ev){
-    \\  try{
-    \\   var d=ev.data;
-    \\   if(d instanceof ArrayBuffer){if(d.byteLength)toRelaySend(d);return}
-    \\   if(d&&d.t==="close")fail();
-    \\  }catch(e){}
-    \\ };
-    \\ try{port.start()}catch(e){}
-    \\ flushToClient();connect();
+    \\ if(client||dead)return;
+    \\ client={native:false,binary:function(value){port.postMessage(value,[value])},control:function(value){port.postMessage(value)},close:function(){port.onmessage=null;if(port.close)port.close()}};
+    \\ port.onmessage=function(event){try{var value=event.data;if(value instanceof ArrayBuffer){send(value);return}if(value&&value.t==="close")finish(false)}catch(e){}};
+    \\ try{port.start()}catch(e){}connect();
     \\}
-    \\
-    \\addEventListener("message",function(ev){
+    \\addEventListener("message",function(event){
     \\ try{
-    \\  var d=ev.data;
-    \\  if(!d||d.t!=="tproxy-init"||d.v!==1)return;
-    \\  if(!ev.ports||!ev.ports.length)return;
-    \\  var o=ev.origin||"";
-    \\  if(o.indexOf("http://127.0.0.1:")!==0)return;
-    \\  useParentPort(ev.ports[0]);
+    \\  if(client||dead||event.source!==parent||event.data===null||typeof event.data!=="object")return;
+    \\  var keys=Object.keys(event.data).sort();
+    \\  if(keys.length!==2||keys[0]!=="t"||keys[1]!=="v"||event.data.t!=="tproxy-init"||event.data.v!==1||!event.ports||event.ports.length!==1)return;
+    \\  var source=new URL(event.origin);
+    \\  if(source.protocol!=="http:"||source.hostname!=="127.0.0.1"||!source.port||source.origin!==event.origin)return;
+    \\  useParentPort(event.ports[0]);
     \\ }catch(e){}
     \\});
-    \\
-    \\setInterval(function(){
-    \\ if(!client)return;
-    \\ var du=up-lastUp,dd=down-lastDown;
-    \\ if(!du&&!dd)return;
-    \\ lastUp=up;lastDown=down;
-    \\ control({t:"traffic",up:du,down:dd});
-    \\},1000);
-    \\
-    \\if(CAP){
-    \\ var native=null;try{native=window.TelegramWebProxy}catch(e){}
-    \\ if(native&&NONCE)useNative(native);
-    \\ // Otherwise we are the framed fallback and wait for the parent's tproxy-init.
-    \\ // Scrub the capability out of the visible URL once it has been read. tdesktop
-    \\ // accepts the scrubbed https://host/ form as a message source.
-    \\ try{history.replaceState(null,"",location.pathname)}catch(e){}
-    \\}
+    \\addEventListener("pagehide",function(){finish(false)},{once:true});
+    \\setInterval(function(){if(!client||dead)return;var du=up-lastUp,dd=down-lastDown;if(!du&&!dd)return;lastUp=up;lastDown=down;control({t:"traffic",up:du,down:dd})},1000);
+    \\var native=null;try{native=window.TelegramWebProxy}catch(e){}
+    \\if(native&&typeof native.postMessage==="function"&&androidNonce)useNative(native);
+    \\try{history.replaceState(null,"",location.pathname)}catch(e){}
     \\})();
     \\</script>
-    \\
     \\</body></html>
 ;
 
-/// Render the bridge page: this deployment's own `cover` page with `ws_path` baked into
-/// the injected script. Serving a *different* visible page to a capability holder would
-/// undo the whole point of the cover, so the bridge is always built from it.
-///
-/// The page is otherwise byte-identical for every user: the capability is read from
-/// `location.search` by the script rather than templated into the body, so the response
-/// carries no per-user bytes at all.
-pub fn renderBridge(allocator: std.mem.Allocator, cover: []const u8, ws_path: []const u8) ![]u8 {
-    if (ws_path.len == 0 or ws_path[0] != '/' or std.mem.startsWith(u8, ws_path, "//") or std.mem.indexOfAny(u8, ws_path, "?#\\") != null) return error.InvalidWsPath;
-    if (!std.mem.endsWith(u8, cover, cover_tail)) return error.InvalidCoverPage;
-    const cover_head = cover[0 .. cover.len - cover_tail.len];
+/// Render a self-contained bridge document for one short-lived carrier token.
+/// `nonce` is also returned in the page's CSP by the relay and is limited to base64url
+/// so it can be embedded in the script attribute without HTML parsing ambiguity.
+pub fn renderSessionBridge(allocator: std.mem.Allocator, ws_path: []const u8, token: []const u8, nonce: []const u8) ![]u8 {
+    try validateWsPath(ws_path);
+    if (token.len != 43 or !isBase64Url(token)) return error.InvalidSessionToken;
+    if (nonce.len == 0 or nonce.len > 128 or !isBase64Url(nonce)) return error.InvalidScriptNonce;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, cover_head);
-    try out.appendSlice(allocator, script_head);
+    try out.appendSlice(allocator, bridge_document_head);
+    try out.appendSlice(allocator, token);
+    try out.appendSlice(allocator, bridge_path_meta);
+    try appendHtmlAttribute(allocator, &out, ws_path);
+    try out.appendSlice(allocator, bridge_script_open);
+    try out.appendSlice(allocator, nonce);
+    try out.appendSlice(allocator, bridge_script_vars);
     try appendJsString(allocator, &out, ws_path);
-    try out.appendSlice(allocator, script_body);
+    try out.appendSlice(allocator, bridge_token_var);
+    try appendJsString(allocator, &out, token);
+    try out.appendSlice(allocator, bridge_script_body);
     return out.toOwnedSlice(allocator);
 }
 
-test "bridge rejects non-origin websocket paths" {
-    for ([_][]const u8{ "", "socket", "//other.test/socket", "/socket?x=1", "/socket#fragment", "/a\\b" }) |path| {
-        try std.testing.expectError(error.InvalidWsPath, renderBridge(std.testing.allocator, "", path));
-    }
+fn validateWsPath(ws_path: []const u8) !void {
+    if (ws_path.len == 0 or ws_path[0] != '/' or std.mem.startsWith(u8, ws_path, "//") or std.mem.indexOfAny(u8, ws_path, "?#\\") != null) return error.InvalidWsPath;
+    for (ws_path) |c| if (c < 0x20 or c == 0x7f) return error.InvalidWebSocketPath;
+}
+
+fn isBase64Url(value: []const u8) bool {
+    for (value) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    return true;
+}
+
+fn appendHtmlAttribute(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    for (value) |c| switch (c) {
+        '&' => try out.appendSlice(allocator, "&amp;"),
+        '"' => try out.appendSlice(allocator, "&quot;"),
+        '<' => try out.appendSlice(allocator, "&lt;"),
+        '>' => try out.appendSlice(allocator, "&gt;"),
+        else => try out.append(allocator, c),
+    };
 }
 
 /// Append `value` as a double-quoted JavaScript string literal, escaping everything that
@@ -373,80 +278,47 @@ fn appendJsString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: 
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-test "the cover page differs between deployments and leaks nothing about them" {
+test "session bridge is a minimal standalone document with token metadata and nonce" {
     const allocator = std.testing.allocator;
-    const one = try renderCover(allocator, "relay.example.com");
-    defer allocator.free(one);
-    const two = try renderCover(allocator, "other.example.org");
-    defer allocator.free(two);
-
-    // The whole point: no single body hash and no single grep string identifies a relay.
-    try std.testing.expect(!std.mem.eql(u8, one, two));
-    // The visitor already knows the hostname, but the page must not repeat it — nor
-    // anything else about the deployment.
-    try std.testing.expect(!std.mem.containsAtLeast(u8, one, 1, "relay.example.com"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, two, 1, "other.example.org"));
-    // Stable for a given host: a site whose text changed on every fetch would itself be
-    // the tell, and the relay renders this page once at startup anyway.
-    const again = try renderCover(allocator, "relay.example.com");
-    defer allocator.free(again);
-    try std.testing.expectEqualStrings(one, again);
-
-    for ([_][]const u8{ one, two }) |html| {
-        try std.testing.expect(std.mem.startsWith(u8, html, "<!doctype html>"));
-        try std.testing.expect(std.mem.endsWith(u8, html, cover_tail));
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, html, "<main>"));
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, html, "</body>"));
-        // Everything is inline: an external reference would be a request the cover page
-        // makes and a plain website's placeholder would not.
-        try std.testing.expect(!std.mem.containsAtLeast(u8, html, 1, "http://"));
-        try std.testing.expect(!std.mem.containsAtLeast(u8, html, 1, "https://"));
-    }
-}
-
-test "bridge page embeds the websocket path in this deployment's own cover page" {
-    const allocator = std.testing.allocator;
-    const cover = try renderCover(allocator, "relay.example.com");
-    defer allocator.free(cover);
-    const html = try renderBridge(allocator, cover, "/api/v1/socket");
+    const token = "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT";
+    const html = try renderSessionBridge(allocator, "/api/v1/socket", token, "nonce_123");
     defer allocator.free(html);
 
-    // A capability holder must see exactly what a prober sees, plus the script.
-    try std.testing.expect(std.mem.startsWith(u8, html, cover[0 .. cover.len - cover_tail.len]));
-    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "var WS_PATH=\"/api/v1/socket\";"));
+    try std.testing.expect(std.mem.startsWith(u8, html, "<!doctype html>"));
     try std.testing.expect(std.mem.endsWith(u8, html, "</body></html>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "<meta name=\"tproxy-token\" content=\"" ++ token ++ "\">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "<meta name=\"tproxy-ws-path\" content=\"/api/v1/socket\">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "<script nonce=\"nonce_123\">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "new WebSocket(\"wss://\"+location.host+WS_PATH,\"tproxy-v1.\"+TOKEN)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "tproxy-android-init"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "tproxy-init"));
-
-    // The script has to land inside the document, so a cover page that does not end in
-    // the closing tags is refused rather than silently appended to.
-    try std.testing.expectError(
-        error.InvalidCoverPage,
-        renderBridge(allocator, "<!doctype html><html></html>", "/s"),
-    );
+    try std.testing.expect(!std.mem.containsAtLeast(u8, html, 1, "<style"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, html, 1, "location.search"));
 }
 
-test "the bridge page carries no per-user bytes" {
-    // The capability must be read from location.search at runtime, never templated in.
+test "session bridge validates all values embedded in markup" {
     const allocator = std.testing.allocator;
-    const cover = try renderCover(allocator, "relay.example.com");
-    defer allocator.free(cover);
-    const html = try renderBridge(allocator, cover, "/s");
-    defer allocator.free(html);
-    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "location.search"));
+    const token = "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT";
+    for ([_][]const u8{ "", "socket", "//other.test/socket", "/socket?x=1", "/socket#fragment", "/a\\b" }) |path| {
+        try std.testing.expectError(error.InvalidWsPath, renderSessionBridge(allocator, path, token, "nonce"));
+    }
+    try std.testing.expectError(error.InvalidWebSocketPath, renderSessionBridge(allocator, "/a\nb", token, "nonce"));
+    try std.testing.expectError(error.InvalidSessionToken, renderSessionBridge(allocator, "/s", "short", "nonce"));
+    try std.testing.expectError(error.InvalidSessionToken, renderSessionBridge(allocator, "/s", "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", "nonce"));
+    try std.testing.expectError(error.InvalidScriptNonce, renderSessionBridge(allocator, "/s", token, "bad nonce"));
 }
 
-test "a path that could break out of the script literal is refused" {
+test "session bridge escapes websocket path for HTML and JavaScript" {
     const allocator = std.testing.allocator;
-    const cover = try renderCover(allocator, "relay.example.com");
-    defer allocator.free(cover);
-    try std.testing.expectError(
-        error.InvalidWebSocketPath,
-        renderBridge(allocator, cover, "/a\nb"),
+    const escaped = try renderSessionBridge(
+        allocator,
+        "/a<b>c&d\"e",
+        "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+        "nonce",
     );
-    const escaped = try renderBridge(allocator, cover, "/a<b>c&d\"e");
     defer allocator.free(escaped);
     try std.testing.expect(!std.mem.containsAtLeast(u8, escaped, 1, "<b>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, escaped, 1, "/a&lt;b&gt;c&amp;d&quot;e"));
     try std.testing.expect(std.mem.containsAtLeast(u8, escaped, 1, "\\u003c"));
     try std.testing.expect(std.mem.containsAtLeast(u8, escaped, 1, "\\\""));
 }

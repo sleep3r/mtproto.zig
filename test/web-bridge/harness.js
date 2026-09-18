@@ -21,7 +21,7 @@ const vm = require('vm');
 
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const NONCE = 'N'.repeat(43);
-const CAP = 'C'.repeat(43);
+const TOKEN = 'T'.repeat(43);
 
 function frame(type, stream, payload) {
   const p = payload || Buffer.alloc(0);
@@ -44,13 +44,16 @@ function boot(opts) {
   const timers = [];
   const listeners = {};
   const toClient = [];
+  const parentWindow = {};
   let initReceiverReady = false;
 
   class FakeWebSocket {
-    constructor(url) {
+    constructor(url, protocol) {
       if (opts.constructorThrows) throw new Error('WebSocket construction failed');
       this.url = url;
+      this.protocol = protocol;
       this.readyState = 0;
+      this.bufferedAmount = 0;
       this.sent = [];
       this.binaryType = 'blob';
       sockets.push(this);
@@ -58,16 +61,21 @@ function boot(opts) {
     send(b) {
       if (this.readyState !== 1) throw new Error('send on a socket that is not open');
       this.sent.push(Buffer.from(b));
+      this.bufferedAmount += b.byteLength;
     }
     close() {
       this.readyState = 3;
       if (this.onclose) this.onclose();
+    }
+    drain(bytes) {
+      this.bufferedAmount = bytes === undefined ? 0 : Math.max(0, this.bufferedAmount - bytes);
     }
     open() {
       this.readyState = 1;
       if (this.onopen) this.onopen();
     }
     deliver(buf) {
+      this.bufferedAmount = 0;
       const data = this.binaryType === 'arraybuffer' ? new Uint8Array(buf).buffer : { blob: Buffer.from(buf) };
       if (this.onmessage) this.onmessage({ data });
     }
@@ -89,18 +97,20 @@ function boot(opts) {
   const g = {
     WebSocket: FakeWebSocket,
     setInterval: () => 0,
-    setTimeout: (fn, ms) => timers.push({ fn, ms }),
-    clearTimeout: () => {},
+    setTimeout: (fn, ms) => { const timer = { fn, ms, cancelled: false }; timers.push(timer); return timer; },
+    clearTimeout: (timer) => { if (timer) timer.cancelled = true; },
     addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
     location: {
-      search: opts.capability === null ? '' : '?bridge=' + CAP,
+      search: '?bridge=' + 'C'.repeat(43),
       hash: opts.native ? '#android=' + NONCE : '',
       host: 'relay.example.com',
       protocol: 'https:',
       pathname: '/',
     },
     history: { replaceState: () => {} },
+    parent: parentWindow,
     ArrayBuffer,
+    URL,
     console,
   };
   if (opts.native) g.TelegramWebProxy = bridge;
@@ -115,8 +125,9 @@ function boot(opts) {
     listeners,
     toClient,
     bridge,
+    parentWindow,
     initReceiverReady: () => initReceiverReady,
-    runNextTimer: () => { const timer = timers.shift(); if (!timer) throw new Error('no timer'); timer.fn(); },
+    runNextTimer: () => { let timer; do { timer = timers.shift(); } while (timer && timer.cancelled); if (!timer) throw new Error('no timer'); timer.fn(); },
     controls: () => toClient.filter(m => typeof m === 'string').map(JSON.parse),
     // `.map(Buffer.from)` would pass the index as a byteOffset — bind the arity.
     binaries: () => toClient.filter(m => m instanceof ArrayBuffer).map(m => Buffer.from(m)),
@@ -136,7 +147,8 @@ cases['native handshake'] = (t) => {
   t.ok(p.initReceiverReady(), 'onmessage was live at the instant init was sent');
 
   t.eq(p.sockets.length, 1, 'exactly one carrier socket');
-  t.eq(p.sockets[0].url, 'wss://relay.example.com/api/v1/socket?b=' + CAP, 'same-origin carrier url');
+  t.eq(p.sockets[0].url, 'wss://relay.example.com/api/v1/socket', 'same-origin carrier url has no bearer');
+  t.eq(p.sockets[0].protocol, 'tproxy-v1.' + TOKEN, 'short-lived bearer is in WebSocket subprotocol');
 
   // HELLO arrives before the socket opens, so it has to be queued rather than dropped.
   t.eq(p.sockets[0].sent.length, 0, 'nothing sent before the socket opened');
@@ -189,11 +201,17 @@ cases['iframe fallback'] = (t) => {
   t.eq(p.sockets.length, 0, 'no carrier before tproxy-init');
 
   const port = { onmessage: null, start() {}, posted: [], postMessage(v, transfer = []) { this.posted.push(structuredClone(v, { transfer })); } };
-  const post = (origin) => p.listeners.message.forEach(fn =>
-    fn({ data: { t: 'tproxy-init', v: 1 }, origin, ports: [port] }));
+  const post = (origin, source = p.parentWindow, data = { t: 'tproxy-init', v: 1 }, ports = [port]) => p.listeners.message.forEach(fn =>
+    fn({ data, origin, source, ports }));
 
   post('https://evil.example');
   t.eq(p.sockets.length, 0, 'tproxy-init from a foreign origin is ignored');
+
+  post('http://127.0.0.1:54321', {}, { t: 'tproxy-init', v: 1 }, [port]);
+  post('http://127.0.0.1:54321', p.parentWindow, { t: 'tproxy-init', v: 1, extra: true }, [port]);
+  post('http://127.0.0.1:54321', p.parentWindow, { t: 'tproxy-init', v: 1 }, [port, port]);
+  post('http://127.0.0.1:54321/', p.parentWindow, { t: 'tproxy-init', v: 1 }, [port]);
+  t.eq(p.sockets.length, 0, 'non-exact fallback initialization is ignored');
 
   post('http://127.0.0.1:54321');
   t.eq(p.sockets.length, 1, 'carrier opened for the loopback parent');
@@ -224,13 +242,87 @@ cases['garbage never throws'] = (t) => {
   t.ok(true, 'handler survived garbage');
 };
 
-// The page must not carry a capability of its own: it reads one from the URL, so the
-// served bytes are identical for every user.
-cases['no carrier without a capability'] = (t) => {
-  const p = boot({ native: true, capability: null });
-  if (typeof p.bridge.onmessage === 'function') p.bridge.onmessage({ data: new Uint8Array(HELLO).buffer });
-  p.timers.forEach(timer => timer.fn());
-  t.eq(p.sockets.length, 0, 'no websocket can open without a capability');
+cases['native downlink batches become validated single frames'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const ping = frame(0x05, 0, Buffer.from('x'));
+  const bye = frame(0x1f, 0);
+  p.sockets[0].deliver(Buffer.concat([ping, bye]));
+  const bins = p.binaries();
+  t.eq(bins.length, 3, 'native bridge receives one complete frame per message');
+  t.ok(bins[0].equals(WELCOME), 'WELCOME remains its own first message');
+  t.ok(bins[1].equals(ping) && bins[2].equals(bye), 'batch is split at frame boundaries');
+
+  p.sockets[0].deliver(frame(0x05, 0, Buffer.from('bad')).subarray(0, 9));
+  t.eq(p.binaries().length, 3, 'partial frame is not delivered');
+  t.ok(p.controls().some(c => c.state === 'failed'), 'partial frame fails closed');
+
+  const bad = boot({ native: true });
+  bad.sockets[0].open();
+  bad.sockets[0].deliver(Buffer.concat([WELCOME, bye]));
+  t.eq(bad.binaries().length, 0, 'batched first WELCOME is rejected');
+  t.ok(bad.controls().some(c => c.state === 'failed'), 'invalid first downlink fails closed');
+};
+
+cases['aggregate browser send buffer is capped at 32 MiB'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const chunk = new ArrayBuffer(4 * 1024 * 1024);
+  for (let i = 0; i < 8; i++) p.bridge.onmessage({ data: chunk });
+  t.eq(p.sockets[0].sent.length, 8, '32 MiB aggregate is accepted');
+  p.bridge.onmessage({ data: chunk });
+  t.eq(p.sockets[0].sent.length, 8, 'payload beyond aggregate cap is not accepted');
+  t.eq(p.sockets[0].readyState, 3, 'overflow closes the carrier');
+  t.ok(p.controls().some(c => c.state === 'failed'), 'overflow reports failure');
+};
+
+cases['adopted stalled socket is capped at 16384 outstanding messages'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const tiny = frame(0x06, 0);
+  for (let i = 0; i < 16384; i++) p.bridge.onmessage({ data: new Uint8Array(tiny).buffer });
+  t.eq(p.sockets[0].sent.length, 16384, 'outstanding item budget is accepted exactly');
+  p.sockets[0].drain(4);
+  p.bridge.onmessage({ data: new Uint8Array(tiny).buffer });
+  t.eq(p.sockets[0].sent.length, 16384, 'partially drained head still counts as outstanding');
+  t.eq(p.sockets[0].readyState, 3, 'outstanding item overflow closes the carrier');
+};
+
+cases['drained adopted socket has no lifetime message cap'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const tiny = frame(0x06, 0);
+  for (let i = 0; i < 20000; i++) {
+    p.bridge.onmessage({ data: new Uint8Array(tiny).buffer });
+    p.sockets[0].drain(tiny.length);
+  }
+  t.eq(p.sockets[0].sent.length, 20000, 'drained messages retire from the outstanding count');
+  t.eq(p.sockets[0].readyState, 1, 'long-running drained carrier stays open');
+  t.ok(!p.controls().some(c => c.state === 'failed'), 'normal lifetime traffic never exhausts item budget');
+};
+
+cases['pre-adoption queue item count is capped'] = (t) => {
+  const p = boot({ native: true });
+  const tiny = new ArrayBuffer(8);
+  for (let i = 0; i < 16385; i++) p.bridge.onmessage({ data: tiny });
+  t.eq(p.sockets[0].readyState, 3, 'the 16385th queued item closes the carrier');
+  t.ok(p.controls().some(c => c.state === 'failed'), 'item overflow reports failure');
+};
+
+cases['pagehide promptly closes the carrier'] = (t) => {
+  const p = boot({ native: true });
+  p.listeners.pagehide.forEach(fn => fn({}));
+  t.eq(p.sockets[0].readyState, 3, 'pagehide closes the websocket');
+
+  const retry = boot({ native: true });
+  retry.sockets[0].close();
+  t.eq(retry.timers.length, 1, 'pre-adoption close scheduled a retry');
+  retry.listeners.pagehide.forEach(fn => fn({}));
+  t.ok(retry.timers.every(timer => timer.cancelled), 'pagehide cancels pending retry');
 };
 
 cases['failure before first open replays exactly one HELLO'] = (t) => {

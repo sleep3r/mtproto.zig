@@ -273,6 +273,10 @@ pub const Config = struct {
         mode: ?[]const u8 = null,
         /// Same-origin WebSocket endpoint the bridge page connects to.
         ws_path: ?[]const u8 = null,
+        /// Operator-owned public files, read once at relay startup (16 MiB total).
+        public_dir: ?[]const u8 = null,
+        /// Additional trusted HTTP terminators (IP literals); separate from relay_sources.
+        trusted_http_sources: []const []const u8 = &.{},
         /// Honour a forwarded-client-address header from the TLS terminator in front of
         /// the relay. Only the right-most entry is used, because that is the one our own
         /// hop wrote; see `web/http.zig`.
@@ -280,7 +284,7 @@ pub const Config = struct {
         /// Which header carries it. `x-forwarded-for` suits our own nginx vhost;
         /// `cf-connecting-ip` suits Cloudflare. Empty disables the lookup entirely.
         client_ip_header: ?[]const u8 = null,
-        /// Require `Origin: https://<domain>` on the WebSocket upgrade.
+        /// Reject a supplied foreign Origin; native WebViews may omit this header.
         check_origin: bool = true,
         max_sessions: u32 = 32,
         max_streams: u32 = 32,
@@ -661,6 +665,7 @@ pub const Config = struct {
             if (domain.len == 0 or domain.len > 253 or std.mem.indexOfScalar(u8, domain, '.') == null) return error.InvalidWebDomain;
             for (domain) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return error.InvalidWebDomain;
             _ = net.IpAddress.parse(self.web.effectiveHost(), self.web.port) catch return error.InvalidWebHost;
+            for (self.web.trusted_http_sources) |source| _ = net.IpAddress.parse(source, 0) catch return error.InvalidWebHttpSource;
             const path = self.web.effectiveWsPath();
             if (path.len == 0 or path[0] != '/' or std.mem.startsWith(u8, path, "//") or std.mem.indexOfAny(u8, path, "?#\\\r\n") != null) return error.InvalidWebSocketPath;
             if (self.web.port == self.port or self.web.port == self.mask_port) return error.WebPortCollision;
@@ -1166,6 +1171,14 @@ pub const Config = struct {
                         const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
                         if (cfg.web.ws_path) |prev| allocator.free(prev);
                         cfg.web.ws_path = replacement;
+                    } else if (std.mem.eql(u8, key, "public_dir")) {
+                        const replacement = if (value.len > 0) try allocator.dupe(u8, value) else null;
+                        if (cfg.web.public_dir) |prev| allocator.free(prev);
+                        cfg.web.public_dir = replacement;
+                    } else if (std.mem.eql(u8, key, "trusted_http_sources")) {
+                        const replacement = try parseStringArrayValue(allocator, value);
+                        freeStringSlice(allocator, cfg.web.trusted_http_sources);
+                        cfg.web.trusted_http_sources = replacement;
                     } else if (std.mem.eql(u8, key, "trust_forwarded_for")) {
                         cfg.web.trust_forwarded_for = parseBool(value);
                     } else if (std.mem.eql(u8, key, "client_ip_header")) {
@@ -1327,6 +1340,8 @@ pub const Config = struct {
             allocator.free(h);
         }
         freeStringSlice(allocator, self.web.relay_sources);
+        freeStringSlice(allocator, self.web.trusted_http_sources);
+        if (self.web.public_dir) |path| allocator.free(path);
     }
 
     /// Get user secrets as a flat slice for handshake validation.
@@ -2674,4 +2689,13 @@ test "parse config - [web] cert/key paths round-trip and free cleanly" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/etc/ssl/relay/fullchain.pem", cfg.web.cert.?);
     try std.testing.expectEqualStrings("/etc/ssl/relay/privkey.pem", cfg.web.key.?);
+}
+
+test "web public site and HTTP peer configuration is retained" {
+    const a = std.testing.allocator;
+    var cfg = try Config.parse(a, "[web]\npublic_dir = \"/srv/site\"\ntrusted_http_sources = [\"192.0.2.7\"]\n");
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.web.public_dir != null);
+    try std.testing.expectEqualStrings("/srv/site", cfg.web.public_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.web.trusted_http_sources.len);
 }

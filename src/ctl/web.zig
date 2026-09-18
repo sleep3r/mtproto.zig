@@ -473,6 +473,12 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
     var staged = opts;
     staged.only = if (opts.only == true) null else opts.only;
     var config_changed = try writeConfig(ui, allocator, domain, staged);
+    // The probe must exercise the newly staged masking route. Apply it while
+    // preserving the existing direct-access setting, before testing WEB-only.
+    if (config_changed) {
+        try restartProxy(ui, allocator);
+        config_changed = false;
+    }
     try installService(ui, allocator);
     if (opts.only == true) {
         if (!sys.isServiceActive(SERVICE_NAME) or !verifyEndToEnd(ui, allocator, domain)) {
@@ -488,14 +494,18 @@ pub fn execute(ui: *Tui, allocator: std.mem.Allocator, opts_in: WebOpts) !void {
         }
     }
     if (config_changed) {
-        ui.step(tr(ui, "Restarting the proxy to apply [web]...", "Перезапускаю прокси, чтобы применить [web]..."));
-        const restart = try sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" });
-        defer restart.deinit();
-        if (restart.exit_code != 0) return error.ProxyRestartFailed;
+        try restartProxy(ui, allocator);
     }
 
     if (opts.only != true and opts.mode == .mask and !opts.quiet) _ = verifyEndToEnd(ui, allocator, domain);
     if (!opts.quiet) printSummary(ui, allocator, domain, opts);
+}
+
+fn restartProxy(ui: *Tui, allocator: std.mem.Allocator) !void {
+    ui.step(tr(ui, "Restarting the proxy to apply [web]...", "Перезапускаю прокси, чтобы применить [web]..."));
+    const restart = try sys.exec(allocator, &.{ "systemctl", "restart", "mtproto-proxy" });
+    defer restart.deinit();
+    if (restart.exit_code != 0) return error.ProxyRestartFailed;
 }
 
 /// nginx + certificate + vhost, in the order that keeps a failure recoverable.
@@ -802,7 +812,8 @@ fn writeVhostContent(
         \\    }}
         \\
         \\    access_log off;
-        \\    error_log /var/log/nginx/mtproto-web-error.log warn;
+        \\    # nginx error messages include request URIs, including bridge credentials.
+        \\    error_log /dev/null;
         \\}}
         \\
     , .{ domain, masking.NGINX_PORT, PROXY_PROTOCOL_PORT, domain, cert, key, port });
@@ -976,7 +987,10 @@ fn applyConfigDoc(doc: *toml.TomlDoc, domain: []const u8, opts: WebOpts) !bool {
 
     var changed = false;
     var host_buf: [128]u8 = undefined;
-    const quoted_host = if (opts.host) |host| try std.fmt.bufPrint(&host_buf, "\"{s}\"", .{host}) else null;
+    // The local nginx upstream always uses 127.0.0.1. A previous behind-mode
+    // listener must not survive switching back to this topology.
+    const effective_host: ?[]const u8 = opts.host orelse if (mask_mode and hasValue(doc, "host")) "127.0.0.1" else null;
+    const quoted_host = if (effective_host) |host| try std.fmt.bufPrint(&host_buf, "\"{s}\"", .{host}) else null;
     if (quoted_host) |host| changed = needsSet(doc, "host", host) or changed;
     if (opts.lets_encrypt) changed = hasValue(doc, "cert") or hasValue(doc, "key") or changed;
     changed = needsSet(doc, "enabled", "true") or changed;
@@ -1116,36 +1130,30 @@ fn installService(ui: *Tui, allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Fetch the relay's own domain over the public path: browser → proxy :443 → masking →
-/// nginx → relay. Anything less than that does not prove the topology works.
+/// Prove authenticated HTTPS → WSS → relay → MTProxy → Telegram before masking
+/// direct links. A public website or WELCOME without a working backend is insufficient.
 fn verifyEndToEnd(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8) bool {
-    if (!sys.commandExists("curl")) return false;
-    var url_buf: [320]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "https://{s}/", .{domain}) catch return false;
     // The proxy was restarted and the relay started moments ago; `is-active` on a
     // Type=simple unit says nothing about the listener being bound yet. Give the
     // chain a few seconds before declaring it broken.
     var attempt: usize = 0;
-    var code: []const u8 = "";
-    var code_buf: [8]u8 = undefined;
-    while (attempt < 6) : (attempt += 1) {
+    while (attempt < 3) : (attempt += 1) {
         if (attempt > 0) sleepSeconds(1);
-        const result = sys.exec(allocator, &.{ "curl", "-s", "--max-time", "8", "-o", "/dev/null", "-w", "%{http_code}", url }) catch continue;
-        defer result.deinit();
-        const trimmed = std.mem.trim(u8, result.stdout, " \r\n");
-        const n = @min(trimmed.len, code_buf.len);
-        @memcpy(code_buf[0..n], trimmed[0..n]);
-        code = code_buf[0..n];
-        if (std.mem.eql(u8, code, "200")) break;
+        const verified = @import("web_probe.zig").verify(allocator, domain, config_path) catch |err| {
+            if (err == error.PythonUnavailable) {
+                ui.warn(tr(ui, "Python 3 is required to verify the WEB path before enabling WEB-only.", "Для проверки WEB-пути перед включением WEB-only требуется Python 3."));
+                return false;
+            }
+            continue;
+        };
+        if (verified) {
+            ui.ok(tr(ui, "Authenticated WEB connection reaches Telegram (req_pq → res_pq)", "Авторизованное WEB-подключение достигает Telegram (req_pq → res_pq)"));
+            return true;
+        }
     }
-    if (std.mem.eql(u8, code, "200")) {
-        ui.ok(tr(ui, "The relay site answers over the public HTTPS path", "Сайт релея отвечает по публичному HTTPS"));
-        return true;
-    } else {
-        ui.warn(tr(ui, "Could not fetch the relay site from this host", "Не удалось получить сайт релея с этого хоста"));
-        ui.hint(tr(ui, "Check DNS, the certificate, and that [censorship].mask is on.", "Проверьте DNS, сертификат и что [censorship].mask включён."));
-        return false;
-    }
+    ui.warn(tr(ui, "The complete WEB connection to Telegram could not be verified", "Не удалось проверить полный WEB-путь до Telegram"));
+    ui.hint(tr(ui, "Check DNS, the certificate, the relay and its MTProxy backend.", "Проверьте DNS, сертификат, релей и его MTProxy-бэкенд."));
+    return false;
 }
 
 fn printSummary(ui: *Tui, allocator: std.mem.Allocator, domain: []const u8, opts: WebOpts) void {
@@ -1385,6 +1393,34 @@ test "WEB provisioning preserves only on update and clears stale mask and certif
     try std.testing.expect(!hasValue(&doc, "key"));
     try std.testing.expect(!needsSet(&doc, "only", "false"));
     try std.testing.expect(!try applyConfigDoc(&doc, "relay.example.com", opts));
+}
+
+test "switching behind to mask resets a saved remote listener without host override" {
+    var doc = toml.TomlDoc.initEmpty(std.testing.allocator);
+    defer doc.deinit();
+    _ = try applyConfigDoc(&doc, "relay.example.com", .{ .mode = .behind, .mode_explicit = true, .host = "192.0.2.10" });
+    _ = try applyConfigDoc(&doc, "relay.example.com", .{ .mode = .mask, .mode_explicit = true });
+    try std.testing.expectEqualStrings("127.0.0.1", doc.get("web", "host").?);
+    try std.testing.expect(!try applyConfigDoc(&doc, "relay.example.com", .{ .mode = .mask, .mode_explicit = true }));
+}
+
+test "behind updates preserve a saved explicit listener" {
+    var doc = toml.TomlDoc.initEmpty(std.testing.allocator);
+    defer doc.deinit();
+    _ = try applyConfigDoc(&doc, "relay.example.com", .{ .mode = .behind, .mode_explicit = true, .host = "192.0.2.10" });
+    try std.testing.expect(!try applyConfigDoc(&doc, "relay.example.com", .{ .mode = .behind }));
+    try std.testing.expectEqualStrings("192.0.2.10", doc.get("web", "host").?);
+}
+
+test "relay nginx error logging cannot persist bridge credentials" {
+    const rendered = try writeVhostContent(std.testing.allocator, "relay.example.com", "8081", "/cert.pem", "/key.pem");
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "error_log /dev/null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "mtproto-web-error.log") == null);
+}
+
+test {
+    _ = @import("web_probe.zig");
 }
 
 test "changing [web].domain is refused without --force, same as tls_domain" {

@@ -464,10 +464,12 @@ alice = true
 | `[web] mask_backend` | не задан | Терминатор с PROXY-протоколом для masked-соединений к `domain` — чтобы реальный IP клиента пережил masking-хоп |
 | `[web] cert` / `[web] key` | не задан | Свой сертификат для vhost релея вместо Let's Encrypt (читается `mtbuddy setup web`) |
 | `[web] ws_path` | `"/api/v1/socket"` | Same-origin WebSocket-эндпоинт страницы-моста |
+| `[web] public_dir` | не задан | Каталог публичного статического сайта; без него обычные запросы получают 404 |
+| `[web] trusted_http_sources` | `[]` | IP доверенных HTTP-терминаторов; loopback доверен по умолчанию |
 | `[web] trust_forwarded_for` | `true` | Брать адрес клиента из forwarded-заголовка (только самая правая запись) |
 | `[web] client_ip_header` | `"x-forwarded-for"` | Какой заголовок его несёт (`cf-connecting-ip` за Cloudflare) |
-| `[web] check_origin` | `true` | Требовать `Origin: https://<domain>` при upgrade |
-| `[web] max_sessions` | `64` | Одновременных десктоп-клиентов |
+| `[web] check_origin` | `true` | Отклонять чужой Origin, если заголовок передан; WebView может его опустить |
+| `[web] max_sessions` | `32` | Одновременных десктоп-клиентов |
 | `[web] max_streams` | `32` | Логических MTProto-сокетов на клиента |
 | `[web] relay_sources` | `[]` | Дополнительные IP, которым разрешён транспорт `dd` (loopback — всегда) |
 | `[access.users] <name>` | — | 32-hex secret на пользователя |
@@ -489,6 +491,15 @@ alice = true
 ---
 
 ## WEB-прокси (Telegram Desktop 7.1+)
+
+После обновления существующие WEB-ссылки сохраняются. Для обычных посетителей
+задайте `[web].public_dir` — каталог своего статического сайта с `index.html`;
+файлы загружаются при запуске релея. Общая сгенерированная заглушка удалена:
+без каталога обычный запрос получает 404, а WEB-ссылки продолжают работать.
+Для удалённого TLS-терминатора задайте его IP в `[web].trusted_http_sources`.
+Перед включением `--only` установщик проверяет HTTPS, мост и настоящий ответ MTProto;
+для этой проверки нужен Python 3. При ошибке прежнее значение WEB-only сохраняется.
+
 
 В Telegram Desktop 7.1 появился четвёртый тип прокси — `WEB`. Это обычный MTProxy, у которого
 **транспорт — браузер**: клиент вообще не открывает MTProto-сокет. Скрытый нативный WebView грузит

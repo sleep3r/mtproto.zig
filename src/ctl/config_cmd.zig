@@ -794,6 +794,8 @@ fn printEffective(ui: *Tui, allocator: std.mem.Allocator, path: []const u8) !voi
     ui.print("max_sessions = {d}\n", .{cfg.web.max_sessions});
     ui.print("max_streams = {d}\n", .{cfg.web.max_streams});
     ui.print("relay_sources count = {d}\n", .{cfg.web.relay_sources.len});
+    ui.print("trusted_http_sources count = {d}\n", .{cfg.web.trusted_http_sources.len});
+    if (cfg.web.public_dir) |dir| ui.print("public_dir = \"{s}\"\n", .{dir});
     ui.writeRaw("\n");
 
     ui.writeRaw("[metrics]\n");

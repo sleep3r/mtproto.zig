@@ -260,6 +260,16 @@ def https_get(path: str):
     status = head.split(b"\r\n")[0].decode()
     return status, head.decode(errors="replace"), body, cert
 
+def bridge_bootstrap(secret: bytes):
+    status, headers, body, cert = https_get("/?bridge=" + capability(HOST, secret))
+    match = re.search(br'<meta name="tproxy-token" content="([A-Za-z0-9_-]{43})">', body)
+    path = re.search(br'<meta name="tproxy-ws-path" content="([^"<>]+)">', body)
+    if "200" not in status or match is None or path is None:
+        fail(f"bridge bootstrap did not return token metadata: {status}")
+    if path.group(1).decode() != WS_PATH:
+        fail(f"bridge advertised unexpected websocket path {path.group(1)!r}")
+    return match.group(1).decode(), status, headers, body, cert
+
 async def web():
     name, secret_hex = next(iter(USERS.items()))
     secret = bytes.fromhex(secret_hex)
@@ -268,50 +278,62 @@ async def web():
     st, head, body, cert = https_get("/")
     issuer = dict(x[0] for x in cert["issuer"])
     ok(f"TLS cert issuer: {issuer.get('organizationName')} / {issuer.get('commonName')}, CN={dict(x[0] for x in cert['subject']).get('commonName')}")
-    if "200" not in st or b"TelegramWebProxy" in body: fail(f"cover page: {st}, bridge leaked={b'TelegramWebProxy' in body}")
-    cover_body = body
+    public_configured = cfg.get("web", {}).get("public_dir") is not None
+    public_status = st.split()[1]
+    if (not public_configured and public_status != "404") or public_status not in ("200", "404") or b"TelegramWebProxy" in body:
+        fail(f"public root: {st}, bridge leaked={b'TelegramWebProxy' in body}")
+    public_body = body
     def normalized_headers(raw):
         return sorted(line.lower().strip() for line in raw.split("\r\n")[1:]
                       if line and not line.lower().startswith(("date:", "connection:")))
-    cover_headers = normalized_headers(head)
-    ok(f"cover page: {st}, {len(body)} bytes, no bridge script")
+    public_headers = normalized_headers(head)
+    ok(f"public root: {st}, {len(body)} bytes, no bridge script")
 
     st, head, body, _ = https_get("/?bridge=" + "A" * 43)
-    if "200" not in st or b"TelegramWebProxy" in body: fail("bad capability leaked the bridge page")
-    if body != cover_body or normalized_headers(head) != cover_headers:
-        fail("bad capability differs from the ordinary cover response")
-    ok("bad capability -> same cover page")
+    if st.split()[1] != public_status or b"TelegramWebProxy" in body: fail("bad capability leaked the bridge page")
+    if body != public_body or normalized_headers(head) != public_headers:
+        fail("bad capability differs from the ordinary public-root response")
+    ok("bad capability -> ordinary public-root response")
     unknown_status, unknown_headers, unknown_body, _ = https_get("/unknown-" + os.urandom(8).hex())
-    if "404" not in unknown_status or unknown_body != cover_body:
-        fail("unknown path must return 404 with the cover body")
+    if "404" not in unknown_status or b"TelegramWebProxy" in unknown_body:
+        fail("unknown path must return a plain 404")
 
-    st, head, body, _ = https_get("/?bridge=" + cap)
+    token, st, head, body, _ = bridge_bootstrap(secret)
     if "200" not in st or b"TelegramWebProxy" not in body or b"tproxy-init" not in body: fail(f"bridge page: {st}")
     csp = [l for l in head.split("\r\n") if l.lower().startswith("content-security-policy")]
     if not csp or "frame-ancestors" not in csp[0] or "connect-src" not in csp[0]:
         fail("bridge CSP is absent or missing frame-ancestors/connect-src")
     if "cache-control: no-store" not in head.lower() or "x-frame-options:" in head.lower():
         fail("bridge needs no-store and must allow the client's iframe")
+    nonce = re.search(br'<script nonce="([A-Za-z0-9_-]+)">', body)
+    if nonce is None or f"script-src 'nonce-{nonce.group(1).decode()}'" not in csp[0]:
+        fail("bridge script nonce does not match CSP")
+    retry_token, _, _, retry_body, _ = bridge_bootstrap(secret)
+    if retry_token == token or retry_body == body:
+        fail("separate bridge renders reused a carrier token")
     for other_name, other_secret in list(USERS.items())[1:2]:
-        _, _, other_body, _ = https_get("/?bridge=" + capability(HOST, bytes.fromhex(other_secret)))
-        if other_body != body:
-            fail(f"bridge content varies by user ({name}, {other_name})")
-    ok(f"bridge page for '{name}': {st}, {len(body)} bytes, CSP present={bool(csp)}")
+        other_token, _, _, other_body, _ = bridge_bootstrap(bytes.fromhex(other_secret))
+        if other_token == token or other_body == body:
+            fail(f"bridge bootstrap tokens are not unique ({name}, {other_name})")
+    ok(f"bridge page for '{name}': {st}, {len(body)} bytes, unique short-lived token, CSP present={bool(csp)}")
 
-    # WSS with a bad capability must look like any unknown path
+    # WSS accepts only a short-lived token in the negotiated subprotocol. A permanent
+    # capability in the URI must look like any unknown path.
     try:
-        async with websockets.connect(f"wss://{HOST}{WS_PATH}?b=" + "A"*43, origin=f"https://{HOST}", open_timeout=10, ssl=SSL_CTX) as w:
-            fail("websocket upgraded with a bad capability")
+        async with websockets.connect(f"wss://{HOST}{WS_PATH}?b={cap}", origin=f"https://{HOST}", open_timeout=10, ssl=SSL_CTX) as w:
+            fail("websocket upgraded with a permanent query capability")
     except websockets.exceptions.InvalidStatus as e:
         if e.response.status_code != 404:
-            fail(f"bad capability returned {e.response.status_code}, expected 404")
+            fail(f"query capability returned {e.response.status_code}, expected 404")
         rejected_headers = "HTTP/1.1 404 Not Found\r\n" + str(e.response.headers)
         if bytes(e.response.body) != unknown_body or normalized_headers(rejected_headers) != normalized_headers(unknown_headers):
-            fail("bad websocket capability differs from an ordinary unknown-path response")
-        ok(f"bad capability -> websocket refused with {e.response.status_code}")
+            fail("query capability differs from an ordinary unknown-path response")
+        ok(f"query capability -> websocket refused with {e.response.status_code}")
 
-    async with websockets.connect(f"wss://{HOST}{WS_PATH}?b={cap}", origin=f"https://{HOST}", open_timeout=10, max_size=2*1024*1024, ssl=SSL_CTX) as w:
-        ok("websocket upgraded (101) for the real capability")
+    protocol = "tproxy-v1." + token
+    async with websockets.connect(f"wss://{HOST}{WS_PATH}", subprotocols=[protocol], origin=f"https://{HOST}", open_timeout=10, max_size=2*1024*1024, ssl=SSL_CTX) as w:
+        if w.subprotocol != protocol: fail("relay did not echo the carrier subprotocol")
+        ok("websocket upgraded (101) for the short-lived carrier token")
         await w.send(frame(0x10, 0, b"\x01"))
         m = await asyncio.wait_for(w.recv(), 10)
         if m != frame(0x11, 0): fail(f"expected WELCOME alone, got {m.hex()}")
@@ -353,8 +375,9 @@ async def idle(seconds: int = 210):
     library does send one and so never looks quiet. Either way the invariant under test is
     the same — the carrier must survive and still work."""
     name, secret_hex = next(iter(USERS.items()))
-    secret = bytes.fromhex(secret_hex); cap = capability(HOST, secret)
-    async with websockets.connect(f"wss://{HOST}{WS_PATH}?b={cap}", origin=f"https://{HOST}", open_timeout=10, max_size=2*1024*1024, ssl=SSL_CTX) as w:
+    secret = bytes.fromhex(secret_hex); token, _, _, _, _ = bridge_bootstrap(secret)
+    protocol = "tproxy-v1." + token
+    async with websockets.connect(f"wss://{HOST}{WS_PATH}", subprotocols=[protocol], origin=f"https://{HOST}", open_timeout=10, max_size=2*1024*1024, ssl=SSL_CTX) as w:
         await w.send(frame(0x10, 0, b"\x01"))
         m = await asyncio.wait_for(w.recv(), 10)
         if m != frame(0x11, 0): fail("no WELCOME")

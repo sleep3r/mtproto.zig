@@ -55,6 +55,9 @@ jobs:
       - name: Probe helper regression tests
         run: python3 -m unittest discover -s test -p test_probe_helpers.py
 
+      - name: WEB setup authenticated HTTPS and WSS probe tests
+        run: python3 -m unittest discover -s test -p test_web_setup_probe.py
+
       - name: Verify the Docker image CPU profiles enable hardware AES
         run: |
           cat > /tmp/check_aes_target.zig <<'EOF'

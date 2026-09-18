@@ -89,7 +89,7 @@ fn stringSetting(section: []const u8, key: []const u8) bool {
     if (std.mem.eql(u8, section, "general")) return std.mem.eql(u8, key, "ad_tag");
     if (std.mem.eql(u8, section, "censorship")) return oneOf(key, &.{ "tls_domain", "mask_target", "unknown_sni_action" });
     if (oneOf(section, &.{ "metrics", "monitor" })) return std.mem.eql(u8, key, "host");
-    if (std.mem.eql(u8, section, "web")) return oneOf(key, &.{ "domain", "listen", "host", "backend", "mask_backend", "cert", "key", "mode", "ws_path", "client_ip_header" });
+    if (std.mem.eql(u8, section, "web")) return oneOf(key, &.{ "domain", "listen", "host", "backend", "mask_backend", "cert", "key", "mode", "ws_path", "client_ip_header", "public_dir" });
     if (std.mem.eql(u8, section, "upstream")) return std.mem.eql(u8, key, "type");
     if (oneOf(section, &.{ "upstream.socks5", "upstream.http" })) return oneOf(key, &.{ "host", "username", "password" });
     if (std.mem.eql(u8, section, "upstream.tunnel")) return oneOf(key, &.{ "interface", "pinned_interface" });

@@ -61,6 +61,8 @@ const frame = @import("frame.zig");
 const http = @import("http.zig");
 const page = @import("page.zig");
 const ws = @import("ws.zig");
+const tokens = @import("tokens.zig");
+const public_site = @import("site.zig");
 
 const log = std.log.scoped(.web);
 
@@ -113,7 +115,13 @@ const http_queue_limit: usize = 256 * 1024;
 
 /// Recently-closed stream ids we tolerate late frames for, mirroring tdesktop's own
 /// retention: an ordinary cross-direction close race must not fail unrelated streams.
-const closed_history: usize = 64;
+const closed_history: usize = 4096;
+
+const QueueBlockPtr = std.meta.Child(@TypeOf(@as(MessageQueue, undefined).blocks.items));
+const QueueBlock = std.meta.Child(QueueBlockPtr);
+const queue_block_payload: usize = @typeInfo(@FieldType(QueueBlock, "data")).array.len;
+const queue_block_bytes: usize = @sizeOf(QueueBlock);
+const queue_free_blocks: usize = 16;
 
 pub const Error = error{
     WebProxyDisabled,
@@ -142,6 +150,8 @@ pub const Options = struct {
     trust_forwarded_for: bool,
     client_ip_header: []const u8,
     check_origin: bool,
+    public_dir: ?[]const u8 = null,
+    trusted_http_sources: []const []const u8 = &.{},
 
     pub fn fromConfig(cfg: *const config.Config, domain_buf: []u8) Error!Options {
         if (!cfg.web.enabled) return error.WebProxyDisabled;
@@ -160,6 +170,8 @@ pub const Options = struct {
             .trust_forwarded_for = cfg.web.trust_forwarded_for,
             .client_ip_header = cfg.web.effectiveClientIpHeader(),
             .check_origin = cfg.web.check_origin,
+            .public_dir = cfg.web.public_dir,
+            .trusted_http_sources = cfg.web.trusted_http_sources,
         };
     }
 };
@@ -289,6 +301,7 @@ const Session = struct {
     /// per-IP accounting, flood guard and Telegram all see the actual client.
     client_addr: ?Address,
     welcomed: bool = false,
+    carrier_token: ?tokens.Token = null,
     tearing_down: bool = false,
     streams: std.AutoHashMapUnmanaged(u32, *Stream) = .empty,
     closed_ids: []u32 = &.{},
@@ -310,7 +323,7 @@ const Session = struct {
     streams_refused: u32 = 0,
 
     fn rememberClosed(self: *Session, id: u32) void {
-        if (self.closed_ids.len == 0) return;
+        if (self.closed_ids.len == 0 or self.recentlyClosed(id)) return;
         self.closed_ids[self.closed_pos] = id;
         self.closed_pos = (self.closed_pos + 1) % self.closed_ids.len;
     }
@@ -324,12 +337,25 @@ const Session = struct {
 };
 
 test "closed stream retention scales beyond the former 64-id cap" {
-    var ids: [256]u32 = [_]u32{0} ** 256;
+    var ids: [4096]u32 = [_]u32{0} ** 4096;
     var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .closed_ids = &ids };
-    for (1..257) |id| session.rememberClosed(@intCast(id));
+    for (1..4097) |id| session.rememberClosed(@intCast(id));
     try std.testing.expect(session.recentlyClosed(1));
-    try std.testing.expect(session.recentlyClosed(256));
+    try std.testing.expect(session.recentlyClosed(4096));
     try std.testing.expect(!session.recentlyClosed(0));
+}
+
+test "remembering an already closed id does not evict other tombstones" {
+    var ids: [4]u32 = [_]u32{0} ** 4;
+    var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .closed_ids = &ids };
+    for (1..5) |id| session.rememberClosed(@intCast(id));
+    for (0..8) |_| session.rememberClosed(4);
+    session.rememberClosed(5);
+    try std.testing.expect(!session.recentlyClosed(1));
+    try std.testing.expect(session.recentlyClosed(2));
+    try std.testing.expect(session.recentlyClosed(3));
+    try std.testing.expect(session.recentlyClosed(4));
+    try std.testing.expect(session.recentlyClosed(5));
 }
 
 test "backend queue accommodates a complete granted receive window" {
@@ -347,13 +373,10 @@ pub const Relay = struct {
     /// Only the implicit backend is guaranteed to be this host's proxy.
     local_backend: bool = false,
     caps: []UserCapability,
-    /// Pre-rendered responses; the bridge page carries no per-user bytes.
-    /// The cover page is generated per deployment (see `page.renderCover`), so it is
-    /// owned here rather than being a constant.
-    cover_page: []u8,
-    bridge_page: []u8,
-    bridge_headers: []u8,
-    cover_headers: []u8,
+    site: public_site.Site = .{},
+    carrier_tokens: tokens.Store = .{},
+    /// Ordinary missing-page response; authenticated pages are rendered per request.
+    notfound_body: []u8,
     notfound_headers: []u8,
 
     epoll_fd: posix.fd_t,
@@ -388,32 +411,11 @@ pub const Relay = struct {
         const caps = try buildCapabilities(allocator, cfg, opts.domain);
         errdefer allocator.free(caps);
 
-        const cover_page = try page.renderCover(allocator, opts.domain);
-        errdefer allocator.free(cover_page);
-
-        // The bridge page IS the cover page plus the script: a capability holder must be
-        // served the same visible site a prober gets, or the cover proves nothing.
-        const bridge_page = try page.renderBridge(allocator, cover_page, opts.ws_path);
-        errdefer allocator.free(bridge_page);
-
-        // The bridge response must be framable by tdesktop's loopback fallback page,
-        // which serves itself from a random numeric loopback origin, and must carry no
-        // X-Frame-Options. `connect-src 'self'` covers the same-origin WebSocket: CSP
-        // treats an `https` source as matching `wss` on the same host.
-        const bridge_headers = try std.fmt.allocPrint(allocator, "Content-Type: text/html; charset=utf-8\r\n" ++
-            "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; " ++
-            "style-src 'unsafe-inline'; connect-src 'self' wss://{s}; base-uri 'none'; " ++
-            "form-action 'none'; frame-ancestors http://127.0.0.1:*\r\n" ++
-            "Referrer-Policy: no-referrer\r\n" ++
-            "X-Content-Type-Options: nosniff\r\n" ++
-            "Cache-Control: no-store\r\n", .{opts.domain});
-        errdefer allocator.free(bridge_headers);
-
-        const cover_headers = try allocator.dupe(u8, "Content-Type: text/html; charset=utf-8\r\n" ++
-            "X-Content-Type-Options: nosniff\r\n" ++
-            "Cache-Control: public, max-age=300\r\n");
-        errdefer allocator.free(cover_headers);
-
+        var site = try public_site.Site.load(allocator, opts.public_dir);
+        errdefer site.deinit(allocator);
+        // No hostname-derived public template. An unset site returns an ordinary 404.
+        const notfound_body = try allocator.dupe(u8, "Not Found\n");
+        errdefer allocator.free(notfound_body);
         const notfound_headers = try allocator.dupe(u8, "Content-Type: text/html; charset=utf-8\r\n" ++
             "X-Content-Type-Options: nosniff\r\n" ++
             "Cache-Control: no-store\r\n");
@@ -452,10 +454,8 @@ pub const Relay = struct {
             .backend_dns_id = dns_id,
             .local_backend = spec == null,
             .caps = caps,
-            .cover_page = cover_page,
-            .bridge_page = bridge_page,
-            .bridge_headers = bridge_headers,
-            .cover_headers = cover_headers,
+            .site = site,
+            .notfound_body = notfound_body,
             .notfound_headers = notfound_headers,
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
@@ -495,10 +495,9 @@ pub const Relay = struct {
         closeFd(self.listen_fd);
         closeFd(self.epoll_fd);
         self.allocator.free(self.caps);
-        self.allocator.free(self.cover_page);
-        self.allocator.free(self.bridge_page);
-        self.allocator.free(self.bridge_headers);
-        self.allocator.free(self.cover_headers);
+        self.site.deinit(self.allocator);
+        self.carrier_tokens.deinit(self.allocator);
+        self.allocator.free(self.notfound_body);
         self.allocator.free(self.notfound_headers);
     }
 
@@ -684,8 +683,18 @@ pub const Relay = struct {
         self.allocator.destroy(conn);
     }
 
+    fn queueBytes(queue: *const MessageQueue) usize {
+        const active_blocks = queue.blocks.items.len - queue.head_idx;
+        return (active_blocks + queue.free.items.len) * queue_block_bytes +
+            (queue.blocks.capacity + queue.free.capacity) * @sizeOf(QueueBlockPtr);
+    }
+
+    fn connBytes(conn: *const Conn) usize {
+        return conn.in.capacity + conn.msg.capacity + conn.batch.capacity + queueBytes(&conn.out);
+    }
+
     fn accountConn(self: *Relay, conn: *Conn) void {
-        const current = conn.out.total_len + conn.in.items.len + conn.msg.items.len + conn.batch.items.len;
+        const current = connBytes(conn);
         self.buffered_bytes = self.buffered_bytes - conn.accounted_bytes + current;
         conn.accounted_bytes = current;
     }
@@ -694,37 +703,86 @@ pub const Relay = struct {
         return extra <= self.opts.max_buffer_bytes -| self.buffered_bytes;
     }
 
+    fn reserveByteList(self: *Relay, list: *std.ArrayList(u8), additional: usize) !void {
+        const needed = std.math.add(usize, list.items.len, additional) catch return error.BufferBudgetExceeded;
+        if (needed <= list.capacity) return;
+        const growth = needed - list.capacity;
+        if (!self.canBuffer(growth)) return error.BufferBudgetExceeded;
+        try list.ensureTotalCapacityPrecise(self.allocator, needed);
+    }
+
+    fn reserveQueueGrowth(self: *Relay, conn: *Conn, additional: usize) !void {
+        if (additional == 0) return;
+        const queue = &conn.out;
+        const active_blocks = queue.blocks.items.len - queue.head_idx;
+        const tail_space = if (active_blocks == 0)
+            0
+        else
+            queue_block_payload - queue.blocks.items[queue.blocks.items.len - 1].len;
+        const after_tail = additional - @min(additional, tail_space);
+        const required_blocks = std.math.divCeil(usize, after_tail, queue_block_payload) catch unreachable;
+        const new_blocks = required_blocks -| queue.free.items.len;
+        const block_items = std.math.add(usize, queue.blocks.items.len, required_blocks) catch return error.BufferBudgetExceeded;
+        const blocks_growth = block_items -| queue.blocks.capacity;
+        const free_growth = queue_free_blocks -| queue.free.capacity;
+        const pointer_growth = std.math.add(usize, blocks_growth, free_growth) catch return error.BufferBudgetExceeded;
+        const pointer_bytes = std.math.mul(usize, pointer_growth, @sizeOf(QueueBlockPtr)) catch return error.BufferBudgetExceeded;
+        const block_bytes = std.math.mul(usize, new_blocks, queue_block_bytes) catch return error.BufferBudgetExceeded;
+        const growth = std.math.add(usize, pointer_bytes, block_bytes) catch return error.BufferBudgetExceeded;
+        if (!self.canBuffer(growth)) return error.BufferBudgetExceeded;
+        try queue.blocks.ensureTotalCapacityPrecise(self.allocator, block_items);
+        try queue.free.ensureTotalCapacityPrecise(self.allocator, queue_free_blocks);
+    }
+
+    fn releaseEmptyQueue(conn: *Conn) void {
+        if (!conn.out.isEmpty()) return;
+        const allocator = conn.out.allocator;
+        conn.out.deinit();
+        conn.out = .{ .allocator = allocator };
+    }
+
+    fn reclaimIdleBuffers(self: *Relay, conn: *Conn, aggressive: bool) void {
+        const keep: usize = if (aggressive) 0 else read_buf_size;
+        if (conn.in.items.len == 0 and conn.in.capacity > keep) conn.in.clearAndFree(self.allocator);
+        if (conn.msg.items.len == 0 and conn.msg.capacity > keep) conn.msg.clearAndFree(self.allocator);
+        if (conn.batch.items.len == 0 and conn.batch.capacity > keep) conn.batch.clearAndFree(self.allocator);
+        if (aggressive and conn.out.isEmpty()) releaseEmptyQueue(conn);
+        self.accountConn(conn);
+    }
+
     fn writePair(self: *Relay, conn: *Conn, first: []const u8, second: []const u8) !bool {
-        if (!self.canBuffer(first.len + second.len)) return error.BufferBudgetExceeded;
+        const total = std.math.add(usize, first.len, second.len) catch return error.BufferBudgetExceeded;
         defer self.accountConn(conn);
+        try self.reserveQueueGrowth(conn, total);
         // Until SO_ERROR confirms the connection, keep every byte available for retry.
         if (conn.connecting) {
             try conn.out.appendCopy(first);
             try conn.out.appendCopy(second);
             return false;
         }
-        return queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, first, second, &self.bytes_out, null);
+        const drained = try queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, first, second, &self.bytes_out, null);
+        if (drained) releaseEmptyQueue(conn);
+        return drained;
     }
 
     fn appendInput(self: *Relay, conn: *Conn, data: []const u8, fragmented: bool) !void {
-        if (!self.canBuffer(data.len)) return error.BufferBudgetExceeded;
         defer self.accountConn(conn);
         const buffer = if (fragmented) &conn.msg else &conn.in;
-        try buffer.appendSlice(self.allocator, data);
+        try self.reserveByteList(buffer, data.len);
+        buffer.appendSliceAssumeCapacity(data);
     }
 
     fn flushBatch(self: *Relay, conn: *Conn) !void {
         if (conn.batch.items.len == 0) return;
         var header: [ws.max_server_header]u8 = undefined;
         const framing = try ws.writeHeader(&header, true, .binary, conn.batch.items.len);
-        if (!self.canBuffer(framing.len)) return error.BufferBudgetExceeded;
         // Transfer already-accounted batch bytes to the socket queue.
         defer self.accountConn(conn);
         errdefer {
             conn.batch.clearRetainingCapacity();
             conn.batch_frames = 0;
         }
-        _ = try queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, framing, conn.batch.items, &self.bytes_out, null);
+        _ = try self.writePair(conn, framing, conn.batch.items);
         conn.batch.clearRetainingCapacity();
         conn.batch_frames = 0;
         self.syncConn(conn);
@@ -866,6 +924,7 @@ pub const Relay = struct {
             self.closeConn(conn, "write failed");
             return;
         };
+        if (drained) releaseEmptyQueue(conn);
         if (conn.kind == .backend) {
             self.creditDrain(conn, before);
             if (!self.alive(fd)) return;
@@ -951,35 +1010,73 @@ pub const Relay = struct {
             self.respondPage(conn, "200 OK", "Content-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\n", body, keep, request.method == .head);
             return;
         }
+        if (http.bridgeValue(request, self.opts.domain)) |value| {
+            if (self.matchCapability(value)) |user| {
+                self.serveBridge(conn, request, user);
+                return;
+            }
+        }
+        if (http.carrierToken(request, self.opts.ws_path, self.opts.domain)) |token| {
+            if (self.carrier_tokens.acquire(token, conn.fd, nowMs())) |user| {
+                const fd = conn.fd;
+                self.upgrade(conn, request, user, token[0..43].*);
+                if (!self.alive(fd) or conn.kind != .websocket) self.carrier_tokens.release(token, fd, false);
+                return;
+            }
+        }
+        // Genuine capabilities in malformed navigation never select a public page.
+        const presented = request.query("bridge") orelse request.query("b");
+        if (presented != null and self.matchCapability(presented.?) != null) {
+            self.respondPage(conn, "404 Not Found", self.notfound_headers, self.notfound_body, keep, request.method == .head);
+            return;
+        }
+        self.servePublic(conn, request);
+    }
+
+    fn serveBridge(self: *Relay, conn: *Conn, request: *const http.Request, user: []const u8) void {
+        const token = self.carrier_tokens.issue(self.allocator, user, nowMs(), @min(@as(usize, self.opts.max_sessions) * 4 + 32, 4096)) catch {
+            self.respondStatus(conn, "503 Service Unavailable");
+            return;
+        };
+        var nonce_bytes: [18]u8 = undefined;
+        crypto.randomBytes(&nonce_bytes);
+        var nonce: [24]u8 = undefined;
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&nonce, &nonce_bytes);
+        const body = page.renderSessionBridge(self.allocator, self.opts.ws_path, &token, &nonce) catch {
+            self.respondStatus(conn, "500 Internal Server Error");
+            return;
+        };
+        defer self.allocator.free(body);
+        var header_buf: [1536]u8 = undefined;
+        const headers = std.fmt.bufPrint(&header_buf, "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n" ++
+            "Referrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\n" ++
+            "Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=(), clipboard-write=()\r\n" ++
+            "Content-Security-Policy: default-src 'none'; script-src 'nonce-{s}'; connect-src 'self' wss://{s}; " ++
+            "base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:*; " ++
+            "sandbox allow-scripts allow-same-origin\r\n", .{ nonce, self.opts.domain }) catch {
+            self.respondStatus(conn, "500 Internal Server Error");
+            return;
+        };
+        self.respondPage(conn, "200 OK", headers, body, request.keepAlive(), false);
+    }
+
+    fn servePublic(self: *Relay, conn: *Conn, request: *const http.Request) void {
         if (request.method == .other) {
             self.respondStatus(conn, "405 Method Not Allowed");
             return;
         }
-
-        const presented = request.query("b") orelse request.query("bridge");
-        const user = if (presented) |value| self.matchCapability(value) else null;
-
-        if (http.isWebSocketUpgrade(request) and
-            std.mem.eql(u8, request.path(), self.opts.ws_path))
-        {
-            if (user) |name| {
-                self.upgrade(conn, request, name);
-            } else {
-                // No valid capability: behave exactly like any other unknown path.
-                self.respondPage(conn, "404 Not Found", self.notfound_headers, self.cover_page, keep, request.method == .head);
-            }
+        const entry = self.site.find(request.path()) orelse {
+            self.respondPage(conn, "404 Not Found", self.notfound_headers, self.notfound_body, request.keepAlive(), request.method == .head);
             return;
-        }
-
-        if (std.mem.eql(u8, request.path(), "/")) {
-            if (user != null) {
-                self.respondPage(conn, "200 OK", self.bridge_headers, self.bridge_page, keep, request.method == .head);
-            } else {
-                self.respondPage(conn, "200 OK", self.cover_headers, self.cover_page, keep, request.method == .head);
-            }
-            return;
-        }
-        self.respondPage(conn, "404 Not Found", self.notfound_headers, self.cover_page, keep, request.method == .head);
+        };
+        var headers_buf: [256]u8 = undefined;
+        var tag: [66]u8 = undefined;
+        tag[0] = '"';
+        @memcpy(tag[1..65], &entry.etag);
+        tag[65] = '"';
+        const headers = std.fmt.bufPrint(&headers_buf, "Content-Type: {s}\r\nETag: {s}\r\nCache-Control: public, max-age=300\r\nX-Content-Type-Options: nosniff\r\n", .{ entry.mime, tag }) catch return;
+        const unchanged = if (request.header("if-none-match")) |condition| std.mem.eql(u8, condition, &tag) or std.mem.eql(u8, condition, "*") else false;
+        self.respondPage(conn, if (unchanged) "304 Not Modified" else "200 OK", headers, entry.body, request.keepAlive(), unchanged or request.method == .head);
     }
 
     fn renderMetrics(self: *const Relay, buffer: []u8) ![]const u8 {
@@ -1016,12 +1113,12 @@ pub const Relay = struct {
         keep_alive: bool,
         head_only: bool,
     ) void {
-        var head_buf: [1024]u8 = undefined;
+        var head_buf: [2048]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&head_buf);
         var date_buf: [40]u8 = undefined;
         const seconds = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds();
         const date = httpDate(&date_buf, @intCast(@max(0, seconds))) catch "Thu, 01 Jan 1970 00:00:00 GMT";
-        writer.print("HTTP/1.1 {s}\r\nDate: {s}\r\nServer: nginx\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{
+        writer.print("HTTP/1.1 {s}\r\nDate: {s}\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{
             status,
             date,
             headers,
@@ -1052,13 +1149,13 @@ pub const Relay = struct {
 
     fn respondStatus(self: *Relay, conn: *Conn, status: []const u8) void {
         var body_buf: [512]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf, "<!doctype html><html><head><title>{s}</title></head><body><h1>{s}</h1></body></html>\n", .{ status, status }) catch self.cover_page;
+        const body = std.fmt.bufPrint(&body_buf, "<!doctype html><html><head><title>{s}</title></head><body><h1>{s}</h1></body></html>\n", .{ status, status }) catch self.notfound_body;
         self.respondPage(conn, status, self.notfound_headers, body, false, false);
     }
 
     // ── WebSocket upgrade ─────────────────────────────────────────────────────
 
-    fn upgrade(self: *Relay, conn: *Conn, request: *const http.Request, user: []const u8) void {
+    fn upgrade(self: *Relay, conn: *Conn, request: *const http.Request, user: []const u8, token: tokens.Token) void {
         if (self.session_count >= self.opts.max_sessions) {
             self.respondStatus(conn, "503 Service Unavailable");
             return;
@@ -1075,9 +1172,9 @@ pub const Relay = struct {
             const origin = request.header("origin") orelse "";
             var expected: [capability.max_host_len + 16]u8 = undefined;
             const want = std.fmt.bufPrint(&expected, "https://{s}", .{self.opts.domain}) catch "";
-            if (!std.mem.eql(u8, origin, want)) {
+            if (origin.len > 0 and !std.mem.eql(u8, origin, want)) {
                 log.debug("rejecting websocket upgrade with unexpected origin", .{});
-                self.respondPage(conn, "404 Not Found", self.notfound_headers, self.cover_page, false, false);
+                self.respondPage(conn, "404 Not Found", self.notfound_headers, self.notfound_body, false, false);
                 return;
             }
         }
@@ -1087,7 +1184,7 @@ pub const Relay = struct {
         const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch {
+            "Sec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: tproxy-v1.{s}\r\n\r\n", .{ accept, token }) catch {
             self.closeConn(conn, "upgrade response too large");
             return;
         };
@@ -1100,10 +1197,11 @@ pub const Relay = struct {
             .conn = conn,
             .user = user,
             .client_addr = self.clientAddress(conn, request),
+            .carrier_token = token,
             .last_rx_ms = nowMs(),
             .last_ping_ms = nowMs(),
         };
-        session.closed_ids = self.allocator.alloc(u32, @max(closed_history, self.opts.max_streams)) catch {
+        session.closed_ids = self.allocator.alloc(u32, closed_history) catch {
             self.allocator.destroy(session);
             self.closeConn(conn, "out of memory");
             return;
@@ -1144,7 +1242,7 @@ pub const Relay = struct {
     /// observes 127.0.0.1. That costs per-IP granularity for relayed users, which is why
     /// they are exempt from the per-IP guards rather than sharing one key with them.
     fn clientAddress(self: *Relay, conn: *Conn, request: *const http.Request) ?Address {
-        if (self.opts.trust_forwarded_for and self.opts.client_ip_header.len > 0 and trusted_peers.isLoopback(conn.peer)) {
+        if (self.opts.trust_forwarded_for and self.opts.client_ip_header.len > 0 and self.trustsHttpPeer(conn.peer)) {
             if (request.lastHeader(self.opts.client_ip_header)) |value| {
                 if (http.forwardedForClient(value)) |text| {
                     if (Address.parse(text, 0)) |addr| {
@@ -1156,9 +1254,19 @@ pub const Relay = struct {
         return conn.peer;
     }
 
+    fn trustsHttpPeer(self: *const Relay, peer: Address) bool {
+        if (trusted_peers.isLoopback(peer)) return true;
+        for (self.opts.trusted_http_sources) |source| {
+            const addr = Address.parse(source, 0) catch continue;
+            if (trusted_peers.sameHost(addr, peer)) return true;
+        }
+        return false;
+    }
+
     fn destroySession(self: *Relay, session: *Session) void {
         if (session.tearing_down) return;
         session.tearing_down = true;
+        if (session.carrier_token) |token| self.carrier_tokens.release(&token, session.conn.fd, session.welcomed);
         var it = session.streams.valueIterator();
         while (it.next()) |stream_ptr| {
             const stream = stream_ptr.*;
@@ -1314,16 +1422,13 @@ pub const Relay = struct {
     fn handleCarrierMessage(self: *Relay, conn: *Conn, message: []const u8) void {
         const fd = conn.fd;
         const session = conn.session orelse return;
-        if (message.len == 0) {
-            self.failCarrier(conn, ws.close_protocol_error, "empty carrier message");
+        self.validateCarrierMessage(session, message) catch {
+            self.failCarrier(conn, ws.close_protocol_error, "invalid relay frame batch");
             return;
-        }
+        };
         var it = frame.Iterator.init(message);
         while (true) {
-            const maybe = it.next() catch {
-                self.failCarrier(conn, ws.close_protocol_error, "malformed relay frame");
-                return;
-            };
+            const maybe = it.next() catch unreachable;
             const f = maybe orelse break;
             self.handleRelayFrame(session, f) catch |err| {
                 log.debug("relay protocol error: {any}", .{err});
@@ -1338,39 +1443,136 @@ pub const Relay = struct {
             // still has a CLOSE frame to flush); nothing after that point is useful.
             if (!self.alive(fd) or conn.close_after_flush) return;
         }
-        if (it.rest().len != 0) {
-            self.failCarrier(conn, ws.close_protocol_error, "partial trailing frame");
-        }
+        std.debug.assert(it.rest().len == 0);
     }
 
     const ProtocolError = error{Protocol};
     /// Returned by `sendFrame` once the carrier is gone, so callers stop touching it.
     const CarrierError = error{CarrierClosed};
 
+    const ValidationState = struct {
+        id: u32 = 0,
+        recv_window: u32 = 0,
+        exists: bool = false,
+        closed: bool = false,
+    };
+    const validation_slot_count = frame.max_batch_frames * 4;
+
+    fn validationSlot(slots: *[validation_slot_count]ValidationState, id: u32) *ValidationState {
+        var index = (@as(usize, id) *% 0x9e37_79b1) & (slots.len - 1);
+        while (slots[index].id != 0 and slots[index].id != id) {
+            index = (index + 1) & (slots.len - 1);
+        }
+        return &slots[index];
+    }
+
+    fn validateClientFrameShape(welcomed: bool, f: frame.Frame) ProtocolError!void {
+        if (f.stream_id == 0) {
+            switch (f.type) {
+                .hello => if (welcomed or f.payload.len != 1 or f.payload[0] != 1) return error.Protocol,
+                .pong => if (!welcomed or f.payload.len > frame.max_ping_payload) return error.Protocol,
+                else => return error.Protocol,
+            }
+            return;
+        }
+        switch (f.type) {
+            .open, .close => if (f.payload.len != 0) return error.Protocol,
+            .data => if (f.payload.len == 0) return error.Protocol,
+            .window => _ = frame.readWindow(f.payload) orelse return error.Protocol,
+            else => return error.Protocol,
+        }
+    }
+
+    /// Validate shape, frame count and every per-stream transition before a batch is
+    /// allowed to mutate live session state. The fixed table keeps attacker-controlled
+    /// batches off the allocator and bounds lookup work on the single-threaded loop.
+    fn validateCarrierMessage(self: *Relay, session: *const Session, message: []const u8) ProtocolError!void {
+        _ = self;
+        if (message.len == 0) return error.Protocol;
+
+        if (!session.welcomed) {
+            const parsed = frame.parseOne(message) catch return error.Protocol;
+            const only = switch (parsed) {
+                .incomplete => return error.Protocol,
+                .frame => |value| value,
+            };
+            if (only.consumed != message.len) return error.Protocol;
+            try validateClientFrameShape(false, only.value);
+            return;
+        }
+
+        var count: usize = 0;
+        var shapes = frame.Iterator.init(message);
+        while (true) {
+            const maybe = shapes.next() catch return error.Protocol;
+            const value = maybe orelse break;
+            if (count == frame.max_batch_frames) return error.Protocol;
+            count += 1;
+            try validateClientFrameShape(true, value);
+        }
+        if (count == 0 or shapes.rest().len != 0) return error.Protocol;
+
+        var states = [_]ValidationState{.{}} ** validation_slot_count;
+        for (session.closed_ids) |id| {
+            if (id == 0) continue;
+            const state = validationSlot(&states, id);
+            state.* = .{ .id = id, .closed = true };
+        }
+
+        var semantics = frame.Iterator.init(message);
+        while ((semantics.next() catch unreachable)) |value| {
+            if (value.stream_id == 0) continue;
+            const state = validationSlot(&states, value.stream_id);
+            if (state.id == 0) {
+                state.id = value.stream_id;
+                if (session.streams.get(value.stream_id)) |stream| {
+                    state.exists = true;
+                    state.recv_window = stream.recv_window;
+                }
+            }
+            switch (value.type) {
+                .open => {
+                    if (state.exists or state.closed) return error.Protocol;
+                    state.exists = true;
+                    state.recv_window = frame.initial_stream_window;
+                },
+                .data => {
+                    if (state.closed) continue;
+                    if (!state.exists or value.payload.len > state.recv_window) return error.Protocol;
+                    state.recv_window -= @intCast(value.payload.len);
+                },
+                .window => {
+                    if (state.closed) continue;
+                    if (!state.exists) return error.Protocol;
+                },
+                .close => {
+                    if (state.closed) continue;
+                    if (!state.exists) return error.Protocol;
+                    state.exists = false;
+                    state.closed = true;
+                },
+                else => unreachable,
+            }
+        }
+    }
+
     fn handleRelayFrame(self: *Relay, session: *Session, f: frame.Frame) !void {
+        try validateClientFrameShape(session.welcomed, f);
         if (!session.welcomed) {
             // Nothing may precede HELLO.
-            if (f.type != .hello or f.stream_id != 0) return error.Protocol;
+            if (f.type != .hello) return error.Protocol;
         }
         if (f.stream_id == 0) {
             switch (f.type) {
                 .hello => {
-                    if (session.welcomed) return error.Protocol;
-                    if (f.payload.len != 1 or f.payload[0] != 1) return error.Protocol;
                     session.welcomed = true;
                     // WELCOME must arrive alone: the client parses the first carrier
                     // message and requires exactly one WELCOME frame in it.
                     try self.sendFrame(session, .welcome, 0, "");
                 },
                 .pong => {
-                    if (f.payload.len > frame.max_ping_payload) return error.Protocol;
                     // Any inbound frame updates last_rx_ms; a late PONG remains valid.
                 },
-                .ping => {
-                    if (f.payload.len > frame.max_ping_payload) return error.Protocol;
-                    try self.sendFrame(session, .pong, 0, f.payload);
-                },
-                .bye => self.byeAndClose(session),
                 else => return error.Protocol,
             }
             return;
@@ -1379,11 +1581,11 @@ pub const Relay = struct {
         const entry = session.streams.get(f.stream_id) orelse {
             if (session.recentlyClosed(f.stream_id)) {
                 // Late DATA/WINDOW/CLOSE for a stream we just closed is an ordinary
-                // cross-direction race. An OPEN is not: the client never reuses an id,
-                // so answer it with a CLOSE rather than leaving it believing the socket
-                // is live.
-                if (f.type == .open) self.sendFrame(session, .close, f.stream_id, "") catch {};
-                return;
+                // cross-direction race. The client may never reuse a stream id.
+                return switch (f.type) {
+                    .data, .window, .close => {},
+                    else => error.Protocol,
+                };
             }
             if (f.type != .open) return error.Protocol;
             try self.openStream(session, f.stream_id);
@@ -1424,7 +1626,7 @@ pub const Relay = struct {
                     return error.CarrierClosed;
                 };
             }
-            if (!self.canBuffer(frame.header_size + payload.len) or conn.out.total_len + conn.batch.items.len + frame.header_size + payload.len > carrier_queue_limit) {
+            if (conn.out.total_len + conn.batch.items.len + frame.header_size + payload.len > carrier_queue_limit) {
                 self.closeConn(conn, "carrier buffer budget exceeded");
                 return error.CarrierClosed;
             }
@@ -1437,7 +1639,7 @@ pub const Relay = struct {
             }
             var relay_header: [frame.header_size]u8 = undefined;
             frame.writeHeader(&relay_header, kind, stream_id, @intCast(payload.len));
-            conn.batch.ensureUnusedCapacity(self.allocator, relay_header.len + payload.len) catch {
+            self.reserveByteList(&conn.batch, relay_header.len + payload.len) catch {
                 self.closeConn(conn, "out of memory");
                 return error.CarrierClosed;
             };
@@ -1807,13 +2009,17 @@ pub const Relay = struct {
         // walking. The scratch list is reused so a 50 ms tick allocates nothing.
         self.tick_scratch.clearRetainingCapacity();
         var queued: usize = 0;
+        const throttle_at = self.opts.max_buffer_bytes -| (2 * read_buf_size);
+        const reclaim_all_idle = self.buffered_bytes >= throttle_at;
         var it = self.conns.iterator();
         while (it.next()) |entry| {
-            queued += entry.value_ptr.*.accounted_bytes;
+            const conn = entry.value_ptr.*;
+            self.reclaimIdleBuffers(conn, reclaim_all_idle);
+            queued += conn.accounted_bytes;
             self.tick_scratch.append(self.allocator, entry.key_ptr.*) catch break;
         }
         const was_throttled = self.throttled;
-        self.throttled = queued >= self.opts.max_buffer_bytes -| (2 * read_buf_size);
+        self.throttled = queued >= throttle_at;
         if (self.throttled != was_throttled) {
             log.warn("relay {s} at {d} KiB queued (budget {d} KiB)", .{
                 if (self.throttled) "throttling" else "resuming",
@@ -1908,10 +2114,7 @@ fn testRelay(allocator: std.mem.Allocator, limit: usize) Relay {
         .allocator = allocator,
         .opts = options,
         .caps = &.{},
-        .cover_page = "",
-        .bridge_page = "",
-        .bridge_headers = "",
-        .cover_headers = "",
+        .notfound_body = "",
         .notfound_headers = "",
         .epoll_fd = -1,
         .listen_fd = -1,
@@ -1920,7 +2123,7 @@ fn testRelay(allocator: std.mem.Allocator, limit: usize) Relay {
     };
 }
 
-test "aggregate budget includes input and fragment buffers and releases consumed bytes" {
+test "aggregate budget includes retained input and fragment capacity" {
     const allocator = std.testing.allocator;
     var relay = testRelay(allocator, 8);
     var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
@@ -1931,9 +2134,196 @@ test "aggregate budget includes input and fragment buffers and releases consumed
     try std.testing.expectEqual(@as(usize, 8), relay.buffered_bytes);
     try std.testing.expectError(error.BufferBudgetExceeded, relay.appendInput(&conn, "9", false));
     dropFront(&conn.in, 3);
+    conn.msg.clearRetainingCapacity();
     relay.accountConn(&conn);
     try relay.appendInput(&conn, "abc", true);
     try std.testing.expectEqual(@as(usize, 8), relay.buffered_bytes);
+}
+
+test "aggregate budget charges retained byte-list capacity and rejects growth before allocation" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 8);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.in.deinit(allocator);
+    try relay.appendInput(&conn, "12345678", false);
+    dropFront(&conn.in, conn.in.items.len);
+    relay.accountConn(&conn);
+    try std.testing.expectEqual(@as(usize, 8), relay.buffered_bytes);
+    try relay.appendInput(&conn, "1", false);
+    const capacity = conn.in.capacity;
+    try std.testing.expectError(error.BufferBudgetExceeded, relay.appendInput(&conn, "23456789", false));
+    try std.testing.expectEqual(capacity, conn.in.capacity);
+}
+
+test "aggregate budget charges retained message queue blocks and reserves before growth" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 4096);
+    var conn = Conn{ .fd = -1, .kind = .backend, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .connecting = true };
+    defer conn.out.deinit();
+    _ = try relay.writePair(&conn, "x", "");
+    try std.testing.expect(relay.buffered_bytes >= 2056);
+    try conn.out.consume(1);
+    relay.accountConn(&conn);
+    try std.testing.expect(relay.buffered_bytes >= 2056);
+
+    var tight = testRelay(allocator, 2055);
+    var rejected = Conn{ .fd = -1, .kind = .backend, .peer = conn.peer, .out = .{ .allocator = allocator }, .connecting = true };
+    defer rejected.out.deinit();
+    try std.testing.expectError(error.BufferBudgetExceeded, tight.writePair(&rejected, "x", ""));
+    try std.testing.expectEqual(@as(usize, 0), rejected.out.blocks.capacity);
+    try std.testing.expectEqual(@as(usize, 0), rejected.out.free.capacity);
+}
+
+test "batch flush reserves retained queue growth before a partial write" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, std.math.maxInt(usize));
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .want_in = true, .want_out = true };
+    defer conn.out.deinit();
+    defer conn.batch.deinit(allocator);
+    try conn.out.appendCopy("x");
+    try conn.batch.ensureTotalCapacityPrecise(allocator, 3000);
+    conn.batch.appendNTimesAssumeCapacity(0, 3000);
+    conn.batch_frames = 1;
+    relay.accountConn(&conn);
+    relay.opts.max_buffer_bytes = relay.buffered_bytes;
+
+    try std.testing.expectError(error.BufferBudgetExceeded, relay.flushBatch(&conn));
+    try std.testing.expect(relay.buffered_bytes <= relay.opts.max_buffer_bytes);
+    try std.testing.expectEqual(@as(usize, 1), conn.out.total_len);
+}
+
+test "idle retained buffers are reclaimed so throttled window grants resume" {
+    const allocator = std.testing.allocator;
+    const limit = 512 * 1024;
+    var relay = testRelay(allocator, limit);
+    defer relay.conns.deinit(allocator);
+    defer relay.tick_scratch.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.msg.deinit(allocator);
+    defer conn.batch.deinit(allocator);
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null, .needs_window_flush = true };
+    defer session.streams.deinit(allocator);
+    var stream = Stream{ .id = 7, .session = &session, .pending_grant = 1024 };
+    try session.streams.put(allocator, stream.id, &stream);
+    conn.session = &session;
+    try relay.conns.put(allocator, conn.fd, &conn);
+    try conn.msg.ensureTotalCapacityPrecise(allocator, 400 * 1024);
+    relay.accountConn(&conn);
+    relay.throttled = true;
+
+    relay.tick(1);
+
+    try std.testing.expect(!relay.throttled);
+    try std.testing.expectEqual(@as(usize, 0), conn.msg.capacity);
+    try std.testing.expectEqual(@as(u32, 0), stream.pending_grant);
+    try std.testing.expect(!session.needs_window_flush);
+    try std.testing.expectEqual(@as(usize, 1), conn.batch_frames);
+}
+
+test "HELLO must be the only frame in its carrier message" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    defer relay.conns.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .want_out = true };
+    defer conn.out.deinit();
+    defer conn.batch.deinit(allocator);
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null };
+    conn.session = &session;
+    try relay.conns.put(allocator, conn.fd, &conn);
+    try conn.out.appendCopy("x");
+    var payload: [17]u8 = undefined;
+    _ = try frame.serialize(payload[0..9], .hello, 0, &.{1});
+    _ = try frame.serialize(payload[9..], .pong, 0, "");
+    relay.handleCarrierMessage(&conn, &payload);
+    try std.testing.expect(!session.welcomed);
+    try std.testing.expect(conn.close_after_flush);
+}
+
+test "carrier validates the entire batch before applying its first frame" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    defer relay.conns.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .want_out = true };
+    defer conn.out.deinit();
+    defer conn.batch.deinit(allocator);
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null, .welcomed = true };
+    var stream = Stream{ .id = 7, .session = &session };
+    defer session.streams.deinit(allocator);
+    try session.streams.put(allocator, stream.id, &stream);
+    conn.session = &session;
+    try relay.conns.put(allocator, conn.fd, &conn);
+    try conn.out.appendCopy("x");
+    var payload: [20]u8 = undefined;
+    _ = try frame.serialize(payload[0..11], .data, stream.id, "abc");
+    _ = try frame.serialize(payload[11..], .ping, 0, &.{1});
+    relay.handleCarrierMessage(&conn, &payload);
+    try std.testing.expectEqual(frame.initial_stream_window, stream.recv_window);
+    try std.testing.expect(conn.close_after_flush);
+}
+
+test "closed streams ignore only well-formed late frames and reject id reuse" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    var ids = [_]u32{7};
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null, .welcomed = true, .closed_ids = &ids };
+    defer session.streams.deinit(allocator);
+    var neighbor = Stream{ .id = 8, .session = &session };
+    try session.streams.put(allocator, neighbor.id, &neighbor);
+    try relay.handleRelayFrame(&session, .{ .type = .data, .stream_id = 7, .payload = "late" });
+    try relay.handleRelayFrame(&session, .{ .type = .window, .stream_id = 7, .payload = &frame.windowPayload(1) });
+    try relay.handleRelayFrame(&session, .{ .type = .close, .stream_id = 7, .payload = "" });
+    try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .data, .stream_id = 7, .payload = "" }));
+    try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .window, .stream_id = 7, .payload = &.{ 0, 0, 0, 0 } }));
+    try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .close, .stream_id = 7, .payload = "x" }));
+    try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .open, .stream_id = 7, .payload = "" }));
+    try std.testing.expectEqual(@as(?*Stream, &neighbor), session.streams.get(8));
+}
+
+test "client relay frame shapes are strict for every type and scope" {
+    const good_window = frame.windowPayload(1);
+    try Relay.validateClientFrameShape(true, .{ .type = .pong, .stream_id = 0, .payload = "ok" });
+    try Relay.validateClientFrameShape(true, .{ .type = .open, .stream_id = 1, .payload = "" });
+    try Relay.validateClientFrameShape(true, .{ .type = .data, .stream_id = 1, .payload = "x" });
+    try Relay.validateClientFrameShape(true, .{ .type = .window, .stream_id = 1, .payload = &good_window });
+    try Relay.validateClientFrameShape(true, .{ .type = .close, .stream_id = 1, .payload = "" });
+
+    const too_long_pong = [_]u8{0} ** (frame.max_ping_payload + 1);
+    const bad = [_]frame.Frame{
+        .{ .type = .ping, .stream_id = 0, .payload = "" },
+        .{ .type = .bye, .stream_id = 0, .payload = "" },
+        .{ .type = .pong, .stream_id = 0, .payload = &too_long_pong },
+        .{ .type = .hello, .stream_id = 0, .payload = &.{1} },
+        .{ .type = .open, .stream_id = 1, .payload = "x" },
+        .{ .type = .data, .stream_id = 1, .payload = "" },
+        .{ .type = .window, .stream_id = 1, .payload = &.{ 0, 0, 0, 0 } },
+        .{ .type = .close, .stream_id = 1, .payload = "x" },
+        .{ .type = .pong, .stream_id = 1, .payload = "" },
+        .{ .type = .open, .stream_id = 0, .payload = "" },
+    };
+    for (bad) |value| try std.testing.expectError(error.Protocol, Relay.validateClientFrameShape(true, value));
+}
+
+test "carrier rejects more than the maximum inbound frame count" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    defer relay.conns.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .want_out = true };
+    defer conn.out.deinit();
+    defer conn.batch.deinit(allocator);
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null, .welcomed = true };
+    conn.session = &session;
+    try relay.conns.put(allocator, conn.fd, &conn);
+    try conn.out.appendCopy("x");
+    const count = frame.max_batch_frames + 1;
+    var payload: [count * frame.header_size]u8 = undefined;
+    for (0..count) |i| frame.writeHeader(payload[i * frame.header_size ..][0..frame.header_size], .pong, 0, 0);
+    relay.handleCarrierMessage(&conn, &payload);
+    try std.testing.expect(conn.close_after_flush);
 }
 
 test "production emitter batches exact DATA and WINDOW bytes and refuses condemned carriers" {
@@ -1992,7 +2382,7 @@ test "metrics accepts direct loopback requests and rejects public or forwarded r
 
 test "a queued websocket CLOSE stops the rest of the same read batch" {
     const allocator = std.testing.allocator;
-    var relay = testRelay(allocator, 1024);
+    var relay = testRelay(allocator, 8192);
     defer relay.conns.deinit(allocator);
     var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
     conn.want_out = true; // epoll interest is already correct; no OS call in this unit test
@@ -2111,17 +2501,15 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
         .allocator = allocator,
         .opts = undefined,
         .caps = undefined,
-        .cover_page = undefined,
-        .bridge_page = undefined,
-        .bridge_headers = undefined,
-        .cover_headers = undefined,
+        .notfound_body = undefined,
         .notfound_headers = undefined,
         .epoll_fd = try socket_utils.epollCreate(),
         .listen_fd = -1,
         .signal_fd = -1,
         .old_sigmask = undefined,
     };
-    relay.opts.max_buffer_bytes = 1024;
+    // One queued byte owns a complete 2 KiB message block plus queue indices.
+    relay.opts.max_buffer_bytes = 4096;
     defer closeFd(relay.epoll_fd);
     defer relay.conns.deinit(allocator);
     defer relay.pending_close.deinit(allocator);
@@ -2232,10 +2620,7 @@ test "a burst of tiny websocket frames compacts the carrier buffer once, not onc
         .allocator = allocator,
         .opts = undefined,
         .caps = undefined,
-        .cover_page = undefined,
-        .bridge_page = undefined,
-        .bridge_headers = undefined,
-        .cover_headers = undefined,
+        .notfound_body = undefined,
         .notfound_headers = undefined,
         .epoll_fd = -1,
         .listen_fd = -1,
@@ -2376,4 +2761,16 @@ test "capabilities cover both accepted secret encodings for every user" {
         if (std.mem.eql(u8, &cap.value, "MHLEY5PmW1GWqJkSrlmJpvJUiLhBH_QKy6yKg8a0JPk")) saw_plain = true;
     }
     try std.testing.expect(saw_padded and saw_plain);
+}
+
+test "only explicitly trusted HTTP terminators supply client identity" {
+    var relay = testRelay(std.testing.allocator, 1024 * 1024);
+    relay.opts.trust_forwarded_for = true;
+    relay.opts.client_ip_header = "x-forwarded-for";
+    relay.opts.trusted_http_sources = &.{"192.0.2.7"};
+    var conn = Conn{ .fd = -1, .kind = .http, .peer = net_helpers.ip4(.{ 192, 0, 2, 7 }, 443), .out = .{ .allocator = std.testing.allocator } };
+    const request = try http.parse("GET / HTTP/1.1\r\nHost: relay.example.com\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n");
+    try std.testing.expect(trusted_peers.sameHost(relay.clientAddress(&conn, &request).?, net_helpers.ip4(.{ 203, 0, 113, 9 }, 0)));
+    conn.peer = net_helpers.ip4(.{ 192, 0, 2, 8 }, 443);
+    try std.testing.expect(trusted_peers.sameHost(relay.clientAddress(&conn, &request).?, conn.peer));
 }

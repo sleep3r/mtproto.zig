@@ -181,13 +181,20 @@ client requires exactly one WELCOME frame in the first message it parses. Then `
 4 MiB window in each direction; we replenish the client's credit only once its bytes have actually
 left for the backend, so a stalled backend throttles the client instead of growing our memory.
 
-**The bridge capability** (`src/web/capability.zig`) is
-`base64url(HMAC-SHA256(key = secret_bytes, "tdesktop-web-proxy-bridge-v1\n" + host))`, computed by the
-client and never carrying the secret itself. Two consequences we lean on: the relay can recompute it
-per configured user and so knows *which* user is connecting without touching the MTProto stream; and a
-visitor who cannot present a capability derived from a real secret never sees the bridge page — they
-get the same cover page every other path returns, so an active prober without a user secret cannot
-distinguish this host from a plain website.
+**Bridge and carrier credentials.** The existing HMAC capability and root WEB links
+remain unchanged. Only a canonical root GET with the configured Host selects the bridge.
+Each response contains a random 120-second carrier token and a nonce-bearing inline script.
+The browser upgrades the same-origin WebSocket with `Sec-WebSocket-Protocol: tproxy-v1.<token>`;
+the long-lived link capability is never repeated in that URL. One token can attach to only
+one carrier at a time; an adopted session cannot be resumed after closure. Native WebViews
+may omit Origin, while a supplied foreign Origin is rejected by default.
+
+**Public site.** `[web].public_dir` supplies operator-owned static files loaded once at
+startup, with exact routes and ETags. Without it ordinary requests get a plain 404.
+The bridge is a standalone minimal page, independent of public site markup. HTTP terminators
+are trusted on loopback or through `[web].trusted_http_sources`; this list does not grant
+access to the MTProto data plane. Retained relay buffer capacity counts toward the global
+budget; the browser independently bounds queued plus socket-buffered uplink to 32 MiB.
 
 **Why `dd` and not `ee`.** The relay is a raw byte pipe; it adds no TLS-emulation record, so the
 client reports an `ee` FakeTLS secret as `Status::Unsupported` for a WEB proxy. WEB links therefore

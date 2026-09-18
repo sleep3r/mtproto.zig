@@ -152,7 +152,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "cover_page", .module = b.createModule(.{ .root_source_file = b.path("src/web/page.zig"), .target = target, .optimize = optimize }) },
+            .{ .name = "cover_page", .module = b.createModule(.{ .root_source_file = b.path("src/ctl/mask_page.zig"), .target = target, .optimize = optimize }) },
             .{ .name = "tunnel", .module = tunnel_mod },
             .{ .name = "version", .module = version_mod },
             .{ .name = "linux_io", .module = linux_io_mod },

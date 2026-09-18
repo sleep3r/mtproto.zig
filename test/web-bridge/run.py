@@ -37,10 +37,11 @@ def extract_script() -> tuple[str, str, str]:
         "-Mframe=" + str(PAGE.with_name("frame.zig")),
     ], check=True, text=True, capture_output=True, cwd=REPO).stdout
     hello, welcome, page = rendered.split("\n", 2)
-    body = page.split("<script>", 1)
-    if len(body) != 2:
+    start = page.find("<script nonce=\"")
+    if start < 0:
         raise SystemExit("the bridge page no longer opens a <script> element")
-    js = body[1].split("</script>", 1)[0]
+    start = page.find(">", start) + 1
+    js = page[start:].split("</script>", 1)[0]
     if "TelegramWebProxy" not in js or "tproxy-init" not in js:
         raise SystemExit("the extracted script is missing a client boundary")
     return js, hello, welcome

@@ -37,6 +37,7 @@ pub const Request = struct {
     method: Method,
     /// Request target as sent, e.g. `/?bridge=abc`.
     target: []const u8,
+    origin_form: bool = true,
     /// Bytes the complete head occupies, including the terminating blank line.
     head_len: usize,
     /// HTTP/1.0 request — different keep-alive default.
@@ -172,6 +173,7 @@ pub fn parse(buf: []const u8) ParseError!Request {
     var request = Request{
         .method = method,
         .target = target,
+        .origin_form = raw_target.len > 0 and raw_target[0] == '/',
         .head_len = end,
         .http_1_0 = http_1_0,
         .headers_buf = undefined,
@@ -390,4 +392,60 @@ test "token list matching is case-insensitive and comma aware" {
     try std.testing.expect(listHasToken("keep-alive, Upgrade", "upgrade"));
     try std.testing.expect(listHasToken("Upgrade", "UPGRADE"));
     try std.testing.expect(!listHasToken("upgraded", "upgrade"));
+}
+
+/// Only the exact origin-form root GET is a bridge navigation.
+pub fn bridgeValue(request: *const Request, host: []const u8) ?[]const u8 {
+    if (request.method != .get or request.has_body or !request.origin_form or !hostMatches(request, host)) return null;
+    const prefix = "/?bridge=";
+    if (request.target.len != prefix.len + 43 or !std.mem.startsWith(u8, request.target, prefix)) return null;
+    const value = request.target[prefix.len..];
+    for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return null;
+    // Canonical base64url has zero unused low bits in its final character.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = std.mem.indexOfScalar(u8, alphabet, value[42]) orelse return null;
+    if (last & 3 != 0) return null;
+    return value;
+}
+
+test "bridge navigation rejects duplicate queries headers wrong host and aliases" {
+    const token = "IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA";
+    const valid = try parse("GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n");
+    try std.testing.expectEqualStrings(token, bridgeValue(&valid, "proxy.example.com").?);
+    const cases = [_][]const u8{
+        "GET /?bridge=" ++ token ++ "&x=1 HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ "&bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "HEAD /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?b=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: other.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\nHost: other.example.com\r\n\r\n",
+    };
+    for (cases) |raw| {
+        const req = try parse(raw);
+        try std.testing.expect(bridgeValue(&req, "proxy.example.com") == null);
+    }
+}
+
+pub fn singleHeader(request: *const Request, name: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (request.headers()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, name)) continue;
+        if (result != null) return null;
+        result = h.value;
+    }
+    return result;
+}
+
+pub fn hostMatches(request: *const Request, expected: []const u8) bool {
+    const host = singleHeader(request, "host") orelse return false;
+    return std.mem.eql(u8, host, expected) or
+        (host.len == expected.len + 4 and std.mem.startsWith(u8, host, expected) and std.mem.endsWith(u8, host, ":443"));
+}
+
+pub fn carrierToken(request: *const Request, path: []const u8, host: []const u8) ?[]const u8 {
+    if (!request.origin_form or !std.mem.eql(u8, request.target, path) or !hostMatches(request, host) or !isWebSocketUpgrade(request)) return null;
+    const protocol = singleHeader(request, "sec-websocket-protocol") orelse return null;
+    const prefix = "tproxy-v1.";
+    if (protocol.len != prefix.len + 43 or !std.mem.startsWith(u8, protocol, prefix)) return null;
+    return protocol[prefix.len..];
 }

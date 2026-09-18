@@ -499,10 +499,12 @@ alice = true   # bypass MiddleProxy for this user
 | `[web] mask_backend` | unset | PROXY-protocol terminator for masked connections to `domain`, so the real client IP survives the mask hop |
 | `[web] cert` / `[web] key` | unset | Bring your own certificate for the relay vhost instead of the Let's Encrypt one (read by `mtbuddy setup web`) |
 | `[web] ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint of the bridge page |
-| `[web] trust_forwarded_for` | `true` | Take the client address from the forwarded header (right-most entry only) |
+| `[web] public_dir` | unset | Operator-owned static site directory, loaded at startup; unset returns a plain 404 to ordinary visitors |
+| `[web] trusted_http_sources` | `[]` | Additional HTTP terminator IPs allowed to supply the client-address header; loopback is implicit |
+| `[web] trust_forwarded_for` | `true` | Take the client address from a trusted HTTP terminator (right-most entry only) |
 | `[web] client_ip_header` | `"x-forwarded-for"` | Which header carries it (`cf-connecting-ip` behind Cloudflare) |
-| `[web] check_origin` | `true` | Require `Origin: https://<domain>` on the upgrade |
-| `[web] max_sessions` | `64` | Concurrent desktop clients |
+| `[web] check_origin` | `true` | Reject a supplied foreign Origin; native WebViews may omit it |
+| `[web] max_sessions` | `32` | Concurrent desktop clients |
 | `[web] max_streams` | `32` | Logical MTProto sockets per client |
 | `[web] relay_sources` | `[]` | Extra IPs allowed to speak the `dd` transport (loopback is implicit) |
 | `[censorship] tls_domain` | `"google.com"` | Domain to impersonate |
@@ -562,6 +564,23 @@ sudo mtbuddy setup web --domain relay.example.com
 sudo mtbuddy links          # now also prints tg://webproxy links
 ```
 
+Existing WEB links keep working after updating. The bridge now issues a short-lived
+carrier token instead of repeating the link capability in WebSocket URLs. Open pages
+may reconnect once when the relay restarts.
+
+For ordinary visitors, serve your own static site by setting `[web].public_dir` to a
+readable directory containing `index.html` and its assets, then restart the proxy/relay.
+The former generated placeholder has been removed: without `public_dir`, public
+requests return a plain 404 while authenticated WEB links still work. Files are read
+once at startup (up to 256 files, 2 MiB each, 16 MiB total); dotfiles and symlinks are
+not served. Use exact file paths for asset links. The bridge is a separate minimal
+document and does not execute scripts from your public site.
+
+When the TLS terminator is on another host, list its IP in
+`[web].trusted_http_sources`; this is separate from `relay_sources`, which controls
+relay-to-MTProto connections. Configure the terminator to overwrite the client-IP
+header, and disable request URI/header logging, including error logs.
+
 You need a domain you control with an A record pointing at this host; `mtbuddy` issues a
 Let's Encrypt certificate over HTTP-01 (so port 80 is opened) and installs a renewal hook.
 
@@ -609,8 +628,9 @@ the bridge never loads.
   `PROXY` protocol header carrying the browser's address, so per-IP accounting, the flood
   guard and Telegram itself see the actual client rather than `127.0.0.1`.
 - **Probe resistance.** The bridge capability is `HMAC-SHA256(user secret)`, so a visitor
-  who cannot present one derived from a configured secret never sees the bridge at all —
-  they get the same plain cover page every other path returns.
+  who cannot present one derived from a configured secret never sees the bridge.
+  Ordinary requests use the operator-owned public site (or a plain 404 when unset).
+  Carrier credentials expire after two minutes and cannot resume an adopted session.
 - **Capacity.** Each WEB client costs one masked connection plus one connection per logical
   MTProto stream against `[server].max_connections`. Budget roughly 3–5× a direct client,
   and raise `max_connections` accordingly.
@@ -629,6 +649,10 @@ is what you are seeing, stop offering the direct door:
 sudo mtbuddy setup web --domain relay.example.com --only
 sudo mtbuddy links          # now prints tg://webproxy links and nothing else
 ```
+
+`setup web --only` verifies HTTPS, the authenticated bridge and a real MTProto reply
+before disabling direct links. Python 3 is required for this deployment check; a
+missing interpreter or failed check leaves the previous WEB-only setting unchanged.
 
 With `[web].only` the data plane answers MTProto for the relay and no one else. Everyone
 else — including a real Telegram client holding a valid `ee` link — is forwarded to the

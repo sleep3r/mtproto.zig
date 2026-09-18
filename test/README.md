@@ -252,3 +252,12 @@ The dashboard suite also checks that traffic sampling creates no TLS contexts,
 ignores environment proxies, refuses redirects and oversized responses, and can
 pause/resume local history independently of Prometheus without modifying its
 saved database while paused or counting the paused interval.
+
+## WEB protocol regressions
+
+`zig build web-bridge` checks bounded browser queues, native frame splitting, exact
+loopback-parent adoption, pagehide cleanup, nonce-bearing token bootstrap, and carrier
+loss. WEB Linux E2E cases obtain a short-lived token from the actual bridge response
+and use the echoed WebSocket subprotocol. `zig build test` also covers retained relay
+buffer allocation budgets, frame-count limits, closed-stream history, canonical HTTP
+routing, token expiry/reuse, operator public files and trusted HTTP terminators.
