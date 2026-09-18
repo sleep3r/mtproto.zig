@@ -1485,8 +1485,35 @@ def scenario_silent_connections_do_not_starve_clients() -> None:
         idle_timeout_sec=120, handshake_timeout_sec=5), port)
     silent = []
     try:
+        def admission_total(snapshot: dict[str, float]) -> float:
+            return (
+                snapshot["mtproto_connections_accepted_total"]
+                + snapshot["mtproto_drops_capacity_total"]
+                + snapshot["mtproto_drops_pool_total"]
+            )
+
+        startup_accounted = wait_for_condition(
+            lambda: admission_total(proxy.scrape()) >= 1,
+            timeout_sec=2,
+        )
+        if not startup_accounted:
+            raise AssertionError(
+                "startup listen probe was not accounted before the saturation setup: "
+                f"metrics={proxy.scrape()}\n{proxy.read_log_tail()}"
+            )
+        before = proxy.scrape()
+        accounted_before = admission_total(before)
         for _ in range(70):
             silent.append(socket.create_connection(("127.0.0.1", port), timeout=2))
+        settled = wait_for_condition(
+            lambda: admission_total(proxy.scrape()) >= accounted_before + len(silent),
+            timeout_sec=3,
+        )
+        if not settled:
+            raise AssertionError(
+                "silent connection attempts did not settle before the admission check: "
+                f"before={before} after={proxy.scrape()}\n{proxy.read_log_tail()}"
+            )
         with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
             client.settimeout(2)
             perform_valid_client_handshake(client, DEFAULT_SECRET_HEX, DEFAULT_TLS_DOMAIN)
