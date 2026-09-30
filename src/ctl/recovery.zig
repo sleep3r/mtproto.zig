@@ -102,12 +102,13 @@ const WEB_HEALTH_SCRIPT =
     \\    inside && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
     \\      sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); gsub(/"/, ""); value=$0
     \\    }
-    \\    END { print value == "" ? fallback : value }
+    \\    END { print (value == "" ? fallback : value) }
     \\  ' /opt/mtproto-proxy/config.toml
     \\}
     \\[[ "$(read_web enabled false)" == true ]] || exit 0
     \\port=$(read_web port 8081)
-    \\host=$(read_web host 127.0.0.1)
+    \\# Both names are accepted by the config parser; the last assignment wins.
+    \\host=$(read_web '(listen|host)' 127.0.0.1)
     \\domain=$(read_web domain '')
     \\[[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port > 0 && 10#$port < 65536)) || exit 1
     \\[[ "$host" =~ ^[0-9a-fA-F:.]+$ ]] || exit 1
@@ -116,8 +117,10 @@ const WEB_HEALTH_SCRIPT =
     \\[[ "$host" == :: ]] && host=::1
     \\[[ "$host" == *:* ]] && host="[$host]"
     \\healthy=false
+    \\# A completed HTTP response proves liveness. The public root is normally 404
+    \\# without public_dir; its status must not trigger a relay/session restart.
     \\for attempt in 1 2 3; do
-    \\  if curl --noproxy '*' -fsS --max-time 5 "http://${host}:${port}/" >/dev/null; then healthy=true; break; fi
+    \\  if curl --noproxy '*' -sS --max-time 5 "http://${host}:${port}/" >/dev/null; then healthy=true; break; fi
     \\  sleep 1
     \\done
     \\if [[ "$healthy" != true ]]; then
@@ -125,7 +128,10 @@ const WEB_HEALTH_SCRIPT =
     \\  systemctl restart mtproto-web-relay.service
     \\  exit 1
     \\fi
-    \\if ! curl --noproxy '*' -fsS --max-time 8 "https://${domain}/" >/dev/null; then
+    \\# The public path may return the same expected 404, but terminator 5xx and
+    \\# transport/TLS failures must remain visible. Never restart the local relay here.
+    \\if ! public_status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://${domain}/") ||
+    \\   [[ ! "$public_status" =~ ^(2[0-9]{2}|3[0-9]{2}|404)$ ]]; then
     \\  logger -t mtproto-web-health 'public HTTPS path failed; check DNS, certificate and terminator'
     \\  exit 1
     \\fi

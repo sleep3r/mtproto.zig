@@ -263,6 +263,18 @@ saved database while paused or counting the paused interval.
 
 ## WEB protocol regressions
 
+Run the installed health-check script against local HTTP fixtures (Bash, curl,
+awk, and Python's standard library; no systemd or Telegram access required):
+
+```bash
+python3 -m unittest discover -s test -p test_web_health.py
+```
+
+This covers `listen`/`host` aliases, IPv4/IPv6 and wildcard probe destinations,
+ordinary 404 responses, public HTTPS failure reporting, and restarting only the
+relay after three local transport failures. Systemd operations are recorded by
+stubs; HTTP status handling uses real curl transfers.
+
 `zig build web-bridge` checks bounded browser queues, native frame splitting, exact
 loopback-parent adoption, pagehide cleanup, nonce-bearing token bootstrap, and carrier
 loss. WEB Linux E2E cases obtain a short-lived token from the actual bridge response
