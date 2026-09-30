@@ -576,6 +576,15 @@ once at startup (up to 256 files, 2 MiB each, 16 MiB total); dotfiles and symlin
 not served. Use exact file paths for asset links. The bridge is a separate minimal
 document and does not execute scripts from your public site.
 
+The WEB health timer probes `[web].listen` (`host` is also accepted). A completed
+local HTTP response, including 404, keeps the relay running; only three failed
+local transfers trigger a relay restart. The public HTTPS check accepts 2xx, 3xx,
+and 404, while other statuses and TLS/network failures report an error without
+restarting the relay. These are liveness checks, not authenticated end-to-end tests.
+When upgrading from a version with the old health script, run
+`sudo mtbuddy update --force` once after the upgrade: the first update finishes
+using the previous updater's embedded scripts, even after replacing its binary.
+
 When the TLS terminator is on another host, list its IP in
 `[web].trusted_http_sources`; this is separate from `relay_sources`, which controls
 relay-to-MTProto connections. Configure the terminator to overwrite the client-IP
